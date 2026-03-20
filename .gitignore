@@ -1,0 +1,8 @@
+/target
+.codex-tmp/
+.idea/
+__pycache__/
+.playwright-mcp/
+.claude/worktrees/
+.worktrees/
+.superpowers/

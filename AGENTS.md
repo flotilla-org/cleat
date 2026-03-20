@@ -17,7 +17,7 @@ If you say a change matches CI locally, it should have been checked against thes
 ## Ghostty Build Metadata
 
 - `ghostty-vt` stays optional and must not affect the default Rust-only build.
-- The future Ghostty helper will read pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), including Ghostty fork/ref and Zig `0.15.2`.
+- The future Ghostty helper will read pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), including an exact Ghostty commit SHA from the fork and Zig `0.15.2`.
 - Keep the metadata file minimal and only add fields that the helper/build flow will actually consume.
 
 ## Repo Scope

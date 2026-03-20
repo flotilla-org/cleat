@@ -1,3 +1,5 @@
+use std::{path::PathBuf, process::Command};
+
 use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, VtEngine};
 
 mod vt_contracts;
@@ -85,4 +87,45 @@ fn vt_ghostty_blank_engine_does_not_emit_replay_payload() {
     let replay = engine.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, false)).expect("replay payload");
 
     assert_eq!(replay, None, "blank ghostty engine should not emit replay");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_prefers_static_library_when_present() {
+    let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
+    let static_library = prefix.join("lib/libghostty-vt.a");
+    if !static_library.exists() {
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test binary");
+    let output = inspect_linkage(&exe);
+    let linkage = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "failed to inspect test binary linkage for {}\nstdout:\n{}\nstderr:\n{}",
+        exe.display(),
+        linkage,
+        stderr
+    );
+    assert!(
+        !linkage.contains("libghostty-vt"),
+        "expected static ghostty-vt linking when {} exists, but the test binary still depends on the shared library:\n{}",
+        static_library.display(),
+        linkage
+    );
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn inspect_linkage(exe: &std::path::Path) -> std::process::Output {
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("ldd").arg(exe).output().expect("run ldd")
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("otool").arg("-L").arg(exe).output().expect("run otool")
+    }
 }

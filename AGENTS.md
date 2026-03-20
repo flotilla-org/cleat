@@ -17,8 +17,9 @@ If you say a change matches CI locally, it should have been checked against thes
 ## Ghostty Build Metadata
 
 - `ghostty-vt` stays optional and must not affect the default Rust-only build.
-- The future Ghostty helper will read pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), including an exact Ghostty commit SHA from the fork and Zig `0.15.2`.
-- Keep the metadata file minimal and only add fields that the helper/build flow will actually consume.
+- The local helper at [`tools/prepare-ghostty-vt.sh`](tools/prepare-ghostty-vt.sh) reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies Zig `0.15.2`, clones or refreshes the Ghostty fork in `.tools/ghostty-src`, and installs into `.tools/ghostty-install`.
+- Re-run the helper after changing the pinned ref or Zig version; it is expected to be idempotent and to refresh the repo-local checkout and install prefix.
+- Verify the helper with `./tools/prepare-ghostty-vt.sh` followed by `find .tools/ghostty-install -maxdepth 3 | sort`.
 
 ## Repo Scope
 

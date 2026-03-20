@@ -18,10 +18,17 @@ cargo test --workspace --locked
 
 ## Optional Ghostty VT Engine
 
-The `ghostty-vt` feature is optional and currently expects a local `libghostty-vt` install. The future helper flow will consume pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), including an exact Ghostty commit SHA from the fork and Zig `0.15.2`.
+The `ghostty-vt` feature is optional and stays out of the default build. Use the repo-local helper to fetch the pinned Ghostty fork/ref and build a local install prefix under `.tools/`.
 
 ```bash
+./tools/prepare-ghostty-vt.sh
 cargo build -p cleat --locked --features ghostty-vt
+```
+
+The helper reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies Zig `0.15.2`, clones or refreshes Ghostty into `.tools/ghostty-src`, and installs headers plus `libghostty-vt.a` and `libghostty-vt.so` into `.tools/ghostty-install`.
+
+```bash
+find .tools/ghostty-install -maxdepth 3 | sort
 ```
 
 Default builds and CI remain Ghostty-free unless the feature is enabled explicitly.

@@ -71,14 +71,6 @@ mkdir -p "$INSTALL_DIR"
 
 (cd "$SOURCE_DIR" && zig build "$build_step" --prefix "$INSTALL_DIR")
 
-mapfile -t object_files < <(find "$SOURCE_DIR/.zig-cache/o" -type f -name '*.o' | sort)
-if (( ${#object_files[@]} == 0 )); then
-  printf 'No Zig object files were produced under %s\n' "$SOURCE_DIR/.zig-cache/o" >&2
-  exit 1
-fi
-
-ar crs "$INSTALL_DIR/lib/libghostty-vt.a" "${object_files[@]}"
-
 test -f "$INSTALL_DIR/include/ghostty/vt.h"
 test -f "$INSTALL_DIR/lib/libghostty-vt.a"
 test -f "$INSTALL_DIR/lib/libghostty-vt.so"

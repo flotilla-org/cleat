@@ -3,5 +3,5 @@ version = "0.15.2"
 
 [ghostty]
 repo = "https://github.com/rjwittams/ghostty.git"
-ref = "4fd534c44d9a5c61d1ed730e57dc63578ee9083e"
+ref = "7b6b5e9e3aecae87182ea97d49f0fbf80fe8b62b"
 build_step = "lib-vt"

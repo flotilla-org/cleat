@@ -25,7 +25,7 @@ The `ghostty-vt` feature is optional and stays out of the default build. Use the
 cargo build -p cleat --locked --features ghostty-vt
 ```
 
-The helper reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies Zig `0.15.2`, clones or refreshes Ghostty into `.tools/ghostty-src`, and installs headers plus `libghostty-vt.a` and `libghostty-vt.so` into `.tools/ghostty-install`.
+The helper reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies Zig `0.15.2`, clones or refreshes Ghostty into `.tools/ghostty-src`, and installs the Ghostty VT headers and libraries into `.tools/ghostty-install`.
 
 ```bash
 find .tools/ghostty-install -maxdepth 3 | sort

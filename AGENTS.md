@@ -17,9 +17,9 @@ If you say a change matches CI locally, it should have been checked against thes
 ## Ghostty Build Metadata
 
 - `ghostty-vt` stays optional and must not affect the default Rust-only build.
-- The local helper at [`tools/prepare-ghostty-vt.sh`](tools/prepare-ghostty-vt.sh) reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies Zig `0.15.2`, clones or refreshes the Ghostty fork in `.tools/ghostty-src`, and installs the Ghostty VT headers and libraries into `.tools/ghostty-install`.
+- The local helper at [`tools/prepare-ghostty-vt.sh`](tools/prepare-ghostty-vt.sh) reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies the configured Zig version, clones or refreshes the Ghostty fork in `.tools/ghostty-src`, and installs the Ghostty VT headers and libraries into `.tools/ghostty-install`.
 - Re-run the helper after changing the pinned ref or Zig version; it is expected to be idempotent and to refresh the repo-local checkout and install prefix.
-- Verify the helper with `./tools/prepare-ghostty-vt.sh` followed by `find .tools/ghostty-install -maxdepth 3 | sort`.
+- Verify the helper with `./tools/prepare-ghostty-vt.sh`, `find .tools/ghostty-install -maxdepth 3 | sort`, and `cargo test --workspace --locked`. Until Task 3 lands, feature-on builds should set `CLEAT_GHOSTTY_PREFIX="$PWD/.tools/ghostty-install"` explicitly.
 
 ## Repo Scope
 

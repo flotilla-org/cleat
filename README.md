@@ -22,10 +22,11 @@ The `ghostty-vt` feature is optional and stays out of the default build. Use the
 
 ```bash
 ./tools/prepare-ghostty-vt.sh
-cargo build -p cleat --locked --features ghostty-vt
+CLEAT_GHOSTTY_PREFIX="$PWD/.tools/ghostty-install" cargo build -p cleat --locked --features ghostty-vt
+cargo test --workspace --locked
 ```
 
-The helper reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies Zig `0.15.2`, clones or refreshes Ghostty into `.tools/ghostty-src`, and installs the Ghostty VT headers and libraries into `.tools/ghostty-install`.
+The helper reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies the configured Zig version, clones or refreshes Ghostty into `.tools/ghostty-src`, and installs the Ghostty VT headers and libraries into `.tools/ghostty-install`. Until Task 3 updates `build.rs`, feature-on builds should point `CLEAT_GHOSTTY_PREFIX` at that repo-local install prefix explicitly.
 
 ```bash
 find .tools/ghostty-install -maxdepth 3 | sort

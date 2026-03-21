@@ -2,6 +2,7 @@ pub mod cli;
 pub mod da;
 pub mod keys;
 pub mod protocol;
+pub mod recording;
 pub mod runtime;
 pub mod server;
 pub mod session;

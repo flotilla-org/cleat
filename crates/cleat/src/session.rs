@@ -456,6 +456,15 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
     let mut detached_da = DeviceAttributeTracker::new();
 
     let mut active_client: Option<ActiveClient> = None;
+    let mut recorder: Option<crate::recording::OutputRecorder> = None;
+    if session.record || std::env::var("CLEAT_RECORD").map(|v| v == "1").unwrap_or(false) {
+        match crate::recording::OutputRecorder::new(&root.join(id)) {
+            Ok(r) => recorder = Some(r),
+            Err(err) => eprintln!("failed to start recording: {err}"),
+        }
+    }
+    let mut bytes_since_snapshot: u64 = 0;
+    const SNAPSHOT_INTERVAL_BYTES: u64 = 256 * 1024; // 256 KB
     let mut had_foreground_client = false;
     loop {
         let poll_result = poll_ready(
@@ -508,6 +517,43 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                         Ok(Frame::SendKeys(bytes)) => {
                             if let Err(err) = write_fd_all(pty_fd, &bytes) {
                                 let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        }
+                        Ok(Frame::Inspect) => {
+                            let result = build_inspect_result(&session, vt_engine.as_ref(), &active_client, &pty_child, &recorder);
+                            match serde_json::to_vec(&result) {
+                                Ok(json) => {
+                                    let _ = Frame::InspectResult(json).write(&mut stream);
+                                }
+                                Err(err) => {
+                                    let _ = Frame::Error(format!("serialize inspect: {err}")).write(&mut stream);
+                                }
+                            }
+                        }
+                        Ok(Frame::Signal { signal, target }) => match dispatch_signal(&pty_child, signal, target) {
+                            Ok(()) => {
+                                let _ = Frame::Ack.write(&mut stream);
+                            }
+                            Err(err) => {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        },
+                        Ok(Frame::RecordControl { enable }) => {
+                            if enable && recorder.is_none() {
+                                match crate::recording::OutputRecorder::new(&root.join(id)) {
+                                    Ok(r) => {
+                                        recorder = Some(r);
+                                        let _ = Frame::Ack.write(&mut stream);
+                                    }
+                                    Err(err) => {
+                                        let _ = Frame::Error(err).write(&mut stream);
+                                    }
+                                }
+                            } else if !enable {
+                                recorder = None;
+                                let _ = Frame::Ack.write(&mut stream);
+                            } else {
+                                let _ = Frame::Ack.write(&mut stream);
                             }
                         }
                         Ok(_) => {
@@ -583,6 +629,21 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                     Ok(0) => break,
                     Ok(n) => {
                         record_pty_output(vt_engine.as_mut(), &buf[..n])?;
+                        if let Some(ref mut rec) = recorder {
+                            if let Err(err) = rec.record(&buf[..n]) {
+                                eprintln!("recording error: {err}");
+                                recorder = None;
+                            }
+                        }
+                        if let Some(ref mut rec) = recorder {
+                            bytes_since_snapshot += n as u64;
+                            if bytes_since_snapshot >= SNAPSHOT_INTERVAL_BYTES {
+                                if let Ok(text) = vt_engine.screen_text() {
+                                    let _ = rec.write_snapshot(text.as_bytes());
+                                }
+                                bytes_since_snapshot = 0;
+                            }
+                        }
                         if active_client.is_none() {
                             for reply in detached_da.push(&buf[..n]) {
                                 write_fd_all(pty_fd, &reply)?;
@@ -616,6 +677,58 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
 #[cfg(not(unix))]
 pub fn run_session_daemon(_root: &Path, _id: &str) -> Result<(), String> {
     Err("session daemon is only supported on unix".into())
+}
+
+fn build_inspect_result(
+    session: &SessionMetadata,
+    vt_engine: &dyn VtEngine,
+    active_client: &Option<ActiveClient>,
+    pty_child: &PtyChild,
+    recorder: &Option<crate::recording::OutputRecorder>,
+) -> crate::protocol::InspectResult {
+    let (cols, rows) = vt_engine.size();
+    // SAFETY: pty_child.master_fd is a valid PTY master fd owned by this process.
+    let foreground_pgid =
+        nix::unistd::tcgetpgrp(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_child.master_fd) }).ok().map(|pid| pid.as_raw() as u32);
+
+    crate::protocol::InspectResult {
+        session: crate::protocol::SessionInspect {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            state: "running".to_string(),
+            vt_engine: session.vt_engine.as_str().to_string(),
+            cwd: session.cwd.clone(),
+            cmd: session.cmd.clone(),
+        },
+        terminal: crate::protocol::TerminalInspect { rows, cols },
+        process: crate::protocol::ProcessInspect { leader_pid: pty_child.pid.as_raw() as u32, foreground_pgid },
+        attachments: if active_client.is_some() {
+            vec![crate::protocol::AttachmentInspect { role: "controller".to_string() }]
+        } else {
+            vec![]
+        },
+        recording: crate::protocol::RecordingInspect {
+            active: recorder.is_some(),
+            bytes_written: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
+        },
+    }
+}
+
+fn dispatch_signal(pty_child: &PtyChild, signal: i32, target: crate::protocol::SignalTarget) -> Result<(), String> {
+    use nix::sys::signal::{killpg, Signal};
+
+    let signal = Signal::try_from(signal).map_err(|err| format!("invalid signal number: {err}"))?;
+
+    match target {
+        crate::protocol::SignalTarget::Foreground => {
+            // SAFETY: pty_child.master_fd is a valid PTY master fd owned by this process.
+            let fg_pgid = nix::unistd::tcgetpgrp(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_child.master_fd) })
+                .map_err(|err| format!("tcgetpgrp: {err}"))?;
+            killpg(fg_pgid, signal).map_err(|err| format!("killpg: {err}"))
+        }
+        crate::protocol::SignalTarget::Leader => nix::sys::signal::kill(pty_child.pid, signal).map_err(|err| format!("kill: {err}")),
+        crate::protocol::SignalTarget::Tree => Err("tree signal target is not yet implemented".to_string()),
+    }
 }
 
 fn spawn_daemon_process(root: &Path, session: &SessionMetadata) -> Result<(), String> {
@@ -1035,7 +1148,7 @@ mod tests {
 
     #[test]
     fn resolve_cleat_executable_prefers_cargo_bin_env() {
-        let _lock = env_lock().lock().expect("env lock");
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let cleat = temp.path().join("cleat");
         fs::write(&cleat, b"#!/bin/sh\n").expect("write fake cleat");
@@ -1053,7 +1166,7 @@ mod tests {
 
     #[test]
     fn resolve_cleat_executable_falls_back_to_path() {
-        let _lock = env_lock().lock().expect("env lock");
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).expect("create bin dir");

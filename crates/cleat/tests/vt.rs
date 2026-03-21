@@ -2,6 +2,9 @@ use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel
 
 mod vt_contracts;
 
+#[cfg(feature = "ghostty-vt")]
+use std::{path::PathBuf, process::Command};
+
 use vt_contracts::{assert_non_replay_contract, assert_replay_contract_placeholder, PassthroughFixture, PlaceholderReplayFixture};
 #[cfg(feature = "ghostty-vt")]
 use vt_contracts::{assert_replay_contract, GhosttyFixture};
@@ -85,4 +88,43 @@ fn vt_ghostty_blank_engine_does_not_emit_replay_payload() {
     let replay = engine.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, false)).expect("replay payload");
 
     assert_eq!(replay, None, "blank ghostty engine should not emit replay");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_links_against_shared_library() {
+    let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
+    let shared_library = prefix.join("lib/libghostty-vt.so");
+    assert!(shared_library.exists(), "expected shared ghostty library at {}", shared_library.display());
+
+    let exe = std::env::current_exe().expect("current test binary");
+    let output = inspect_linkage(&exe);
+    let linkage = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "failed to inspect test binary linkage for {}\nstdout:\n{}\nstderr:\n{}",
+        exe.display(),
+        linkage,
+        stderr
+    );
+    assert!(
+        linkage.contains("libghostty-vt.so"),
+        "expected shared ghostty-vt linkage via {}, but test binary dependencies were:\n{}",
+        shared_library.display(),
+        linkage
+    );
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn inspect_linkage(exe: &std::path::Path) -> std::process::Output {
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("ldd").arg(exe).output().expect("run ldd")
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("otool").arg("-L").arg(exe).output().expect("run otool")
+    }
 }

@@ -1,3 +1,9 @@
+use std::{
+    os::unix::net::UnixStream,
+    path::Path,
+    time::{Duration, Instant},
+};
+
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::{
@@ -71,8 +77,7 @@ impl SessionService {
         }
 
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::Detach.write(&mut stream).map_err(|err| format!("write detach request: {err}"))?;
         Ok(())
     }
@@ -83,8 +88,7 @@ impl SessionService {
         }
 
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::Capture.write(&mut stream).map_err(|err| format!("write capture request: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read capture response: {err}"))? {
             Frame::Output(bytes) => String::from_utf8(bytes).map_err(|err| format!("capture response was not valid utf-8: {err}")),
@@ -99,8 +103,7 @@ impl SessionService {
         }
 
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::SendKeys(bytes.to_vec()).write(&mut stream).map_err(|err| format!("write send-keys request: {err}"))
     }
 
@@ -207,6 +210,22 @@ fn session_info_from_record(root: &std::path::Path, record: SessionRecord) -> Se
         cwd: record.metadata.cwd,
         cmd: record.metadata.cmd,
         status,
+    }
+}
+
+fn connect_session_socket(socket_path: &Path) -> Result<UnixStream, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match UnixStream::connect(socket_path) {
+            Ok(stream) => return Ok(stream),
+            Err(err)
+                if matches!(err.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => return Err(format!("connect {}: {err}", socket_path.display())),
+        }
     }
 }
 

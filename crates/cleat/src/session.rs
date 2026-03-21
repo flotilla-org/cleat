@@ -360,6 +360,11 @@ pub fn foreground_path(root: &Path, id: &str) -> PathBuf {
 }
 
 fn default_vt_engine(kind: VtEngineKind) -> Result<Box<dyn VtEngine>, String> {
+    #[cfg(test)]
+    if kind == VtEngineKind::Ghostty {
+        return Ok(Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)));
+    }
+
     if std::env::var_os("CARGO_BIN_EXE_cleat").is_some()
         && std::env::var_os("CLEAT_TEST_VT_ENGINE").as_deref() == Some(std::ffi::OsStr::new("replay-probe"))
     {
@@ -871,7 +876,7 @@ fn poll_ready(
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if path.exists() {
             return Ok(());

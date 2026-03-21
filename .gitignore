@@ -1,4 +1,5 @@
 /target
+.tools/
 .codex-tmp/
 .idea/
 __pycache__/

@@ -705,7 +705,6 @@ fn build_inspect_result(
         recording: crate::protocol::RecordingInspect {
             active: recorder.is_some(),
             bytes_written: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
-            cursor: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
         },
     }
 }

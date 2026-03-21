@@ -101,9 +101,9 @@ pub fn command() -> clap::Command {
 pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, String> {
     match cli.command {
         Command::Attach { id, no_create, vt, cwd, cmd, record } => {
-            let (_attached, guard) = service.attach(id, vt, cwd, cmd, no_create)?;
+            let (attached, guard) = service.attach(id, vt, cwd, cmd, no_create)?;
             if record {
-                service.record(&_attached.id, true)?;
+                service.record(&attached.id, true)?;
             }
             guard.relay_stdio()?;
             Ok(None)
@@ -111,16 +111,10 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
         Command::Create { id, json, vt, cwd, cmd, record } => {
             let created = service.create(id, vt, cwd, cmd)?;
             if record {
-                let meta_path = service.layout_root().join(&created.id).join("meta.json");
-                if let Ok(contents) = std::fs::read_to_string(&meta_path) {
-                    if let Ok(mut meta) = serde_json::from_str::<crate::runtime::SessionMetadata>(&contents) {
-                        meta.record = true;
-                        let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).expect("serialize"));
-                    }
-                }
-                // The daemon is already running by the time create() returns, so also
-                // send a RecordControl frame to activate recording immediately.
-                // The daemon may still be initializing, so retry briefly.
+                // The daemon is already running by the time create() returns, so send
+                // a RecordControl frame to activate recording. service.record() also
+                // persists the flag to meta.json. Retry briefly since the daemon may
+                // still be initializing.
                 let record_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 loop {
                     match service.record(&created.id, true) {

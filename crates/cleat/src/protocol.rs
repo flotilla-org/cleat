@@ -63,7 +63,6 @@ pub struct AttachmentInspect {
 pub struct RecordingInspect {
     pub active: bool,
     pub bytes_written: u64,
-    pub cursor: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

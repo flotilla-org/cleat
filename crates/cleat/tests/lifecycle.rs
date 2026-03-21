@@ -25,6 +25,17 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn wait_for_socket(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for socket {}", path.display());
+}
+
 fn require_python3() -> bool {
     let available = Command::new("python3")
         .arg("--version")
@@ -702,6 +713,72 @@ fn cleat_attach_exits_on_sigterm_and_keeps_session_alive() {
 
     assert!(!foreground_path(temp.path(), "alpha").exists(), "signal exit should clear the foreground marker");
     assert!(temp.path().join("alpha").exists(), "signal exit should leave the session directory intact");
+}
+
+#[test]
+fn inspect_returns_structured_session_state() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let info = service.create(Some("alpha".into()), None, None, Some("bash".into())).expect("create session");
+
+    let socket_path = session_socket_path(temp.path(), &info.id);
+    wait_for_socket(&socket_path);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        match service.inspect(&info.id) {
+            Ok(result) => break result,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => panic!("inspect session: {err}"),
+        }
+    };
+
+    assert_eq!(result.session.id, "alpha");
+    assert_eq!(result.session.state, "running");
+    assert!(result.process.leader_pid > 0);
+    assert!(result.process.foreground_pgid.is_some());
+    assert_eq!(result.terminal.cols, 80);
+    assert_eq!(result.terminal.rows, 24);
+    assert!(!result.recording.active);
+
+    service.kill(&info.id).expect("kill session");
+}
+
+#[test]
+fn signal_term_to_leader_terminates_session() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let info = service.create(Some("beta".into()), None, None, Some("sleep 60".into())).expect("create session");
+
+    let socket_path = session_socket_path(temp.path(), &info.id);
+    wait_for_socket(&socket_path);
+
+    let inspect_deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        match service.inspect(&info.id) {
+            Ok(result) => break result,
+            Err(_) if Instant::now() < inspect_deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => panic!("inspect before signal: {err}"),
+        }
+    };
+    assert!(result.process.leader_pid > 0);
+
+    service.signal(&info.id, libc::SIGTERM, cleat::protocol::SignalTarget::Leader).expect("signal session");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !socket_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!socket_path.exists(), "socket should be gone after SIGTERM to leader");
 }
 
 #[test]

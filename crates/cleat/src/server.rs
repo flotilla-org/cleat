@@ -133,6 +133,36 @@ impl SessionService {
         ))
     }
 
+    pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {
+        if !self.layout.root().join(id).join("meta.json").exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        Frame::Inspect.write(&mut stream).map_err(|err| format!("write inspect request: {err}"))?;
+        match Frame::read(&mut stream).map_err(|err| format!("read inspect response: {err}"))? {
+            Frame::InspectResult(json) => serde_json::from_slice(&json).map_err(|err| format!("parse inspect response: {err}")),
+            Frame::Error(message) => Err(message),
+            other => Err(format!("unexpected inspect response: {other:?}")),
+        }
+    }
+
+    pub fn signal(&self, id: &str, signal: i32, target: crate::protocol::SignalTarget) -> Result<(), String> {
+        if !self.layout.root().join(id).join("meta.json").exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        Frame::Signal { signal, target }.write(&mut stream).map_err(|err| format!("write signal request: {err}"))?;
+        match Frame::read(&mut stream).map_err(|err| format!("read signal response: {err}"))? {
+            Frame::Ack => Ok(()),
+            Frame::Error(message) => Err(message),
+            other => Err(format!("unexpected signal response: {other:?}")),
+        }
+    }
+
     pub fn serve(&self, id: &str) -> Result<(), String> {
         run_session_daemon(self.layout.root(), id)
     }

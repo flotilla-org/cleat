@@ -451,6 +451,7 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
     let mut detached_da = DeviceAttributeTracker::new();
 
     let mut active_client: Option<ActiveClient> = None;
+    let recorder: Option<()> = None;
     let mut had_foreground_client = false;
     loop {
         let poll_result = poll_ready(
@@ -505,6 +506,25 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         }
+                        Ok(Frame::Inspect) => {
+                            let result = build_inspect_result(&session, vt_engine.as_ref(), &active_client, &pty_child, &recorder);
+                            match serde_json::to_vec(&result) {
+                                Ok(json) => {
+                                    let _ = Frame::InspectResult(json).write(&mut stream);
+                                }
+                                Err(err) => {
+                                    let _ = Frame::Error(format!("serialize inspect: {err}")).write(&mut stream);
+                                }
+                            }
+                        }
+                        Ok(Frame::Signal { signal, target }) => match dispatch_signal(&pty_child, signal, target) {
+                            Ok(()) => {
+                                let _ = Frame::Ack.write(&mut stream);
+                            }
+                            Err(err) => {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        },
                         Ok(_) => {
                             let _ = Frame::Busy.write(&mut stream);
                         }
@@ -611,6 +631,62 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
 #[cfg(not(unix))]
 pub fn run_session_daemon(_root: &Path, _id: &str) -> Result<(), String> {
     Err("session daemon is only supported on unix".into())
+}
+
+fn build_inspect_result(
+    session: &SessionMetadata,
+    vt_engine: &dyn VtEngine,
+    active_client: &Option<ActiveClient>,
+    pty_child: &PtyChild,
+    _recorder: &Option<()>,
+) -> crate::protocol::InspectResult {
+    let (cols, rows) = vt_engine.size();
+    // SAFETY: pty_child.master_fd is a valid PTY master fd owned by this process.
+    let foreground_pgid =
+        nix::unistd::tcgetpgrp(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_child.master_fd) }).ok().map(|pid| pid.as_raw() as u32);
+
+    crate::protocol::InspectResult {
+        session: crate::protocol::SessionInspect {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            state: "running".to_string(),
+            vt_engine: session.vt_engine.as_str().to_string(),
+            cwd: session.cwd.clone(),
+            cmd: session.cmd.clone(),
+        },
+        terminal: crate::protocol::TerminalInspect { rows, cols },
+        process: crate::protocol::ProcessInspect { leader_pid: pty_child.pid.as_raw() as u32, foreground_pgid },
+        attachments: if active_client.is_some() {
+            vec![crate::protocol::AttachmentInspect { role: "controller".to_string() }]
+        } else {
+            vec![]
+        },
+        recording: crate::protocol::RecordingInspect { active: false, bytes_written: 0, cursor: 0 },
+    }
+}
+
+fn dispatch_signal(pty_child: &PtyChild, signal: i32, target: crate::protocol::SignalTarget) -> Result<(), String> {
+    let result = match target {
+        crate::protocol::SignalTarget::Foreground => {
+            // SAFETY: pty_child.master_fd is a valid PTY master fd owned by this process.
+            let fg_pgid = nix::unistd::tcgetpgrp(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_child.master_fd) })
+                .map_err(|err| format!("tcgetpgrp: {err}"))?;
+            // SAFETY: fg_pgid is a valid process group from tcgetpgrp on our PTY.
+            unsafe { libc::killpg(fg_pgid.as_raw(), signal) }
+        }
+        crate::protocol::SignalTarget::Leader => {
+            // SAFETY: pty_child.pid is the leader process we spawned.
+            unsafe { libc::kill(pty_child.pid.as_raw(), signal) }
+        }
+        crate::protocol::SignalTarget::Tree => {
+            return Err("tree signal target is not yet implemented".to_string());
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!("signal delivery failed: {}", std::io::Error::last_os_error()))
+    }
 }
 
 fn spawn_daemon_process(root: &Path, session: &SessionMetadata) -> Result<(), String> {

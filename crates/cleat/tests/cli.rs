@@ -10,7 +10,7 @@ use cleat::{
 fn help_lists_expected_subcommands() {
     let command = Cli::command();
     let subcommands: Vec<_> = command.get_subcommands().filter(|sub| !sub.is_hide_set()).map(|sub| sub.get_name().to_string()).collect();
-    assert_eq!(subcommands, vec!["attach", "create", "list", "capture", "detach", "kill", "send-keys"]);
+    assert_eq!(subcommands, vec!["attach", "create", "list", "capture", "detach", "kill", "send-keys", "inspect", "signal"]);
 }
 
 #[test]
@@ -146,6 +146,32 @@ fn send_keys_command_rejects_literal_and_hex_together() {
 #[test]
 fn send_keys_command_rejects_zero_repeat() {
     assert!(Cli::try_parse_from(["cleat", "send-keys", "-N", "0", "demo", "Enter"]).is_err());
+}
+
+#[test]
+fn inspect_parses_session_id() {
+    let cli = Cli::try_parse_from(["cleat", "inspect", "alpha"]).expect("parse inspect");
+    assert!(matches!(cli.command, Command::Inspect { ref id, json: false } if id == "alpha"));
+}
+
+#[test]
+fn inspect_json_flag() {
+    let cli = Cli::try_parse_from(["cleat", "inspect", "alpha", "--json"]).expect("parse inspect --json");
+    assert!(matches!(cli.command, Command::Inspect { json: true, .. }));
+}
+
+#[test]
+fn signal_parses_session_and_signal_name() {
+    let cli = Cli::try_parse_from(["cleat", "signal", "alpha", "INT"]).expect("parse signal");
+    assert!(
+        matches!(cli.command, Command::Signal { ref id, ref signal, ref target } if id == "alpha" && signal == "INT" && target == "foreground")
+    );
+}
+
+#[test]
+fn signal_with_target() {
+    let cli = Cli::try_parse_from(["cleat", "signal", "alpha", "TERM", "--target", "leader"]).expect("parse signal --target");
+    assert!(matches!(cli.command, Command::Signal { ref target, .. } if target == "leader"));
 }
 
 #[test]

@@ -169,11 +169,19 @@ fn capture_rejects_passthrough_sessions() {
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn capture_returns_text_for_ghostty_sessions() {
+    if !require_python3() {
+        return;
+    }
     let _lock = lock_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service
-        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("printf 'hello capture'; sleep 5".into()))
+        .create(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("python3 -c 'import sys, time; sys.stdout.write(\"hello capture\"); sys.stdout.flush(); time.sleep(5)'".into()),
+        )
         .expect("create alpha");
     let deadline = Instant::now() + Duration::from_secs(2);
     let output = loop {

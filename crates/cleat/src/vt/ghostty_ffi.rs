@@ -1,4 +1,4 @@
-use std::{ffi::c_void, ptr, slice};
+use std::{ffi::c_void, ptr};
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -130,12 +130,7 @@ unsafe extern "C" {
         terminal: GhosttyTerminal,
         options: GhosttyFormatterTerminalOptions,
     ) -> GhosttyResult;
-    fn ghostty_formatter_format_alloc(
-        formatter: GhosttyFormatter,
-        allocator: *const c_void,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-    ) -> GhosttyResult;
+    fn ghostty_formatter_format_buf(formatter: GhosttyFormatter, buf: *mut u8, buf_len: usize, out_written: *mut usize) -> GhosttyResult;
     fn ghostty_formatter_free(formatter: GhosttyFormatter);
 }
 
@@ -186,20 +181,25 @@ pub fn format_terminal_alloc(terminal: GhosttyTerminal, options: GhosttyFormatte
     let result = unsafe { ghostty_formatter_terminal_new(ptr::null(), &mut formatter, terminal, options) };
     check_result(result, "ghostty_formatter_terminal_new")?;
 
-    let mut out_ptr = ptr::null_mut();
-    let mut out_len = 0usize;
-    let result = unsafe { ghostty_formatter_format_alloc(formatter, ptr::null(), &mut out_ptr, &mut out_len) };
+    let bytes = format_terminal_into_owned_buffer(formatter);
     unsafe { ghostty_formatter_free(formatter) };
-    check_result(result, "ghostty_formatter_format_alloc")?;
+    bytes
+}
 
-    if out_ptr.is_null() {
-        return Ok(Vec::new());
+fn format_terminal_into_owned_buffer(formatter: GhosttyFormatter) -> Result<Vec<u8>, String> {
+    let mut required = 0usize;
+    let result = unsafe { ghostty_formatter_format_buf(formatter, ptr::null_mut(), 0, &mut required) };
+    match result {
+        GhosttyResult::OutOfSpace => {}
+        GhosttyResult::Success => return Ok(Vec::new()),
+        other => return check_result(other, "ghostty_formatter_format_buf").map(|_| Vec::new()),
     }
 
-    let bytes = unsafe { slice::from_raw_parts(out_ptr, out_len) }.to_vec();
-    unsafe {
-        libc::free(out_ptr.cast());
-    }
+    let mut bytes = vec![0u8; required];
+    let mut written = 0usize;
+    let result = unsafe { ghostty_formatter_format_buf(formatter, bytes.as_mut_ptr(), bytes.len(), &mut written) };
+    check_result(result, "ghostty_formatter_format_buf")?;
+    bytes.truncate(written);
     Ok(bytes)
 }
 

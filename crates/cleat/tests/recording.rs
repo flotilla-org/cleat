@@ -30,3 +30,30 @@ fn bytes_written_starts_at_zero() {
     let recorder = OutputRecorder::new(temp.path()).expect("create recorder");
     assert_eq!(recorder.bytes_written(), 0);
 }
+
+#[test]
+fn take_snapshot_writes_to_snapshots_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut recorder = OutputRecorder::new(temp.path()).expect("create recorder");
+    recorder.record(b"hello world").expect("record bytes");
+
+    recorder.take_snapshot(b"screen state data").expect("take snapshot");
+
+    let snapshot_dir = temp.path().join("snapshots");
+    assert!(snapshot_dir.exists());
+    let entries: Vec<_> = fs::read_dir(&snapshot_dir).expect("read snapshots").collect();
+    assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn snapshot_filename_includes_byte_offset() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut recorder = OutputRecorder::new(temp.path()).expect("create recorder");
+    recorder.record(b"12345").expect("record 5 bytes");
+
+    recorder.take_snapshot(b"snap").expect("take snapshot");
+
+    let snapshot_path = temp.path().join("snapshots").join("at-5.bin");
+    assert!(snapshot_path.exists());
+    assert_eq!(fs::read(&snapshot_path).expect("read snapshot"), b"snap");
+}

@@ -458,6 +458,8 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
             Err(err) => eprintln!("failed to start recording: {err}"),
         }
     }
+    let mut bytes_since_snapshot: u64 = 0;
+    const SNAPSHOT_INTERVAL_BYTES: u64 = 256 * 1024; // 256 KB
     let mut had_foreground_client = false;
     loop {
         let poll_result = poll_ready(
@@ -626,6 +628,15 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                             if let Err(err) = rec.record(&buf[..n]) {
                                 eprintln!("recording error: {err}");
                                 recorder = None;
+                            }
+                        }
+                        if let Some(ref mut rec) = recorder {
+                            bytes_since_snapshot += n as u64;
+                            if bytes_since_snapshot >= SNAPSHOT_INTERVAL_BYTES {
+                                if let Ok(text) = vt_engine.screen_text() {
+                                    let _ = rec.take_snapshot(text.as_bytes());
+                                }
+                                bytes_since_snapshot = 0;
                             }
                         }
                         if active_client.is_none() {

@@ -196,6 +196,13 @@ fn create_record_flag() {
 }
 
 #[test]
+fn serve_parses_all_flags() {
+    let cli = Cli::try_parse_from(["cleat", "serve", "--id", "alpha", "--vt", "passthrough", "--cmd", "bash", "--cwd", "/tmp", "--record"])
+        .expect("parse serve");
+    assert!(matches!(cli.command, Command::Serve { ref id, record: true, .. } if id == "alpha"));
+}
+
+#[test]
 fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,

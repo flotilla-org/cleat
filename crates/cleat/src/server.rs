@@ -190,8 +190,8 @@ impl SessionService {
         }
     }
 
-    pub fn serve(&self, id: &str) -> Result<(), String> {
-        run_session_daemon(self.layout.root(), id)
+    pub fn serve(&self, session: &crate::runtime::SessionMetadata) -> Result<(), String> {
+        run_session_daemon(self.layout.root(), session)
     }
 }
 

@@ -432,8 +432,8 @@ fn apply_attach_state(
 }
 
 #[cfg(unix)]
-pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
-    let session = load_session(root, id)?.ok_or_else(|| format!("missing session metadata for {id}"))?;
+pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
+    let id = &session.id;
     let socket_path = session_socket_path(root, id);
     if socket_path.exists() {
         let _ = fs::remove_file(&socket_path);
@@ -444,7 +444,7 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
     listener.set_nonblocking(true).map_err(|err| format!("set listener nonblocking: {err}"))?;
     fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let pty_child = spawn_pty_child(&session)?;
+    let pty_child = spawn_pty_child(session)?;
     let pty_fd = pty_child.master_fd;
     set_nonblocking(pty_fd)?;
     let mut vt_engine = default_vt_engine(session.vt_engine)?;
@@ -515,7 +515,7 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                             }
                         }
                         Ok(Frame::Inspect) => {
-                            let result = build_inspect_result(&session, vt_engine.as_ref(), &active_client, &pty_child, &recorder);
+                            let result = build_inspect_result(session, vt_engine.as_ref(), &active_client, &pty_child, &recorder);
                             match serde_json::to_vec(&result) {
                                 Ok(json) => {
                                     let _ = Frame::InspectResult(json).write(&mut stream);
@@ -670,7 +670,7 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-pub fn run_session_daemon(_root: &Path, _id: &str) -> Result<(), String> {
+pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<(), String> {
     Err("session daemon is only supported on unix".into())
 }
 
@@ -728,15 +728,17 @@ fn dispatch_signal(pty_child: &PtyChild, signal: i32, target: crate::protocol::S
 fn spawn_daemon_process(root: &Path, session: &SessionMetadata) -> Result<(), String> {
     let exe = resolve_cleat_executable()?;
     let mut command = Command::new(exe);
-    command
-        .arg("--runtime-root")
-        .arg(root)
-        .arg("serve")
-        .arg("--id")
-        .arg(&session.id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.arg("--runtime-root").arg(root).arg("serve").arg("--id").arg(&session.id).arg("--vt").arg(session.vt_engine.as_str());
+    if let Some(cmd) = &session.cmd {
+        command.arg("--cmd").arg(cmd);
+    }
+    if let Some(cwd) = &session.cwd {
+        command.arg("--cwd").arg(cwd);
+    }
+    if session.record {
+        command.arg("--record");
+    }
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let child = command.spawn().map_err(|err| format!("spawn session daemon for {}: {err}", session.id))?;
     fs::write(daemon_pid_path(root, &session.id), child.id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
     Ok(())

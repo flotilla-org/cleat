@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::{keys::encode_send_keys, server::SessionService, vt::VtEngineKind};
+use crate::{keys::encode_send_keys, runtime::SessionMetadata, server::SessionService, vt::VtEngineKind};
 
 #[derive(Debug, Parser)]
 #[command(name = "cleat", version)]
@@ -87,6 +87,14 @@ pub enum Command {
     Serve {
         #[arg(long)]
         id: String,
+        #[arg(long, value_enum, default_value_t = crate::vt::default_vt_engine_kind())]
+        vt: VtEngineKind,
+        #[arg(long)]
+        cmd: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        record: bool,
     },
 }
 
@@ -174,8 +182,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             service.record(&id, true)?;
             Ok(None)
         }
-        Command::Serve { id } => {
-            service.serve(&id)?;
+        Command::Serve { id, vt, cmd, cwd, record } => {
+            let session = SessionMetadata { id, vt_engine: vt, cwd, cmd, record };
+            service.serve(&session)?;
             Ok(None)
         }
     }

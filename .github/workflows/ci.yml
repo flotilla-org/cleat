@@ -60,3 +60,30 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
       - run: cargo test --workspace --locked
+
+  ghostty-vt:
+    name: Ghostty VT
+    runs-on: ubuntu-latest
+    needs: fmt
+    env:
+      LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/ghostty-install/lib
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            .tools/ghostty-src/.zig-cache/
+          key: ${{ runner.os }}-cargo-ghostty-vt-${{ hashFiles('Cargo.lock', 'tools/ghostty-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ghostty-vt-
+      - run: ./tools/prepare-ghostty-vt.sh
+      - run: cargo build -p cleat --locked --features ghostty-vt
+      - run: cargo test -p cleat --locked --features ghostty-vt

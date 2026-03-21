@@ -1,0 +1,7 @@
+[zig]
+version = "0.15.2"
+
+[ghostty]
+repo = "https://github.com/rjwittams/ghostty.git"
+ref = "355e40e7662572d8153b506efddda9e9d8379925"
+build_step = "lib-vt"

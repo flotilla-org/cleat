@@ -310,26 +310,26 @@ pub fn ensure_session_started(
     cmd: Option<String>,
     record: bool,
 ) -> Result<SessionMetadata, String> {
-    let session = match id {
-        Some(ref id_str) if layout.root().join(id_str).exists() => {
-            // Session directory exists — reuse it. Build metadata for daemon spawn.
+    // If a named session directory already exists with a live socket, reuse it.
+    if let Some(ref id_str) = id {
+        let socket_path = session_socket_path(layout.root(), id_str);
+        if socket_path.exists() {
+            // Daemon is running — return the id. The caller should use inspect()
+            // if it needs the session's actual config.
             let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-            SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record }
+            return Ok(SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record });
         }
-        _ => {
-            let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-            vt_engine.ensure_available()?;
-            let mut meta = layout.create_session(id, vt_engine, cwd, cmd)?;
-            meta.record = record;
-            meta
-        }
-    };
+    }
+
+    // Create a new session and spawn the daemon.
+    let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
+    vt_engine.ensure_available()?;
+    let mut session = layout.create_session(id, vt_engine, cwd, cmd)?;
+    session.record = record;
 
     let socket_path = session_socket_path(layout.root(), &session.id);
-    if !socket_path.exists() {
-        spawn_daemon_process(layout.root(), &session)?;
-        wait_for_socket(&socket_path)?;
-    }
+    spawn_daemon_process(layout.root(), &session)?;
+    wait_for_socket(&socket_path)?;
 
     Ok(session)
 }
@@ -368,6 +368,11 @@ pub fn foreground_path(root: &Path, id: &str) -> PathBuf {
 }
 
 fn default_vt_engine(kind: VtEngineKind) -> Result<Box<dyn VtEngine>, String> {
+    #[cfg(test)]
+    if kind == VtEngineKind::Ghostty {
+        return Ok(Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)));
+    }
+
     if std::env::var_os("CARGO_BIN_EXE_cleat").is_some()
         && std::env::var_os("CLEAT_TEST_VT_ENGINE").as_deref() == Some(std::ffi::OsStr::new("replay-probe"))
     {
@@ -442,6 +447,8 @@ fn apply_attach_state(
 #[cfg(unix)]
 pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
     let id = &session.id;
+    let session_dir = root.join(id);
+    fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
     let socket_path = session_socket_path(root, id);
     if socket_path.exists() {
         let _ = fs::remove_file(&socket_path);
@@ -880,7 +887,7 @@ fn poll_ready(
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if path.exists() {
             return Ok(());

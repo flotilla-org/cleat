@@ -309,12 +309,17 @@ pub fn ensure_session_started(
     cwd: Option<PathBuf>,
     cmd: Option<String>,
 ) -> Result<SessionMetadata, String> {
-    let session = if let Some(existing) = id.as_deref().and_then(|value| load_session(layout.root(), value).ok().flatten()) {
-        existing
-    } else {
-        let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-        vt_engine.ensure_available()?;
-        layout.create_session(id, vt_engine, cwd, cmd)?.metadata
+    let session = match id {
+        Some(ref id_str) if layout.root().join(id_str).exists() => {
+            // Session directory exists — reuse it. Build metadata for daemon spawn.
+            let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
+            SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record: false }
+        }
+        _ => {
+            let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
+            vt_engine.ensure_available()?;
+            layout.create_session(id, vt_engine, cwd, cmd)?.metadata
+        }
     };
 
     let socket_path = session_socket_path(layout.root(), &session.id);
@@ -903,15 +908,6 @@ fn current_terminal_size() -> (u16, u16) {
     let cols = std::env::var("COLUMNS").ok().and_then(|value| value.parse::<u16>().ok()).unwrap_or(80);
     let rows = std::env::var("LINES").ok().and_then(|value| value.parse::<u16>().ok()).unwrap_or(24);
     (cols, rows)
-}
-
-fn load_session(root: &Path, id: &str) -> Result<Option<SessionMetadata>, String> {
-    let path = root.join(id).join("meta.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = fs::read_to_string(&path).map_err(|err| format!("read metadata {}: {err}", path.display()))?;
-    serde_json::from_str(&contents).map(Some).map_err(|err| format!("parse metadata {}: {err}", path.display()))
 }
 
 #[cfg(unix)]

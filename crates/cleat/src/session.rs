@@ -763,7 +763,7 @@ fn poll_ready(
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if path.exists() {
             return Ok(());

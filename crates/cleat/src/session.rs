@@ -711,26 +711,19 @@ fn build_inspect_result(
 }
 
 fn dispatch_signal(pty_child: &PtyChild, signal: i32, target: crate::protocol::SignalTarget) -> Result<(), String> {
-    let result = match target {
+    use nix::sys::signal::{killpg, Signal};
+
+    let signal = Signal::try_from(signal).map_err(|err| format!("invalid signal number: {err}"))?;
+
+    match target {
         crate::protocol::SignalTarget::Foreground => {
             // SAFETY: pty_child.master_fd is a valid PTY master fd owned by this process.
             let fg_pgid = nix::unistd::tcgetpgrp(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_child.master_fd) })
                 .map_err(|err| format!("tcgetpgrp: {err}"))?;
-            // SAFETY: fg_pgid is a valid process group from tcgetpgrp on our PTY.
-            unsafe { libc::killpg(fg_pgid.as_raw(), signal) }
+            killpg(fg_pgid, signal).map_err(|err| format!("killpg: {err}"))
         }
-        crate::protocol::SignalTarget::Leader => {
-            // SAFETY: pty_child.pid is the leader process we spawned.
-            unsafe { libc::kill(pty_child.pid.as_raw(), signal) }
-        }
-        crate::protocol::SignalTarget::Tree => {
-            return Err("tree signal target is not yet implemented".to_string());
-        }
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!("signal delivery failed: {}", std::io::Error::last_os_error()))
+        crate::protocol::SignalTarget::Leader => nix::sys::signal::kill(pty_child.pid, signal).map_err(|err| format!("kill: {err}")),
+        crate::protocol::SignalTarget::Tree => Err("tree signal target is not yet implemented".to_string()),
     }
 }
 

@@ -15,7 +15,7 @@ comfy-table = "7.2.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"
-nix = { version = "0.31.2", features = ["fs", "poll", "process", "term"] }
+nix = { version = "0.31.2", features = ["fs", "poll", "process", "signal", "term"] }
 sysinfo = "0.38"
 uuid = { version = "1", features = ["v4"] }
 

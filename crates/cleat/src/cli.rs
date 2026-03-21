@@ -223,19 +223,24 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
 }
 
 fn parse_signal_name(name: &str) -> Result<i32, String> {
+    use nix::sys::signal::Signal;
+
     let normalized = name.to_uppercase();
     let normalized = normalized.trim_start_matches("SIG");
-    match normalized {
-        "INT" => Ok(libc::SIGINT),
-        "TERM" => Ok(libc::SIGTERM),
-        "HUP" => Ok(libc::SIGHUP),
-        "KILL" => Ok(libc::SIGKILL),
-        "USR1" => Ok(libc::SIGUSR1),
-        "USR2" => Ok(libc::SIGUSR2),
-        "STOP" => Ok(libc::SIGSTOP),
-        "CONT" => Ok(libc::SIGCONT),
-        other => Err(format!("unknown signal: {other}")),
-    }
+    let signal = match normalized {
+        "HUP" => Signal::SIGHUP,
+        "INT" => Signal::SIGINT,
+        "QUIT" => Signal::SIGQUIT,
+        "KILL" => Signal::SIGKILL,
+        "TERM" => Signal::SIGTERM,
+        "STOP" => Signal::SIGSTOP,
+        "TSTP" => Signal::SIGTSTP,
+        "CONT" => Signal::SIGCONT,
+        "USR1" => Signal::SIGUSR1,
+        "USR2" => Signal::SIGUSR2,
+        other => return Err(format!("unknown signal: {other}")),
+    };
+    Ok(signal as i32)
 }
 
 fn parse_signal_target(target: &str) -> Result<crate::protocol::SignalTarget, String> {

@@ -23,6 +23,56 @@ pub enum SessionStatus {
     Detached,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectResult {
+    pub session: SessionInspect,
+    pub terminal: TerminalInspect,
+    pub process: ProcessInspect,
+    pub attachments: Vec<AttachmentInspect>,
+    pub recording: RecordingInspect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInspect {
+    pub id: String,
+    pub name: Option<String>,
+    pub state: String,
+    pub vt_engine: String,
+    pub cwd: Option<PathBuf>,
+    pub cmd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalInspect {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInspect {
+    pub leader_pid: u32,
+    pub foreground_pgid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentInspect {
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingInspect {
+    pub active: bool,
+    pub bytes_written: u64,
+    pub cursor: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalTarget {
+    Foreground = 0,
+    Leader = 1,
+    Tree = 2,
+}
+
 const TAG_ATTACH_INIT: u8 = 1;
 const TAG_INPUT: u8 = 2;
 const TAG_OUTPUT: u8 = 3;
@@ -33,6 +83,10 @@ const TAG_DETACH: u8 = 7;
 const TAG_CAPTURE: u8 = 8;
 const TAG_ERROR: u8 = 9;
 const TAG_SEND_KEYS: u8 = 10;
+const TAG_INSPECT: u8 = 11;
+const TAG_INSPECT_RESULT: u8 = 12;
+const TAG_SIGNAL: u8 = 13;
+const TAG_RECORD_CONTROL: u8 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -46,6 +100,10 @@ pub enum Frame {
     Capture,
     SendKeys(Vec<u8>),
     Error(String),
+    Inspect,
+    InspectResult(Vec<u8>),
+    Signal { signal: i32, target: SignalTarget },
+    RecordControl { enable: bool },
 }
 
 impl Frame {
@@ -91,6 +149,15 @@ impl Frame {
             Frame::Capture => (TAG_CAPTURE, vec![]),
             Frame::SendKeys(bytes) => (TAG_SEND_KEYS, bytes.clone()),
             Frame::Error(message) => (TAG_ERROR, message.clone().into_bytes()),
+            Frame::Inspect => (TAG_INSPECT, vec![]),
+            Frame::InspectResult(bytes) => (TAG_INSPECT_RESULT, bytes.clone()),
+            Frame::Signal { signal, target } => {
+                let mut payload = Vec::with_capacity(5);
+                payload.extend_from_slice(&signal.to_le_bytes());
+                payload.push(*target as u8);
+                (TAG_SIGNAL, payload)
+            }
+            Frame::RecordControl { enable } => (TAG_RECORD_CONTROL, vec![if *enable { 1 } else { 0 }]),
         }
     }
 
@@ -108,6 +175,27 @@ impl Frame {
             TAG_ERROR => String::from_utf8(payload)
                 .map(Frame::Error)
                 .map_err(|err| Error::new(ErrorKind::InvalidData, format!("invalid error frame utf-8: {err}"))),
+            TAG_INSPECT => Ok(Frame::Inspect),
+            TAG_INSPECT_RESULT => Ok(Frame::InspectResult(payload)),
+            TAG_SIGNAL => {
+                if payload.len() != 5 {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid signal frame"));
+                }
+                let signal = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let target = match payload[4] {
+                    0 => SignalTarget::Foreground,
+                    1 => SignalTarget::Leader,
+                    2 => SignalTarget::Tree,
+                    _ => return Err(Error::new(ErrorKind::InvalidData, "invalid signal target")),
+                };
+                Ok(Frame::Signal { signal, target })
+            }
+            TAG_RECORD_CONTROL => {
+                if payload.len() != 1 {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid record control frame"));
+                }
+                Ok(Frame::RecordControl { enable: payload[0] != 0 })
+            }
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
     }
@@ -159,7 +247,7 @@ fn decode_capabilities(byte: u8) -> std::io::Result<ClientCapabilities> {
 
 #[cfg(test)]
 mod tests {
-    use super::Frame;
+    use super::{Frame, SignalTarget};
     use crate::vt::{ClientCapabilities, ColorLevel};
 
     #[test]
@@ -183,6 +271,43 @@ mod tests {
     #[test]
     fn send_keys_round_trip_preserves_binary_payloads() {
         let frame = Frame::SendKeys(vec![0, 1, 2, 3, 4, 5]);
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write frame");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read frame");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn inspect_result_round_trip_preserves_json_payload() {
+        let json = br#"{"session":{"id":"test"}}"#.to_vec();
+        let frame = Frame::InspectResult(json.clone());
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write frame");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read frame");
+        assert_eq!(decoded, Frame::InspectResult(json));
+    }
+
+    #[test]
+    fn inspect_round_trip_is_empty() {
+        let frame = Frame::Inspect;
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write frame");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read frame");
+        assert_eq!(decoded, Frame::Inspect);
+    }
+
+    #[test]
+    fn signal_round_trip_preserves_target_and_signal() {
+        let frame = Frame::Signal { signal: libc::SIGINT, target: SignalTarget::Foreground };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write frame");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read frame");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn record_control_round_trip() {
+        let frame = Frame::RecordControl { enable: true };
         let mut bytes = Vec::new();
         frame.write(&mut bytes).expect("write frame");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read frame");

@@ -40,6 +40,10 @@ impl SessionService {
         record: bool,
     ) -> Result<SessionInfo, String> {
         let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, record)?;
+        // If the daemon was already running, get real config via inspect.
+        if let Ok(result) = self.inspect(&session.id) {
+            return Ok(session_info_from_inspect(result, SessionStatus::Detached));
+        }
         Ok(SessionInfo {
             id: session.id,
             vt_engine: session.vt_engine,
@@ -158,17 +162,20 @@ impl SessionService {
         } else {
             ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, false)?
         };
-        let attach = attach_foreground(&self.layout, &session.id)?;
-        Ok((
+        // Get real config from the daemon before attaching (which takes the foreground slot).
+        let info = if let Ok(result) = self.inspect(&session.id) {
+            session_info_from_inspect(result, SessionStatus::Attached)
+        } else {
             SessionInfo {
-                id: session.id,
+                id: session.id.clone(),
                 vt_engine: session.vt_engine,
                 cwd: session.cwd,
                 cmd: session.cmd,
                 status: SessionStatus::Attached,
-            },
-            attach,
-        ))
+            }
+        };
+        let attach = attach_foreground(&self.layout, &info.id)?;
+        Ok((info, attach))
     }
 
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {
@@ -225,6 +232,16 @@ fn parse_vt_engine_kind(s: &str) -> VtEngineKind {
     match s {
         "ghostty" => VtEngineKind::Ghostty,
         _ => VtEngineKind::Passthrough,
+    }
+}
+
+fn session_info_from_inspect(result: crate::protocol::InspectResult, status: SessionStatus) -> SessionInfo {
+    SessionInfo {
+        id: result.session.id,
+        vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+        cwd: result.session.cwd,
+        cmd: result.session.cmd,
+        status,
     }
 }
 

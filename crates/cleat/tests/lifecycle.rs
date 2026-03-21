@@ -796,3 +796,36 @@ fn short_lived_session_reaps_its_directory_after_child_exit() {
 
     assert!(!session_dir.exists(), "session directory should be reaped after child exit");
 }
+
+#[test]
+fn record_command_activates_recording_on_running_session() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let info = service.create(Some("delta".into()), None, None, Some("sleep 30".into())).expect("create session");
+
+    let socket_path = session_socket_path(temp.path(), &info.id);
+    wait_for_socket(&socket_path);
+
+    // Wait for daemon to be ready for inspect
+    let inspect_deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        match service.inspect(&info.id) {
+            Ok(result) => break result,
+            Err(_) if Instant::now() < inspect_deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => panic!("inspect before record: {err}"),
+        }
+    };
+    assert!(!result.recording.active);
+
+    // Activate recording
+    service.record(&info.id, true).expect("activate recording");
+
+    // Verify recording is now on
+    let result = service.inspect(&info.id).expect("inspect after record");
+    assert!(result.recording.active);
+
+    service.kill(&info.id).expect("kill session");
+}

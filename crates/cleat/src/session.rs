@@ -451,7 +451,13 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
     let mut detached_da = DeviceAttributeTracker::new();
 
     let mut active_client: Option<ActiveClient> = None;
-    let recorder: Option<()> = None;
+    let mut recorder: Option<crate::recording::OutputRecorder> = None;
+    if session.record || std::env::var("CLEAT_RECORD").map(|v| v == "1").unwrap_or(false) {
+        match crate::recording::OutputRecorder::new(&root.join(id)) {
+            Ok(r) => recorder = Some(r),
+            Err(err) => eprintln!("failed to start recording: {err}"),
+        }
+    }
     let mut had_foreground_client = false;
     loop {
         let poll_result = poll_ready(
@@ -525,6 +531,24 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         },
+                        Ok(Frame::RecordControl { enable }) => {
+                            if enable && recorder.is_none() {
+                                match crate::recording::OutputRecorder::new(&root.join(id)) {
+                                    Ok(r) => {
+                                        recorder = Some(r);
+                                        let _ = Frame::Ack.write(&mut stream);
+                                    }
+                                    Err(err) => {
+                                        let _ = Frame::Error(err).write(&mut stream);
+                                    }
+                                }
+                            } else if !enable {
+                                recorder = None;
+                                let _ = Frame::Ack.write(&mut stream);
+                            } else {
+                                let _ = Frame::Ack.write(&mut stream);
+                            }
+                        }
                         Ok(_) => {
                             let _ = Frame::Busy.write(&mut stream);
                         }
@@ -598,6 +622,12 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                     Ok(0) => break,
                     Ok(n) => {
                         record_pty_output(vt_engine.as_mut(), &buf[..n])?;
+                        if let Some(ref mut rec) = recorder {
+                            if let Err(err) = rec.record(&buf[..n]) {
+                                eprintln!("recording error: {err}");
+                                recorder = None;
+                            }
+                        }
                         if active_client.is_none() {
                             for reply in detached_da.push(&buf[..n]) {
                                 write_fd_all(pty_fd, &reply)?;
@@ -638,7 +668,7 @@ fn build_inspect_result(
     vt_engine: &dyn VtEngine,
     active_client: &Option<ActiveClient>,
     pty_child: &PtyChild,
-    _recorder: &Option<()>,
+    recorder: &Option<crate::recording::OutputRecorder>,
 ) -> crate::protocol::InspectResult {
     let (cols, rows) = vt_engine.size();
     // SAFETY: pty_child.master_fd is a valid PTY master fd owned by this process.
@@ -661,7 +691,11 @@ fn build_inspect_result(
         } else {
             vec![]
         },
-        recording: crate::protocol::RecordingInspect { active: false, bytes_written: 0, cursor: 0 },
+        recording: crate::protocol::RecordingInspect {
+            active: recorder.is_some(),
+            bytes_written: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
+            cursor: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
+        },
     }
 }
 

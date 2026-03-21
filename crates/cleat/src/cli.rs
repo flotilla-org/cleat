@@ -27,6 +27,8 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         cmd: Option<String>,
+        #[arg(long)]
+        record: bool,
     },
     Create {
         #[arg(value_name = "ID")]
@@ -39,6 +41,8 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         cmd: Option<String>,
+        #[arg(long)]
+        record: bool,
     },
     List {
         #[arg(long)]
@@ -76,6 +80,9 @@ pub enum Command {
         #[arg(long, default_value = "foreground")]
         target: String,
     },
+    Record {
+        id: String,
+    },
     #[command(hide = true)]
     Serve {
         #[arg(long)]
@@ -93,13 +100,25 @@ pub fn command() -> clap::Command {
 
 pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, String> {
     match cli.command {
-        Command::Attach { id, no_create, vt, cwd, cmd } => {
+        Command::Attach { id, no_create, vt, cwd, cmd, record } => {
             let (_attached, guard) = service.attach(id, vt, cwd, cmd, no_create)?;
+            if record {
+                let _ = service.record(&_attached.id, true);
+            }
             guard.relay_stdio()?;
             Ok(None)
         }
-        Command::Create { id, json, vt, cwd, cmd } => {
+        Command::Create { id, json, vt, cwd, cmd, record } => {
             let created = service.create(id, vt, cwd, cmd)?;
+            if record {
+                let meta_path = service.layout_root().join(&created.id).join("meta.json");
+                if let Ok(contents) = std::fs::read_to_string(&meta_path) {
+                    if let Ok(mut meta) = serde_json::from_str::<crate::runtime::SessionMetadata>(&contents) {
+                        meta.record = true;
+                        let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).expect("serialize"));
+                    }
+                }
+            }
             if json {
                 serde_json::to_string(&created).map(Some).map_err(|err| format!("serialize create result: {err}"))
             } else {
@@ -142,6 +161,10 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             let sig = parse_signal_name(&signal)?;
             let tgt = parse_signal_target(&target)?;
             service.signal(&id, sig, tgt)?;
+            Ok(None)
+        }
+        Command::Record { id } => {
+            service.record(&id, true)?;
             Ok(None)
         }
         Command::Serve { id } => {

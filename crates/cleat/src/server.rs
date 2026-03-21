@@ -21,6 +21,10 @@ impl SessionService {
         Self::new(RuntimeLayout::discover())
     }
 
+    pub fn layout_root(&self) -> &std::path::Path {
+        self.layout.root()
+    }
+
     pub fn create(
         &self,
         name: Option<String>,
@@ -160,6 +164,21 @@ impl SessionService {
             Frame::Ack => Ok(()),
             Frame::Error(message) => Err(message),
             other => Err(format!("unexpected signal response: {other:?}")),
+        }
+    }
+
+    pub fn record(&self, id: &str, enable: bool) -> Result<(), String> {
+        if !self.layout.root().join(id).join("meta.json").exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        Frame::RecordControl { enable }.write(&mut stream).map_err(|err| format!("write record control: {err}"))?;
+        match Frame::read(&mut stream).map_err(|err| format!("read record response: {err}"))? {
+            Frame::Ack => Ok(()),
+            Frame::Error(message) => Err(message),
+            other => Err(format!("unexpected record response: {other:?}")),
         }
     }
 

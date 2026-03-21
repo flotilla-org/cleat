@@ -32,7 +32,7 @@
 | `crates/cleat/src/session.rs` | Daemon handlers for Inspect, Signal, RecordControl frames; recording integration in PTY output path |
 | `crates/cleat/src/runtime.rs` | `record` field on `SessionMetadata` |
 | `crates/cleat/src/lib.rs` | `pub mod recording;` declaration |
-| `crates/cleat/Cargo.toml` | No changes needed (uses `libc::killpg`/`libc::kill` directly) |
+| `crates/cleat/Cargo.toml` | Add `comfy-table` dependency for human-readable inspect output |
 | `crates/cleat/tests/cli.rs` | CLI parsing tests for new commands |
 | `crates/cleat/tests/lifecycle.rs` | Integration tests for inspect, signal, recording |
 
@@ -308,17 +308,21 @@ Add helper functions in `cli.rs`:
 
 ```rust
 fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
-    let mut lines = vec![
-        format!("session:\t{}", result.session.id),
-        format!("state:\t\t{}", result.session.state),
-        format!("terminal:\t{}x{}", result.terminal.cols, result.terminal.rows),
-        format!("leader_pid:\t{}", result.process.leader_pid),
-    ];
+    use comfy_table::{Table, presets::NOTHING};
+
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+
+    table.add_row(vec!["session", &result.session.id]);
+    table.add_row(vec!["state", &result.session.state]);
+    table.add_row(vec!["terminal", &format!("{}x{}", result.terminal.cols, result.terminal.rows)]);
+    table.add_row(vec!["leader_pid", &result.process.leader_pid.to_string()]);
     if let Some(fg) = result.process.foreground_pgid {
-        lines.push(format!("fg_pgid:\t{fg}"));
+        table.add_row(vec!["fg_pgid", &fg.to_string()]);
     }
-    lines.push(format!("recording:\t{}", if result.recording.active { "active" } else { "off" }));
-    lines.join("\n")
+    table.add_row(vec!["recording", if result.recording.active { "active" } else { "off" }]);
+
+    table.to_string()
 }
 
 fn parse_signal_name(name: &str) -> Result<i32, String> {
@@ -483,7 +487,13 @@ fn dispatch_signal(pty_child: &PtyChild, signal: i32, target: crate::protocol::S
 }
 ```
 
-Note: no Cargo.toml changes needed — `dispatch_signal` uses `libc::killpg` and `libc::kill` directly (libc is already a dependency), and `tcgetpgrp` comes from `nix::unistd` (covered by the existing `"process"` feature).
+Add `comfy-table` to `crates/cleat/Cargo.toml` dependencies (matching the version used in `flotilla-tui`):
+
+```toml
+comfy-table = "7.2.2"
+```
+
+Note: `dispatch_signal` uses `libc::killpg` and `libc::kill` directly (libc is already a dependency), and `tcgetpgrp` comes from `nix::unistd` (covered by the existing `"process"` feature).
 
 - [ ] **Step 7: Write lifecycle test for inspect**
 

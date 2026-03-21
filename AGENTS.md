@@ -19,7 +19,9 @@ If you say a change matches CI locally, it should have been checked against thes
 - `ghostty-vt` stays optional and must not affect the default Rust-only build.
 - The local helper at [`tools/prepare-ghostty-vt.sh`](tools/prepare-ghostty-vt.sh) reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies the configured Zig version, clones or refreshes the Ghostty fork in `.tools/ghostty-src`, and installs the Ghostty VT headers and libraries into `.tools/ghostty-install`.
 - Re-run the helper after changing the pinned ref or Zig version; it is expected to be idempotent and to refresh the repo-local checkout and install prefix.
-- Verify the helper with `./tools/prepare-ghostty-vt.sh`, `find .tools/ghostty-install -maxdepth 3 | sort`, and `cargo test --workspace --locked`. Until Task 3 lands, feature-on builds should set `CLEAT_GHOSTTY_PREFIX="$PWD/.tools/ghostty-install"` explicitly.
+- `cleat` treats Ghostty as a prefix-only shared-library dependency: headers at `.tools/ghostty-install/include/ghostty/vt.h` and `libghostty-vt.so` at `.tools/ghostty-install/lib/libghostty-vt.so`.
+- Feature-on builds and tests must set `LD_LIBRARY_PATH="$PWD/.tools/ghostty-install/lib"` so the dynamic loader can find `libghostty-vt.so`.
+- Verify the helper with `./tools/prepare-ghostty-vt.sh`, `find .tools/ghostty-install -maxdepth 3 | sort`, `LD_LIBRARY_PATH="$PWD/.tools/ghostty-install/lib" cargo build -p cleat --locked --features ghostty-vt`, and `LD_LIBRARY_PATH="$PWD/.tools/ghostty-install/lib" cargo test -p cleat --locked --features ghostty-vt`.
 
 ## Repo Scope
 

@@ -1,8 +1,9 @@
-use std::{path::PathBuf, process::Command};
-
 use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, VtEngine};
 
 mod vt_contracts;
+
+#[cfg(feature = "ghostty-vt")]
+use std::{path::PathBuf, process::Command};
 
 use vt_contracts::{assert_non_replay_contract, assert_replay_contract_placeholder, PassthroughFixture, PlaceholderReplayFixture};
 #[cfg(feature = "ghostty-vt")]
@@ -91,12 +92,10 @@ fn vt_ghostty_blank_engine_does_not_emit_replay_payload() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
-fn vt_ghostty_prefers_static_library_when_present() {
+fn vt_ghostty_links_against_shared_library() {
     let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
-    let static_library = prefix.join("lib/libghostty-vt.a");
-    if !static_library.exists() {
-        return;
-    }
+    let shared_library = prefix.join("lib/libghostty-vt.so");
+    assert!(shared_library.exists(), "expected shared ghostty library at {}", shared_library.display());
 
     let exe = std::env::current_exe().expect("current test binary");
     let output = inspect_linkage(&exe);
@@ -110,9 +109,9 @@ fn vt_ghostty_prefers_static_library_when_present() {
         stderr
     );
     assert!(
-        !linkage.contains("libghostty-vt"),
-        "expected static ghostty-vt linking when {} exists, but the test binary still depends on the shared library:\n{}",
-        static_library.display(),
+        linkage.contains("libghostty-vt.so"),
+        "expected shared ghostty-vt linkage via {}, but test binary dependencies were:\n{}",
+        shared_library.display(),
         linkage
     );
 }

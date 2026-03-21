@@ -72,5 +72,4 @@ mkdir -p "$INSTALL_DIR"
 (cd "$SOURCE_DIR" && zig build "$build_step" --prefix "$INSTALL_DIR")
 
 test -f "$INSTALL_DIR/include/ghostty/vt.h"
-test -f "$INSTALL_DIR/lib/libghostty-vt.a"
 test -f "$INSTALL_DIR/lib/libghostty-vt.so"

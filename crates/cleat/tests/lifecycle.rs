@@ -74,7 +74,7 @@ impl Drop for EnvVarGuard {
 
 #[test]
 fn create_makes_session_directory_and_returns_metadata() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let cli = Cli::try_parse_from(["cleat", "create", "alpha", "--cmd", "bash"]).expect("parse create");
@@ -86,7 +86,7 @@ fn create_makes_session_directory_and_returns_metadata() {
 
 #[test]
 fn create_json_returns_structured_metadata() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let cli = Cli::try_parse_from(["cleat", "create", "--json", "alpha", "--cmd", "bash"]).expect("parse create");
@@ -101,7 +101,7 @@ fn create_json_returns_structured_metadata() {
 
 #[test]
 fn create_uses_requested_vt_engine() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let cli = Cli::try_parse_from(["cleat", "create", "--json", "--vt", "passthrough", "alpha"]).expect("parse create");
@@ -115,7 +115,7 @@ fn create_uses_requested_vt_engine() {
 #[cfg(not(feature = "ghostty-vt"))]
 #[test]
 fn create_rejects_unavailable_vt_engine() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let cli = Cli::try_parse_from(["cleat", "create", "--vt", "ghostty", "alpha"]).expect("parse create");
@@ -127,7 +127,7 @@ fn create_rejects_unavailable_vt_engine() {
 
 #[test]
 fn list_reports_existing_sessions() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None).expect("create alpha");
@@ -145,7 +145,7 @@ fn list_reports_existing_sessions() {
 
 #[test]
 fn list_json_reports_existing_sessions() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None).expect("create alpha");
@@ -162,7 +162,7 @@ fn list_json_reports_existing_sessions() {
 
 #[test]
 fn capture_rejects_passthrough_sessions() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 5".into())).expect("create alpha");
@@ -176,7 +176,7 @@ fn capture_rejects_passthrough_sessions() {
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn capture_returns_text_for_ghostty_sessions() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service
@@ -205,7 +205,7 @@ fn capture_returns_text_for_ghostty_sessions() {
 
 #[test]
 fn kill_removes_session_directory() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, None).expect("create alpha");
@@ -219,7 +219,7 @@ fn kill_removes_session_directory() {
 
 #[test]
 fn kill_missing_session_is_an_error() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let cli = Cli::try_parse_from(["cleat", "kill", "missing"]).expect("parse kill");
@@ -231,7 +231,7 @@ fn kill_missing_session_is_an_error() {
 
 #[test]
 fn attach_creates_session_lazily_and_reuses_it_on_later_attach() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
@@ -249,7 +249,7 @@ fn attach_creates_session_lazily_and_reuses_it_on_later_attach() {
 
 #[test]
 fn attach_vt_only_applies_when_creating_new_session() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
@@ -265,7 +265,7 @@ fn attach_vt_only_applies_when_creating_new_session() {
 
 #[test]
 fn attach_rejects_second_foreground_client_while_one_is_active() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
@@ -277,7 +277,7 @@ fn attach_rejects_second_foreground_client_while_one_is_active() {
 
 #[test]
 fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_client_policy() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
@@ -297,7 +297,7 @@ fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_c
 
 #[test]
 fn lifecycle_attach_init_capabilities_drive_replay_output_on_daemon_path() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _guard = EnvVarGuard::set("CLEAT_TEST_VT_ENGINE", "replay-probe");
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -318,7 +318,7 @@ fn lifecycle_attach_init_capabilities_drive_replay_output_on_daemon_path() {
 
 #[test]
 fn send_keys_injects_input_into_running_session_pty() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("cat".into())).expect("create alpha");
@@ -354,7 +354,7 @@ fn send_keys_injects_input_into_running_session_pty() {
 
 #[test]
 fn send_keys_cli_executes_end_to_end() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("cat".into())).expect("create alpha");
@@ -394,7 +394,7 @@ fn detached_session_answers_da_queries() {
     if !require_python3() {
         return;
     }
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let cmd = r#"python3 -c 'import os,select,time,tty; fd=os.open("/dev/tty", os.O_RDWR); tty.setcbreak(fd); os.write(fd,b"\x1b[c"); data=b""; deadline=time.time()+2; 
@@ -421,7 +421,7 @@ fn attached_session_does_not_get_synthetic_da_reply() {
     if !require_python3() {
         return;
     }
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let cmd = r#"python3 -c 'import os,select,time,tty; fd=os.open("/dev/tty", os.O_RDWR); tty.setcbreak(fd);
@@ -456,7 +456,7 @@ open("da.txt","wb").write(data); time.sleep(5)'"#;
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn replay_reattach_delivers_restore_before_new_live_output() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service
@@ -514,7 +514,7 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn first_attach_replay_does_not_clear_before_output() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 5".into())).expect("create alpha");
@@ -536,7 +536,7 @@ fn first_attach_replay_does_not_clear_before_output() {
 
 #[test]
 fn dropping_foreground_attach_keeps_session_alive_for_later_attach() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
@@ -552,7 +552,7 @@ fn dropping_foreground_attach_keeps_session_alive_for_later_attach() {
 
 #[test]
 fn stale_foreground_file_does_not_block_attach() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
@@ -564,7 +564,7 @@ fn stale_foreground_file_does_not_block_attach() {
 
 #[test]
 fn attach_no_create_rejects_missing_session() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let cli = Cli::try_parse_from(["cleat", "attach", "--no-create", "missing"]).expect("parse attach");
@@ -576,7 +576,7 @@ fn attach_no_create_rejects_missing_session() {
 
 #[test]
 fn cleat_attach_exits_when_session_is_killed() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("sleep 30".into())).expect("create alpha");
@@ -619,7 +619,7 @@ fn cleat_attach_exits_when_session_is_killed() {
 
 #[test]
 fn cleat_detach_exits_foreground_client_and_keeps_session_alive() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("sleep 30".into())).expect("create alpha");
@@ -665,7 +665,7 @@ fn cleat_detach_exits_foreground_client_and_keeps_session_alive() {
 
 #[test]
 fn cleat_attach_exits_on_sigterm_and_keeps_session_alive() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("sleep 30".into())).expect("create alpha");
@@ -717,7 +717,7 @@ fn cleat_attach_exits_on_sigterm_and_keeps_session_alive() {
 
 #[test]
 fn inspect_returns_structured_session_state() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let info = service.create(Some("alpha".into()), None, None, Some("bash".into())).expect("create session");
@@ -749,7 +749,7 @@ fn inspect_returns_structured_session_state() {
 
 #[test]
 fn signal_term_to_leader_terminates_session() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let info = service.create(Some("beta".into()), None, None, Some("sleep 60".into())).expect("create session");
@@ -783,7 +783,7 @@ fn signal_term_to_leader_terminates_session() {
 
 #[test]
 fn short_lived_session_reaps_its_directory_after_child_exit() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("printf done; sleep 0.1".into())).expect("create alpha");
@@ -799,7 +799,7 @@ fn short_lived_session_reaps_its_directory_after_child_exit() {
 
 #[test]
 fn record_command_activates_recording_on_running_session() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let info = service.create(Some("delta".into()), None, None, Some("sleep 30".into())).expect("create session");
@@ -832,7 +832,7 @@ fn record_command_activates_recording_on_running_session() {
 
 #[test]
 fn create_with_record_flag_activates_recording() {
-    let _lock = env_lock().lock().expect("env lock");
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 

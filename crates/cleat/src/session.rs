@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn resolve_cleat_executable_prefers_cargo_bin_env() {
-        let _lock = env_lock().lock().expect("env lock");
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let cleat = temp.path().join("cleat");
         fs::write(&cleat, b"#!/bin/sh\n").expect("write fake cleat");
@@ -1169,7 +1169,7 @@ mod tests {
 
     #[test]
     fn resolve_cleat_executable_falls_back_to_path() {
-        let _lock = env_lock().lock().expect("env lock");
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).expect("create bin dir");

@@ -168,9 +168,19 @@ impl SessionService {
     }
 
     pub fn record(&self, id: &str, enable: bool) -> Result<(), String> {
-        if !self.layout.root().join(id).join("meta.json").exists() {
+        let meta_path = self.layout.root().join(id).join("meta.json");
+        if !meta_path.exists() {
             return Err(format!("missing session {id}"));
         }
+
+        // Persist to metadata so recording survives daemon restarts.
+        if let Ok(contents) = std::fs::read_to_string(&meta_path) {
+            if let Ok(mut meta) = serde_json::from_str::<crate::runtime::SessionMetadata>(&contents) {
+                meta.record = enable;
+                let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).expect("serialize"));
+            }
+        }
+
         let socket_path = session_socket_path(self.layout.root(), id);
         let mut stream =
             std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;

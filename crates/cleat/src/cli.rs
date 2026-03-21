@@ -103,7 +103,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
         Command::Attach { id, no_create, vt, cwd, cmd, record } => {
             let (_attached, guard) = service.attach(id, vt, cwd, cmd, no_create)?;
             if record {
-                let _ = service.record(&_attached.id, true);
+                service.record(&_attached.id, true)?;
             }
             guard.relay_stdio()?;
             Ok(None)
@@ -242,7 +242,7 @@ fn parse_signal_target(target: &str) -> Result<crate::protocol::SignalTarget, St
     match target {
         "foreground" => Ok(crate::protocol::SignalTarget::Foreground),
         "leader" => Ok(crate::protocol::SignalTarget::Leader),
-        "tree" => Ok(crate::protocol::SignalTarget::Tree),
+        "tree" => Err("tree signal target is not yet implemented".to_string()),
         other => Err(format!("unknown signal target: {other}")),
     }
 }

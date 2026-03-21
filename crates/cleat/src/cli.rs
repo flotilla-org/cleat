@@ -118,6 +118,19 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
                         let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).expect("serialize"));
                     }
                 }
+                // The daemon is already running by the time create() returns, so also
+                // send a RecordControl frame to activate recording immediately.
+                // The daemon may still be initializing, so retry briefly.
+                let record_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    match service.record(&created.id, true) {
+                        Ok(()) => break,
+                        Err(_) if std::time::Instant::now() < record_deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(err) => return Err(format!("activate recording: {err}")),
+                    }
+                }
             }
             if json {
                 serde_json::to_string(&created).map(Some).map_err(|err| format!("serialize create result: {err}"))

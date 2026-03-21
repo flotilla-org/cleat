@@ -829,3 +829,30 @@ fn record_command_activates_recording_on_running_session() {
 
     service.kill(&info.id).expect("kill session");
 }
+
+#[test]
+fn create_with_record_flag_activates_recording() {
+    let _lock = env_lock().lock().expect("env lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+
+    let cli = Cli::try_parse_from(["cleat", "create", "gamma", "--record"]).expect("parse create --record");
+    cli::execute(cli, &service).expect("execute create --record");
+
+    let socket_path = session_socket_path(temp.path(), "gamma");
+    wait_for_socket(&socket_path);
+
+    let inspect_deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        match service.inspect("gamma") {
+            Ok(result) => break result,
+            Err(_) if Instant::now() < inspect_deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => panic!("inspect after create --record: {err}"),
+        }
+    };
+    assert!(result.recording.active, "recording should be active with --record flag");
+
+    service.kill("gamma").expect("kill session");
+}

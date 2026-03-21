@@ -308,17 +308,20 @@ pub fn ensure_session_started(
     vt_engine: Option<VtEngineKind>,
     cwd: Option<PathBuf>,
     cmd: Option<String>,
+    record: bool,
 ) -> Result<SessionMetadata, String> {
     let session = match id {
         Some(ref id_str) if layout.root().join(id_str).exists() => {
             // Session directory exists — reuse it. Build metadata for daemon spawn.
             let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-            SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record: false }
+            SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record }
         }
         _ => {
             let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
             vt_engine.ensure_available()?;
-            layout.create_session(id, vt_engine, cwd, cmd)?.metadata
+            let mut meta = layout.create_session(id, vt_engine, cwd, cmd)?;
+            meta.record = record;
+            meta
         }
     };
 

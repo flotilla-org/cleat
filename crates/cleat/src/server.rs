@@ -2,8 +2,8 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::{
     protocol::{Frame, SessionInfo, SessionStatus},
-    runtime::{RuntimeLayout, SessionRecord},
-    session::{attach_foreground, ensure_session_started, foreground_path, run_session_daemon, session_socket_path, ForegroundAttach},
+    runtime::RuntimeLayout,
+    session::{attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, ForegroundAttach},
     vt::VtEngineKind,
 };
 
@@ -31,8 +31,9 @@ impl SessionService {
         vt_engine: Option<VtEngineKind>,
         cwd: Option<std::path::PathBuf>,
         cmd: Option<String>,
+        record: bool,
     ) -> Result<SessionInfo, String> {
-        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd)?;
+        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, record)?;
         Ok(SessionInfo {
             id: session.id,
             vt_engine: session.vt_engine,
@@ -43,9 +44,41 @@ impl SessionService {
     }
 
     pub fn list(&self) -> Result<Vec<SessionInfo>, String> {
-        self.layout
-            .list_sessions()
-            .map(|sessions| sessions.into_iter().map(|record| session_info_from_record(self.layout.root(), record)).collect())
+        if !self.layout.root().exists() {
+            return Ok(vec![]);
+        }
+
+        let mut sessions = Vec::new();
+        let entries =
+            std::fs::read_dir(self.layout.root()).map_err(|err| format!("read runtime root {}: {err}", self.layout.root().display()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("read runtime entry: {err}"))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let id = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            let socket_path = session_socket_path(self.layout.root(), &id);
+            if !socket_path.exists() {
+                continue;
+            }
+            if let Ok(result) = self.inspect(&id) {
+                let status = if result.attachments.is_empty() { SessionStatus::Detached } else { SessionStatus::Attached };
+                sessions.push(SessionInfo {
+                    id: result.session.id,
+                    vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+                    cwd: result.session.cwd,
+                    cmd: result.session.cmd,
+                    status,
+                });
+            }
+        }
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(sessions)
     }
 
     pub fn kill(&self, id: &str) -> Result<(), String> {
@@ -119,7 +152,7 @@ impl SessionService {
             let vt_engine = vt_engine.unwrap_or_else(crate::vt::default_vt_engine_kind);
             crate::runtime::SessionMetadata { id, vt_engine, cwd, cmd, record: false }
         } else {
-            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd)?
+            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, false)?
         };
         let attach = attach_foreground(&self.layout, &session.id)?;
         Ok((
@@ -184,10 +217,11 @@ impl SessionService {
     }
 }
 
-fn session_info_from_record(root: &std::path::Path, record: SessionRecord) -> SessionInfo {
-    let id = record.metadata.id.clone();
-    let status = if foreground_path(root, &id).exists() { SessionStatus::Attached } else { SessionStatus::Detached };
-    SessionInfo { id: record.metadata.id, vt_engine: record.metadata.vt_engine, cwd: record.metadata.cwd, cmd: record.metadata.cmd, status }
+fn parse_vt_engine_kind(s: &str) -> VtEngineKind {
+    match s {
+        "ghostty" => VtEngineKind::Ghostty,
+        _ => VtEngineKind::Passthrough,
+    }
 }
 
 fn is_expected_bollard_process(pid: i32) -> bool {

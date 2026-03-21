@@ -8,8 +8,8 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::{
     protocol::{Frame, SessionInfo, SessionStatus},
-    runtime::{RuntimeLayout, SessionRecord},
-    session::{attach_foreground, ensure_session_started, foreground_path, run_session_daemon, session_socket_path, ForegroundAttach},
+    runtime::RuntimeLayout,
+    session::{attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, ForegroundAttach},
     vt::VtEngineKind,
 };
 
@@ -37,11 +37,15 @@ impl SessionService {
         vt_engine: Option<VtEngineKind>,
         cwd: Option<std::path::PathBuf>,
         cmd: Option<String>,
+        record: bool,
     ) -> Result<SessionInfo, String> {
-        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd)?;
+        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, record)?;
+        // If the daemon was already running, get real config via inspect.
+        if let Ok(result) = self.inspect(&session.id) {
+            return Ok(session_info_from_inspect(result, SessionStatus::Detached));
+        }
         Ok(SessionInfo {
             id: session.id,
-            name: session.name,
             vt_engine: session.vt_engine,
             cwd: session.cwd,
             cmd: session.cmd,
@@ -50,13 +54,45 @@ impl SessionService {
     }
 
     pub fn list(&self) -> Result<Vec<SessionInfo>, String> {
-        self.layout
-            .list_sessions()
-            .map(|sessions| sessions.into_iter().map(|record| session_info_from_record(self.layout.root(), record)).collect())
+        if !self.layout.root().exists() {
+            return Ok(vec![]);
+        }
+
+        let mut sessions = Vec::new();
+        let entries =
+            std::fs::read_dir(self.layout.root()).map_err(|err| format!("read runtime root {}: {err}", self.layout.root().display()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("read runtime entry: {err}"))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let id = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            let socket_path = session_socket_path(self.layout.root(), &id);
+            if !socket_path.exists() {
+                continue;
+            }
+            if let Ok(result) = self.inspect(&id) {
+                let status = if result.attachments.is_empty() { SessionStatus::Detached } else { SessionStatus::Attached };
+                sessions.push(SessionInfo {
+                    id: result.session.id,
+                    vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+                    cwd: result.session.cwd,
+                    cmd: result.session.cmd,
+                    status,
+                });
+            }
+        }
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(sessions)
     }
 
     pub fn kill(&self, id: &str) -> Result<(), String> {
-        if !self.layout.root().join(id).join("meta.json").exists() {
+        if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let pid_path = crate::session::daemon_pid_path(self.layout.root(), id);
@@ -72,7 +108,7 @@ impl SessionService {
     }
 
     pub fn detach(&self, id: &str) -> Result<(), String> {
-        if !self.layout.root().join(id).join("meta.json").exists() {
+        if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
@@ -83,7 +119,7 @@ impl SessionService {
     }
 
     pub fn capture(&self, id: &str) -> Result<String, String> {
-        if !self.layout.root().join(id).join("meta.json").exists() {
+        if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
@@ -98,7 +134,7 @@ impl SessionService {
     }
 
     pub fn send_keys(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
-        if !self.layout.root().join(id).join("meta.json").exists() {
+        if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
@@ -117,36 +153,37 @@ impl SessionService {
     ) -> Result<(SessionInfo, ForegroundAttach), String> {
         let session = if no_create {
             let id = name.ok_or_else(|| "attach --no-create requires a session id".to_string())?;
-            self.layout
-                .list_sessions()?
-                .into_iter()
-                .find(|record| record.metadata.id == id)
-                .map(|record| record.metadata)
-                .ok_or_else(|| format!("missing session {id}"))?
+            let socket_path = session_socket_path(self.layout.root(), &id);
+            if !socket_path.exists() {
+                return Err(format!("missing session {id}"));
+            }
+            let vt_engine = vt_engine.unwrap_or_else(crate::vt::default_vt_engine_kind);
+            crate::runtime::SessionMetadata { id, vt_engine, cwd, cmd, record: false }
         } else {
-            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd)?
+            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, false)?
         };
-        let attach = attach_foreground(&self.layout, &session.id)?;
-        Ok((
+        // Get real config from the daemon before attaching (which takes the foreground slot).
+        let info = if let Ok(result) = self.inspect(&session.id) {
+            session_info_from_inspect(result, SessionStatus::Attached)
+        } else {
             SessionInfo {
-                id: session.id,
-                name: session.name,
+                id: session.id.clone(),
                 vt_engine: session.vt_engine,
                 cwd: session.cwd,
                 cmd: session.cmd,
                 status: SessionStatus::Attached,
-            },
-            attach,
-        ))
+            }
+        };
+        let attach = attach_foreground(&self.layout, &info.id)?;
+        Ok((info, attach))
     }
 
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {
-        if !self.layout.root().join(id).join("meta.json").exists() {
+        if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::Inspect.write(&mut stream).map_err(|err| format!("write inspect request: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read inspect response: {err}"))? {
             Frame::InspectResult(json) => serde_json::from_slice(&json).map_err(|err| format!("parse inspect response: {err}")),
@@ -156,12 +193,11 @@ impl SessionService {
     }
 
     pub fn signal(&self, id: &str, signal: i32, target: crate::protocol::SignalTarget) -> Result<(), String> {
-        if !self.layout.root().join(id).join("meta.json").exists() {
+        if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::Signal { signal, target }.write(&mut stream).map_err(|err| format!("write signal request: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read signal response: {err}"))? {
             Frame::Ack => Ok(()),
@@ -171,22 +207,11 @@ impl SessionService {
     }
 
     pub fn record(&self, id: &str, enable: bool) -> Result<(), String> {
-        let meta_path = self.layout.root().join(id).join("meta.json");
-        if !meta_path.exists() {
+        if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
-
-        // Persist to metadata so recording survives daemon restarts.
-        if let Ok(contents) = std::fs::read_to_string(&meta_path) {
-            if let Ok(mut meta) = serde_json::from_str::<crate::runtime::SessionMetadata>(&contents) {
-                meta.record = enable;
-                let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).expect("serialize"));
-            }
-        }
-
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::RecordControl { enable }.write(&mut stream).map_err(|err| format!("write record control: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read record response: {err}"))? {
             Frame::Ack => Ok(()),
@@ -195,20 +220,24 @@ impl SessionService {
         }
     }
 
-    pub fn serve(&self, id: &str) -> Result<(), String> {
-        run_session_daemon(self.layout.root(), id)
+    pub fn serve(&self, session: &crate::runtime::SessionMetadata) -> Result<(), String> {
+        run_session_daemon(self.layout.root(), session)
     }
 }
 
-fn session_info_from_record(root: &std::path::Path, record: SessionRecord) -> SessionInfo {
-    let id = record.metadata.id.clone();
-    let status = if foreground_path(root, &id).exists() { SessionStatus::Attached } else { SessionStatus::Detached };
+fn parse_vt_engine_kind(s: &str) -> VtEngineKind {
+    match s {
+        "ghostty" => VtEngineKind::Ghostty,
+        _ => VtEngineKind::Passthrough,
+    }
+}
+
+fn session_info_from_inspect(result: crate::protocol::InspectResult, status: SessionStatus) -> SessionInfo {
     SessionInfo {
-        id: record.metadata.id,
-        name: record.metadata.name,
-        vt_engine: record.metadata.vt_engine,
-        cwd: record.metadata.cwd,
-        cmd: record.metadata.cmd,
+        id: result.session.id,
+        vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+        cwd: result.session.cwd,
+        cmd: result.session.cmd,
         status,
     }
 }
@@ -253,7 +282,6 @@ mod tests {
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
         let session_dir = temp.path().join("alpha");
         fs::create_dir_all(&session_dir).expect("create session dir");
-        fs::write(session_dir.join("meta.json"), r#"{"id":"alpha","name":"alpha","cwd":null,"cmd":null}"#).expect("write metadata");
 
         let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
         fs::write(daemon_pid_path(temp.path(), "alpha"), child.id().to_string()).expect("write pid");
@@ -283,7 +311,6 @@ mod tests {
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
         let session_dir = temp.path().join("alpha");
         fs::create_dir_all(&session_dir).expect("create session dir");
-        fs::write(session_dir.join("meta.json"), r#"{"id":"alpha","name":"alpha","cwd":null,"cmd":null}"#).expect("write metadata");
 
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");

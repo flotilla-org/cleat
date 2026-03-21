@@ -130,8 +130,8 @@ fn list_reports_existing_sessions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None).expect("create alpha");
-    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("zsh".into())).expect("create beta");
+    service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None, false).expect("create alpha");
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("zsh".into()), false).expect("create beta");
     let cli = Cli::try_parse_from(["cleat", "list"]).expect("parse list");
 
     let output = cli::execute(cli, &service).expect("execute list").expect("list output");
@@ -148,8 +148,8 @@ fn list_json_reports_existing_sessions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None).expect("create alpha");
-    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("zsh".into())).expect("create beta");
+    service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None, false).expect("create alpha");
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("zsh".into()), false).expect("create beta");
     let cli = Cli::try_parse_from(["cleat", "list", "--json"]).expect("parse list");
 
     let output = cli::execute(cli, &service).expect("execute list").expect("list output");
@@ -165,7 +165,7 @@ fn capture_rejects_passthrough_sessions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 5".into())).expect("create alpha");
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 5".into()), false).expect("create alpha");
     let cli = Cli::try_parse_from(["cleat", "capture", "alpha"]).expect("parse capture");
 
     let err = cli::execute(cli, &service).expect_err("passthrough capture should fail");
@@ -188,6 +188,7 @@ fn capture_returns_text_for_ghostty_sessions() {
             Some(VtEngineKind::Ghostty),
             None,
             Some("python3 -c 'import sys, time; sys.stdout.write(\"hello capture\"); sys.stdout.flush(); time.sleep(5)'".into()),
+            false,
         )
         .expect("create alpha");
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -216,7 +217,7 @@ fn kill_removes_session_directory() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, None).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, None, false).expect("create alpha");
     let cli = Cli::try_parse_from(["cleat", "kill", "alpha"]).expect("parse kill");
 
     let output = cli::execute(cli, &service).expect("execute kill");
@@ -289,7 +290,7 @@ fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_c
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
-    service.create(Some("alpha".into()), None, None, Some("sleep 5".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("create alpha");
 
     let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
     Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
@@ -310,7 +311,7 @@ fn lifecycle_attach_init_capabilities_drive_replay_output_on_daemon_path() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, Some("sleep 5".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("create alpha");
 
     let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
     Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
@@ -329,7 +330,7 @@ fn send_keys_injects_input_into_running_session_pty() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, Some("cat".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("cat".into()), false).expect("create alpha");
 
     let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
     Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
@@ -365,7 +366,7 @@ fn send_keys_cli_executes_end_to_end() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, Some("cat".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("cat".into()), false).expect("create alpha");
 
     let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
     Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
@@ -412,7 +413,7 @@ while time.time() < deadline and not data.endswith(b"c"):
     data += os.read(fd, 1)
 open("da.txt","wb").write(data); time.sleep(5)'"#;
 
-    service.create(Some("alpha".into()), None, Some(temp.path().to_path_buf()), Some(cmd.into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, Some(temp.path().to_path_buf()), Some(cmd.into()), false).expect("create alpha");
 
     let result_path = temp.path().join("da.txt");
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -442,7 +443,7 @@ while time.time() < deadline and not data.endswith(b"c"):
     data += os.read(fd, 1)
 open("da.txt","wb").write(data); time.sleep(5)'"#;
 
-    service.create(Some("alpha".into()), None, Some(temp.path().to_path_buf()), Some(cmd.into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, Some(temp.path().to_path_buf()), Some(cmd.into()), false).expect("create alpha");
 
     let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
     Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
@@ -468,7 +469,7 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service
-        .create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 1; printf 'after'; sleep 5".into()))
+        .create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 1; printf 'after'; sleep 5".into()), false)
         .expect("create alpha");
 
     let mut first = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect first socket");
@@ -525,7 +526,7 @@ fn first_attach_replay_does_not_clear_before_output() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 5".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 5".into()), false).expect("create alpha");
 
     let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
     Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
@@ -564,7 +565,7 @@ fn stale_foreground_file_does_not_block_attach() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
-    service.create(Some("alpha".into()), None, None, Some("sleep 5".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("create alpha");
     std::fs::write(foreground_path(temp.path(), "alpha"), b"999999").expect("write stale foreground marker");
 
     let (_session, _attach) = service.attach(Some("alpha".into()), None, None, None, false).expect("attach with stale foreground marker");
@@ -587,7 +588,7 @@ fn cleat_attach_exits_when_session_is_killed() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, Some("sleep 30".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("sleep 30".into()), false).expect("create alpha");
 
     let cleat_bin = std::env::var("CARGO_BIN_EXE_cleat").expect("cleat bin");
     let mut child = Command::new(cleat_bin)
@@ -630,7 +631,7 @@ fn cleat_detach_exits_foreground_client_and_keeps_session_alive() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, Some("sleep 30".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("sleep 30".into()), false).expect("create alpha");
 
     let cleat_bin = std::env::var("CARGO_BIN_EXE_cleat").expect("cleat bin");
     let mut child = Command::new(cleat_bin)
@@ -676,7 +677,7 @@ fn cleat_attach_exits_on_sigterm_and_keeps_session_alive() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, Some("sleep 30".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("sleep 30".into()), false).expect("create alpha");
 
     let cleat_bin = std::env::var("CARGO_BIN_EXE_cleat").expect("cleat bin");
     let mut child = Command::new(cleat_bin)
@@ -728,7 +729,7 @@ fn inspect_returns_structured_session_state() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    let info = service.create(Some("alpha".into()), None, None, Some("bash".into())).expect("create session");
+    let info = service.create(Some("alpha".into()), None, None, Some("bash".into()), false).expect("create session");
 
     let socket_path = session_socket_path(temp.path(), &info.id);
     wait_for_socket(&socket_path);
@@ -760,7 +761,7 @@ fn signal_term_to_leader_terminates_session() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    let info = service.create(Some("beta".into()), None, None, Some("sleep 60".into())).expect("create session");
+    let info = service.create(Some("beta".into()), None, None, Some("sleep 60".into()), false).expect("create session");
 
     let socket_path = session_socket_path(temp.path(), &info.id);
     wait_for_socket(&socket_path);
@@ -794,7 +795,7 @@ fn short_lived_session_reaps_its_directory_after_child_exit() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service.create(Some("alpha".into()), None, None, Some("printf done; sleep 0.1".into())).expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("printf done; sleep 0.1".into()), false).expect("create alpha");
 
     let session_dir = temp.path().join("alpha");
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -810,7 +811,7 @@ fn record_command_activates_recording_on_running_session() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    let info = service.create(Some("delta".into()), None, None, Some("sleep 30".into())).expect("create session");
+    let info = service.create(Some("delta".into()), None, None, Some("sleep 30".into()), false).expect("create session");
 
     let socket_path = session_socket_path(temp.path(), &info.id);
     wait_for_socket(&socket_path);

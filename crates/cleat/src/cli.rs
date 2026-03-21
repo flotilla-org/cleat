@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::{keys::encode_send_keys, server::SessionService, vt::VtEngineKind};
+use crate::{keys::encode_send_keys, runtime::SessionMetadata, server::SessionService, vt::VtEngineKind};
 
 #[derive(Debug, Parser)]
 #[command(name = "cleat", version)]
@@ -87,6 +87,14 @@ pub enum Command {
     Serve {
         #[arg(long)]
         id: String,
+        #[arg(long, value_enum, default_value_t = crate::vt::default_vt_engine_kind())]
+        vt: VtEngineKind,
+        #[arg(long)]
+        cmd: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        record: bool,
     },
 }
 
@@ -109,23 +117,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             Ok(None)
         }
         Command::Create { id, json, vt, cwd, cmd, record } => {
-            let created = service.create(id, vt, cwd, cmd)?;
-            if record {
-                // The daemon is already running by the time create() returns, so send
-                // a RecordControl frame to activate recording. service.record() also
-                // persists the flag to meta.json. Retry briefly since the daemon may
-                // still be initializing.
-                let record_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-                loop {
-                    match service.record(&created.id, true) {
-                        Ok(()) => break,
-                        Err(_) if std::time::Instant::now() < record_deadline => {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
-                        Err(err) => return Err(format!("activate recording: {err}")),
-                    }
-                }
-            }
+            let created = service.create(id, vt, cwd, cmd, record)?;
             if json {
                 serde_json::to_string(&created).map(Some).map_err(|err| format!("serialize create result: {err}"))
             } else {
@@ -174,8 +166,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             service.record(&id, true)?;
             Ok(None)
         }
-        Command::Serve { id } => {
-            service.serve(&id)?;
+        Command::Serve { id, vt, cmd, cwd, record } => {
+            let session = SessionMetadata { id, vt_engine: vt, cwd, cmd, record };
+            service.serve(&session)?;
             Ok(None)
         }
     }

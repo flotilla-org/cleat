@@ -15,7 +15,6 @@ fn named_sessions_use_supplied_name_as_id() {
         .expect("create session");
 
     assert_eq!(session.metadata.id, "demo");
-    assert_eq!(session.metadata.name.as_deref(), Some("demo"));
     assert_eq!(session.metadata.vt_engine, VtEngineKind::Passthrough);
     assert!(session.dir.ends_with("demo"));
 }

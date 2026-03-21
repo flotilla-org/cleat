@@ -304,17 +304,17 @@ impl Drop for TerminalModeGuard {
 
 pub fn ensure_session_started(
     layout: &RuntimeLayout,
-    name: Option<String>,
+    id: Option<String>,
     vt_engine: Option<VtEngineKind>,
     cwd: Option<PathBuf>,
     cmd: Option<String>,
 ) -> Result<SessionMetadata, String> {
-    let session = if let Some(existing) = name.as_deref().and_then(|value| load_session(layout.root(), value).ok().flatten()) {
+    let session = if let Some(existing) = id.as_deref().and_then(|value| load_session(layout.root(), value).ok().flatten()) {
         existing
     } else {
         let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
         vt_engine.ensure_available()?;
-        layout.create_session(name, vt_engine, cwd, cmd)?.metadata
+        layout.create_session(id, vt_engine, cwd, cmd)?.metadata
     };
 
     let socket_path = session_socket_path(layout.root(), &session.id);
@@ -689,7 +689,6 @@ fn build_inspect_result(
     crate::protocol::InspectResult {
         session: crate::protocol::SessionInspect {
             id: session.id.clone(),
-            name: session.name.clone(),
             state: "running".to_string(),
             vt_engine: session.vt_engine.as_str().to_string(),
             cwd: session.cwd.clone(),

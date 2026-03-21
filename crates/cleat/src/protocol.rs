@@ -10,7 +10,6 @@ use crate::vt::{ClientCapabilities, ColorLevel, VtEngineKind};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
-    pub name: Option<String>,
     pub vt_engine: VtEngineKind,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
@@ -35,7 +34,6 @@ pub struct InspectResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInspect {
     pub id: String,
-    pub name: Option<String>,
     pub state: String,
     pub vt_engine: String,
     pub cwd: Option<PathBuf>,

@@ -13,7 +13,6 @@ const SESSION_ROOT_DIR: &str = "cleat";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetadata {
     pub id: String,
-    pub name: Option<String>,
     #[serde(default = "crate::vt::default_vt_engine_kind")]
     pub vt_engine: VtEngineKind,
     pub cwd: Option<PathBuf>,
@@ -59,17 +58,17 @@ impl RuntimeLayout {
 
     pub fn create_session(
         &self,
-        name: Option<String>,
+        id: Option<String>,
         vt_engine: VtEngineKind,
         cwd: Option<PathBuf>,
         cmd: Option<String>,
     ) -> Result<SessionRecord, String> {
         self.ensure_root()?;
 
-        let id = name.clone().unwrap_or_else(|| format!("session-{}", Uuid::new_v4()));
+        let id = id.unwrap_or_else(|| format!("session-{}", Uuid::new_v4()));
         let dir = self.root.join(&id);
         fs::create_dir_all(&dir).map_err(|err| format!("create session dir {}: {err}", dir.display()))?;
-        let metadata = SessionMetadata { id, name, vt_engine, cwd, cmd, record: false };
+        let metadata = SessionMetadata { id, vt_engine, cwd, cmd, record: false };
         self.write_metadata(&metadata)?;
         Ok(SessionRecord { dir, metadata })
     }

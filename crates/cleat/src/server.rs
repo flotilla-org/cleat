@@ -35,7 +35,6 @@ impl SessionService {
         let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd)?;
         Ok(SessionInfo {
             id: session.id,
-            name: session.name,
             vt_engine: session.vt_engine,
             cwd: session.cwd,
             cmd: session.cmd,
@@ -127,7 +126,6 @@ impl SessionService {
         Ok((
             SessionInfo {
                 id: session.id,
-                name: session.name,
                 vt_engine: session.vt_engine,
                 cwd: session.cwd,
                 cmd: session.cmd,
@@ -200,14 +198,7 @@ impl SessionService {
 fn session_info_from_record(root: &std::path::Path, record: SessionRecord) -> SessionInfo {
     let id = record.metadata.id.clone();
     let status = if foreground_path(root, &id).exists() { SessionStatus::Attached } else { SessionStatus::Detached };
-    SessionInfo {
-        id: record.metadata.id,
-        name: record.metadata.name,
-        vt_engine: record.metadata.vt_engine,
-        cwd: record.metadata.cwd,
-        cmd: record.metadata.cmd,
-        status,
-    }
+    SessionInfo { id: record.metadata.id, vt_engine: record.metadata.vt_engine, cwd: record.metadata.cwd, cmd: record.metadata.cmd, status }
 }
 
 fn is_expected_bollard_process(pid: i32) -> bool {

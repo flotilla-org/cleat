@@ -184,6 +184,18 @@ fn signal_with_target() {
 }
 
 #[test]
+fn record_parses_session_id() {
+    let cli = Cli::try_parse_from(["cleat", "record", "alpha"]).expect("parse record");
+    assert!(matches!(cli.command, Command::Record { ref id } if id == "alpha"));
+}
+
+#[test]
+fn create_record_flag() {
+    let cli = Cli::try_parse_from(["cleat", "create", "alpha", "--record"]).expect("parse create --record");
+    assert!(matches!(cli.command, Command::Create { record: true, .. }));
+}
+
+#[test]
 fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,

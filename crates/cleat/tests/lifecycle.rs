@@ -856,3 +856,19 @@ fn create_with_record_flag_activates_recording() {
 
     service.kill("gamma").expect("kill session");
 }
+
+#[test]
+fn inspect_missing_session_is_an_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let err = service.inspect("missing").expect_err("missing session should error");
+    assert!(err.contains("missing"));
+}
+
+#[test]
+fn signal_missing_session_is_an_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let err = service.signal("missing", libc::SIGINT, cleat::protocol::SignalTarget::Foreground).expect_err("missing session should error");
+    assert!(err.contains("missing"));
+}

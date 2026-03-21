@@ -10,19 +10,19 @@ use cleat::{
 fn help_lists_expected_subcommands() {
     let command = Cli::command();
     let subcommands: Vec<_> = command.get_subcommands().filter(|sub| !sub.is_hide_set()).map(|sub| sub.get_name().to_string()).collect();
-    assert_eq!(subcommands, vec!["attach", "create", "list", "capture", "detach", "kill", "send-keys"]);
+    assert_eq!(subcommands, vec!["attach", "create", "list", "capture", "detach", "kill", "send-keys", "inspect", "signal", "record"]);
 }
 
 #[test]
 fn attach_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "attach", "demo"]).expect("attach positional parses");
-    assert_eq!(cli.command, Command::Attach { id: Some("demo".into()), no_create: false, vt: None, cwd: None, cmd: None });
+    assert_eq!(cli.command, Command::Attach { id: Some("demo".into()), no_create: false, vt: None, cwd: None, cmd: None, record: false });
 }
 
 #[test]
 fn attach_command_parses_no_create() {
     let cli = Cli::try_parse_from(["cleat", "attach", "--no-create", "demo"]).expect("attach --no-create parses");
-    assert_eq!(cli.command, Command::Attach { id: Some("demo".into()), no_create: true, vt: None, cwd: None, cmd: None });
+    assert_eq!(cli.command, Command::Attach { id: Some("demo".into()), no_create: true, vt: None, cwd: None, cmd: None, record: false });
 }
 
 #[test]
@@ -33,26 +33,34 @@ fn attach_command_parses_vt() {
         no_create: false,
         vt: Some(VtEngineKind::Passthrough),
         cwd: None,
-        cmd: None
+        cmd: None,
+        record: false
     });
 }
 
 #[test]
 fn create_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create parses");
-    assert_eq!(cli.command, Command::Create { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()) });
+    assert_eq!(cli.command, Command::Create { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
 }
 
 #[test]
 fn create_command_parses_positional_name() {
     let cli = Cli::try_parse_from(["cleat", "create", "demo", "--cmd", "bash"]).expect("create positional parses");
-    assert_eq!(cli.command, Command::Create { id: Some("demo".into()), json: false, vt: None, cwd: None, cmd: Some("bash".into()) });
+    assert_eq!(cli.command, Command::Create {
+        id: Some("demo".into()),
+        json: false,
+        vt: None,
+        cwd: None,
+        cmd: Some("bash".into()),
+        record: false
+    });
 }
 
 #[test]
 fn create_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "create", "--json", "demo"]).expect("create --json parses");
-    assert_eq!(cli.command, Command::Create { id: Some("demo".into()), json: true, vt: None, cwd: None, cmd: None });
+    assert_eq!(cli.command, Command::Create { id: Some("demo".into()), json: true, vt: None, cwd: None, cmd: None, record: false });
 }
 
 #[test]
@@ -63,7 +71,8 @@ fn create_command_parses_vt() {
         json: false,
         vt: Some(VtEngineKind::Ghostty),
         cwd: None,
-        cmd: None
+        cmd: None,
+        record: false
     });
 }
 
@@ -146,6 +155,44 @@ fn send_keys_command_rejects_literal_and_hex_together() {
 #[test]
 fn send_keys_command_rejects_zero_repeat() {
     assert!(Cli::try_parse_from(["cleat", "send-keys", "-N", "0", "demo", "Enter"]).is_err());
+}
+
+#[test]
+fn inspect_parses_session_id() {
+    let cli = Cli::try_parse_from(["cleat", "inspect", "alpha"]).expect("parse inspect");
+    assert!(matches!(cli.command, Command::Inspect { ref id, json: false } if id == "alpha"));
+}
+
+#[test]
+fn inspect_json_flag() {
+    let cli = Cli::try_parse_from(["cleat", "inspect", "alpha", "--json"]).expect("parse inspect --json");
+    assert!(matches!(cli.command, Command::Inspect { json: true, .. }));
+}
+
+#[test]
+fn signal_parses_session_and_signal_name() {
+    let cli = Cli::try_parse_from(["cleat", "signal", "alpha", "INT"]).expect("parse signal");
+    assert!(
+        matches!(cli.command, Command::Signal { ref id, ref signal, ref target } if id == "alpha" && signal == "INT" && target == "foreground")
+    );
+}
+
+#[test]
+fn signal_with_target() {
+    let cli = Cli::try_parse_from(["cleat", "signal", "alpha", "TERM", "--target", "leader"]).expect("parse signal --target");
+    assert!(matches!(cli.command, Command::Signal { ref target, .. } if target == "leader"));
+}
+
+#[test]
+fn record_parses_session_id() {
+    let cli = Cli::try_parse_from(["cleat", "record", "alpha"]).expect("parse record");
+    assert!(matches!(cli.command, Command::Record { ref id } if id == "alpha"));
+}
+
+#[test]
+fn create_record_flag() {
+    let cli = Cli::try_parse_from(["cleat", "create", "alpha", "--record"]).expect("parse create --record");
+    assert!(matches!(cli.command, Command::Create { record: true, .. }));
 }
 
 #[test]

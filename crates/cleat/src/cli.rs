@@ -27,6 +27,8 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         cmd: Option<String>,
+        #[arg(long)]
+        record: bool,
     },
     Create {
         #[arg(value_name = "ID")]
@@ -39,6 +41,8 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         cmd: Option<String>,
+        #[arg(long)]
+        record: bool,
     },
     List {
         #[arg(long)]
@@ -65,6 +69,20 @@ pub enum Command {
         #[arg(value_name = "KEY", required = true, num_args = 1..)]
         keys: Vec<String>,
     },
+    Inspect {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Signal {
+        id: String,
+        signal: String,
+        #[arg(long, default_value = "foreground")]
+        target: String,
+    },
+    Record {
+        id: String,
+    },
     #[command(hide = true)]
     Serve {
         #[arg(long)]
@@ -82,13 +100,32 @@ pub fn command() -> clap::Command {
 
 pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, String> {
     match cli.command {
-        Command::Attach { id, no_create, vt, cwd, cmd } => {
-            let (_attached, guard) = service.attach(id, vt, cwd, cmd, no_create)?;
+        Command::Attach { id, no_create, vt, cwd, cmd, record } => {
+            let (attached, guard) = service.attach(id, vt, cwd, cmd, no_create)?;
+            if record {
+                service.record(&attached.id, true)?;
+            }
             guard.relay_stdio()?;
             Ok(None)
         }
-        Command::Create { id, json, vt, cwd, cmd } => {
+        Command::Create { id, json, vt, cwd, cmd, record } => {
             let created = service.create(id, vt, cwd, cmd)?;
+            if record {
+                // The daemon is already running by the time create() returns, so send
+                // a RecordControl frame to activate recording. service.record() also
+                // persists the flag to meta.json. Retry briefly since the daemon may
+                // still be initializing.
+                let record_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    match service.record(&created.id, true) {
+                        Ok(()) => break,
+                        Err(_) if std::time::Instant::now() < record_deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(err) => return Err(format!("activate recording: {err}")),
+                    }
+                }
+            }
             if json {
                 serde_json::to_string(&created).map(Some).map_err(|err| format!("serialize create result: {err}"))
             } else {
@@ -119,6 +156,24 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             service.send_keys(&id, &bytes)?;
             Ok(None)
         }
+        Command::Inspect { id, json } => {
+            let result = service.inspect(&id)?;
+            if json {
+                serde_json::to_string_pretty(&result).map(Some).map_err(|err| format!("serialize inspect result: {err}"))
+            } else {
+                Ok(Some(format_inspect_human(&result)))
+            }
+        }
+        Command::Signal { id, signal, target } => {
+            let sig = parse_signal_name(&signal)?;
+            let tgt = parse_signal_target(&target)?;
+            service.signal(&id, sig, tgt)?;
+            Ok(None)
+        }
+        Command::Record { id } => {
+            service.record(&id, true)?;
+            Ok(None)
+        }
         Command::Serve { id } => {
             service.serve(&id)?;
             Ok(None)
@@ -140,6 +195,54 @@ fn format_session_status(status: &crate::protocol::SessionStatus) -> &'static st
     match status {
         crate::protocol::SessionStatus::Attached => "attached",
         crate::protocol::SessionStatus::Detached => "detached",
+    }
+}
+
+fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
+    use comfy_table::{presets::NOTHING, Table};
+
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+
+    table.add_row(vec!["session", &result.session.id]);
+    table.add_row(vec!["state", &result.session.state]);
+    table.add_row(vec!["terminal", &format!("{}x{}", result.terminal.cols, result.terminal.rows)]);
+    table.add_row(vec!["leader_pid", &result.process.leader_pid.to_string()]);
+    if let Some(fg) = result.process.foreground_pgid {
+        table.add_row(vec!["fg_pgid", &fg.to_string()]);
+    }
+    table.add_row(vec!["recording", if result.recording.active { "active" } else { "off" }]);
+
+    table.to_string()
+}
+
+fn parse_signal_name(name: &str) -> Result<i32, String> {
+    use nix::sys::signal::Signal;
+
+    let normalized = name.to_uppercase();
+    let normalized = normalized.trim_start_matches("SIG");
+    let signal = match normalized {
+        "HUP" => Signal::SIGHUP,
+        "INT" => Signal::SIGINT,
+        "QUIT" => Signal::SIGQUIT,
+        "KILL" => Signal::SIGKILL,
+        "TERM" => Signal::SIGTERM,
+        "STOP" => Signal::SIGSTOP,
+        "TSTP" => Signal::SIGTSTP,
+        "CONT" => Signal::SIGCONT,
+        "USR1" => Signal::SIGUSR1,
+        "USR2" => Signal::SIGUSR2,
+        other => return Err(format!("unknown signal: {other}")),
+    };
+    Ok(signal as i32)
+}
+
+fn parse_signal_target(target: &str) -> Result<crate::protocol::SignalTarget, String> {
+    match target {
+        "foreground" => Ok(crate::protocol::SignalTarget::Foreground),
+        "leader" => Ok(crate::protocol::SignalTarget::Leader),
+        "tree" => Err("tree signal target is not yet implemented".to_string()),
+        other => Err(format!("unknown signal target: {other}")),
     }
 }
 

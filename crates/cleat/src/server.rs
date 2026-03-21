@@ -183,8 +183,7 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::Inspect.write(&mut stream).map_err(|err| format!("write inspect request: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read inspect response: {err}"))? {
             Frame::InspectResult(json) => serde_json::from_slice(&json).map_err(|err| format!("parse inspect response: {err}")),
@@ -198,8 +197,7 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::Signal { signal, target }.write(&mut stream).map_err(|err| format!("write signal request: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read signal response: {err}"))? {
             Frame::Ack => Ok(()),
@@ -213,8 +211,7 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+        let mut stream = connect_session_socket(&socket_path)?;
         Frame::RecordControl { enable }.write(&mut stream).map_err(|err| format!("write record control: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read record response: {err}"))? {
             Frame::Ack => Ok(()),

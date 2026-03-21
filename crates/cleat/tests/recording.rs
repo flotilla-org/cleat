@@ -37,7 +37,7 @@ fn take_snapshot_writes_to_snapshots_directory() {
     let mut recorder = OutputRecorder::new(temp.path()).expect("create recorder");
     recorder.record(b"hello world").expect("record bytes");
 
-    recorder.take_snapshot(b"screen state data").expect("take snapshot");
+    recorder.write_snapshot(b"screen state data").expect("take snapshot");
 
     let snapshot_dir = temp.path().join("snapshots");
     assert!(snapshot_dir.exists());
@@ -51,7 +51,7 @@ fn snapshot_filename_includes_byte_offset() {
     let mut recorder = OutputRecorder::new(temp.path()).expect("create recorder");
     recorder.record(b"12345").expect("record 5 bytes");
 
-    recorder.take_snapshot(b"snap").expect("take snapshot");
+    recorder.write_snapshot(b"snap").expect("take snapshot");
 
     let snapshot_path = temp.path().join("snapshots").join("at-5.bin");
     assert!(snapshot_path.exists());

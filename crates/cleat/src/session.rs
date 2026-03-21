@@ -634,7 +634,7 @@ pub fn run_session_daemon(root: &Path, id: &str) -> Result<(), String> {
                             bytes_since_snapshot += n as u64;
                             if bytes_since_snapshot >= SNAPSHOT_INTERVAL_BYTES {
                                 if let Ok(text) = vt_engine.screen_text() {
-                                    let _ = rec.take_snapshot(text.as_bytes());
+                                    let _ = rec.write_snapshot(text.as_bytes());
                                 }
                                 bytes_since_snapshot = 0;
                             }

@@ -36,7 +36,7 @@ impl OutputRecorder {
         self.bytes_written
     }
 
-    pub fn take_snapshot(&mut self, data: &[u8]) -> Result<(), String> {
+    pub fn write_snapshot(&mut self, data: &[u8]) -> Result<(), String> {
         let snapshot_dir = self.session_dir.join("snapshots");
         std::fs::create_dir_all(&snapshot_dir).map_err(|err| format!("create snapshot dir: {err}"))?;
         let snapshot_path = snapshot_dir.join(format!("at-{}.bin", self.bytes_written));

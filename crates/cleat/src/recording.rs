@@ -61,6 +61,7 @@ pub struct SessionRecorder {
     prev_time: Duration,
     coalesce: CoalesceBuffer,
     output_bytes_since_snapshot: u64,
+    paused: bool,
 }
 
 impl SessionRecorder {
@@ -101,11 +102,40 @@ impl SessionRecorder {
             prev_time: Duration::ZERO,
             coalesce: CoalesceBuffer::new(),
             output_bytes_since_snapshot: 0,
+            paused: false,
         })
     }
 
+    /// Pause recording. Flushes the buffer first. Output/input calls become no-ops.
+    pub fn pause(&mut self, time: Duration) {
+        if !self.paused {
+            self.flush();
+            self.paused = true;
+            // Gap event is emitted on resume, not on pause, so it appears
+            // in the stream at the point where data resumes.
+            let _ = time; // timestamp captured at resume
+        }
+    }
+
+    /// Resume recording after a pause. Emits a gap event marking the discontinuity.
+    pub fn resume(&mut self, time: Duration) {
+        if self.paused {
+            self.paused = false;
+            self.emit_gap("recording-paused", time);
+        }
+    }
+
+    /// Whether recording is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
     /// Buffer output bytes for coalescing. Flushes on type change or size threshold.
+    /// No-op when paused.
     pub fn output(&mut self, bytes: &[u8], time: Duration) {
+        if self.paused {
+            return;
+        }
         // Flush if switching from input to output.
         if !self.coalesce.is_empty() && self.coalesce.is_input {
             self.flush();
@@ -118,7 +148,11 @@ impl SessionRecorder {
     }
 
     /// Buffer input bytes for coalescing. Flushes on type change or size threshold.
+    /// No-op when paused.
     pub fn input(&mut self, bytes: &[u8], time: Duration) {
+        if self.paused {
+            return;
+        }
         // Flush if switching from output to input.
         if !self.coalesce.is_empty() && !self.coalesce.is_input {
             self.flush();
@@ -182,12 +216,15 @@ impl SessionRecorder {
     }
 
     /// Write a single event line to the cast file, updating bytes_written and prev_time.
+    /// On write failure, prev_time is NOT advanced so subsequent events have correct deltas.
     fn write_event(&mut self, event: &Event) {
-        let line = encode_event(event, &mut self.prev_time) + "\n";
+        let mut candidate_prev = self.prev_time;
+        let line = encode_event(event, &mut candidate_prev) + "\n";
         if let Err(err) = self.cast_file.write_all(line.as_bytes()) {
             eprintln!("recording write error: {err}");
             return;
         }
+        self.prev_time = candidate_prev;
         self.bytes_written += line.len() as u64;
     }
 }

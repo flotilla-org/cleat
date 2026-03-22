@@ -1,7 +1,7 @@
 use std::{fs, time::Duration};
 
 use cleat::{
-    asciicast::{decode_event, decode_header},
+    asciicast::{decode_event, decode_header, EventCode},
     recording::SessionRecorder,
 };
 
@@ -154,4 +154,124 @@ fn gap_event_emitted_on_resume() {
 
     assert_eq!(gap_event.code, cleat::asciicast::EventCode::Custom('g'));
     assert!(gap_event.data.contains("detach"), "gap data should contain the reason");
+}
+
+// --- Tests for pause/resume gap tracking ---
+
+#[test]
+fn pause_makes_output_noop() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut recorder = new_recorder(temp.path());
+
+    recorder.output(b"before", Duration::from_millis(100));
+    recorder.flush();
+    let offset_before_pause = recorder.bytes_written();
+
+    recorder.pause(Duration::from_millis(200));
+    recorder.output(b"should be dropped", Duration::from_millis(300));
+    recorder.flush();
+
+    assert_eq!(recorder.bytes_written(), offset_before_pause, "no bytes should be written while paused");
+    assert!(recorder.is_paused());
+}
+
+#[test]
+fn pause_makes_input_noop() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut recorder = new_recorder(temp.path());
+
+    recorder.pause(Duration::from_millis(100));
+    recorder.input(b"dropped keys", Duration::from_millis(200));
+    recorder.flush();
+
+    let contents = fs::read_to_string(temp.path().join("session.cast")).expect("read");
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 1, "only header, no events while paused");
+}
+
+#[test]
+fn resume_emits_gap_event() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut recorder = new_recorder(temp.path());
+
+    recorder.output(b"before", Duration::from_millis(100));
+    recorder.pause(Duration::from_millis(200));
+    recorder.resume(Duration::from_millis(5000));
+    recorder.output(b"after", Duration::from_millis(5100));
+    recorder.flush();
+
+    let contents = fs::read_to_string(temp.path().join("session.cast")).expect("read");
+    let lines: Vec<&str> = contents.lines().collect();
+    // header + output("before") + gap + output("after") = 4
+    assert_eq!(lines.len(), 4);
+
+    let mut prev = Duration::ZERO;
+    let _ = decode_event(lines[1], &mut prev).expect("first output");
+    let gap = decode_event(lines[2], &mut prev).expect("gap event");
+    let after = decode_event(lines[3], &mut prev).expect("second output");
+
+    assert_eq!(gap.code, EventCode::Custom('g'));
+    assert!(gap.data.contains("recording-paused"));
+    assert_eq!(after.code, EventCode::Output);
+    assert_eq!(after.data, "after");
+}
+
+#[test]
+fn resume_when_not_paused_is_noop() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut recorder = new_recorder(temp.path());
+    let offset = recorder.bytes_written();
+
+    recorder.resume(Duration::from_millis(100)); // not paused, should be no-op
+
+    assert_eq!(recorder.bytes_written(), offset, "resume when not paused should not write anything");
+}
+
+#[test]
+fn pause_when_already_paused_is_noop() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut recorder = new_recorder(temp.path());
+
+    recorder.pause(Duration::from_millis(100));
+    let offset = recorder.bytes_written();
+    recorder.pause(Duration::from_millis(200)); // already paused
+
+    assert_eq!(recorder.bytes_written(), offset, "double pause should not write anything");
+}
+
+// --- Test for event timing consistency ---
+
+#[test]
+fn event_deltas_are_consistent_across_multiple_events() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut recorder = new_recorder(temp.path());
+
+    recorder.output(b"a", Duration::from_millis(1000));
+    recorder.flush();
+    recorder.output(b"b", Duration::from_millis(2000));
+    recorder.flush();
+    recorder.output(b"c", Duration::from_millis(3500));
+    recorder.flush();
+
+    let contents = fs::read_to_string(temp.path().join("session.cast")).expect("read");
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 4); // header + 3 events
+
+    let mut prev = Duration::ZERO;
+    let e1 = decode_event(lines[1], &mut prev).expect("event 1");
+    let e2 = decode_event(lines[2], &mut prev).expect("event 2");
+    let e3 = decode_event(lines[3], &mut prev).expect("event 3");
+
+    // Absolute times should be correct
+    assert_eq!(e1.time, Duration::from_millis(1000));
+    assert_eq!(e2.time, Duration::from_millis(2000));
+    assert_eq!(e3.time, Duration::from_millis(3500));
+
+    // Verify raw deltas in JSON
+    let raw1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let raw2: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    let raw3: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
+    assert_eq!(raw1[0].as_f64().unwrap(), 1.0); // 1000ms from 0
+    assert_eq!(raw2[0].as_f64().unwrap(), 1.0); // 1000ms from 1000ms
+    assert_eq!(raw3[0].as_f64().unwrap(), 1.5); // 1500ms from 2000ms
 }

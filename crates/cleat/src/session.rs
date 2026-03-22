@@ -587,6 +587,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         }
                         Ok(Frame::RecordControl { enable }) => {
                             if enable && recorder.is_none() {
+                                // First-time activation: create new recorder
                                 let (cols, rows) = vt_engine.size();
                                 match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
                                     Ok(mut r) => {
@@ -603,11 +604,27 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                         let _ = Frame::Error(err).write(&mut stream);
                                     }
                                 }
-                            } else if !enable && recorder.is_some() {
+                            } else if enable {
+                                // Resume from pause
                                 if let Some(ref mut rec) = recorder {
-                                    rec.flush();
+                                    if rec.is_paused() {
+                                        rec.resume(epoch.elapsed());
+                                        // Emit a VT snapshot so the resumed portion has screen context
+                                        if let Ok(Some(payload)) =
+                                            vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback())
+                                        {
+                                            let (cols, rows) = vt_engine.size();
+                                            let state = String::from_utf8_lossy(&payload);
+                                            rec.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, epoch.elapsed());
+                                        }
+                                    }
                                 }
-                                recorder = None;
+                                let _ = Frame::Ack.write(&mut stream);
+                            } else if !enable && recorder.as_ref().is_some_and(|r| !r.is_paused()) {
+                                // Pause recording (keep recorder alive for gap tracking)
+                                if let Some(ref mut rec) = recorder {
+                                    rec.pause(epoch.elapsed());
+                                }
                                 let _ = Frame::Ack.write(&mut stream);
                             } else {
                                 let _ = Frame::Ack.write(&mut stream);
@@ -740,14 +757,14 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
         }
 
-        if child_exited(pty_child.pid)?.is_some() {
+        if let Some(status) = child_exited(pty_child.pid)? {
+            if let Some(ref mut rec) = recorder {
+                let code = exit_code_from_wait_status(&status);
+                rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());
+                rec.flush();
+            }
             break;
         }
-    }
-
-    if let Some(ref mut rec) = recorder {
-        rec.event(crate::asciicast::EventCode::Exit, "0", epoch.elapsed());
-        rec.flush();
     }
 
     let session_dir = root.join(id);
@@ -793,7 +810,7 @@ fn build_inspect_result(
             vec![]
         },
         recording: crate::protocol::RecordingInspect {
-            active: recorder.is_some(),
+            active: recorder.as_ref().is_some_and(|r| !r.is_paused()),
             bytes_written: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
         },
     }
@@ -1085,12 +1102,20 @@ fn resize_pty(fd: RawFd, cols: u16, rows: u16) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn child_exited(child_pid: Pid) -> Result<Option<i32>, String> {
+fn child_exited(child_pid: Pid) -> Result<Option<WaitStatus>, String> {
     match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
         Ok(WaitStatus::StillAlive) => Ok(None),
-        Ok(_) => Ok(Some(1)),
+        Ok(status) => Ok(Some(status)),
         Err(nix::errno::Errno::ECHILD) => Ok(None),
         Err(err) => Err(format!("waitpid failed: {err}")),
+    }
+}
+
+fn exit_code_from_wait_status(status: &WaitStatus) -> i32 {
+    match status {
+        WaitStatus::Exited(_, code) => *code,
+        WaitStatus::Signaled(_, sig, _) => 128 + *sig as i32,
+        _ => 1,
     }
 }
 
@@ -1102,9 +1127,11 @@ mod tests {
         sync::{Arc, Mutex, OnceLock},
     };
 
+    use nix::{sys::wait::WaitStatus, unistd::Pid};
+
     use super::{
-        apply_attach_state, attach_init_capabilities, default_vt_engine, is_executable_file, record_pty_output, resolve_cleat_executable,
-        AttachCleanupGuard, TestReplayProbeVtEngine,
+        apply_attach_state, attach_init_capabilities, default_vt_engine, exit_code_from_wait_status, is_executable_file, record_pty_output,
+        resolve_cleat_executable, AttachCleanupGuard, TestReplayProbeVtEngine,
     };
     use crate::vt::{self, VtEngine};
 
@@ -1276,5 +1303,23 @@ mod tests {
         }
         assert_eq!(resolved, cleat);
         assert!(is_executable_file(&cleat));
+    }
+
+    #[test]
+    fn exit_code_from_normal_exit() {
+        let status = WaitStatus::Exited(Pid::from_raw(1), 42);
+        assert_eq!(exit_code_from_wait_status(&status), 42);
+    }
+
+    #[test]
+    fn exit_code_from_zero_exit() {
+        let status = WaitStatus::Exited(Pid::from_raw(1), 0);
+        assert_eq!(exit_code_from_wait_status(&status), 0);
+    }
+
+    #[test]
+    fn exit_code_from_signal_is_128_plus_signal() {
+        let status = WaitStatus::Signaled(Pid::from_raw(1), nix::sys::signal::Signal::SIGTERM, false);
+        assert_eq!(exit_code_from_wait_status(&status), 128 + libc::SIGTERM);
     }
 }

@@ -10,7 +10,19 @@ use cleat::{
 fn help_lists_expected_subcommands() {
     let command = Cli::command();
     let subcommands: Vec<_> = command.get_subcommands().filter(|sub| !sub.is_hide_set()).map(|sub| sub.get_name().to_string()).collect();
-    assert_eq!(subcommands, vec!["attach", "create", "list", "capture", "detach", "kill", "send-keys", "inspect", "signal", "record"]);
+    assert_eq!(subcommands, vec![
+        "attach",
+        "create",
+        "list",
+        "capture",
+        "detach",
+        "kill",
+        "send-keys",
+        "inspect",
+        "signal",
+        "record",
+        "mark"
+    ]);
 }
 
 #[test]
@@ -200,6 +212,12 @@ fn serve_parses_all_flags() {
     let cli = Cli::try_parse_from(["cleat", "serve", "--id", "alpha", "--vt", "passthrough", "--cmd", "bash", "--cwd", "/tmp", "--record"])
         .expect("parse serve");
     assert!(matches!(cli.command, Command::Serve { ref id, record: true, .. } if id == "alpha"));
+}
+
+#[test]
+fn mark_command_parses_session_id() {
+    let cli = Cli::try_parse_from(["cleat", "mark", "my-session"]).expect("mark parses");
+    assert_eq!(cli.command, Command::Mark { id: "my-session".into() });
 }
 
 #[test]

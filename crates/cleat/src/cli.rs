@@ -83,6 +83,9 @@ pub enum Command {
     Record {
         id: String,
     },
+    Mark {
+        id: String,
+    },
     #[command(hide = true)]
     Serve {
         #[arg(long)]
@@ -165,6 +168,10 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
         Command::Record { id } => {
             service.record(&id, true)?;
             Ok(None)
+        }
+        Command::Mark { id } => {
+            let offset = service.mark(&id)?;
+            Ok(Some(offset.to_string()))
         }
         Command::Serve { id, vt, cmd, cwd, record } => {
             let session = SessionMetadata { id, vt_engine: vt, cwd, cmd, record };

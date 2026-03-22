@@ -1,3 +1,4 @@
+pub mod asciicast;
 pub mod cli;
 pub mod da;
 pub mod keys;

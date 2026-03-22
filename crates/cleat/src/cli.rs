@@ -50,6 +50,12 @@ pub enum Command {
     },
     Capture {
         id: String,
+        /// Byte offset in .cast file; return output events after this position
+        #[arg(long)]
+        since: Option<u64>,
+        /// Return raw event data instead of VT-rendered text (only with --since)
+        #[arg(long)]
+        raw: bool,
     },
     Detach {
         id: String,
@@ -137,7 +143,22 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
                 Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
-        Command::Capture { id } => service.capture(&id).map(Some),
+        Command::Capture { id, since, raw } => {
+            if raw && since.is_none() {
+                return Err("--raw requires --since".to_string());
+            }
+            match since {
+                Some(offset) => {
+                    if raw {
+                        service.capture_since_raw(&id, offset).map(Some)
+                    } else {
+                        // Phase 1: --text mode also returns concatenated output
+                        service.capture_since_raw(&id, offset).map(Some)
+                    }
+                }
+                None => service.capture(&id).map(Some),
+            }
+        }
         Command::Detach { id } => {
             service.detach(&id)?;
             Ok(None)

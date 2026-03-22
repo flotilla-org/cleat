@@ -84,6 +84,8 @@ const TAG_INSPECT: u8 = 11;
 const TAG_INSPECT_RESULT: u8 = 12;
 const TAG_SIGNAL: u8 = 13;
 const TAG_RECORD_CONTROL: u8 = 14;
+const TAG_MARK: u8 = 15;
+const TAG_MARK_RESULT: u8 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -101,6 +103,8 @@ pub enum Frame {
     InspectResult(Vec<u8>),
     Signal { signal: i32, target: SignalTarget },
     RecordControl { enable: bool },
+    Mark,
+    MarkResult { offset: u64 },
 }
 
 impl Frame {
@@ -155,6 +159,8 @@ impl Frame {
                 (TAG_SIGNAL, payload)
             }
             Frame::RecordControl { enable } => (TAG_RECORD_CONTROL, vec![if *enable { 1 } else { 0 }]),
+            Frame::Mark => (TAG_MARK, vec![]),
+            Frame::MarkResult { offset } => (TAG_MARK_RESULT, offset.to_le_bytes().to_vec()),
         }
     }
 
@@ -192,6 +198,15 @@ impl Frame {
                     return Err(Error::new(ErrorKind::InvalidData, "invalid record control frame"));
                 }
                 Ok(Frame::RecordControl { enable: payload[0] != 0 })
+            }
+            TAG_MARK => Ok(Frame::Mark),
+            TAG_MARK_RESULT => {
+                if payload.len() != 8 {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid mark result frame"));
+                }
+                let offset =
+                    u64::from_le_bytes([payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]]);
+                Ok(Frame::MarkResult { offset })
             }
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
@@ -309,5 +324,23 @@ mod tests {
         frame.write(&mut bytes).expect("write frame");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read frame");
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn mark_round_trip() {
+        let frame = Frame::Mark;
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, Frame::Mark);
+    }
+
+    #[test]
+    fn mark_result_round_trip() {
+        let frame = Frame::MarkResult { offset: 12345 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, Frame::MarkResult { offset: 12345 });
     }
 }

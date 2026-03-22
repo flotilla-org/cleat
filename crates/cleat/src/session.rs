@@ -576,6 +576,15 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         },
+                        Ok(Frame::Mark) => {
+                            if let Some(ref mut rec) = recorder {
+                                rec.flush();
+                                let offset = rec.bytes_written();
+                                let _ = Frame::MarkResult { offset }.write(&mut stream);
+                            } else {
+                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
+                            }
+                        }
                         Ok(Frame::RecordControl { enable }) => {
                             if enable && recorder.is_none() {
                                 let (cols, rows) = vt_engine.size();

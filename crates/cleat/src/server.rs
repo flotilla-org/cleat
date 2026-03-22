@@ -206,6 +206,20 @@ impl SessionService {
         }
     }
 
+    pub fn mark(&self, id: &str) -> Result<u64, String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream = connect_session_socket(&socket_path)?;
+        Frame::Mark.write(&mut stream).map_err(|e| format!("write mark: {e}"))?;
+        match Frame::read(&mut stream).map_err(|e| format!("read mark response: {e}"))? {
+            Frame::MarkResult { offset } => Ok(offset),
+            Frame::Error(msg) => Err(msg),
+            other => Err(format!("unexpected mark response: {other:?}")),
+        }
+    }
+
     pub fn record(&self, id: &str, enable: bool) -> Result<(), String> {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));

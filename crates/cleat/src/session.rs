@@ -466,15 +466,22 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let mut detached_da = DeviceAttributeTracker::new();
 
     let mut active_client: Option<ActiveClient> = None;
-    let mut recorder: Option<crate::recording::OutputRecorder> = None;
+    let mut recorder: Option<crate::recording::SessionRecorder> = None;
+    let epoch = Instant::now();
     if session.record || std::env::var("CLEAT_RECORD").map(|v| v == "1").unwrap_or(false) {
-        match crate::recording::OutputRecorder::new(&root.join(id)) {
-            Ok(r) => recorder = Some(r),
+        let (cols, rows) = vt_engine.size();
+        match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
+            Ok(mut r) => {
+                // Bootstrap: emit initial snapshot if VT engine has state
+                if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
+                    let state = String::from_utf8_lossy(&payload);
+                    r.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, std::time::Duration::ZERO);
+                }
+                recorder = Some(r);
+            }
             Err(err) => eprintln!("failed to start recording: {err}"),
         }
     }
-    let mut bytes_since_snapshot: u64 = 0;
-    const SNAPSHOT_INTERVAL_BYTES: u64 = 256 * 1024; // 256 KB
     let mut had_foreground_client = false;
     loop {
         let poll_result = poll_ready(
@@ -508,12 +515,18 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = fs::write(foreground_path(root, id), b"1");
                                 active_client = Some(client);
                                 had_foreground_client = true;
+                                if let Some(ref mut rec) = recorder {
+                                    rec.event(crate::asciicast::EventCode::Custom('a'), r#"{"client":"foreground"}"#, epoch.elapsed());
+                                }
                             } else {
                                 let _ = Frame::Busy.write(&mut stream);
                             }
                         }
                         Ok(Frame::Detach) => {
                             let _ = fs::remove_file(foreground_path(root, id));
+                            if let Some(ref mut rec) = recorder {
+                                rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
+                            }
                             active_client = None;
                         }
                         Ok(Frame::Capture) => match vt_engine.screen_text() {
@@ -542,6 +555,18 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         }
                         Ok(Frame::Signal { signal, target }) => match dispatch_signal(&pty_child, signal, target) {
                             Ok(()) => {
+                                if let Some(ref mut rec) = recorder {
+                                    let target_str = match target {
+                                        crate::protocol::SignalTarget::Foreground => "foreground",
+                                        crate::protocol::SignalTarget::Leader => "leader",
+                                        crate::protocol::SignalTarget::Tree => "tree",
+                                    };
+                                    rec.event(
+                                        crate::asciicast::EventCode::Custom('s'),
+                                        &serde_json::json!({"signal": signal, "target": target_str}).to_string(),
+                                        epoch.elapsed(),
+                                    );
+                                }
                                 let _ = Frame::Ack.write(&mut stream);
                             }
                             Err(err) => {
@@ -550,8 +575,15 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         },
                         Ok(Frame::RecordControl { enable }) => {
                             if enable && recorder.is_none() {
-                                match crate::recording::OutputRecorder::new(&root.join(id)) {
-                                    Ok(r) => {
+                                let (cols, rows) = vt_engine.size();
+                                match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
+                                    Ok(mut r) => {
+                                        if let Ok(Some(payload)) =
+                                            vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback())
+                                        {
+                                            let state = String::from_utf8_lossy(&payload);
+                                            r.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, epoch.elapsed());
+                                        }
                                         recorder = Some(r);
                                         let _ = Frame::Ack.write(&mut stream);
                                     }
@@ -559,7 +591,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                         let _ = Frame::Error(err).write(&mut stream);
                                     }
                                 }
-                            } else if !enable {
+                            } else if !enable && recorder.is_some() {
+                                if let Some(ref mut rec) = recorder {
+                                    rec.flush();
+                                }
                                 recorder = None;
                                 let _ = Frame::Ack.write(&mut stream);
                             } else {
@@ -606,8 +641,16 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
             while let Some(frame) = pending.pop_front() {
                 match frame {
-                    Frame::Input(bytes) => write_fd_all(pty_fd, &bytes)?,
+                    Frame::Input(bytes) => {
+                        if let Some(ref mut rec) = recorder {
+                            rec.input(&bytes, epoch.elapsed());
+                        }
+                        write_fd_all(pty_fd, &bytes)?;
+                    }
                     Frame::Resize { cols, rows } => {
+                        if let Some(ref mut rec) = recorder {
+                            rec.event(crate::asciicast::EventCode::Resize, &format!("{}x{}", cols, rows), epoch.elapsed());
+                        }
                         resize_pty(pty_fd, cols, rows)?;
                         vt_engine.resize(cols, rows)?;
                     }
@@ -617,6 +660,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
             if client_disconnected {
                 let _ = fs::remove_file(foreground_path(root, id));
+                if let Some(ref mut rec) = recorder {
+                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
+                }
                 active_client = None;
             }
         }
@@ -628,6 +674,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             };
             if !client_writable {
                 let _ = fs::remove_file(foreground_path(root, id));
+                if let Some(ref mut rec) = recorder {
+                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
+                }
                 active_client = None;
             }
         }
@@ -640,18 +689,14 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     Ok(n) => {
                         record_pty_output(vt_engine.as_mut(), &buf[..n])?;
                         if let Some(ref mut rec) = recorder {
-                            if let Err(err) = rec.record(&buf[..n]) {
-                                eprintln!("recording error: {err}");
-                                recorder = None;
-                            }
-                        }
-                        if let Some(ref mut rec) = recorder {
-                            bytes_since_snapshot += n as u64;
-                            if bytes_since_snapshot >= SNAPSHOT_INTERVAL_BYTES {
-                                if let Ok(text) = vt_engine.screen_text() {
-                                    let _ = rec.write_snapshot(text.as_bytes());
+                            let elapsed = epoch.elapsed();
+                            rec.output(&buf[..n], elapsed);
+                            if rec.output_bytes_since_snapshot() >= 256 * 1024 {
+                                if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
+                                    let (cols, rows) = vt_engine.size();
+                                    let state = String::from_utf8_lossy(&payload);
+                                    rec.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, elapsed);
                                 }
-                                bytes_since_snapshot = 0;
                             }
                         }
                         if active_client.is_none() {
@@ -662,6 +707,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         if let Some(client) = active_client.as_mut() {
                             if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
                                 let _ = fs::remove_file(foreground_path(root, id));
+                                if let Some(ref mut rec) = recorder {
+                                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
+                                }
                                 active_client = None;
                             }
                         }
@@ -672,15 +720,29 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
         }
 
+        if let Some(ref mut rec) = recorder {
+            if !poll_result.pty_readable && !poll_result.client_readable && !poll_result.listener_readable {
+                rec.flush();
+            }
+        }
+
         if child_exited(pty_child.pid)?.is_some() {
             break;
         }
     }
 
+    if let Some(ref mut rec) = recorder {
+        rec.event(crate::asciicast::EventCode::Exit, "0", epoch.elapsed());
+        rec.flush();
+    }
+
+    let session_dir = root.join(id);
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(daemon_pid_path(root, id));
     let _ = fs::remove_file(foreground_path(root, id));
-    let _ = fs::remove_dir_all(root.join(id));
+    if recorder.is_none() {
+        let _ = fs::remove_dir_all(&session_dir);
+    }
     Ok(())
 }
 
@@ -694,7 +756,7 @@ fn build_inspect_result(
     vt_engine: &dyn VtEngine,
     active_client: &Option<ActiveClient>,
     pty_child: &PtyChild,
-    recorder: &Option<crate::recording::OutputRecorder>,
+    recorder: &Option<crate::recording::SessionRecorder>,
 ) -> crate::protocol::InspectResult {
     let (cols, rows) = vt_engine.size();
     // SAFETY: pty_child.master_fd is a valid PTY master fd owned by this process.

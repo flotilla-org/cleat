@@ -152,8 +152,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
                     if raw {
                         service.capture_since_raw(&id, offset).map(Some)
                     } else {
-                        // Phase 1: --text mode also returns concatenated output
-                        service.capture_since_raw(&id, offset).map(Some)
+                        service.capture_since_text(&id, offset).map(Some)
                     }
                 }
                 None => service.capture(&id).map(Some),

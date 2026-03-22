@@ -103,7 +103,7 @@ fn list_command_parses_json() {
 #[test]
 fn capture_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "capture", "session-1"]).expect("capture parses");
-    assert_eq!(cli.command, Command::Capture { id: "session-1".into() });
+    assert_eq!(cli.command, Command::Capture { id: "session-1".into(), since: None, raw: false });
 }
 
 #[test]
@@ -230,4 +230,31 @@ fn send_keys_execute_reports_missing_session() {
 
     let err = execute(cli, &service).expect_err("missing session should fail");
     assert!(err.contains("missing"));
+}
+
+#[test]
+fn capture_with_since_flag_parses() {
+    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "12345"]).expect("parse");
+    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(12345), raw: false });
+}
+
+#[test]
+fn capture_with_raw_flag_parses() {
+    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "0", "--raw"]).expect("parse");
+    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(0), raw: true });
+}
+
+#[test]
+fn capture_without_since_still_works() {
+    let cli = Cli::try_parse_from(["cleat", "capture", "sess"]).expect("parse");
+    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, raw: false });
+}
+
+#[test]
+fn capture_raw_without_since_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--raw"]).expect("parse");
+    let err = execute(cli, &service).unwrap_err();
+    assert!(err.contains("--raw requires --since"));
 }

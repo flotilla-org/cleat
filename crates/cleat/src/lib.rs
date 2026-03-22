@@ -1,4 +1,5 @@
 pub mod asciicast;
+pub mod cast_reader;
 pub mod cli;
 pub mod da;
 pub mod keys;

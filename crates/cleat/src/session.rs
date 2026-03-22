@@ -538,6 +538,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
                         },
                         Ok(Frame::SendKeys(bytes)) => {
+                            if let Some(ref mut rec) = recorder {
+                                rec.input(&bytes, epoch.elapsed());
+                            }
                             if let Err(err) = write_fd_all(pty_fd, &bytes) {
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
@@ -696,6 +699,8 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                     let (cols, rows) = vt_engine.size();
                                     let state = String::from_utf8_lossy(&payload);
                                     rec.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, elapsed);
+                                } else {
+                                    rec.reset_output_bytes_since_snapshot();
                                 }
                             }
                         }

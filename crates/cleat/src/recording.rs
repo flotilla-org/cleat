@@ -213,6 +213,12 @@ impl SessionRecorder {
         self.output_bytes_since_snapshot
     }
 
+    /// Reset the output bytes counter without writing a snapshot (e.g. when no
+    /// snapshot payload is available).
+    pub fn reset_output_bytes_since_snapshot(&mut self) {
+        self.output_bytes_since_snapshot = 0;
+    }
+
     /// The session directory this recorder is writing into.
     pub fn session_dir(&self) -> &Path {
         &self.session_dir

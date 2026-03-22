@@ -687,7 +687,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 }
             }
 
-            if client_disconnected {
+            if client_disconnected && active_client.is_some() {
                 let _ = fs::remove_file(foreground_path(root, id));
                 if let Some(ref mut rec) = recorder {
                     rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());

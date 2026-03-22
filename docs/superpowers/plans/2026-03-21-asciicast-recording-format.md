@@ -1,7 +1,5 @@
 # Asciicast v3 Recording Format Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Replace the ad-hoc `output.log` + text snapshots recording format with structured asciicast v3 NDJSON, enabling timestamped playback, incremental capture, and rich metadata events.
 
 **Architecture:** New `asciicast` module owns the v3 format types and encoder. The existing `recording` module is rewritten to use asciicast events with coalescing. The daemon writes events to a single `session.cast` file. Input recording is added alongside output. The `Mark` protocol frame reports current file offset for cursor-based capture (#6, future work).

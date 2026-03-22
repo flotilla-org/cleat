@@ -170,6 +170,9 @@ pub fn decode_event(line: &str, prev_time: &mut Duration) -> Result<Event, Strin
     let abs_time = *prev_time + delta;
     *prev_time = abs_time;
 
+    if code_str.len() != 1 {
+        return Err(format!("event code must be a single character, got {:?}", code_str));
+    }
     let code_char = code_str.chars().next().ok_or_else(|| "empty event code".to_string())?;
 
     Ok(Event { time: abs_time, code: EventCode::from_char(code_char), data })

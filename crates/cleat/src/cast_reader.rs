@@ -15,6 +15,10 @@ use crate::asciicast::{decode_event, Event, EventCode};
 ///
 /// When `offset` is 0, the header line is skipped automatically.
 /// Returns an empty vec if `offset` is at or beyond the end of the file.
+///
+/// **Note:** When `offset` is nonzero, `Event.time` values are relative to the
+/// seek point (not absolute from recording start), since delta accumulation
+/// restarts at zero. Use `data` and `code` fields; do not rely on `time`.
 pub fn read_output_since(path: &Path, offset: u64) -> Result<Vec<Event>, String> {
     read_events_since(path, offset, Some(EventCode::Output))
 }
@@ -23,6 +27,9 @@ pub fn read_output_since(path: &Path, offset: u64) -> Result<Vec<Event>, String>
 ///
 /// When `offset` is 0, the header line is skipped automatically.
 /// Returns an empty vec if `offset` is at or beyond the end of the file.
+///
+/// **Note:** When `offset` is nonzero, `Event.time` values are relative to the
+/// seek point (not absolute from recording start). See [`read_output_since`].
 pub fn read_all_events_since(path: &Path, offset: u64) -> Result<Vec<Event>, String> {
     read_events_since(path, offset, None)
 }
@@ -33,12 +40,9 @@ pub fn read_all_events_since(path: &Path, offset: u64) -> Result<Vec<Event>, Str
 /// Returns `None` if no snapshot event is found before `offset`.
 pub fn find_nearest_snapshot(path: &Path, offset: u64) -> Result<Option<(u64, String)>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
-    let file_size = file.metadata().map_err(|e| format!("metadata {path:?}: {e}"))?.len();
 
-    if offset > file_size {
-        // Past EOF — scan the whole file.
-    }
-
+    // When offset > file_size, the loop below naturally scans the whole file
+    // (byte_pos never reaches offset), returning the last snapshot found.
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut byte_pos: u64 = 0;

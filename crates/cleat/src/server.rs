@@ -149,9 +149,6 @@ impl SessionService {
             return Err(format!("no recording for session {id}"));
         }
         let events = crate::cast_reader::read_output_since(&cast_path, offset)?;
-        if events.is_empty() {
-            return Ok(String::new());
-        }
         // Phase 1: concatenate output event data directly.
         // Full VT replay (snapshot + engine) is a future enhancement.
         let output: String = events.iter().map(|e| e.data.as_str()).collect();

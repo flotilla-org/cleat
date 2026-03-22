@@ -495,7 +495,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         if poll_result.listener_readable {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_millis(10))).map_err(|err| format!("set client read timeout: {err}"))?;
+                    // Accepted sockets inherit nonblocking mode from the listener on macOS/BSD.
+                    // Reset to blocking so the initial frame read works correctly.
+                    stream.set_nonblocking(false).map_err(|err| format!("set accepted stream blocking: {err}"))?;
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                     match Frame::read(&mut stream) {
                         Ok(Frame::AttachInit { cols, rows, capabilities }) => {
                             if active_client.is_none() {

@@ -103,7 +103,7 @@ fn list_command_parses_json() {
 #[test]
 fn capture_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "capture", "session-1"]).expect("capture parses");
-    assert_eq!(cli.command, Command::Capture { id: "session-1".into(), since: None, raw: false });
+    assert_eq!(cli.command, Command::Capture { id: "session-1".into(), since: None, since_marker: None, raw: false });
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn serve_parses_all_flags() {
 #[test]
 fn mark_command_parses_session_id() {
     let cli = Cli::try_parse_from(["cleat", "mark", "my-session"]).expect("mark parses");
-    assert_eq!(cli.command, Command::Mark { id: "my-session".into() });
+    assert_eq!(cli.command, Command::Mark { id: "my-session".into(), name: None });
 }
 
 #[test]
@@ -235,19 +235,19 @@ fn send_keys_execute_reports_missing_session() {
 #[test]
 fn capture_with_since_flag_parses() {
     let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "12345"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(12345), raw: false });
+    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(12345), since_marker: None, raw: false });
 }
 
 #[test]
 fn capture_with_raw_flag_parses() {
     let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "0", "--raw"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(0), raw: true });
+    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(0), since_marker: None, raw: true });
 }
 
 #[test]
 fn capture_without_since_still_works() {
     let cli = Cli::try_parse_from(["cleat", "capture", "sess"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, raw: false });
+    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, since_marker: None, raw: false });
 }
 
 #[test]
@@ -256,5 +256,29 @@ fn capture_raw_without_since_is_rejected() {
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
     let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--raw"]).expect("parse");
     let err = execute(cli, &service).unwrap_err();
-    assert!(err.contains("--raw requires --since"));
+    assert!(err.contains("--raw requires --since or --since-marker"));
+}
+
+#[test]
+fn mark_with_name_parses() {
+    let cli = Cli::try_parse_from(["cleat", "mark", "sess", "checkpoint"]).expect("parse");
+    assert_eq!(cli.command, Command::Mark { id: "sess".into(), name: Some("checkpoint".into()) });
+}
+
+#[test]
+fn mark_without_name_still_works() {
+    let cli = Cli::try_parse_from(["cleat", "mark", "sess"]).expect("parse");
+    assert_eq!(cli.command, Command::Mark { id: "sess".into(), name: None });
+}
+
+#[test]
+fn capture_with_since_marker_parses() {
+    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since-marker", "checkpoint"]).expect("parse");
+    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, since_marker: Some("checkpoint".into()), raw: false });
+}
+
+#[test]
+fn capture_since_and_since_marker_are_mutually_exclusive() {
+    let result = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "100", "--since-marker", "foo"]);
+    assert!(result.is_err(), "--since and --since-marker should be mutually exclusive");
 }

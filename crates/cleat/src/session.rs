@@ -468,6 +468,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let mut active_client: Option<ActiveClient> = None;
     let mut recorder: Option<crate::recording::SessionRecorder> = None;
     let epoch = Instant::now();
+    let mut markers: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     if session.record || std::env::var("CLEAT_RECORD").map(|v| v == "1").unwrap_or(false) {
         let (cols, rows) = vt_engine.size();
         match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
@@ -549,7 +550,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
                         }
                         Ok(Frame::Inspect) => {
-                            let result = build_inspect_result(session, vt_engine.as_ref(), &active_client, &pty_child, &recorder);
+                            let result = build_inspect_result(session, vt_engine.as_ref(), &active_client, &pty_child, &recorder, &markers);
                             match serde_json::to_vec(&result) {
                                 Ok(json) => {
                                     let _ = Frame::InspectResult(json).write(&mut stream);
@@ -579,13 +580,25 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         },
-                        Ok(Frame::Mark) => {
+                        Ok(Frame::Mark { name }) => {
                             if let Some(ref mut rec) = recorder {
                                 rec.flush();
                                 let offset = rec.bytes_written();
+                                if let Some(ref marker_name) = name {
+                                    markers.insert(marker_name.clone(), offset);
+                                    // Emit standard asciicast "m" event
+                                    rec.event(crate::asciicast::EventCode::Marker, marker_name, epoch.elapsed());
+                                }
                                 let _ = Frame::MarkResult { offset }.write(&mut stream);
                             } else {
                                 let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
+                            }
+                        }
+                        Ok(Frame::ResolveMarker { name }) => {
+                            if let Some(offset) = markers.get(&name) {
+                                let _ = Frame::MarkResult { offset: *offset }.write(&mut stream);
+                            } else {
+                                let _ = Frame::Error(format!("marker not found: {name}")).write(&mut stream);
                             }
                         }
                         Ok(Frame::RecordControl { enable }) => {
@@ -791,6 +804,7 @@ fn build_inspect_result(
     active_client: &Option<ActiveClient>,
     pty_child: &PtyChild,
     recorder: &Option<crate::recording::SessionRecorder>,
+    markers: &std::collections::HashMap<String, u64>,
 ) -> crate::protocol::InspectResult {
     let (cols, rows) = vt_engine.size();
     // SAFETY: pty_child.master_fd is a valid PTY master fd owned by this process.
@@ -815,6 +829,7 @@ fn build_inspect_result(
         recording: crate::protocol::RecordingInspect {
             active: recorder.as_ref().is_some_and(|r| !r.is_paused()),
             bytes_written: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
+            markers: markers.clone(),
         },
     }
 }

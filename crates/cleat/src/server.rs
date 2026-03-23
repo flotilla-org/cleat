@@ -229,16 +229,38 @@ impl SessionService {
     }
 
     pub fn mark(&self, id: &str) -> Result<u64, String> {
+        self.mark_impl(id, None)
+    }
+
+    pub fn named_mark(&self, id: &str, name: &str) -> Result<u64, String> {
+        self.mark_impl(id, Some(name))
+    }
+
+    fn mark_impl(&self, id: &str, name: Option<&str>) -> Result<u64, String> {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let socket_path = session_socket_path(self.layout.root(), id);
         let mut stream = connect_session_socket(&socket_path)?;
-        Frame::Mark.write(&mut stream).map_err(|e| format!("write mark: {e}"))?;
+        Frame::Mark { name: name.map(|n| n.to_string()) }.write(&mut stream).map_err(|e| format!("write mark: {e}"))?;
         match Frame::read(&mut stream).map_err(|e| format!("read mark response: {e}"))? {
             Frame::MarkResult { offset } => Ok(offset),
             Frame::Error(msg) => Err(msg),
             other => Err(format!("unexpected mark response: {other:?}")),
+        }
+    }
+
+    pub fn resolve_marker(&self, id: &str, name: &str) -> Result<u64, String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream = connect_session_socket(&socket_path)?;
+        Frame::ResolveMarker { name: name.to_string() }.write(&mut stream).map_err(|e| format!("write resolve: {e}"))?;
+        match Frame::read(&mut stream).map_err(|e| format!("read resolve response: {e}"))? {
+            Frame::MarkResult { offset } => Ok(offset),
+            Frame::Error(msg) => Err(msg),
+            other => Err(format!("unexpected resolve response: {other:?}")),
         }
     }
 

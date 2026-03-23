@@ -51,12 +51,12 @@ pub enum Command {
     Capture {
         id: String,
         /// Byte offset in .cast file; return output events after this position
-        #[arg(long)]
+        #[arg(long, conflicts_with = "since_marker")]
         since: Option<u64>,
         /// Named marker to use as the start offset
-        #[arg(long)]
+        #[arg(long, conflicts_with = "since")]
         since_marker: Option<String>,
-        /// Return raw event data instead of VT-rendered text (only with --since)
+        /// Return raw event data instead of VT-rendered text (requires --since or --since-marker)
         #[arg(long)]
         raw: bool,
     },
@@ -153,9 +153,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             if raw && since.is_none() && since_marker.is_none() {
                 return Err("--raw requires --since or --since-marker".to_string());
             }
-            if since.is_some() && since_marker.is_some() {
-                return Err("--since and --since-marker are mutually exclusive".to_string());
-            }
+            // --since and --since-marker mutual exclusion enforced by clap conflicts_with
             let offset = match (since, &since_marker) {
                 (Some(o), _) => Some(o),
                 (_, Some(name)) => Some(service.resolve_marker(&id, name)?),

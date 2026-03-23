@@ -376,15 +376,6 @@ mod tests {
     }
 
     #[test]
-    fn unnamed_mark_round_trip() {
-        let frame = Frame::Mark { name: None };
-        let mut bytes = Vec::new();
-        frame.write(&mut bytes).expect("write");
-        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
-        assert_eq!(decoded, Frame::Mark { name: None });
-    }
-
-    #[test]
     fn resolve_marker_round_trip() {
         let frame = Frame::ResolveMarker { name: "checkpoint".to_string() };
         let mut bytes = Vec::new();

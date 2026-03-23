@@ -276,3 +276,9 @@ fn capture_with_since_marker_parses() {
     let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since-marker", "checkpoint"]).expect("parse");
     assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, since_marker: Some("checkpoint".into()), raw: false });
 }
+
+#[test]
+fn capture_since_and_since_marker_are_mutually_exclusive() {
+    let result = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "100", "--since-marker", "foo"]);
+    assert!(result.is_err(), "--since and --since-marker should be mutually exclusive");
+}

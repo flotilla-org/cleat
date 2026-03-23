@@ -234,7 +234,7 @@ impl SessionService {
         }
         let socket_path = session_socket_path(self.layout.root(), id);
         let mut stream = connect_session_socket(&socket_path)?;
-        Frame::Mark.write(&mut stream).map_err(|e| format!("write mark: {e}"))?;
+        Frame::Mark { name: None }.write(&mut stream).map_err(|e| format!("write mark: {e}"))?;
         match Frame::read(&mut stream).map_err(|e| format!("read mark response: {e}"))? {
             Frame::MarkResult { offset } => Ok(offset),
             Frame::Error(msg) => Err(msg),

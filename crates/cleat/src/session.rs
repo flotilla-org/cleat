@@ -579,7 +579,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         },
-                        Ok(Frame::Mark) => {
+                        Ok(Frame::Mark { name: _ }) => {
                             if let Some(ref mut rec) = recorder {
                                 rec.flush();
                                 let offset = rec.bytes_written();
@@ -815,6 +815,7 @@ fn build_inspect_result(
         recording: crate::protocol::RecordingInspect {
             active: recorder.as_ref().is_some_and(|r| !r.is_paused()),
             bytes_written: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
+            markers: std::collections::HashMap::new(),
         },
     }
 }

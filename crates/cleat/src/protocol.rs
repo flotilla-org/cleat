@@ -61,6 +61,7 @@ pub struct AttachmentInspect {
 pub struct RecordingInspect {
     pub active: bool,
     pub bytes_written: u64,
+    pub markers: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +87,7 @@ const TAG_SIGNAL: u8 = 13;
 const TAG_RECORD_CONTROL: u8 = 14;
 const TAG_MARK: u8 = 15;
 const TAG_MARK_RESULT: u8 = 16;
+const TAG_RESOLVE_MARKER: u8 = 17;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -103,8 +105,9 @@ pub enum Frame {
     InspectResult(Vec<u8>),
     Signal { signal: i32, target: SignalTarget },
     RecordControl { enable: bool },
-    Mark,
+    Mark { name: Option<String> },
     MarkResult { offset: u64 },
+    ResolveMarker { name: String },
 }
 
 impl Frame {
@@ -159,8 +162,15 @@ impl Frame {
                 (TAG_SIGNAL, payload)
             }
             Frame::RecordControl { enable } => (TAG_RECORD_CONTROL, vec![if *enable { 1 } else { 0 }]),
-            Frame::Mark => (TAG_MARK, vec![]),
+            Frame::Mark { ref name } => {
+                let payload = match name {
+                    Some(n) => n.as_bytes().to_vec(),
+                    None => vec![],
+                };
+                (TAG_MARK, payload)
+            }
             Frame::MarkResult { offset } => (TAG_MARK_RESULT, offset.to_le_bytes().to_vec()),
+            Frame::ResolveMarker { ref name } => (TAG_RESOLVE_MARKER, name.as_bytes().to_vec()),
         }
     }
 
@@ -199,7 +209,19 @@ impl Frame {
                 }
                 Ok(Frame::RecordControl { enable: payload[0] != 0 })
             }
-            TAG_MARK => Ok(Frame::Mark),
+            TAG_MARK => {
+                let name = if payload.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8(payload).map_err(|e| Error::new(ErrorKind::InvalidData, format!("invalid mark name: {e}")))?)
+                };
+                Ok(Frame::Mark { name })
+            }
+            TAG_RESOLVE_MARKER => {
+                let name =
+                    String::from_utf8(payload).map_err(|e| Error::new(ErrorKind::InvalidData, format!("invalid marker name: {e}")))?;
+                Ok(Frame::ResolveMarker { name })
+            }
             TAG_MARK_RESULT => {
                 if payload.len() != 8 {
                     return Err(Error::new(ErrorKind::InvalidData, "invalid mark result frame"));
@@ -328,11 +350,11 @@ mod tests {
 
     #[test]
     fn mark_round_trip() {
-        let frame = Frame::Mark;
+        let frame = Frame::Mark { name: None };
         let mut bytes = Vec::new();
         frame.write(&mut bytes).expect("write");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
-        assert_eq!(decoded, Frame::Mark);
+        assert_eq!(decoded, Frame::Mark { name: None });
     }
 
     #[test]
@@ -342,5 +364,32 @@ mod tests {
         frame.write(&mut bytes).expect("write");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
         assert_eq!(decoded, Frame::MarkResult { offset: 12345 });
+    }
+
+    #[test]
+    fn named_mark_round_trip() {
+        let frame = Frame::Mark { name: Some("test-start".to_string()) };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, Frame::Mark { name: Some("test-start".to_string()) });
+    }
+
+    #[test]
+    fn unnamed_mark_round_trip() {
+        let frame = Frame::Mark { name: None };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, Frame::Mark { name: None });
+    }
+
+    #[test]
+    fn resolve_marker_round_trip() {
+        let frame = Frame::ResolveMarker { name: "checkpoint".to_string() };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, Frame::ResolveMarker { name: "checkpoint".to_string() });
     }
 }

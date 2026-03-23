@@ -53,6 +53,9 @@ pub enum Command {
         /// Byte offset in .cast file; return output events after this position
         #[arg(long)]
         since: Option<u64>,
+        /// Named marker to use as the start offset
+        #[arg(long)]
+        since_marker: Option<String>,
         /// Return raw event data instead of VT-rendered text (only with --since)
         #[arg(long)]
         raw: bool,
@@ -91,6 +94,9 @@ pub enum Command {
     },
     Mark {
         id: String,
+        /// Optional marker name — stores the current offset with this label
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
     },
     #[command(hide = true)]
     Serve {
@@ -143,16 +149,24 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
                 Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
-        Command::Capture { id, since, raw } => {
-            if raw && since.is_none() {
-                return Err("--raw requires --since".to_string());
+        Command::Capture { id, since, since_marker, raw } => {
+            if raw && since.is_none() && since_marker.is_none() {
+                return Err("--raw requires --since or --since-marker".to_string());
             }
-            match since {
-                Some(offset) => {
+            if since.is_some() && since_marker.is_some() {
+                return Err("--since and --since-marker are mutually exclusive".to_string());
+            }
+            let offset = match (since, &since_marker) {
+                (Some(o), _) => Some(o),
+                (_, Some(name)) => Some(service.resolve_marker(&id, name)?),
+                _ => None,
+            };
+            match offset {
+                Some(o) => {
                     if raw {
-                        service.capture_since_raw(&id, offset).map(Some)
+                        service.capture_since_raw(&id, o).map(Some)
                     } else {
-                        service.capture_since_text(&id, offset).map(Some)
+                        service.capture_since_text(&id, o).map(Some)
                     }
                 }
                 None => service.capture(&id).map(Some),
@@ -189,8 +203,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             service.record(&id, true)?;
             Ok(None)
         }
-        Command::Mark { id } => {
-            let offset = service.mark(&id)?;
+        Command::Mark { id, name } => {
+            let offset = match name {
+                Some(ref n) => service.named_mark(&id, n)?,
+                None => service.mark(&id)?,
+            };
             Ok(Some(offset.to_string()))
         }
         Command::Serve { id, vt, cmd, cwd, record } => {
@@ -232,6 +249,10 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
         table.add_row(vec!["fg_pgid", &fg.to_string()]);
     }
     table.add_row(vec!["recording", if result.recording.active { "active" } else { "off" }]);
+    if !result.recording.markers.is_empty() {
+        let markers_str = result.recording.markers.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ");
+        table.add_row(vec!["markers", &markers_str]);
+    }
 
     table.to_string()
 }

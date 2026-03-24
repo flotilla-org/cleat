@@ -469,7 +469,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let mut recorder: Option<crate::recording::SessionRecorder> = None;
     let epoch = Instant::now();
     let mut markers: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    if session.record || std::env::var("CLEAT_RECORD").map(|v| v == "1").unwrap_or(false) {
+    if session.record {
         let (cols, rows) = vt_engine.size();
         match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
             Ok(mut r) => {

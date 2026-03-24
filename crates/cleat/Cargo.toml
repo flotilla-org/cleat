@@ -10,7 +10,7 @@ default = []
 ghostty-vt = []
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 serde = { workspace = true }
 serde_json = { workspace = true }

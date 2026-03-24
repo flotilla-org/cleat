@@ -27,7 +27,7 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         cmd: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "CLEAT_RECORD")]
         record: bool,
     },
     Create {
@@ -41,7 +41,7 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         cmd: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "CLEAT_RECORD")]
         record: bool,
     },
     List {
@@ -108,7 +108,7 @@ pub enum Command {
         cmd: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, env = "CLEAT_RECORD")]
         record: bool,
     },
 }

@@ -72,4 +72,8 @@ mkdir -p "$INSTALL_DIR"
 (cd "$SOURCE_DIR" && zig build "$build_step" --prefix "$INSTALL_DIR")
 
 test -f "$INSTALL_DIR/include/ghostty/vt.h"
-test -f "$INSTALL_DIR/lib/libghostty-vt.so"
+
+case "$(uname -s)" in
+  Darwin) test -f "$INSTALL_DIR/lib/libghostty-vt.dylib" ;;
+  *)      test -f "$INSTALL_DIR/lib/libghostty-vt.so" ;;
+esac

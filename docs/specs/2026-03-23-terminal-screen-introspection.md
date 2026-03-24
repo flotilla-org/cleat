@@ -32,7 +32,7 @@ The core insight: **a terminal screen is not a grid of characters — it is a la
 
 **Screen model first, analysis second.** The VT engine gives us a cell grid with styles. A separate analysis layer infers structure from that grid. Keep these concerns in separate crates. The analysis crate takes a grid of cells and returns observations — it knows nothing about Ghostty, PTYs, or daemons.
 
-**Raw truth + derived observations.** Always keep the raw cell grid alongside any inferred regions. The raw grid is authoritative. Inferred regions are best-effort observations with confidence scores. Consumers can use either layer.
+**Raw truth + derived observations.** Always keep the raw cell grid alongside any inferred regions. The raw grid is authoritative. Inferred regions are best-effort observations with confidence scores (0.0–1.0, where 1.0 means certainty — e.g. a complete box-drawing rectangle — and lower values indicate heuristic inference). Consumers can filter by confidence threshold; results below 0.5 should generally be treated as speculative.
 
 **Separate observation from interpretation.** An observation is "row 23 is full-width, reverse video, contains 'Connected'". An interpretation is "this is a status bar". A semantic claim is "status = Connected". Keep these distinct — it enables debugging when inference is wrong and lets detectors improve independently.
 
@@ -124,7 +124,7 @@ The `ScreenGrid` is the stable interface that the analysis crate works against. 
 
 ### Layer 2: Screen analysis crate (`crates/terminal-screen`)
 
-A new workspace crate that takes a `ScreenGrid` reference and returns structural observations. No Ghostty dependency, no daemon awareness — pure analysis of a cell grid.
+A new workspace crate that owns the `ScreenGrid` type and provides structural analysis. No Ghostty dependency, no daemon awareness — pure analysis of a cell grid. The daemon populates a `ScreenGrid` from the VT engine; the crate defines the type and all analysis functions.
 
 #### Text search
 
@@ -252,19 +252,26 @@ This extends the existing inspect infrastructure. The `--screen` flag triggers a
 
 ### VtEngine trait extension
 
-The `VtEngine` trait gets new methods for screen grid access:
+The `VtEngine` trait gets a single new method that atomically updates the screen grid and returns dirty information:
 
 ```rust
+pub struct ScreenUpdate {
+    pub grid: ScreenGrid,
+    pub dirty_rows: Vec<bool>,
+    pub resized: bool,  // true if dimensions changed since last call
+}
+
 pub trait VtEngine {
     // ... existing methods ...
 
-    /// Get the current screen grid with resolved styles
-    fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
-
-    /// Get which rows changed since last call
-    fn dirty_rows(&mut self) -> Result<Vec<bool>, String>;
+    /// Update the screen grid with current terminal state.
+    /// Returns the full grid, per-row dirty flags, and whether a resize occurred.
+    /// Dirty flags are cleared after this call (cleat is the renderer).
+    fn update_screen(&mut self) -> Result<ScreenUpdate, String>;
 }
 ```
+
+A single method avoids ambiguous call ordering between separate `screen_grid()` and `dirty_rows()` calls — since dirty flags are cleared during the Ghostty RenderState update, splitting these would create a footgun.
 
 The passthrough engine returns empty/default results. The Ghostty engine delegates to the new C API. This keeps the VT engine abstraction clean.
 
@@ -300,6 +307,10 @@ assert_region("status").contains("Connected");
 assert_region("files").selected_text() == "Cargo.toml";
 wait_until_stable(ignore=["spinner"]);
 ```
+
+### Wait/watch mode for inspect
+
+The initial `inspect --screen` is one-shot. Agents and tests will quickly want "wait until X appears on screen" semantics. A `--wait-for "text"` or `--watch` flag would poll the screen grid and block until a condition is met or a timeout expires. This is a stepping stone toward the full event subscription model (#9) and avoids agents implementing their own poll loops.
 
 ### Asciicast recording extensions
 

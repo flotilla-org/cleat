@@ -324,10 +324,16 @@ fn connect_session_socket(socket_path: &Path) -> Result<UnixStream, String> {
 
 /// Check whether the daemon for a session is still alive by reading its PID file
 /// and verifying the process exists and is a cleat process.
+///
+/// Returns `true` if the daemon is alive OR if the PID file is missing (the daemon
+/// may still be starting up — the socket is bound before the PID file is written).
+/// Returns `false` only when the PID file exists and the process is dead, which is
+/// the definitive signal that the daemon has exited and the session is stale.
 fn is_session_daemon_alive(root: &Path, id: &str) -> bool {
     let pid_path = crate::session::daemon_pid_path(root, id);
     let Ok(contents) = std::fs::read_to_string(&pid_path) else {
-        return false;
+        // No PID file yet — daemon may still be starting up. Don't treat as stale.
+        return true;
     };
     let Some(pid) = contents.trim().parse::<i32>().ok() else {
         return false;
@@ -414,9 +420,9 @@ mod tests {
         let session_dir = temp.path().join("stale-session");
         fs::create_dir_all(&session_dir).expect("create session dir");
         let socket_path = session_socket_path(temp.path(), "stale-session");
-        // Create a socket file that nobody is listening on.
-        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
-        drop(_listener); // Drop immediately — socket file remains, nobody listening.
+        // Create a socket file that nobody is listening on, then drop the listener.
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        drop(listener);
         // Write a PID that doesn't exist.
         fs::write(daemon_pid_path(temp.path(), "stale-session"), "999999999").expect("write pid");
 

@@ -76,6 +76,10 @@ impl SessionService {
             if !socket_path.exists() {
                 continue;
             }
+            if !is_session_daemon_alive(self.layout.root(), &id) {
+                let _ = self.layout.remove_session(&id);
+                continue;
+            }
             if let Ok(result) = self.inspect(&id) {
                 let status = if result.attachments.is_empty() { SessionStatus::Detached } else { SessionStatus::Attached };
                 sessions.push(SessionInfo {
@@ -178,6 +182,10 @@ impl SessionService {
             let socket_path = session_socket_path(self.layout.root(), &id);
             if !socket_path.exists() {
                 return Err(format!("missing session {id}"));
+            }
+            if !is_session_daemon_alive(self.layout.root(), &id) {
+                let _ = self.layout.remove_session(&id);
+                return Err(format!("session {id} has a stale daemon (cleaned up)"));
             }
             let vt_engine = vt_engine.unwrap_or_else(crate::vt::default_vt_engine_kind);
             crate::runtime::SessionMetadata { id, vt_engine, cwd, cmd, record: false }
@@ -305,15 +313,32 @@ fn connect_session_socket(socket_path: &Path) -> Result<UnixStream, String> {
     loop {
         match UnixStream::connect(socket_path) {
             Ok(stream) => return Ok(stream),
-            Err(err)
-                if matches!(err.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
-                    && Instant::now() < deadline =>
-            {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                // Socket not yet created — daemon may still be starting up.
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(err) => return Err(format!("connect {}: {err}", socket_path.display())),
         }
     }
+}
+
+/// Check whether the daemon for a session is still alive by reading its PID file
+/// and verifying the process exists and is a cleat process.
+///
+/// Returns `true` if the daemon is alive OR if the PID file is missing (the daemon
+/// may still be starting up — the socket is bound before the PID file is written).
+/// Returns `false` only when the PID file exists and the process is dead, which is
+/// the definitive signal that the daemon has exited and the session is stale.
+fn is_session_daemon_alive(root: &Path, id: &str) -> bool {
+    let pid_path = crate::session::daemon_pid_path(root, id);
+    let Ok(contents) = std::fs::read_to_string(&pid_path) else {
+        // No PID file yet — daemon may still be starting up. Don't treat as stale.
+        return true;
+    };
+    let Some(pid) = contents.trim().parse::<i32>().ok() else {
+        return false;
+    };
+    is_expected_bollard_process(pid)
 }
 
 fn is_expected_bollard_process(pid: i32) -> bool {
@@ -384,5 +409,25 @@ mod tests {
 
         reader.join().expect("join reader");
         assert_eq!(frame, Frame::SendKeys(b"hello\r".to_vec()));
+    }
+
+    #[test]
+    fn list_skips_and_cleans_up_stale_sessions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+        // Create a session directory with a socket file and a PID file pointing to a dead process.
+        let session_dir = temp.path().join("stale-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let socket_path = session_socket_path(temp.path(), "stale-session");
+        // Create a socket file that nobody is listening on, then drop the listener.
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        drop(listener);
+        // Write a PID that doesn't exist.
+        fs::write(daemon_pid_path(temp.path(), "stale-session"), "999999999").expect("write pid");
+
+        let sessions = service.list().expect("list sessions");
+        assert!(sessions.is_empty(), "stale session should not appear in list");
+        assert!(!session_dir.exists(), "stale session directory should be cleaned up");
     }
 }

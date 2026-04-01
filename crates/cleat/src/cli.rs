@@ -171,7 +171,8 @@ pub enum ExecResult {
 }
 
 impl ExecResult {
-    /// Convert to `Result<Option<String>, String>`, panicking with `msg` on `Err` or `Exit`.
+    /// Test helper — panics on `Err` or `Exit`. Not intended for production use.
+    #[doc(hidden)]
     pub fn expect(self, msg: &str) -> Option<String> {
         match self {
             ExecResult::Ok(v) => v,
@@ -182,7 +183,8 @@ impl ExecResult {
         }
     }
 
-    /// Convert to the error string, panicking with `msg` if it was `Ok` or a non-error `Exit`.
+    /// Test helper — panics on `Ok` or `Exit`. Not intended for production use.
+    #[doc(hidden)]
     pub fn expect_err(self, msg: &str) -> String {
         match self {
             ExecResult::Err(e) => e,
@@ -374,8 +376,15 @@ fn execute_wait(
         };
     }
 
+    if !timeout.is_finite() || timeout < 0.0 {
+        return ExecResult::Exit { code: 2, message: Some(format!("invalid timeout: {timeout}")), output: None };
+    }
+
     let mut conditions = Vec::new();
     if let Some(secs) = idle_time {
+        if !secs.is_finite() || secs < 0.0 {
+            return ExecResult::Exit { code: 2, message: Some(format!("invalid idle-time: {secs}")), output: None };
+        }
         conditions.push(WaitCondition::OutputIdle { quiet_ms: (secs * 1000.0) as u64 });
     }
     if let Some(pattern) = text {

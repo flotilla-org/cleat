@@ -189,6 +189,7 @@ impl Frame {
             Frame::MarkResult { offset } => (TAG_MARK_RESULT, offset.to_le_bytes().to_vec()),
             Frame::ResolveMarker { ref name } => (TAG_RESOLVE_MARKER, name.as_bytes().to_vec()),
             Frame::Wait { ref conditions, timeout_ms } => {
+                debug_assert!(conditions.len() <= 255, "wait frame supports at most 255 conditions");
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&timeout_ms.to_le_bytes());
                 payload.push(conditions.len() as u8);

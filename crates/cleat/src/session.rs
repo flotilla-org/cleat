@@ -827,7 +827,8 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
         }
 
-        // Evaluate pending waits on each loop tick
+        // Evaluate pending waits on each loop tick.
+        // Write errors are intentionally discarded — the client may have disconnected.
         pending_waits.retain_mut(|wait| {
             let elapsed = wait.registered_at.elapsed();
             let elapsed_ms = elapsed.as_millis() as u64;

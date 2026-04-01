@@ -657,47 +657,44 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = Frame::Ack.write(&mut stream);
                             }
                         }
-                        Ok(Frame::Wait { conditions, timeout_ms }) => {
+                        Ok(Frame::Wait { conditions, timeout_ms }) => 'wait: {
                             if conditions.is_empty() {
                                 let _ = Frame::Error("at least one wait condition is required".to_string()).write(&mut stream);
-                            } else {
-                                let has_text_match =
-                                    conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::TextMatch { .. }));
-                                if has_text_match {
-                                    if let Err(err) = vt_engine.screen_text() {
-                                        let _ = Frame::Error(format!("text matching not supported: {err}")).write(&mut stream);
-                                    } else {
-                                        // Check --text immediately at registration
-                                        let mut already_met = false;
-                                        for condition in &conditions {
-                                            if let crate::protocol::WaitCondition::TextMatch { text } = condition {
-                                                if let Ok(screen) = vt_engine.screen_text() {
-                                                    if screen.contains(text.as_str()) {
-                                                        let _ =
-                                                            Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
-                                                                .write(&mut stream);
-                                                        already_met = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if !already_met {
-                                            stream.set_nonblocking(true).ok();
-                                            pending_waits.push(PendingWait {
-                                                stream,
-                                                conditions,
-                                                timeout_ms,
-                                                registered_at: Instant::now(),
-                                            });
-                                        }
-                                    }
-                                } else {
-                                    // No text match — just register
-                                    stream.set_nonblocking(true).ok();
-                                    pending_waits.push(PendingWait { stream, conditions, timeout_ms, registered_at: Instant::now() });
+                                break 'wait;
+                            }
+
+                            // Validate: TextMatch requires screen_text support
+                            let has_text_match =
+                                conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::TextMatch { .. }));
+                            if has_text_match {
+                                if let Err(err) = vt_engine.screen_text() {
+                                    let _ = Frame::Error(format!("text matching not supported: {err}")).write(&mut stream);
+                                    break 'wait;
                                 }
                             }
+
+                            // Check --text immediately at registration
+                            if has_text_match {
+                                if let Ok(screen) = vt_engine.screen_text() {
+                                    for condition in &conditions {
+                                        if let crate::protocol::WaitCondition::TextMatch { text } = condition {
+                                            if screen.contains(text.as_str()) {
+                                                let _ =
+                                                    Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
+                                                        .write(&mut stream);
+                                                break 'wait;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Register for async evaluation
+                            if let Err(err) = stream.set_nonblocking(true) {
+                                let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
+                                break 'wait;
+                            }
+                            pending_waits.push(PendingWait { stream, conditions, timeout_ms, registered_at: Instant::now() });
                         }
                         Ok(_) => {
                             let _ = Frame::Busy.write(&mut stream);

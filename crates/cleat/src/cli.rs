@@ -376,14 +376,14 @@ fn execute_wait(
         };
     }
 
-    if !timeout.is_finite() || timeout < 0.0 {
-        return ExecResult::Exit { code: 2, message: Some(format!("invalid timeout: {timeout}")), output: None };
+    if !timeout.is_finite() || !(0.0..=86_400.0).contains(&timeout) {
+        return ExecResult::Exit { code: 2, message: Some(format!("invalid timeout: {timeout} (max 86400)")), output: None };
     }
 
     let mut conditions = Vec::new();
     if let Some(secs) = idle_time {
-        if !secs.is_finite() || secs < 0.0 {
-            return ExecResult::Exit { code: 2, message: Some(format!("invalid idle-time: {secs}")), output: None };
+        if !secs.is_finite() || !(0.0..=86_400.0).contains(&secs) {
+            return ExecResult::Exit { code: 2, message: Some(format!("invalid idle-time: {secs} (max 86400)")), output: None };
         }
         conditions.push(WaitCondition::OutputIdle { quiet_ms: (secs * 1000.0) as u64 });
     }

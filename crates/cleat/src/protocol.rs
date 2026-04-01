@@ -200,6 +200,7 @@ impl Frame {
                             payload.extend_from_slice(&quiet_ms.to_le_bytes());
                         }
                         WaitCondition::TextMatch { text } => {
+                            debug_assert!(text.len() <= u32::MAX as usize, "text match pattern too long");
                             payload.push(1);
                             payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
                             payload.extend_from_slice(text.as_bytes());

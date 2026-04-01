@@ -412,9 +412,7 @@ fn detached_session_answers_da_queries() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service
-        .create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true)
-        .expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create alpha");
 
     // Wait for stty to take effect
     std::thread::sleep(Duration::from_millis(300));
@@ -427,10 +425,7 @@ fn detached_session_answers_da_queries() {
     // Read recorded output since the mark
     let output = service.capture_since_raw("alpha", offset).expect("capture since");
 
-    assert!(
-        output.contains("\x1b[?62;22c"),
-        "detached session should inject DA1 response in recorded output, got: {output:?}"
-    );
+    assert!(output.contains("\x1b[?62;22c"), "detached session should inject DA1 response in recorded output, got: {output:?}");
 }
 
 /// When a client IS attached, the daemon should NOT inject synthetic DA responses —
@@ -445,9 +440,7 @@ fn attached_session_does_not_get_synthetic_da_reply() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    service
-        .create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), false)
-        .expect("create alpha");
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), false).expect("create alpha");
 
     // Wait for stty to take effect
     std::thread::sleep(Duration::from_millis(300));

@@ -972,19 +972,31 @@ fn resolve_cleat_executable() -> Result<PathBuf, String> {
         return Ok(path);
     }
 
-    let path_var = std::env::var_os("PATH").ok_or_else(|| "PATH is not set; cannot locate cleat executable".to_string())?;
-    for dir in std::env::split_paths(&path_var) {
+    let sibling = current_exe_sibling("cleat");
+    let path_var = std::env::var_os("PATH")
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    resolve_cleat_with_sibling(sibling.as_deref(), &path_var)
+}
+
+fn resolve_cleat_with_sibling(sibling: Option<&Path>, path_var: &str) -> Result<PathBuf, String> {
+    // Prefer sibling of current executable — strongest "same version" signal.
+    if let Some(path) = sibling {
+        if is_executable_file(path) {
+            return Ok(path.to_path_buf());
+        }
+    }
+
+    // Fall back to PATH search.
+    for dir in std::env::split_paths(&std::ffi::OsString::from(path_var)) {
         let candidate = dir.join("cleat");
         if is_executable_file(&candidate) {
             return Ok(candidate);
         }
     }
 
-    if let Some(path) = current_exe_sibling("cleat") {
-        return Ok(path);
-    }
-
-    Err("unable to locate cleat executable in PATH".into())
+    Err("unable to locate cleat executable on PATH or next to current binary".into())
 }
 
 fn current_exe_sibling(name: &str) -> Option<PathBuf> {
@@ -1238,7 +1250,6 @@ fn exit_code_from_wait_status(status: &WaitStatus) -> i32 {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
         sync::{Arc, Mutex, OnceLock},
     };
 
@@ -1386,36 +1397,19 @@ mod tests {
 
     #[test]
     fn resolve_cleat_executable_falls_back_to_path() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).expect("create bin dir");
         let cleat = bin_dir.join("cleat");
         fs::write(&cleat, b"#!/bin/sh\n").expect("write fake cleat");
         let mut perms = fs::metadata(&cleat).expect("metadata").permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        fs::set_permissions(&cleat, perms).expect("set executable");
 
-            perms.set_mode(0o755);
-            fs::set_permissions(&cleat, perms).expect("set executable");
-        }
+        let resolved = super::resolve_cleat_with_sibling(None, &bin_dir.to_string_lossy()).expect("resolve from path");
 
-        let original_bin = std::env::var_os("CARGO_BIN_EXE_cleat");
-        let original_path = std::env::var_os("PATH");
-        std::env::remove_var("CARGO_BIN_EXE_cleat");
-        std::env::set_var("PATH", PathBuf::from(&bin_dir).into_os_string());
-
-        let resolved = resolve_cleat_executable().expect("resolve from path");
-
-        match original_bin {
-            Some(value) => std::env::set_var("CARGO_BIN_EXE_cleat", value),
-            None => std::env::remove_var("CARGO_BIN_EXE_cleat"),
-        }
-        match original_path {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
         assert_eq!(resolved, cleat);
         assert!(is_executable_file(&cleat));
     }
@@ -1436,5 +1430,55 @@ mod tests {
     fn exit_code_from_signal_is_128_plus_signal() {
         let status = WaitStatus::Signaled(Pid::from_raw(1), nix::sys::signal::Signal::SIGTERM, false);
         assert_eq!(exit_code_from_wait_status(&status), 128 + libc::SIGTERM);
+    }
+
+    #[test]
+    fn resolve_cleat_exe_prefers_sibling_over_path() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // Create a "sibling" cleat binary
+        let sibling_dir = temp.path().join("sibling");
+        fs::create_dir_all(&sibling_dir).expect("create sibling dir");
+        let sibling_exe = sibling_dir.join("cleat");
+        fs::write(&sibling_exe, "#!/bin/sh\n").expect("write sibling");
+        fs::set_permissions(&sibling_exe, fs::Permissions::from_mode(0o755)).expect("chmod sibling");
+
+        // Create a "PATH" cleat binary
+        let path_dir = temp.path().join("path-bin");
+        fs::create_dir_all(&path_dir).expect("create path dir");
+        let path_exe = path_dir.join("cleat");
+        fs::write(&path_exe, "#!/bin/sh\n").expect("write path");
+        fs::set_permissions(&path_exe, fs::Permissions::from_mode(0o755)).expect("chmod path");
+
+        let result = super::resolve_cleat_with_sibling(
+            Some(&sibling_exe),
+            &path_dir.to_string_lossy(),
+        );
+
+        assert_eq!(result.unwrap(), sibling_exe);
+    }
+
+    #[test]
+    fn resolve_cleat_exe_falls_back_to_path_when_no_sibling() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let path_dir = temp.path().join("path-bin");
+        fs::create_dir_all(&path_dir).expect("create path dir");
+        let path_exe = path_dir.join("cleat");
+        fs::write(&path_exe, "#!/bin/sh\n").expect("write path");
+        fs::set_permissions(&path_exe, fs::Permissions::from_mode(0o755)).expect("chmod path");
+
+        let result = super::resolve_cleat_with_sibling(
+            None,
+            &path_dir.to_string_lossy(),
+        );
+
+        assert_eq!(result.unwrap(), path_exe);
     }
 }

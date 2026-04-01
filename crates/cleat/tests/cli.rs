@@ -12,7 +12,7 @@ fn help_lists_expected_subcommands() {
     let subcommands: Vec<_> = command.get_subcommands().filter(|sub| !sub.is_hide_set()).map(|sub| sub.get_name().to_string()).collect();
     assert_eq!(subcommands, vec![
         "attach",
-        "create",
+        "launch",
         "list",
         "capture",
         "detach",
@@ -23,6 +23,7 @@ fn help_lists_expected_subcommands() {
         "record",
         "mark"
     ]);
+    assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
 }
 
 #[test]
@@ -51,15 +52,15 @@ fn attach_command_parses_vt() {
 }
 
 #[test]
-fn create_command_parses() {
-    let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create parses");
-    assert_eq!(cli.command, Command::Create { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
+fn launch_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "--cmd", "bash"]).expect("launch parses");
+    assert_eq!(cli.command, Command::Launch { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
 }
 
 #[test]
-fn create_command_parses_positional_name() {
-    let cli = Cli::try_parse_from(["cleat", "create", "demo", "--cmd", "bash"]).expect("create positional parses");
-    assert_eq!(cli.command, Command::Create {
+fn launch_command_parses_positional_name() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--cmd", "bash"]).expect("launch positional parses");
+    assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         json: false,
         vt: None,
@@ -70,15 +71,15 @@ fn create_command_parses_positional_name() {
 }
 
 #[test]
-fn create_command_parses_json() {
-    let cli = Cli::try_parse_from(["cleat", "create", "--json", "demo"]).expect("create --json parses");
-    assert_eq!(cli.command, Command::Create { id: Some("demo".into()), json: true, vt: None, cwd: None, cmd: None, record: false });
+fn launch_command_parses_json() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
+    assert_eq!(cli.command, Command::Launch { id: Some("demo".into()), json: true, vt: None, cwd: None, cmd: None, record: false });
 }
 
 #[test]
-fn create_command_parses_vt() {
-    let cli = Cli::try_parse_from(["cleat", "create", "--vt", "ghostty", "demo"]).expect("create --vt parses");
-    assert_eq!(cli.command, Command::Create {
+fn launch_command_parses_vt() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "--vt", "ghostty", "demo"]).expect("launch --vt parses");
+    assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         json: false,
         vt: Some(VtEngineKind::Ghostty),
@@ -86,6 +87,12 @@ fn create_command_parses_vt() {
         cmd: None,
         record: false
     });
+}
+
+#[test]
+fn create_alias_still_parses_as_launch() {
+    let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create alias parses");
+    assert_eq!(cli.command, Command::Launch { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
 }
 
 #[test]
@@ -202,9 +209,9 @@ fn record_parses_session_id() {
 }
 
 #[test]
-fn create_record_flag() {
-    let cli = Cli::try_parse_from(["cleat", "create", "alpha", "--record"]).expect("parse create --record");
-    assert!(matches!(cli.command, Command::Create { record: true, .. }));
+fn launch_record_flag() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "alpha", "--record"]).expect("parse launch --record");
+    assert!(matches!(cli.command, Command::Launch { record: true, .. }));
 }
 
 #[test]

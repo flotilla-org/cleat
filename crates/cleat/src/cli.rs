@@ -32,7 +32,8 @@ pub enum Command {
         record: bool,
     },
     /// Create a new session
-    Create {
+    #[command(alias = "create", after_long_help = "Tip: launch a shell (e.g. zsh) and use `send` to run commands.\nSessions exit when the launched process exits.")]
+    Launch {
         #[arg(value_name = "ID")]
         id: Option<String>,
         #[arg(long, help = "Output as JSON")]
@@ -143,7 +144,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
             guard.relay_stdio()?;
             Ok(None)
         }
-        Command::Create { id, json, vt, cwd, cmd, record } => {
+        Command::Launch { id, json, vt, cwd, cmd, record } => {
             let created = service.create(id, vt, cwd, cmd, record)?;
             if json {
                 serde_json::to_string(&created).map(Some).map_err(|err| format!("serialize create result: {err}"))

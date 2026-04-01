@@ -399,70 +399,88 @@ fn send_keys_cli_executes_end_to_end() {
     );
 }
 
+/// When no client is attached, the daemon's DA tracker should inject a synthetic
+/// DA1 response into the PTY when it sees a DA query in the output stream.
+///
+/// Strategy: launch `sh -c 'stty raw; exec cat'` with recording. Raw mode
+/// disables line buffering so the DA response passes through immediately.
+/// send-keys injects the DA query → cat echoes it → PTY output → daemon sees
+/// it and (detached) injects the response → PTY input → cat echoes the
+/// response → PTY output (recorded).
 #[test]
 fn detached_session_answers_da_queries() {
-    if !require_python3() {
-        return;
-    }
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    let cmd = r#"python3 -c 'import os,select,time,tty; fd=os.open("/dev/tty", os.O_RDWR); tty.setcbreak(fd); os.write(fd,b"\x1b[c"); data=b""; deadline=time.time()+2; 
-while time.time() < deadline and not data.endswith(b"c"):
-    timeout=max(0.0, deadline-time.time()); ready,_,_=select.select([fd], [], [], timeout);
-    if not ready: break
-    data += os.read(fd, 1)
-open("da.txt","wb").write(data); time.sleep(5)'"#;
+    service
+        .create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true)
+        .expect("create alpha");
 
-    service.create(Some("alpha".into()), None, Some(temp.path().to_path_buf()), Some(cmd.into()), false).expect("create alpha");
+    // Wait for stty to take effect
+    std::thread::sleep(Duration::from_millis(300));
 
-    let result_path = temp.path().join("da.txt");
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while !result_path.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // Mark, then send DA1 query while detached
+    let offset = service.mark("alpha").expect("mark");
+    service.send_keys("alpha", b"\x1b[c").expect("send DA query");
+    std::thread::sleep(Duration::from_millis(500));
 
-    assert!(result_path.exists(), "da.txt was not created within deadline — python child may have crashed");
-    let contents = std::fs::read(&result_path).expect("read DA result");
-    assert_eq!(contents, b"\x1b[?62;22c");
+    // Read recorded output since the mark
+    let output = service.capture_since_raw("alpha", offset).expect("capture since");
+
+    assert!(
+        output.contains("\x1b[?62;22c"),
+        "detached session should inject DA1 response in recorded output, got: {output:?}"
+    );
 }
 
+/// When a client IS attached, the daemon should NOT inject synthetic DA responses —
+/// the real terminal handles them.
+///
+/// Strategy: launch `sh -c 'stty raw; exec cat'`, attach first, THEN send DA
+/// query via send-keys. cat echoes it → PTY output → daemon forwards to attached
+/// client but does NOT inject a response. We read frames from the client stream
+/// and verify the DA response is absent.
 #[test]
 fn attached_session_does_not_get_synthetic_da_reply() {
-    if !require_python3() {
-        return;
-    }
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
-    let cmd = r#"python3 -c 'import os,select,time,tty; fd=os.open("/dev/tty", os.O_RDWR); tty.setcbreak(fd);
-while not os.path.exists("go"):
-    time.sleep(0.01)
-os.write(fd,b"\x1b[c"); data=b""; deadline=time.time()+1;
-while time.time() < deadline and not data.endswith(b"c"):
-    timeout=max(0.0, deadline-time.time()); ready,_,_=select.select([fd], [], [], timeout);
-    if not ready: break
-    data += os.read(fd, 1)
-open("da.txt","wb").write(data); time.sleep(5)'"#;
+    service
+        .create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
 
-    service.create(Some("alpha".into()), None, Some(temp.path().to_path_buf()), Some(cmd.into()), false).expect("create alpha");
+    // Wait for stty to take effect
+    std::thread::sleep(Duration::from_millis(300));
 
-    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
-    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
+    // Attach BEFORE sending the DA query
+    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_millis(100))).ok();
+    Frame::AttachInit { cols: 80, rows: 24, capabilities: ClientCapabilities::conservative_fallback() }
         .write(&mut stream)
         .expect("write attach init");
-    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
-    std::fs::write(temp.path().join("go"), b"x").expect("write attached test gate");
+    assert_eq!(Frame::read(&mut stream).expect("read ack"), Frame::Ack);
 
-    let result_path = temp.path().join("da.txt");
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while !result_path.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
+    // Send DA1 query while attached — cat echoes it, daemon forwards but should NOT inject response
+    service.send_keys("alpha", b"\x1b[c").expect("send DA query");
+
+    // Read output frames for a short window — we should see the echoed query but NOT a DA response
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut output = Vec::new();
+    while Instant::now() < deadline {
+        match Frame::read(&mut stream) {
+            Ok(Frame::Output(bytes)) => output.extend_from_slice(&bytes),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                continue;
+            }
+            Err(e) => panic!("read frame: {e}"),
+        }
     }
 
-    assert!(result_path.exists(), "da.txt was not created within deadline — python child may have crashed");
-    let contents = std::fs::read(&result_path).expect("read DA result");
-    assert!(contents.is_empty(), "attached sessions should rely on the real terminal for DA replies");
+    assert!(
+        !output.windows(b"\x1b[?62;22c".len()).any(|w| w == b"\x1b[?62;22c"),
+        "attached session should NOT inject DA1 response, but got one in output"
+    );
 }
 
 #[cfg(feature = "ghostty-vt")]

@@ -592,13 +592,15 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         Ok(Frame::Mark { name }) => {
                             if let Some(ref mut rec) = recorder {
                                 rec.flush();
-                                let offset = rec.bytes_written();
                                 if let Some(ref marker_name) = name {
-                                    markers.insert(marker_name.clone(), offset);
                                     // Emit standard asciicast "m" event
                                     rec.event(crate::asciicast::EventCode::Marker, marker_name, epoch.elapsed());
+                                    // Store the offset *after* the marker event so that
+                                    // read_events_since starts at the first event following
+                                    // the marker rather than at the marker line itself.
+                                    markers.insert(marker_name.clone(), rec.bytes_written());
                                 }
-                                let _ = Frame::MarkResult { offset }.write(&mut stream);
+                                let _ = Frame::MarkResult { offset: rec.bytes_written() }.write(&mut stream);
                             } else {
                                 let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
                             }

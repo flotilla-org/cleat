@@ -140,7 +140,7 @@ impl TerminalHandle {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
-        let result = unsafe { ghostty_terminal_resize(self.raw, cols, rows, 0, 0) };
+        let result = unsafe { ghostty_terminal_resize(self.raw, cols, rows, 1, 1) };
         check_result(result, "ghostty_terminal_resize")
     }
 

@@ -15,12 +15,9 @@ pub const BUILD_SUPPORT_MESSAGE: &str = FUNCTIONAL_BUILD_MESSAGE;
 #[cfg(not(feature = "ghostty-vt"))]
 pub const BUILD_SUPPORT_MESSAGE: &str = NONFUNCTIONAL_BUILD_MESSAGE;
 
+/// Returns the VT support status baked into this binary at compile time via `build.rs`.
 pub fn functional_vt_available() -> bool {
     option_env!("CLEAT_FUNCTIONAL_VT_AVAILABLE") == Some("1")
-}
-
-pub fn build_support_message() -> &'static str {
-    BUILD_SUPPORT_MESSAGE
 }
 
 pub const fn vt_engine_status(engine: VtEngineKind) -> &'static str {

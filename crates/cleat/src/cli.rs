@@ -222,7 +222,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             }
         }
         Command::Launch { id, json, vt, cwd, cmd, record } => {
-            if !crate::vt::functional_vt_available() && vt != Some(crate::vt::VtEngineKind::Ghostty) {
+            if !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
             }
             let created = match service.create(id, vt, cwd, cmd, record) {
@@ -440,11 +440,8 @@ fn execute_wait(
 }
 
 fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
-    let mut fields = vec![
-        session.id.clone(),
-        format_session_status(&session.status).to_string(),
-        format!("{} ({})", session.vt_engine.as_str(), session.vt_engine_status),
-    ];
+    let mut fields =
+        vec![session.id.clone(), format_session_status(&session.status).to_string(), crate::vt::vt_engine_label(session.vt_engine)];
     if let Some(cwd) = &session.cwd {
         fields.push(cwd.display().to_string());
     } else if let Some(cmd) = &session.cmd {

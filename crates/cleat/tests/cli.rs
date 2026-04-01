@@ -38,7 +38,7 @@ fn help_surfaces_vt_support_policy() {
     let help = String::from_utf8(buffer).expect("help utf8");
 
     assert!(help.contains("Ghostty is currently the only functional VT engine"));
-    assert!(help.contains(vt::build_support_message()));
+    assert!(help.contains(vt::BUILD_SUPPORT_MESSAGE));
 
     let mut launch = Cli::command().find_subcommand_mut("launch").expect("launch command").clone();
     let mut launch_buffer = Vec::new();

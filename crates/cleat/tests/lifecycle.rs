@@ -131,7 +131,8 @@ fn create_rejects_unavailable_vt_engine() {
 
     let err = cli::execute(cli, &service).expect_err("ghostty should be unavailable");
 
-    assert!(err.contains("not compiled"));
+    assert!(err.contains("non-functional for real terminal usage"));
+    assert!(err.contains("ghostty-vt"));
 }
 
 #[cfg(not(feature = "ghostty-vt"))]
@@ -295,10 +296,9 @@ fn attach_rejects_lazy_create_in_nonfunctional_build() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
+    let cli = Cli::try_parse_from(["cleat", "attach", "alpha", "--cmd", "sleep 5"]).expect("parse attach");
 
-    let err = service
-        .attach(Some("alpha".into()), None, None, Some("sleep 5".into()), false)
-        .expect_err("lazy attach should be rejected without ghostty");
+    let err = cli::execute(cli, &service).expect_err("lazy attach should be rejected without ghostty");
 
     assert!(err.contains("non-functional for real terminal usage"));
     assert!(err.contains("ghostty-vt"));

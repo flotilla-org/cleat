@@ -11,7 +11,7 @@ use vt_contracts::{assert_replay_contract, GhosttyFixture};
 
 #[test]
 fn vt_build_support_message_is_nonempty_and_matches_feature_state() {
-    assert!(!cleat::vt::build_support_message().is_empty());
+    assert!(!cleat::vt::BUILD_SUPPORT_MESSAGE.is_empty());
     #[cfg(feature = "ghostty-vt")]
     assert!(cleat::vt::functional_vt_available());
     #[cfg(not(feature = "ghostty-vt"))]

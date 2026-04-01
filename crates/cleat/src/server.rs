@@ -181,9 +181,6 @@ impl SessionService {
         cmd: Option<String>,
         no_create: bool,
     ) -> Result<(SessionInfo, ForegroundAttach), String> {
-        if !no_create && vt_engine.is_none() && !crate::vt::functional_vt_available() {
-            return Err(crate::vt::nonfunctional_build_error());
-        }
         let session = if no_create {
             let id = name.ok_or_else(|| "attach --no-create requires a session id".to_string())?;
             let socket_path = session_socket_path(self.layout.root(), &id);

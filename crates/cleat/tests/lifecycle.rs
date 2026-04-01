@@ -8,7 +8,7 @@ use std::{
 
 use clap::Parser;
 use cleat::{
-    cli::{self, Cli},
+    cli::{self, Cli, ExecResult},
     protocol::{Frame, SessionInfo},
     runtime::RuntimeLayout,
     server::SessionService,
@@ -195,17 +195,17 @@ fn capture_returns_text_for_ghostty_sessions() {
     let output = loop {
         let cli = Cli::try_parse_from(["cleat", "capture", "alpha"]).expect("parse capture");
         match cli::execute(cli, &service) {
-            Ok(Some(text)) if text.contains("hello capture") => break text,
-            Ok(Some(_)) if Instant::now() < deadline => {
+            ExecResult::Ok(Some(text)) if text.contains("hello capture") => break text,
+            ExecResult::Ok(Some(_)) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Ok(Some(text)) => panic!("capture did not include expected text: {text}"),
-            Ok(None) => panic!("capture returned no output"),
-            Err(err) if Instant::now() < deadline => {
-                let _ = err;
+            ExecResult::Ok(Some(text)) => panic!("capture did not include expected text: {text}"),
+            ExecResult::Ok(None) => panic!("capture returned no output"),
+            ExecResult::Err(_) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(err) => panic!("capture failed: {err}"),
+            ExecResult::Err(err) => panic!("capture failed: {err}"),
+            other => panic!("unexpected result: {other:?}"),
         }
     };
 

@@ -165,8 +165,11 @@ Frame::WaitResult { status: WaitStatus, elapsed_ms: u64 }
 `WaitStatus` variants:
 - `Ready`
 - `Timeout`
+- `SessionGone`
 
-The daemon registers the wait conditions on the accepted socket connection. The event loop evaluates pending conditions after each PTY read. When any condition is met or the timeout expires, the daemon writes `WaitResult` and closes the wait. Multiple concurrent waiters are supported — each wait request opens its own socket connection and the daemon tracks each independently.
+If the session process exits while a wait is pending, the daemon writes `WaitResult { status: SessionGone }`. If the socket drops unexpectedly (daemon crash), the client treats the read error as exit code 2.
+
+The daemon registers the wait conditions on the accepted socket connection. Conditions are evaluated immediately at registration (so `--text` succeeds instantly if the text is already on screen, and `--idle-time` succeeds if output has already been quiet long enough). After registration, the event loop evaluates pending conditions on each loop tick — not only after PTY reads, since `--idle-time` requires timer-driven evaluation when no output arrives. When any condition is met, the timeout expires, or the session exits, the daemon writes `WaitResult` and closes the wait. Multiple concurrent waiters are supported — each wait request opens its own socket connection and the daemon tracks each independently.
 
 ### 4. Off-by-one in since-marker capture
 

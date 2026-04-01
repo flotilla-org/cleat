@@ -1,18 +1,21 @@
+#[cfg(feature = "ghostty-vt")]
+use std::process::{Command, Stdio};
 use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
-    process::{Command, Stdio},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use clap::Parser;
+#[cfg(feature = "ghostty-vt")]
+use cleat::session::{daemon_pid_path, foreground_path};
 use cleat::{
     cli::{self, Cli},
     protocol::{Frame, SessionInfo},
     runtime::RuntimeLayout,
     server::SessionService,
-    session::{daemon_pid_path, foreground_path, session_socket_path},
+    session::session_socket_path,
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
 
@@ -73,6 +76,7 @@ impl Drop for EnvVarGuard {
     }
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn create_makes_session_directory_and_returns_metadata() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -85,6 +89,7 @@ fn create_makes_session_directory_and_returns_metadata() {
     assert!(temp.path().join("alpha").exists());
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn create_json_returns_structured_metadata() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -97,9 +102,12 @@ fn create_json_returns_structured_metadata() {
 
     assert_eq!(created.id, "alpha");
     assert_eq!(created.vt_engine, vt::default_vt_engine_kind());
+    assert_eq!(created.vt_engine_status, vt::vt_engine_status(vt::default_vt_engine_kind()));
+    assert_eq!(created.functional_vt_available, vt::functional_vt_available());
     assert_eq!(created.cmd.as_deref(), Some("bash"));
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn create_uses_requested_vt_engine() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -123,7 +131,22 @@ fn create_rejects_unavailable_vt_engine() {
 
     let err = cli::execute(cli, &service).expect_err("ghostty should be unavailable");
 
-    assert!(err.contains("not compiled"));
+    assert!(err.contains("non-functional for real terminal usage"));
+    assert!(err.contains("ghostty-vt"));
+}
+
+#[cfg(not(feature = "ghostty-vt"))]
+#[test]
+fn create_rejects_default_nonfunctional_build() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let cli = Cli::try_parse_from(["cleat", "create", "alpha"]).expect("parse create");
+
+    let err = cli::execute(cli, &service).expect_err("default create should be rejected");
+
+    assert!(err.contains("non-functional for real terminal usage"));
+    assert!(err.contains("ghostty-vt"));
 }
 
 #[test]
@@ -139,8 +162,12 @@ fn list_reports_existing_sessions() {
     let lines: Vec<_> = output.lines().collect();
 
     assert_eq!(lines, vec![
-        format!("alpha\tdetached\t{}\t/repo", vt::default_vt_engine_kind().as_str()),
-        "beta\tdetached\tpassthrough\tzsh".to_string(),
+        format!(
+            "alpha\tdetached\t{} ({})\t/repo",
+            vt::default_vt_engine_kind().as_str(),
+            vt::vt_engine_status(vt::default_vt_engine_kind())
+        ),
+        format!("beta\tdetached\tpassthrough ({})\tzsh", vt::vt_engine_status(VtEngineKind::Passthrough)),
     ]);
 }
 
@@ -158,7 +185,11 @@ fn list_json_reports_existing_sessions() {
 
     assert_eq!(listed.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
     assert_eq!(listed[0].vt_engine, vt::default_vt_engine_kind());
+    assert_eq!(listed[0].vt_engine_status, vt::vt_engine_status(vt::default_vt_engine_kind()));
+    assert_eq!(listed[0].functional_vt_available, vt::functional_vt_available());
     assert_eq!(listed[1].vt_engine, VtEngineKind::Passthrough);
+    assert_eq!(listed[1].vt_engine_status, vt::vt_engine_status(VtEngineKind::Passthrough));
+    assert_eq!(listed[1].functional_vt_available, vt::functional_vt_available());
 }
 
 #[test]
@@ -171,7 +202,7 @@ fn capture_rejects_passthrough_sessions() {
 
     let err = cli::execute(cli, &service).expect_err("passthrough capture should fail");
 
-    assert!(err.contains("unsupported"));
+    assert!(err.contains("placeholder"));
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -240,6 +271,7 @@ fn kill_missing_session_is_an_error() {
     assert!(err.contains("missing"));
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn attach_creates_session_lazily_and_reuses_it_on_later_attach() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -258,6 +290,20 @@ fn attach_creates_session_lazily_and_reuses_it_on_later_attach() {
     assert_eq!(second.vt_engine, vt::default_vt_engine_kind());
 }
 
+#[cfg(not(feature = "ghostty-vt"))]
+#[test]
+fn attach_rejects_lazy_create_in_nonfunctional_build() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let cli = Cli::try_parse_from(["cleat", "attach", "alpha", "--cmd", "sleep 5"]).expect("parse attach");
+
+    let err = cli::execute(cli, &service).expect_err("lazy attach should be rejected without ghostty");
+
+    assert!(err.contains("non-functional for real terminal usage"));
+    assert!(err.contains("ghostty-vt"));
+}
+
 #[test]
 fn attach_vt_only_applies_when_creating_new_session() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -274,6 +320,7 @@ fn attach_vt_only_applies_when_creating_new_session() {
     assert_eq!(reattached.vt_engine, VtEngineKind::Passthrough);
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn attach_rejects_second_foreground_client_while_one_is_active() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -286,6 +333,7 @@ fn attach_rejects_second_foreground_client_while_one_is_active() {
     assert!(err.contains("foreground client"));
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_client_policy() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -558,6 +606,7 @@ fn first_attach_replay_does_not_clear_before_output() {
     assert_ne!(bytes, b"\x1b[2J\x1b[H".to_vec(), "first attach should not clear before replay/output");
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn dropping_foreground_attach_keeps_session_alive_for_later_attach() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -574,6 +623,7 @@ fn dropping_foreground_attach_keeps_session_alive_for_later_attach() {
     assert!(pid_path.exists());
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn stale_foreground_file_does_not_block_attach() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -598,6 +648,7 @@ fn attach_no_create_rejects_missing_session() {
     assert!(err.contains("missing"));
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn cleat_attach_exits_when_session_is_killed() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -641,6 +692,7 @@ fn cleat_attach_exits_when_session_is_killed() {
     }
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn cleat_detach_exits_foreground_client_and_keeps_session_alive() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -687,6 +739,7 @@ fn cleat_detach_exits_foreground_client_and_keeps_session_alive() {
     assert!(temp.path().join("alpha").exists(), "detach should leave the session directory intact");
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn cleat_attach_exits_on_sigterm_and_keeps_session_alive() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -762,6 +815,9 @@ fn inspect_returns_structured_session_state() {
 
     assert_eq!(result.session.id, "alpha");
     assert_eq!(result.session.state, "running");
+    assert_eq!(result.session.vt_engine, vt::default_vt_engine_kind().as_str());
+    assert_eq!(result.session.vt_engine_status, vt::vt_engine_status(vt::default_vt_engine_kind()));
+    assert_eq!(result.session.functional_vt_available, vt::functional_vt_available());
     assert!(result.process.leader_pid > 0);
     assert!(result.process.foreground_pgid.is_some());
     assert_eq!(result.terminal.cols, 80);
@@ -854,6 +910,7 @@ fn record_command_activates_recording_on_running_session() {
     service.kill(&info.id).expect("kill session");
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn create_with_record_flag_activates_recording() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());

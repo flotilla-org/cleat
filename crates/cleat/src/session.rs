@@ -911,6 +911,8 @@ fn build_inspect_result(
             id: session.id.clone(),
             state: "running".to_string(),
             vt_engine: session.vt_engine.as_str().to_string(),
+            vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
+            functional_vt_available: crate::vt::functional_vt_available(),
             cwd: session.cwd.clone(),
             cmd: session.cmd.clone(),
         },

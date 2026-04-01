@@ -3,7 +3,7 @@ use cleat::{
     cli::{execute, Cli, Command, ExecResult},
     runtime::RuntimeLayout,
     server::SessionService,
-    vt::VtEngineKind,
+    vt::{self, VtEngineKind},
 };
 
 #[test]
@@ -28,6 +28,23 @@ fn help_lists_expected_subcommands() {
         "wait"
     ]);
     assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
+}
+
+#[test]
+fn help_surfaces_vt_support_policy() {
+    let mut command = Cli::command();
+    let mut buffer = Vec::new();
+    command.write_long_help(&mut buffer).expect("write help");
+    let help = String::from_utf8(buffer).expect("help utf8");
+
+    assert!(help.contains("Ghostty is currently the only functional VT engine"));
+    assert!(help.contains(vt::BUILD_SUPPORT_MESSAGE));
+
+    let mut launch = Cli::command().find_subcommand_mut("launch").expect("launch command").clone();
+    let mut launch_buffer = Vec::new();
+    launch.write_long_help(&mut launch_buffer).expect("write launch help");
+    let launch_help = String::from_utf8(launch_buffer).expect("launch help utf8");
+    assert!(launch_help.contains("placeholder engines are for testing/development only"));
 }
 
 #[test]

@@ -47,6 +47,8 @@ impl SessionService {
         Ok(SessionInfo {
             id: session.id,
             vt_engine: session.vt_engine,
+            vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
+            functional_vt_available: crate::vt::functional_vt_available(),
             cwd: session.cwd,
             cmd: session.cmd,
             status: SessionStatus::Detached,
@@ -85,6 +87,8 @@ impl SessionService {
                 sessions.push(SessionInfo {
                     id: result.session.id,
                     vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+                    vt_engine_status: result.session.vt_engine_status,
+                    functional_vt_available: result.session.functional_vt_available,
                     cwd: result.session.cwd,
                     cmd: result.session.cmd,
                     status,
@@ -199,6 +203,8 @@ impl SessionService {
             SessionInfo {
                 id: session.id.clone(),
                 vt_engine: session.vt_engine,
+                vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
+                functional_vt_available: crate::vt::functional_vt_available(),
                 cwd: session.cwd,
                 cmd: session.cmd,
                 status: SessionStatus::Attached,
@@ -324,6 +330,8 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
     SessionInfo {
         id: result.session.id,
         vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+        vt_engine_status: result.session.vt_engine_status,
+        functional_vt_available: result.session.functional_vt_available,
         cwd: result.session.cwd,
         cmd: result.session.cmd,
         status,

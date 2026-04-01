@@ -5,7 +5,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::{keys::encode_send_keys, runtime::SessionMetadata, server::SessionService, vt::VtEngineKind};
 
 #[derive(Debug, Parser)]
-#[command(name = "cleat", version)]
+#[command(name = "cleat", version, about = "Session daemon with a structured control plane for agents and terminal persistence")]
 pub struct Cli {
     #[arg(long, hide = true)]
     pub runtime_root: Option<PathBuf>,
@@ -16,38 +16,42 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
+    /// Attach to a session interactively
     Attach {
         #[arg(value_name = "ID")]
         id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Fail if the session does not exist")]
         no_create: bool,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, help = "Virtual terminal engine")]
         vt: Option<VtEngineKind>,
-        #[arg(long)]
+        #[arg(long, help = "Working directory for the session")]
         cwd: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, help = "Command to run (default: user's shell)")]
         cmd: Option<String>,
-        #[arg(long, env = "CLEAT_RECORD")]
+        #[arg(long, env = "CLEAT_RECORD", help = "Enable output recording")]
         record: bool,
     },
+    /// Create a new session
     Create {
         #[arg(value_name = "ID")]
         id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Output as JSON")]
         json: bool,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, help = "Virtual terminal engine")]
         vt: Option<VtEngineKind>,
-        #[arg(long)]
+        #[arg(long, help = "Working directory for the session")]
         cwd: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, help = "Command to run (default: user's shell)")]
         cmd: Option<String>,
-        #[arg(long, env = "CLEAT_RECORD")]
+        #[arg(long, env = "CLEAT_RECORD", help = "Enable output recording")]
         record: bool,
     },
+    /// List all sessions
     List {
-        #[arg(long)]
+        #[arg(long, help = "Output as JSON")]
         json: bool,
     },
+    /// Capture terminal screen content
     Capture {
         id: String,
         /// Byte offset in .cast file; return output events after this position
@@ -60,38 +64,46 @@ pub enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Detach from a session
     Detach {
         id: String,
     },
+    /// Terminate a session
     Kill {
         id: String,
     },
+    /// Send key sequences using tmux-style names
+    #[command(after_long_help = "Key names: Enter, Escape (Esc), Tab, BSpace, Space,\n           Up, Down, Left, Right, Home, End,\n           PgUp (PageUp), PgDn (PageDown),\n           IC (Insert), DC (Delete),\n           F1-F12, BTab (Shift-Tab)\n\nModifiers:  C-x (Ctrl), M-x (Meta/Alt), S-x (Shift)\n            ^x  (Ctrl, alternative syntax)\n\nExamples:   cleat send-keys myapp Enter\n            cleat send-keys myapp C-c\n            cleat send-keys myapp -l 'literal text'\n            cleat send-keys myapp -H 1b5b41")]
     SendKeys {
         #[arg(value_name = "ID")]
         id: String,
-        #[arg(short = 'l', conflicts_with = "hex")]
+        #[arg(short = 'l', conflicts_with = "hex", help = "Send keys as literal characters")]
         literal: bool,
-        #[arg(short = 'H', conflicts_with = "literal")]
+        #[arg(short = 'H', conflicts_with = "literal", help = "Send keys as hex-encoded bytes")]
         hex: bool,
-        #[arg(short = 'N', default_value_t = 1, value_parser = parse_repeat)]
+        #[arg(short = 'N', default_value_t = 1, value_parser = parse_repeat, help = "Repeat the key sequence N times")]
         repeat: usize,
         #[arg(value_name = "KEY", required = true, num_args = 1..)]
         keys: Vec<String>,
     },
+    /// Show session state and process info
     Inspect {
         id: String,
-        #[arg(long)]
+        #[arg(long, help = "Output as JSON")]
         json: bool,
     },
+    /// Send an OS signal to the session process
     Signal {
         id: String,
         signal: String,
-        #[arg(long, default_value = "foreground")]
+        #[arg(long, default_value = "foreground", help = "Signal target: foreground (default) or leader")]
         target: String,
     },
+    /// Enable output recording
     Record {
         id: String,
     },
+    /// Set a named marker in the recording
     Mark {
         id: String,
         /// Optional marker name — stores the current offset with this label

@@ -38,7 +38,9 @@ pub struct SessionInspect {
     pub id: String,
     pub state: String,
     pub vt_engine: String,
+    #[serde(default)]
     pub vt_engine_status: String,
+    #[serde(default)]
     pub functional_vt_available: bool,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
@@ -557,5 +559,20 @@ mod tests {
         frame.write(&mut bytes).expect("write");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn session_inspect_deserializes_without_vt_status_fields() {
+        let json = r#"{
+            "id": "test",
+            "state": "running",
+            "vt_engine": "ghostty",
+            "cwd": null,
+            "cmd": "bash"
+        }"#;
+        let result: super::SessionInspect = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(result.id, "test");
+        assert_eq!(result.vt_engine_status, "");
+        assert!(!result.functional_vt_available);
     }
 }

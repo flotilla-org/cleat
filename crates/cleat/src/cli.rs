@@ -2,7 +2,13 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::{keys::encode_send_keys, runtime::SessionMetadata, server::SessionService, vt::VtEngineKind};
+use crate::{
+    keys::encode_send_keys,
+    protocol::{WaitCondition, WaitStatus},
+    runtime::SessionMetadata,
+    server::SessionService,
+    vt::VtEngineKind,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "cleat", version, about = "Session daemon with a structured control plane for agents and terminal persistence")]
@@ -14,7 +20,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-#[derive(Debug, Subcommand, PartialEq, Eq)]
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum Command {
     /// Attach to a session interactively
     Attach {
@@ -122,6 +128,18 @@ pub enum Command {
     Interrupt { id: String },
     /// Send Escape to a session
     Escape { id: String },
+    /// Wait for a condition before continuing
+    Wait {
+        id: String,
+        #[arg(long, help = "Wait until output settles for this many seconds")]
+        idle_time: Option<f64>,
+        #[arg(long, help = "Wait until this text appears on screen")]
+        text: Option<String>,
+        #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
+        timeout: f64,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
     #[command(hide = true)]
     Serve {
         #[arg(long)]
@@ -145,113 +163,251 @@ pub fn command() -> clap::Command {
     Cli::command()
 }
 
-pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, String> {
+pub enum ExecResult {
+    Ok(Option<String>),
+    Err(String),
+    Exit { code: i32, message: Option<String>, output: Option<String> },
+}
+
+impl ExecResult {
+    /// Convert to `Result<Option<String>, String>`, panicking with `msg` on `Err` or `Exit`.
+    pub fn expect(self, msg: &str) -> Option<String> {
+        match self {
+            ExecResult::Ok(v) => v,
+            ExecResult::Err(e) => panic!("{msg}: {e}"),
+            ExecResult::Exit { code, message, .. } => {
+                panic!("{msg}: exit code {code}{}", message.map(|m| format!(": {m}")).unwrap_or_default())
+            }
+        }
+    }
+
+    /// Convert to the error string, panicking with `msg` if it was `Ok` or a non-error `Exit`.
+    pub fn expect_err(self, msg: &str) -> String {
+        match self {
+            ExecResult::Err(e) => e,
+            ExecResult::Ok(v) => panic!("{msg}: got Ok({v:?})"),
+            ExecResult::Exit { code, message, .. } => {
+                panic!("{msg}: got Exit {{ code: {code}, message: {message:?} }}")
+            }
+        }
+    }
+}
+
+pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     match cli.command {
         Command::Attach { id, no_create, vt, cwd, cmd, record } => {
-            let (attached, guard) = service.attach(id, vt, cwd, cmd, no_create)?;
+            let (attached, guard) = match service.attach(id, vt, cwd, cmd, no_create) {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
             if record {
-                service.record(&attached.id, true)?;
+                if let Err(e) = service.record(&attached.id, true) {
+                    return ExecResult::Err(e);
+                }
             }
-            guard.relay_stdio()?;
-            Ok(None)
+            match guard.relay_stdio() {
+                Ok(()) => ExecResult::Ok(None),
+                Err(e) => ExecResult::Err(e),
+            }
         }
         Command::Launch { id, json, vt, cwd, cmd, record } => {
-            let created = service.create(id, vt, cwd, cmd, record)?;
+            let created = match service.create(id, vt, cwd, cmd, record) {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
             if json {
-                serde_json::to_string(&created).map(Some).map_err(|err| format!("serialize create result: {err}"))
+                match serde_json::to_string(&created) {
+                    Ok(s) => ExecResult::Ok(Some(s)),
+                    Err(err) => ExecResult::Err(format!("serialize create result: {err}")),
+                }
             } else {
-                Ok(Some(created.id))
+                ExecResult::Ok(Some(created.id))
             }
         }
         Command::List { json } => {
-            let sessions = service.list()?;
+            let sessions = match service.list() {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
             if json {
-                serde_json::to_string(&sessions).map(Some).map_err(|err| format!("serialize list result: {err}"))
+                match serde_json::to_string(&sessions) {
+                    Ok(s) => ExecResult::Ok(Some(s)),
+                    Err(err) => ExecResult::Err(format!("serialize list result: {err}")),
+                }
             } else if sessions.is_empty() {
-                Ok(None)
+                ExecResult::Ok(None)
             } else {
-                Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
+                ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
         Command::Capture { id, since, since_marker, raw } => {
             if raw && since.is_none() && since_marker.is_none() {
-                return Err("--raw requires --since or --since-marker".to_string());
+                return ExecResult::Err("--raw requires --since or --since-marker".to_string());
             }
             // --since and --since-marker mutual exclusion enforced by clap conflicts_with
             let offset = match (since, &since_marker) {
                 (Some(o), _) => Some(o),
-                (_, Some(name)) => Some(service.resolve_marker(&id, name)?),
+                (_, Some(name)) => match service.resolve_marker(&id, name) {
+                    Ok(o) => Some(o),
+                    Err(e) => return ExecResult::Err(e),
+                },
                 _ => None,
             };
-            match offset {
+            let result = match offset {
                 Some(o) => {
                     if raw {
-                        service.capture_since_raw(&id, o).map(Some)
+                        service.capture_since_raw(&id, o)
                     } else {
-                        service.capture_since_text(&id, o).map(Some)
+                        service.capture_since_text(&id, o)
                     }
                 }
-                None => service.capture(&id).map(Some),
+                None => service.capture(&id),
+            };
+            match result {
+                Ok(s) => ExecResult::Ok(Some(s)),
+                Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Detach { id } => {
-            service.detach(&id)?;
-            Ok(None)
-        }
-        Command::Kill { id } => {
-            service.kill(&id)?;
-            Ok(None)
-        }
+        Command::Detach { id } => match service.detach(&id) {
+            Ok(()) => ExecResult::Ok(None),
+            Err(e) => ExecResult::Err(e),
+        },
+        Command::Kill { id } => match service.kill(&id) {
+            Ok(()) => ExecResult::Ok(None),
+            Err(e) => ExecResult::Err(e),
+        },
         Command::SendKeys { id, literal, hex, repeat, keys } => {
-            let bytes = encode_send_keys(&keys, literal, hex, repeat)?;
-            service.send_keys(&id, &bytes)?;
-            Ok(None)
+            let bytes = match encode_send_keys(&keys, literal, hex, repeat) {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
+            match service.send_keys(&id, &bytes) {
+                Ok(()) => ExecResult::Ok(None),
+                Err(e) => ExecResult::Err(e),
+            }
         }
         Command::Inspect { id, json } => {
-            let result = service.inspect(&id)?;
+            let result = match service.inspect(&id) {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
             if json {
-                serde_json::to_string_pretty(&result).map(Some).map_err(|err| format!("serialize inspect result: {err}"))
+                match serde_json::to_string_pretty(&result) {
+                    Ok(s) => ExecResult::Ok(Some(s)),
+                    Err(err) => ExecResult::Err(format!("serialize inspect result: {err}")),
+                }
             } else {
-                Ok(Some(format_inspect_human(&result)))
+                ExecResult::Ok(Some(format_inspect_human(&result)))
             }
         }
         Command::Signal { id, signal, target } => {
-            let sig = parse_signal_name(&signal)?;
-            let tgt = parse_signal_target(&target)?;
-            service.signal(&id, sig, tgt)?;
-            Ok(None)
+            let sig = match parse_signal_name(&signal) {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
+            let tgt = match parse_signal_target(&target) {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
+            match service.signal(&id, sig, tgt) {
+                Ok(()) => ExecResult::Ok(None),
+                Err(e) => ExecResult::Err(e),
+            }
         }
-        Command::Record { id } => {
-            service.record(&id, true)?;
-            Ok(None)
-        }
+        Command::Record { id } => match service.record(&id, true) {
+            Ok(()) => ExecResult::Ok(None),
+            Err(e) => ExecResult::Err(e),
+        },
         Command::Mark { id, name } => {
             let offset = match name {
-                Some(ref n) => service.named_mark(&id, n)?,
-                None => service.mark(&id)?,
+                Some(ref n) => service.named_mark(&id, n),
+                None => service.mark(&id),
             };
-            Ok(Some(offset.to_string()))
+            match offset {
+                Ok(v) => ExecResult::Ok(Some(v.to_string())),
+                Err(e) => ExecResult::Err(e),
+            }
         }
         Command::Send { id, text, no_enter } => {
             let mut bytes = text.into_bytes();
             if !no_enter {
                 bytes.push(b'\r');
             }
-            service.send_keys(&id, &bytes)?;
-            Ok(None)
+            match service.send_keys(&id, &bytes) {
+                Ok(()) => ExecResult::Ok(None),
+                Err(e) => ExecResult::Err(e),
+            }
         }
-        Command::Interrupt { id } => {
-            service.send_keys(&id, &[0x03])?;
-            Ok(None)
-        }
-        Command::Escape { id } => {
-            service.send_keys(&id, &[0x1b])?;
-            Ok(None)
-        }
+        Command::Interrupt { id } => match service.send_keys(&id, &[0x03]) {
+            Ok(()) => ExecResult::Ok(None),
+            Err(e) => ExecResult::Err(e),
+        },
+        Command::Escape { id } => match service.send_keys(&id, &[0x1b]) {
+            Ok(()) => ExecResult::Ok(None),
+            Err(e) => ExecResult::Err(e),
+        },
+        Command::Wait { id, idle_time, text, timeout, json } => execute_wait(service, id, idle_time, text, timeout, json),
         Command::Serve { id, vt, cmd, cwd, record } => {
             let session = SessionMetadata { id, vt_engine: vt, cwd, cmd, record };
-            service.serve(&session)?;
-            Ok(None)
+            match service.serve(&session) {
+                Ok(()) => ExecResult::Ok(None),
+                Err(e) => ExecResult::Err(e),
+            }
+        }
+    }
+}
+
+fn execute_wait(
+    service: &SessionService,
+    id: String,
+    idle_time: Option<f64>,
+    text: Option<String>,
+    timeout: f64,
+    json: bool,
+) -> ExecResult {
+    if idle_time.is_none() && text.is_none() {
+        return ExecResult::Err("wait requires at least one of --idle-time or --text".to_string());
+    }
+
+    let mut conditions = Vec::new();
+    if let Some(secs) = idle_time {
+        conditions.push(WaitCondition::OutputIdle { quiet_ms: (secs * 1000.0) as u64 });
+    }
+    if let Some(pattern) = text {
+        conditions.push(WaitCondition::TextMatch { text: pattern });
+    }
+    let timeout_ms = (timeout * 1000.0) as u64;
+
+    let (status, elapsed_ms) = match service.wait(&id, conditions, timeout_ms) {
+        Ok(v) => v,
+        Err(e) => return ExecResult::Err(e),
+    };
+
+    match status {
+        WaitStatus::Ready => {
+            if json {
+                ExecResult::Ok(Some(format!(r#"{{"status":"ready","elapsed_ms":{elapsed_ms}}}"#)))
+            } else {
+                ExecResult::Ok(None)
+            }
+        }
+        WaitStatus::Timeout => {
+            if json {
+                ExecResult::Exit { code: 1, message: None, output: Some(format!(r#"{{"status":"timeout","elapsed_ms":{elapsed_ms}}}"#)) }
+            } else {
+                ExecResult::Exit { code: 1, message: Some("wait timed out".to_string()), output: None }
+            }
+        }
+        WaitStatus::SessionGone => {
+            if json {
+                ExecResult::Exit {
+                    code: 2,
+                    message: None,
+                    output: Some(format!(r#"{{"status":"session_gone","elapsed_ms":{elapsed_ms}}}"#)),
+                }
+            } else {
+                ExecResult::Exit { code: 2, message: Some("session exited while waiting".to_string()), output: None }
+            }
         }
     }
 }

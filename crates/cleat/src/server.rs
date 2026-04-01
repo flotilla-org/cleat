@@ -286,6 +286,28 @@ impl SessionService {
         }
     }
 
+    pub fn wait(
+        &self,
+        id: &str,
+        conditions: Vec<crate::protocol::WaitCondition>,
+        timeout_ms: u64,
+    ) -> Result<(crate::protocol::WaitStatus, u64), String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream = connect_session_socket(&socket_path)?;
+        // The wait response can take up to timeout_ms plus some overhead.
+        // Remove any default read timeout so the blocking read succeeds.
+        stream.set_read_timeout(Some(Duration::from_millis(timeout_ms + 5000))).map_err(|err| format!("set read timeout: {err}"))?;
+        Frame::Wait { conditions, timeout_ms }.write(&mut stream).map_err(|err| format!("write wait request: {err}"))?;
+        match Frame::read(&mut stream).map_err(|err| format!("read wait response: {err}"))? {
+            Frame::WaitResult { status, elapsed_ms } => Ok((status, elapsed_ms)),
+            Frame::Error(message) => Err(message),
+            other => Err(format!("unexpected wait response: {other:?}")),
+        }
+    }
+
     pub fn serve(&self, session: &crate::runtime::SessionMetadata) -> Result<(), String> {
         run_session_daemon(self.layout.root(), session)
     }

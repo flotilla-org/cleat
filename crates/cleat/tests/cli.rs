@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser};
 use cleat::{
-    cli::{execute, Cli, Command},
+    cli::{execute, Cli, Command, ExecResult},
     runtime::RuntimeLayout,
     server::SessionService,
     vt::VtEngineKind,
@@ -24,7 +24,8 @@ fn help_lists_expected_subcommands() {
         "mark",
         "send",
         "interrupt",
-        "escape"
+        "escape",
+        "wait"
     ]);
     assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
 }
@@ -238,7 +239,11 @@ fn send_keys_execute_reports_missing_session() {
     };
     let service = SessionService::new(RuntimeLayout::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()));
 
-    let err = execute(cli, &service).expect_err("missing session should fail");
+    let result = execute(cli, &service);
+    let err = match result {
+        ExecResult::Err(e) => e,
+        _ => panic!("missing session should fail"),
+    };
     assert!(err.contains("missing"));
 }
 
@@ -265,7 +270,11 @@ fn capture_raw_without_since_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
     let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--raw"]).expect("parse");
-    let err = execute(cli, &service).unwrap_err();
+    let result = execute(cli, &service);
+    let err = match result {
+        ExecResult::Err(e) => e,
+        _ => panic!("--raw without --since should fail"),
+    };
     assert!(err.contains("--raw requires --since or --since-marker"));
 }
 
@@ -315,4 +324,51 @@ fn interrupt_command_parses() {
 fn escape_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "escape", "demo"]).expect("escape parses");
     assert_eq!(cli.command, Command::Escape { id: "demo".into() });
+}
+
+#[test]
+fn wait_requires_at_least_one_condition() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess"]).expect("parse succeeds");
+    // The validation happens at execute time, not parse time
+    // But we can test that it parses and has the right defaults
+    assert!(matches!(cli.command, Command::Wait { idle_time: None, text: None, timeout, json: false, .. } if timeout == 30.0));
+}
+
+#[test]
+fn wait_idle_time_parses() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "2.0"]).expect("parse");
+    assert!(matches!(cli.command, Command::Wait { idle_time: Some(t), text: None, .. } if (t - 2.0).abs() < f64::EPSILON));
+}
+
+#[test]
+fn wait_text_parses() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--text", "DONE"]).expect("parse");
+    assert!(matches!(cli.command, Command::Wait { text: Some(ref t), idle_time: None, .. } if t == "DONE"));
+}
+
+#[test]
+fn wait_combined_parses() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "1.0", "--text", "ready", "--timeout", "10"]).expect("parse");
+    assert!(
+        matches!(cli.command, Command::Wait { idle_time: Some(_), text: Some(_), timeout, .. } if (timeout - 10.0).abs() < f64::EPSILON)
+    );
+}
+
+#[test]
+fn wait_json_flag() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "1", "--json"]).expect("parse");
+    assert!(matches!(cli.command, Command::Wait { json: true, .. }));
+}
+
+#[test]
+fn wait_execute_rejects_no_conditions() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess"]).expect("parse");
+    let result = execute(cli, &service);
+    let err = match result {
+        ExecResult::Err(e) => e,
+        _ => panic!("wait without conditions should fail"),
+    };
+    assert!(err.contains("at least one of --idle-time or --text"));
 }

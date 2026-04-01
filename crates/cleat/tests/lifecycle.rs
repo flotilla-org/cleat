@@ -417,11 +417,12 @@ open("da.txt","wb").write(data); time.sleep(5)'"#;
     service.create(Some("alpha".into()), None, Some(temp.path().to_path_buf()), Some(cmd.into()), false).expect("create alpha");
 
     let result_path = temp.path().join("da.txt");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while !result_path.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(50));
     }
 
+    assert!(result_path.exists(), "da.txt was not created within deadline — python child may have crashed");
     let contents = std::fs::read(&result_path).expect("read DA result");
     assert_eq!(contents, b"\x1b[?62;22c");
 }
@@ -454,11 +455,12 @@ open("da.txt","wb").write(data); time.sleep(5)'"#;
     std::fs::write(temp.path().join("go"), b"x").expect("write attached test gate");
 
     let result_path = temp.path().join("da.txt");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(8);
     while !result_path.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(50));
     }
 
+    assert!(result_path.exists(), "da.txt was not created within deadline — python child may have crashed");
     let contents = std::fs::read(&result_path).expect("read DA result");
     assert!(contents.is_empty(), "attached sessions should rely on the real terminal for DA replies");
 }

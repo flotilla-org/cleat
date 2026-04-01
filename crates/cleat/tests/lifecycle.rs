@@ -8,7 +8,7 @@ use std::{
 
 use clap::Parser;
 use cleat::{
-    cli::{self, Cli, ExecResult},
+    cli::{self, Cli},
     protocol::{Frame, SessionInfo},
     runtime::RuntimeLayout,
     server::SessionService,
@@ -176,6 +176,7 @@ fn capture_rejects_passthrough_sessions() {
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn capture_returns_text_for_ghostty_sessions() {
+    use cleat::cli::ExecResult;
     if !require_python3() {
         return;
     }

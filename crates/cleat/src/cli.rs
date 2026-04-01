@@ -111,6 +111,22 @@ pub enum Command {
         #[arg(value_name = "NAME")]
         name: Option<String>,
     },
+    /// Send text to a session
+    Send {
+        id: String,
+        #[arg(value_name = "TEXT", help = "Text to send")]
+        text: String,
+        #[arg(long, help = "Do not append Enter after the text")]
+        no_enter: bool,
+    },
+    /// Send Ctrl-C to a session
+    Interrupt {
+        id: String,
+    },
+    /// Send Escape to a session
+    Escape {
+        id: String,
+    },
     #[command(hide = true)]
     Serve {
         #[arg(long)]
@@ -220,6 +236,22 @@ pub fn execute(cli: Cli, service: &SessionService) -> Result<Option<String>, Str
                 None => service.mark(&id)?,
             };
             Ok(Some(offset.to_string()))
+        }
+        Command::Send { id, text, no_enter } => {
+            let mut bytes = text.into_bytes();
+            if !no_enter {
+                bytes.push(b'\r');
+            }
+            service.send_keys(&id, &bytes)?;
+            Ok(None)
+        }
+        Command::Interrupt { id } => {
+            service.send_keys(&id, &[0x03])?;
+            Ok(None)
+        }
+        Command::Escape { id } => {
+            service.send_keys(&id, &[0x1b])?;
+            Ok(None)
         }
         Command::Serve { id, vt, cmd, cwd, record } => {
             let session = SessionMetadata { id, vt_engine: vt, cwd, cmd, record };

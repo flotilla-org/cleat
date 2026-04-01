@@ -21,7 +21,10 @@ fn help_lists_expected_subcommands() {
         "inspect",
         "signal",
         "record",
-        "mark"
+        "mark",
+        "send",
+        "interrupt",
+        "escape"
     ]);
     assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
 }
@@ -288,4 +291,28 @@ fn capture_with_since_marker_parses() {
 fn capture_since_and_since_marker_are_mutually_exclusive() {
     let result = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "100", "--since-marker", "foo"]);
     assert!(result.is_err(), "--since and --since-marker should be mutually exclusive");
+}
+
+#[test]
+fn send_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "send", "demo", "echo hello"]).expect("send parses");
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "echo hello".into(), no_enter: false });
+}
+
+#[test]
+fn send_command_parses_no_enter() {
+    let cli = Cli::try_parse_from(["cleat", "send", "--no-enter", "demo", "partial"]).expect("send --no-enter parses");
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true });
+}
+
+#[test]
+fn interrupt_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "interrupt", "demo"]).expect("interrupt parses");
+    assert_eq!(cli.command, Command::Interrupt { id: "demo".into() });
+}
+
+#[test]
+fn escape_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "escape", "demo"]).expect("escape parses");
+    assert_eq!(cli.command, Command::Escape { id: "demo".into() });
 }

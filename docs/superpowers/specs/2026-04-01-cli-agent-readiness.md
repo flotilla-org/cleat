@@ -147,7 +147,7 @@ At least one condition is required. There is no implicit default mode — proces
 
 The current binary exits 0 or 1 for all commands (`main.rs` maps `Err` to exit code 1). This spec requires changing `cli::execute` to return a typed result that `main` maps to distinct exit codes. The `WaitTimeout` variant maps to exit 1; other errors map to exit 2. All existing commands continue to exit 0 on success and 1 on error (no behavior change for them).
 
-**`--json`** outputs `{"status": "ready", "elapsed_ms": 342}` or `{"status": "timeout", "elapsed_ms": 30000}`. Without `--json`, silent on success, error message on timeout or failure.
+**`--json`** outputs a JSON object with `status` and `elapsed_ms`. Status values: `"ready"`, `"timeout"`, `"session_gone"`. Examples: `{"status": "ready", "elapsed_ms": 342}`, `{"status": "timeout", "elapsed_ms": 30000}`, `{"status": "session_gone", "elapsed_ms": 1204}`. Without `--json`, silent on success, error message on timeout or session gone.
 
 #### Protocol
 
@@ -169,7 +169,7 @@ Frame::WaitResult { status: WaitStatus, elapsed_ms: u64 }
 
 If the session process exits while a wait is pending, the daemon writes `WaitResult { status: SessionGone }`. If the socket drops unexpectedly (daemon crash), the client treats the read error as exit code 2.
 
-The daemon registers the wait conditions on the accepted socket connection. Conditions are evaluated immediately at registration (so `--text` succeeds instantly if the text is already on screen, and `--idle-time` succeeds if output has already been quiet long enough). After registration, the event loop evaluates pending conditions on each loop tick — not only after PTY reads, since `--idle-time` requires timer-driven evaluation when no output arrives. When any condition is met, the timeout expires, or the session exits, the daemon writes `WaitResult` and closes the wait. Multiple concurrent waiters are supported — each wait request opens its own socket connection and the daemon tracks each independently.
+The daemon registers the wait conditions on the accepted socket connection. Conditions are evaluated immediately at registration (so `--text` succeeds instantly if the text is already on screen). Note: `--idle-time` cannot succeed at registration because silence is measured from registration time — see the idle-time definition above. After registration, the event loop evaluates pending conditions on each loop tick — not only after PTY reads, since `--idle-time` requires timer-driven evaluation when no output arrives. When any condition is met, the timeout expires, or the session exits, the daemon writes `WaitResult` and closes the wait. Multiple concurrent waiters are supported — each wait request opens its own socket connection and the daemon tracks each independently.
 
 ### 4. Off-by-one in since-marker capture
 

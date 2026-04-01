@@ -163,6 +163,7 @@ pub fn command() -> clap::Command {
     Cli::command()
 }
 
+#[derive(Debug)]
 pub enum ExecResult {
     Ok(Option<String>),
     Err(String),
@@ -366,7 +367,11 @@ fn execute_wait(
     json: bool,
 ) -> ExecResult {
     if idle_time.is_none() && text.is_none() {
-        return ExecResult::Err("wait requires at least one of --idle-time or --text".to_string());
+        return ExecResult::Exit {
+            code: 2,
+            message: Some("wait requires at least one of --idle-time or --text".to_string()),
+            output: None,
+        };
     }
 
     let mut conditions = Vec::new();
@@ -380,7 +385,9 @@ fn execute_wait(
 
     let (status, elapsed_ms) = match service.wait(&id, conditions, timeout_ms) {
         Ok(v) => v,
-        Err(e) => return ExecResult::Err(e),
+        Err(e) => {
+            return ExecResult::Exit { code: 2, message: Some(e), output: None };
+        }
     };
 
     match status {

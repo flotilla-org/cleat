@@ -366,9 +366,10 @@ fn wait_execute_rejects_no_conditions() {
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
     let cli = Cli::try_parse_from(["cleat", "wait", "sess"]).expect("parse");
     let result = execute(cli, &service);
-    let err = match result {
-        ExecResult::Err(e) => e,
-        _ => panic!("wait without conditions should fail"),
-    };
-    assert!(err.contains("at least one of --idle-time or --text"));
+    match result {
+        ExecResult::Exit { code: 2, message: Some(msg), .. } => {
+            assert!(msg.contains("at least one of --idle-time or --text"));
+        }
+        other => panic!("wait without conditions should exit 2, got: {other:?}"),
+    }
 }

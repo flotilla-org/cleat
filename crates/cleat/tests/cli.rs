@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser};
 use cleat::{
-    cli::{execute, Cli, Command},
+    cli::{execute, Cli, Command, ExecResult},
     runtime::RuntimeLayout,
     server::SessionService,
     vt::VtEngineKind,
@@ -12,7 +12,7 @@ fn help_lists_expected_subcommands() {
     let subcommands: Vec<_> = command.get_subcommands().filter(|sub| !sub.is_hide_set()).map(|sub| sub.get_name().to_string()).collect();
     assert_eq!(subcommands, vec![
         "attach",
-        "create",
+        "launch",
         "list",
         "capture",
         "detach",
@@ -21,8 +21,13 @@ fn help_lists_expected_subcommands() {
         "inspect",
         "signal",
         "record",
-        "mark"
+        "mark",
+        "send",
+        "interrupt",
+        "escape",
+        "wait"
     ]);
+    assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
 }
 
 #[test]
@@ -51,15 +56,15 @@ fn attach_command_parses_vt() {
 }
 
 #[test]
-fn create_command_parses() {
-    let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create parses");
-    assert_eq!(cli.command, Command::Create { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
+fn launch_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "--cmd", "bash"]).expect("launch parses");
+    assert_eq!(cli.command, Command::Launch { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
 }
 
 #[test]
-fn create_command_parses_positional_name() {
-    let cli = Cli::try_parse_from(["cleat", "create", "demo", "--cmd", "bash"]).expect("create positional parses");
-    assert_eq!(cli.command, Command::Create {
+fn launch_command_parses_positional_name() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--cmd", "bash"]).expect("launch positional parses");
+    assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         json: false,
         vt: None,
@@ -70,15 +75,15 @@ fn create_command_parses_positional_name() {
 }
 
 #[test]
-fn create_command_parses_json() {
-    let cli = Cli::try_parse_from(["cleat", "create", "--json", "demo"]).expect("create --json parses");
-    assert_eq!(cli.command, Command::Create { id: Some("demo".into()), json: true, vt: None, cwd: None, cmd: None, record: false });
+fn launch_command_parses_json() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
+    assert_eq!(cli.command, Command::Launch { id: Some("demo".into()), json: true, vt: None, cwd: None, cmd: None, record: false });
 }
 
 #[test]
-fn create_command_parses_vt() {
-    let cli = Cli::try_parse_from(["cleat", "create", "--vt", "ghostty", "demo"]).expect("create --vt parses");
-    assert_eq!(cli.command, Command::Create {
+fn launch_command_parses_vt() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "--vt", "ghostty", "demo"]).expect("launch --vt parses");
+    assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         json: false,
         vt: Some(VtEngineKind::Ghostty),
@@ -86,6 +91,12 @@ fn create_command_parses_vt() {
         cmd: None,
         record: false
     });
+}
+
+#[test]
+fn create_alias_still_parses_as_launch() {
+    let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create alias parses");
+    assert_eq!(cli.command, Command::Launch { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
 }
 
 #[test]
@@ -202,9 +213,9 @@ fn record_parses_session_id() {
 }
 
 #[test]
-fn create_record_flag() {
-    let cli = Cli::try_parse_from(["cleat", "create", "alpha", "--record"]).expect("parse create --record");
-    assert!(matches!(cli.command, Command::Create { record: true, .. }));
+fn launch_record_flag() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "alpha", "--record"]).expect("parse launch --record");
+    assert!(matches!(cli.command, Command::Launch { record: true, .. }));
 }
 
 #[test]
@@ -228,7 +239,11 @@ fn send_keys_execute_reports_missing_session() {
     };
     let service = SessionService::new(RuntimeLayout::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()));
 
-    let err = execute(cli, &service).expect_err("missing session should fail");
+    let result = execute(cli, &service);
+    let err = match result {
+        ExecResult::Err(e) => e,
+        _ => panic!("missing session should fail"),
+    };
     assert!(err.contains("missing"));
 }
 
@@ -255,7 +270,11 @@ fn capture_raw_without_since_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
     let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--raw"]).expect("parse");
-    let err = execute(cli, &service).unwrap_err();
+    let result = execute(cli, &service);
+    let err = match result {
+        ExecResult::Err(e) => e,
+        _ => panic!("--raw without --since should fail"),
+    };
     assert!(err.contains("--raw requires --since or --since-marker"));
 }
 
@@ -281,4 +300,76 @@ fn capture_with_since_marker_parses() {
 fn capture_since_and_since_marker_are_mutually_exclusive() {
     let result = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "100", "--since-marker", "foo"]);
     assert!(result.is_err(), "--since and --since-marker should be mutually exclusive");
+}
+
+#[test]
+fn send_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "send", "demo", "echo hello"]).expect("send parses");
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "echo hello".into(), no_enter: false });
+}
+
+#[test]
+fn send_command_parses_no_enter() {
+    let cli = Cli::try_parse_from(["cleat", "send", "--no-enter", "demo", "partial"]).expect("send --no-enter parses");
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true });
+}
+
+#[test]
+fn interrupt_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "interrupt", "demo"]).expect("interrupt parses");
+    assert_eq!(cli.command, Command::Interrupt { id: "demo".into() });
+}
+
+#[test]
+fn escape_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "escape", "demo"]).expect("escape parses");
+    assert_eq!(cli.command, Command::Escape { id: "demo".into() });
+}
+
+#[test]
+fn wait_requires_at_least_one_condition() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess"]).expect("parse succeeds");
+    // The validation happens at execute time, not parse time
+    // But we can test that it parses and has the right defaults
+    assert!(matches!(cli.command, Command::Wait { idle_time: None, text: None, timeout, json: false, .. } if timeout == 30.0));
+}
+
+#[test]
+fn wait_idle_time_parses() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "2.0"]).expect("parse");
+    assert!(matches!(cli.command, Command::Wait { idle_time: Some(t), text: None, .. } if (t - 2.0).abs() < f64::EPSILON));
+}
+
+#[test]
+fn wait_text_parses() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--text", "DONE"]).expect("parse");
+    assert!(matches!(cli.command, Command::Wait { text: Some(ref t), idle_time: None, .. } if t == "DONE"));
+}
+
+#[test]
+fn wait_combined_parses() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "1.0", "--text", "ready", "--timeout", "10"]).expect("parse");
+    assert!(
+        matches!(cli.command, Command::Wait { idle_time: Some(_), text: Some(_), timeout, .. } if (timeout - 10.0).abs() < f64::EPSILON)
+    );
+}
+
+#[test]
+fn wait_json_flag() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "1", "--json"]).expect("parse");
+    assert!(matches!(cli.command, Command::Wait { json: true, .. }));
+}
+
+#[test]
+fn wait_execute_rejects_no_conditions() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess"]).expect("parse");
+    let result = execute(cli, &service);
+    match result {
+        ExecResult::Exit { code: 2, message: Some(msg), .. } => {
+            assert!(msg.contains("at least one of --idle-time or --text"));
+        }
+        other => panic!("wait without conditions should exit 2, got: {other:?}"),
+    }
 }

@@ -88,6 +88,21 @@ const TAG_RECORD_CONTROL: u8 = 14;
 const TAG_MARK: u8 = 15;
 const TAG_MARK_RESULT: u8 = 16;
 const TAG_RESOLVE_MARKER: u8 = 17;
+const TAG_WAIT: u8 = 18;
+const TAG_WAIT_RESULT: u8 = 19;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitCondition {
+    OutputIdle { quiet_ms: u64 },
+    TextMatch { text: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitStatus {
+    Ready = 0,
+    Timeout = 1,
+    SessionGone = 2,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -108,6 +123,8 @@ pub enum Frame {
     Mark { name: Option<String> },
     MarkResult { offset: u64 },
     ResolveMarker { name: String },
+    Wait { conditions: Vec<WaitCondition>, timeout_ms: u64 },
+    WaitResult { status: WaitStatus, elapsed_ms: u64 },
 }
 
 impl Frame {
@@ -171,6 +188,33 @@ impl Frame {
             }
             Frame::MarkResult { offset } => (TAG_MARK_RESULT, offset.to_le_bytes().to_vec()),
             Frame::ResolveMarker { ref name } => (TAG_RESOLVE_MARKER, name.as_bytes().to_vec()),
+            Frame::Wait { ref conditions, timeout_ms } => {
+                debug_assert!(conditions.len() <= 255, "wait frame supports at most 255 conditions");
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&timeout_ms.to_le_bytes());
+                payload.push(conditions.len() as u8);
+                for condition in conditions {
+                    match condition {
+                        WaitCondition::OutputIdle { quiet_ms } => {
+                            payload.push(0);
+                            payload.extend_from_slice(&quiet_ms.to_le_bytes());
+                        }
+                        WaitCondition::TextMatch { text } => {
+                            debug_assert!(text.len() <= u32::MAX as usize, "text match pattern too long");
+                            payload.push(1);
+                            payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                            payload.extend_from_slice(text.as_bytes());
+                        }
+                    }
+                }
+                (TAG_WAIT, payload)
+            }
+            Frame::WaitResult { status, elapsed_ms } => {
+                let mut payload = Vec::with_capacity(9);
+                payload.push(*status as u8);
+                payload.extend_from_slice(&elapsed_ms.to_le_bytes());
+                (TAG_WAIT_RESULT, payload)
+            }
         }
     }
 
@@ -230,6 +274,76 @@ impl Frame {
                     u64::from_le_bytes([payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]]);
                 Ok(Frame::MarkResult { offset })
             }
+            TAG_WAIT => {
+                if payload.len() < 9 {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid wait frame: too short"));
+                }
+                let timeout_ms =
+                    u64::from_le_bytes([payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]]);
+                let num_conditions = payload[8] as usize;
+                let mut offset = 9;
+                let mut conditions = Vec::with_capacity(num_conditions);
+                for _ in 0..num_conditions {
+                    if offset >= payload.len() {
+                        return Err(Error::new(ErrorKind::InvalidData, "invalid wait frame: truncated condition"));
+                    }
+                    let condition_tag = payload[offset];
+                    offset += 1;
+                    match condition_tag {
+                        0 => {
+                            if offset + 8 > payload.len() {
+                                return Err(Error::new(ErrorKind::InvalidData, "invalid wait frame: truncated output_idle"));
+                            }
+                            let quiet_ms = u64::from_le_bytes([
+                                payload[offset],
+                                payload[offset + 1],
+                                payload[offset + 2],
+                                payload[offset + 3],
+                                payload[offset + 4],
+                                payload[offset + 5],
+                                payload[offset + 6],
+                                payload[offset + 7],
+                            ]);
+                            offset += 8;
+                            conditions.push(WaitCondition::OutputIdle { quiet_ms });
+                        }
+                        1 => {
+                            if offset + 4 > payload.len() {
+                                return Err(Error::new(ErrorKind::InvalidData, "invalid wait frame: truncated text_match length"));
+                            }
+                            let text_len =
+                                u32::from_le_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]])
+                                    as usize;
+                            offset += 4;
+                            if offset + text_len > payload.len() {
+                                return Err(Error::new(ErrorKind::InvalidData, "invalid wait frame: truncated text_match text"));
+                            }
+                            let text = String::from_utf8(payload[offset..offset + text_len].to_vec())
+                                .map_err(|e| Error::new(ErrorKind::InvalidData, format!("invalid wait text_match utf-8: {e}")))?;
+                            offset += text_len;
+                            conditions.push(WaitCondition::TextMatch { text });
+                        }
+                        _ => {
+                            return Err(Error::new(ErrorKind::InvalidData, format!("invalid wait condition tag: {condition_tag}")));
+                        }
+                    }
+                }
+                Ok(Frame::Wait { conditions, timeout_ms })
+            }
+            TAG_WAIT_RESULT => {
+                if payload.len() != 9 {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid wait result frame"));
+                }
+                let status = match payload[0] {
+                    0 => WaitStatus::Ready,
+                    1 => WaitStatus::Timeout,
+                    2 => WaitStatus::SessionGone,
+                    _ => return Err(Error::new(ErrorKind::InvalidData, format!("invalid wait status: {}", payload[0]))),
+                };
+                let elapsed_ms =
+                    u64::from_le_bytes([payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7], payload[8]]);
+                Ok(Frame::WaitResult { status, elapsed_ms })
+            }
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
     }
@@ -281,7 +395,7 @@ fn decode_capabilities(byte: u8) -> std::io::Result<ClientCapabilities> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, SignalTarget};
+    use super::{Frame, SignalTarget, WaitCondition, WaitStatus};
     use crate::vt::{ClientCapabilities, ColorLevel};
 
     #[test]
@@ -382,5 +496,62 @@ mod tests {
         frame.write(&mut bytes).expect("write");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
         assert_eq!(decoded, Frame::ResolveMarker { name: "checkpoint".to_string() });
+    }
+
+    #[test]
+    fn wait_output_idle_round_trip() {
+        let frame = Frame::Wait { conditions: vec![WaitCondition::OutputIdle { quiet_ms: 500 }], timeout_ms: 5000 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn wait_text_match_round_trip() {
+        let frame = Frame::Wait { conditions: vec![WaitCondition::TextMatch { text: "hello world".to_string() }], timeout_ms: 3000 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn wait_combined_conditions_round_trip() {
+        let frame = Frame::Wait {
+            conditions: vec![WaitCondition::OutputIdle { quiet_ms: 200 }, WaitCondition::TextMatch { text: "$ ".to_string() }],
+            timeout_ms: 10000,
+        };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn wait_result_ready_round_trip() {
+        let frame = Frame::WaitResult { status: WaitStatus::Ready, elapsed_ms: 42 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn wait_result_timeout_round_trip() {
+        let frame = Frame::WaitResult { status: WaitStatus::Timeout, elapsed_ms: 5000 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn wait_result_session_gone_round_trip() {
+        let frame = Frame::WaitResult { status: WaitStatus::SessionGone, elapsed_ms: 1234 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
     }
 }

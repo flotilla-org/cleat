@@ -444,6 +444,13 @@ fn apply_attach_state(
     }
 }
 
+struct PendingWait {
+    stream: UnixStream,
+    conditions: Vec<crate::protocol::WaitCondition>,
+    timeout_ms: u64,
+    registered_at: Instant,
+}
+
 #[cfg(unix)]
 pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
     let id = &session.id;
@@ -484,6 +491,8 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         }
     }
     let mut had_foreground_client = false;
+    let mut pending_waits: Vec<PendingWait> = Vec::new();
+    let mut last_pty_output_at: Option<Instant> = None;
     loop {
         let poll_result = poll_ready(
             listener.as_raw_fd(),
@@ -583,13 +592,15 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         Ok(Frame::Mark { name }) => {
                             if let Some(ref mut rec) = recorder {
                                 rec.flush();
-                                let offset = rec.bytes_written();
                                 if let Some(ref marker_name) = name {
-                                    markers.insert(marker_name.clone(), offset);
                                     // Emit standard asciicast "m" event
                                     rec.event(crate::asciicast::EventCode::Marker, marker_name, epoch.elapsed());
+                                    // Store the offset *after* the marker event so that
+                                    // read_events_since starts at the first event following
+                                    // the marker rather than at the marker line itself.
+                                    markers.insert(marker_name.clone(), rec.bytes_written());
                                 }
-                                let _ = Frame::MarkResult { offset }.write(&mut stream);
+                                let _ = Frame::MarkResult { offset: rec.bytes_written() }.write(&mut stream);
                             } else {
                                 let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
                             }
@@ -645,6 +656,43 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             } else {
                                 let _ = Frame::Ack.write(&mut stream);
                             }
+                        }
+                        Ok(Frame::Wait { conditions, timeout_ms }) => 'wait: {
+                            if conditions.is_empty() {
+                                let _ = Frame::Error("at least one wait condition is required".to_string()).write(&mut stream);
+                                break 'wait;
+                            }
+
+                            // Validate: TextMatch requires screen_text support
+                            let has_text_match = conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::TextMatch { .. }));
+                            if has_text_match {
+                                if let Err(err) = vt_engine.screen_text() {
+                                    let _ = Frame::Error(format!("text matching not supported: {err}")).write(&mut stream);
+                                    break 'wait;
+                                }
+                            }
+
+                            // Check --text immediately at registration
+                            if has_text_match {
+                                if let Ok(screen) = vt_engine.screen_text() {
+                                    for condition in &conditions {
+                                        if let crate::protocol::WaitCondition::TextMatch { text } = condition {
+                                            if screen.contains(text.as_str()) {
+                                                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
+                                                    .write(&mut stream);
+                                                break 'wait;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Register for async evaluation
+                            if let Err(err) = stream.set_nonblocking(true) {
+                                let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
+                                break 'wait;
+                            }
+                            pending_waits.push(PendingWait { stream, conditions, timeout_ms, registered_at: Instant::now() });
                         }
                         Ok(_) => {
                             let _ = Frame::Busy.write(&mut stream);
@@ -732,6 +780,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 match read_fd(pty_fd, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        last_pty_output_at = Some(Instant::now());
                         record_pty_output(vt_engine.as_mut(), &buf[..n])?;
                         if let Some(ref mut rec) = recorder {
                             let elapsed = epoch.elapsed();
@@ -773,7 +822,53 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
         }
 
+        // Evaluate pending waits on each loop tick.
+        // Write errors are intentionally discarded — the client may have disconnected.
+        pending_waits.retain_mut(|wait| {
+            let elapsed = wait.registered_at.elapsed();
+            let elapsed_ms = elapsed.as_millis() as u64;
+
+            // Check timeout first
+            if elapsed_ms >= wait.timeout_ms {
+                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Timeout, elapsed_ms }.write(&mut wait.stream);
+                return false;
+            }
+
+            // Check conditions (OR semantics — any match wins)
+            for condition in &wait.conditions {
+                match condition {
+                    crate::protocol::WaitCondition::OutputIdle { quiet_ms } => {
+                        // Silence measured from max(registration_time, last_output_time)
+                        let silence_since = match last_pty_output_at {
+                            Some(t) if t > wait.registered_at => t,
+                            _ => wait.registered_at,
+                        };
+                        let quiet_duration = silence_since.elapsed().as_millis() as u64;
+                        if quiet_duration >= *quiet_ms {
+                            let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut wait.stream);
+                            return false;
+                        }
+                    }
+                    crate::protocol::WaitCondition::TextMatch { text } => {
+                        if let Ok(screen) = vt_engine.screen_text() {
+                            if screen.contains(text.as_str()) {
+                                let _ =
+                                    Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut wait.stream);
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            true // keep waiting
+        });
+
         if let Some(status) = child_exited(pty_child.pid)? {
+            for mut wait in pending_waits.drain(..) {
+                let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
+                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut wait.stream);
+            }
             if let Some(ref mut rec) = recorder {
                 let code = exit_code_from_wait_status(&status);
                 rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());

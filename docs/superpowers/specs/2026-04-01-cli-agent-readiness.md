@@ -10,7 +10,7 @@ An audit of cleat's CLI from an agent's perspective revealed five gaps:
 
 2. **`send-keys` is awkward for agents.** Agents almost always send literal text followed by Enter. With `send-keys`, this requires two calls (`send-keys -l 'echo hello'` then `send-keys Enter`) because `-l` makes `Enter` literal.
 
-3. **No `wait` primitive.** Agents sleep and hope the command finished. No way to block until the shell is idle.
+3. **No `wait` primitive.** Agents sleep and hope the command finished. No way to block until output settles or a condition is met.
 
 4. **Command names diverge from tmux-cli.** Agents trained on tmux-cli expect `launch`, `send`, `interrupt`. Cleat uses `create` and lacks the high-level verbs.
 
@@ -37,7 +37,7 @@ Add clap `about` and `help` attributes throughout.
 | `capture` | Capture terminal screen content |
 | `list` | List all sessions |
 | `inspect` | Show session state and process info |
-| `wait` | Wait for a session to become idle |
+| `wait` | Wait for a condition before continuing |
 | `kill` | Terminate a session |
 | `detach` | Detach from a session |
 | `signal` | Send an OS signal to the session process |
@@ -88,7 +88,7 @@ Examples:   cleat send-keys myapp Enter
 
 **Rename `create` to `launch`**
 
-Rename the `Create` variant to `Launch` in the `Command` enum. Add `#[command(alias = "create")]` for backwards compatibility. Same arguments and behavior.
+Rename the `Create` variant to `Launch` in the `Command` enum. Add `#[command(alias = "create")]` as a hidden alias for backwards compatibility. Same arguments and behavior.
 
 Add help guidance in `after_long_help`:
 
@@ -127,16 +127,16 @@ Sends `0x1b` (Escape). Equivalent to `send-keys <ID> Escape`.
 ### 3. `wait` command
 
 ```
-cleat wait <ID> [--timeout <SECS>] [--idle-time <SECS>] [--text <TEXT>] [--json]
+cleat wait <ID> <--idle-time <SECS> | --text <TEXT>> [--timeout <SECS>] [--json]
 ```
 
-**Default mode — process state.** The daemon checks `tcgetpgrp` on each event loop cycle and responds when `foreground_pgid == leader_pid` (the shell is idle — the foreground command returned).
+At least one condition is required. There is no implicit default mode — process-state detection (`foreground_pgid == leader_pid`) only works for shell sessions and silently gives wrong answers for non-shell commands (e.g. `launch --cmd 'sleep 60'` would report "ready" immediately). Callers specify what they are waiting for.
 
 **`--idle-time <SECS>` — output silence.** The daemon tracks when PTY output last arrived and responds when no output has arrived for the specified duration.
 
-**`--text <TEXT>` — text match.** The daemon checks the VT-rendered screen after each output event and responds when the text appears.
+**`--text <TEXT>` — text match.** The daemon checks the VT-rendered screen after each output event and responds when the text appears. Returns an error for passthrough sessions (text matching requires a VT engine that supports screen capture, same as `capture` without `--since`).
 
-`--idle-time` and `--text` are mutually exclusive. Each wait request evaluates one condition.
+**Flags compose with OR semantics.** When both `--idle-time` and `--text` are specified, the daemon responds when *either* condition is met — "wait until this text appears or output settles." This matches the agent intent: multiple heuristics for "something finished."
 
 **`--timeout <SECS>`** applies to all modes. Default: 30 seconds.
 
@@ -145,6 +145,8 @@ cleat wait <ID> [--timeout <SECS>] [--idle-time <SECS>] [--text <TEXT>] [--json]
 - 1 — timeout
 - 2 — session gone or error
 
+The current binary exits 0 or 1 for all commands (`main.rs` maps `Err` to exit code 1). This spec requires changing `cli::execute` to return a typed result that `main` maps to distinct exit codes. The `WaitTimeout` variant maps to exit 1; other errors map to exit 2. All existing commands continue to exit 0 on success and 1 on error (no behavior change for them).
+
 **`--json`** outputs `{"status": "ready", "elapsed_ms": 342}` or `{"status": "timeout", "elapsed_ms": 30000}`. Without `--json`, silent on success, error message on timeout or failure.
 
 #### Protocol
@@ -152,12 +154,11 @@ cleat wait <ID> [--timeout <SECS>] [--idle-time <SECS>] [--text <TEXT>] [--json]
 New frames:
 
 ```
-Frame::Wait { mode: WaitMode, timeout_ms: u64 }
+Frame::Wait { conditions: Vec<WaitCondition>, timeout_ms: u64 }
 Frame::WaitResult { status: WaitStatus, elapsed_ms: u64 }
 ```
 
-`WaitMode` variants:
-- `ProcessIdle` — foreground pgid == leader pid
+`WaitCondition` variants:
 - `OutputIdle { quiet_ms: u64 }` — no PTY output for `quiet_ms` milliseconds
 - `TextMatch { text: String }` — text found on VT-rendered screen
 
@@ -165,23 +166,23 @@ Frame::WaitResult { status: WaitStatus, elapsed_ms: u64 }
 - `Ready`
 - `Timeout`
 
-The daemon registers the wait condition on the accepted socket connection. The event loop evaluates pending wait conditions after each PTY read or SIGCHLD. When the condition is met or the timeout expires, the daemon writes `WaitResult` and closes the wait.
+The daemon registers the wait conditions on the accepted socket connection. The event loop evaluates pending conditions after each PTY read. When any condition is met or the timeout expires, the daemon writes `WaitResult` and closes the wait. Multiple concurrent waiters are supported — each wait request opens its own socket connection and the daemon tracks each independently.
 
 ### 4. Off-by-one in since-marker capture
 
 **Symptom:** `capture --since-marker` starts with a duplicated first character (`eecho hello` instead of `echo hello`).
 
-**Area:** The boundary between `mark` (flushes coalescing buffer, records `bytes_written()`) and `read_output_since` (seeks to that offset). The coalescing buffer may split terminal echo into separate events based on arrival timing.
+**Investigation required.** The marker offset is recorded after `rec.flush()` and before the marker event is written, in the single-threaded daemon event loop (`session.rs:583`). The offset should be writer-aligned. The root cause could be in the stored offset, the reader's seek behavior, or a race between PTY output arrival and the flush. Do not prescribe a fix direction until the fault is identified.
 
 **Approach:** Test-first.
 
 1. Write a test that creates a session, waits for the prompt to settle, sets a marker, sends known text, captures since the marker, and asserts the exact output.
-2. Dump the raw cast file around the marker offset to see event boundaries.
-3. Check whether the coalescing flush in the mark handler races with concurrent PTY output on the event loop.
-4. Fix the root cause — either tighten the flush/offset boundary or adjust `read_output_since` to handle a partial leading event.
+2. Dump the raw cast file around the marker offset to see exact event boundaries and verify the offset lands at a line start.
+3. Determine whether the stored offset or the reader semantics are at fault.
+4. Fix the identified root cause.
 
 ## Scope boundary
 
-**In scope:** Help text, command renames/additions, `wait` with protocol frames, off-by-one fix.
+**In scope:** Help text, command renames/additions, `wait` with protocol frames, exit code changes for `wait`, off-by-one fix.
 
 **Out of scope:** VT stream transcoding for `capture --since-marker` rendered text (#29, depends on #22). Terminal screen introspection. The `capture --since-marker` command continues to return raw event data until #29 lands.

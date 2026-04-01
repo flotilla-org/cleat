@@ -414,13 +414,13 @@ fn detached_session_answers_da_queries() {
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create alpha");
 
-    // Wait for stty to take effect
-    std::thread::sleep(Duration::from_millis(300));
+    // Wait for sh + stty + exec cat to complete
+    std::thread::sleep(Duration::from_secs(1));
 
     // Mark, then send DA1 query while detached
     let offset = service.mark("alpha").expect("mark");
     service.send_keys("alpha", b"\x1b[c").expect("send DA query");
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_secs(1));
 
     // Read recorded output since the mark
     let output = service.capture_since_raw("alpha", offset).expect("capture since");
@@ -442,8 +442,8 @@ fn attached_session_does_not_get_synthetic_da_reply() {
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), false).expect("create alpha");
 
-    // Wait for stty to take effect
-    std::thread::sleep(Duration::from_millis(300));
+    // Wait for sh + stty + exec cat to complete
+    std::thread::sleep(Duration::from_secs(1));
 
     // Attach BEFORE sending the DA query
     let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect");

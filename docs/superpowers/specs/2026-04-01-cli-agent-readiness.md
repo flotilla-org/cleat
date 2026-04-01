@@ -132,9 +132,9 @@ cleat wait <ID> <--idle-time <SECS> | --text <TEXT>> [--timeout <SECS>] [--json]
 
 At least one condition is required. There is no implicit default mode — process-state detection (`foreground_pgid == leader_pid`) only works for shell sessions and silently gives wrong answers for non-shell commands (e.g. `launch --cmd 'sleep 60'` would report "ready" immediately). Callers specify what they are waiting for.
 
-**`--idle-time <SECS>` — output silence.** The daemon tracks when PTY output last arrived and responds when no output has arrived for the specified duration.
+**`--idle-time <SECS>` — output silence.** The daemon measures silence relative to the wait registration time, not historical output. Specifically: the condition is satisfied when `now - max(registration_time, last_output_time) >= idle_time`. Stale silence from before registration does not count; fresh output resets the clock.
 
-**`--text <TEXT>` — text match.** The daemon checks the VT-rendered screen after each output event and responds when the text appears. Returns an error for passthrough sessions (text matching requires a VT engine that supports screen capture, same as `capture` without `--since`).
+**`--text <TEXT>` — text match.** The daemon checks the VT-rendered screen and responds when the text appears. Requires a VT engine that supports screen capture (same as `capture` without `--since`). Returns an error for passthrough sessions — including when combined with `--idle-time`. The daemon validates all conditions before registering the wait; if any condition is unsupported, the entire request fails. Silently dropping an unsupported condition would change OR semantics in ways the caller did not intend.
 
 **Flags compose with OR semantics.** When both `--idle-time` and `--text` are specified, the daemon responds when *either* condition is met — "wait until this text appears or output settles." This matches the agent intent: multiple heuristics for "something finished."
 

@@ -664,8 +664,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
 
                             // Validate: TextMatch requires screen_text support
-                            let has_text_match =
-                                conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::TextMatch { .. }));
+                            let has_text_match = conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::TextMatch { .. }));
                             if has_text_match {
                                 if let Err(err) = vt_engine.screen_text() {
                                     let _ = Frame::Error(format!("text matching not supported: {err}")).write(&mut stream);
@@ -679,9 +678,8 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                     for condition in &conditions {
                                         if let crate::protocol::WaitCondition::TextMatch { text } = condition {
                                             if screen.contains(text.as_str()) {
-                                                let _ =
-                                                    Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
-                                                        .write(&mut stream);
+                                                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
+                                                    .write(&mut stream);
                                                 break 'wait;
                                             }
                                         }

@@ -32,7 +32,10 @@ pub enum Command {
         record: bool,
     },
     /// Create a new session
-    #[command(alias = "create", after_long_help = "Tip: launch a shell (e.g. zsh) and use `send` to run commands.\nSessions exit when the launched process exits.")]
+    #[command(
+        alias = "create",
+        after_long_help = "Tip: launch a shell (e.g. zsh) and use `send` to run commands.\nSessions exit when the launched process exits."
+    )]
     Launch {
         #[arg(value_name = "ID")]
         id: Option<String>,
@@ -66,15 +69,13 @@ pub enum Command {
         raw: bool,
     },
     /// Detach from a session
-    Detach {
-        id: String,
-    },
+    Detach { id: String },
     /// Terminate a session
-    Kill {
-        id: String,
-    },
+    Kill { id: String },
     /// Send key sequences using tmux-style names
-    #[command(after_long_help = "Key names: Enter, Escape (Esc), Tab, BSpace, Space,\n           Up, Down, Left, Right, Home, End,\n           PgUp (PageUp), PgDn (PageDown),\n           IC (Insert), DC (Delete),\n           F1-F12, BTab (Shift-Tab)\n\nModifiers:  C-x (Ctrl), M-x (Meta/Alt), S-x (Shift)\n            ^x  (Ctrl, alternative syntax)\n\nExamples:   cleat send-keys myapp Enter\n            cleat send-keys myapp C-c\n            cleat send-keys myapp -l 'literal text'\n            cleat send-keys myapp -H 1b5b41")]
+    #[command(
+        after_long_help = "Key names: Enter, Escape (Esc), Tab, BSpace, Space,\n           Up, Down, Left, Right, Home, End,\n           PgUp (PageUp), PgDn (PageDown),\n           IC (Insert), DC (Delete),\n           F1-F12, BTab (Shift-Tab)\n\nModifiers:  C-x (Ctrl), M-x (Meta/Alt), S-x (Shift)\n            ^x  (Ctrl, alternative syntax)\n\nExamples:   cleat send-keys myapp Enter\n            cleat send-keys myapp C-c\n            cleat send-keys myapp -l 'literal text'\n            cleat send-keys myapp -H 1b5b41"
+    )]
     SendKeys {
         #[arg(value_name = "ID")]
         id: String,
@@ -101,9 +102,7 @@ pub enum Command {
         target: String,
     },
     /// Enable output recording
-    Record {
-        id: String,
-    },
+    Record { id: String },
     /// Set a named marker in the recording
     Mark {
         id: String,
@@ -120,13 +119,9 @@ pub enum Command {
         no_enter: bool,
     },
     /// Send Ctrl-C to a session
-    Interrupt {
-        id: String,
-    },
+    Interrupt { id: String },
     /// Send Escape to a session
-    Escape {
-        id: String,
-    },
+    Escape { id: String },
     #[command(hide = true)]
     Serve {
         #[arg(long)]

@@ -36,6 +36,7 @@ fn wait_for_socket(path: &std::path::Path) {
     panic!("timed out waiting for socket {}", path.display());
 }
 
+#[cfg(feature = "ghostty-vt")]
 fn require_python3() -> bool {
     let available = Command::new("python3")
         .arg("--version")

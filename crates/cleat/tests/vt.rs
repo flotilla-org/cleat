@@ -94,7 +94,8 @@ fn vt_ghostty_blank_engine_does_not_emit_replay_payload() {
 #[test]
 fn vt_ghostty_links_against_shared_library() {
     let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
-    let shared_library = prefix.join("lib/libghostty-vt.so");
+    let lib_name = shared_library_filename();
+    let shared_library = prefix.join("lib").join(lib_name);
     assert!(shared_library.exists(), "expected shared ghostty library at {}", shared_library.display());
 
     let exe = std::env::current_exe().expect("current test binary");
@@ -109,11 +110,23 @@ fn vt_ghostty_links_against_shared_library() {
         stderr
     );
     assert!(
-        linkage.contains("libghostty-vt.so"),
+        linkage.contains(lib_name),
         "expected shared ghostty-vt linkage via {}, but test binary dependencies were:\n{}",
         shared_library.display(),
         linkage
     );
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn shared_library_filename() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "libghostty-vt.so"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "libghostty-vt.dylib"
+    }
 }
 
 #[cfg(feature = "ghostty-vt")]

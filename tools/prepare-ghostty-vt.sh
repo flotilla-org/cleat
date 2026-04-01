@@ -48,16 +48,11 @@ ghostty_repo="$(toml_value ghostty repo "$TOOLCHAIN_FILE")"
 ghostty_ref="$(toml_value ghostty ref "$TOOLCHAIN_FILE")"
 build_step="$(toml_value ghostty build_step "$TOOLCHAIN_FILE")"
 
-if [[ "$build_step" != "lib-vt" ]]; then
-  printf 'Expected ghostty.build_step to be lib-vt, found %s\n' "$build_step" >&2
-  exit 1
-fi
-
 mkdir -p "$REPO_ROOT/.tools"
 
 if [[ -d "$SOURCE_DIR/.git" ]]; then
   git -C "$SOURCE_DIR" remote set-url origin "$ghostty_repo"
-  git -C "$SOURCE_DIR" fetch origin --prune --tags
+  git -C "$SOURCE_DIR" fetch origin --prune --tags --force
 else
   rm -rf "$SOURCE_DIR"
   git clone "$ghostty_repo" "$SOURCE_DIR"
@@ -69,7 +64,8 @@ git -C "$SOURCE_DIR" reset --hard "$ghostty_ref"
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-(cd "$SOURCE_DIR" && zig build "$build_step" --prefix "$INSTALL_DIR")
+# shellcheck disable=SC2086
+(cd "$SOURCE_DIR" && zig build $build_step --prefix "$INSTALL_DIR")
 
 test -f "$INSTALL_DIR/include/ghostty/vt.h"
 

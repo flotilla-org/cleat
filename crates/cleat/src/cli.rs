@@ -11,7 +11,12 @@ use crate::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "cleat", version, about = "Session daemon with a structured control plane for agents and terminal persistence")]
+#[command(
+    name = "cleat",
+    version,
+    about = "Session daemon with a structured control plane for agents and terminal persistence",
+    after_help = crate::vt::BUILD_SUPPORT_MESSAGE
+)]
 pub struct Cli {
     #[arg(long, hide = true)]
     pub runtime_root: Option<PathBuf>,
@@ -28,7 +33,7 @@ pub enum Command {
         id: Option<String>,
         #[arg(long, help = "Fail if the session does not exist")]
         no_create: bool,
-        #[arg(long, value_enum, help = "Virtual terminal engine")]
+        #[arg(long, value_enum, help = crate::vt::VT_ENGINE_HELP)]
         vt: Option<VtEngineKind>,
         #[arg(long, help = "Working directory for the session")]
         cwd: Option<PathBuf>,
@@ -47,7 +52,7 @@ pub enum Command {
         id: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
-        #[arg(long, value_enum, help = "Virtual terminal engine")]
+        #[arg(long, value_enum, help = crate::vt::VT_ENGINE_HELP)]
         vt: Option<VtEngineKind>,
         #[arg(long, help = "Working directory for the session")]
         cwd: Option<PathBuf>,
@@ -199,6 +204,9 @@ impl ExecResult {
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     match cli.command {
         Command::Attach { id, no_create, vt, cwd, cmd, record } => {
+            if !no_create && !crate::vt::functional_vt_available() {
+                return ExecResult::Err(crate::vt::nonfunctional_build_error());
+            }
             let (attached, guard) = match service.attach(id, vt, cwd, cmd, no_create) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
@@ -214,6 +222,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             }
         }
         Command::Launch { id, json, vt, cwd, cmd, record } => {
+            if !crate::vt::functional_vt_available() && vt != Some(crate::vt::VtEngineKind::Ghostty) {
+                return ExecResult::Err(crate::vt::nonfunctional_build_error());
+            }
             let created = match service.create(id, vt, cwd, cmd, record) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
@@ -429,7 +440,11 @@ fn execute_wait(
 }
 
 fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
-    let mut fields = vec![session.id.clone(), format_session_status(&session.status).to_string(), session.vt_engine.as_str().to_string()];
+    let mut fields = vec![
+        session.id.clone(),
+        format_session_status(&session.status).to_string(),
+        format!("{} ({})", session.vt_engine.as_str(), session.vt_engine_status),
+    ];
     if let Some(cwd) = &session.cwd {
         fields.push(cwd.display().to_string());
     } else if let Some(cmd) = &session.cmd {
@@ -453,6 +468,8 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
 
     table.add_row(vec!["session", &result.session.id]);
     table.add_row(vec!["state", &result.session.state]);
+    table.add_row(vec!["vt_engine", &format!("{} ({})", result.session.vt_engine, result.session.vt_engine_status)]);
+    table.add_row(vec!["functional_vt", if result.session.functional_vt_available { "yes" } else { "no" }]);
     table.add_row(vec!["terminal", &format!("{}x{}", result.terminal.cols, result.terminal.rows)]);
     table.add_row(vec!["leader_pid", &result.process.leader_pid.to_string()]);
     if let Some(fg) = result.process.foreground_pgid {

@@ -1,4 +1,5 @@
 pub mod passthrough;
+pub mod support;
 
 #[cfg(feature = "ghostty-vt")]
 pub mod ghostty;
@@ -7,6 +8,11 @@ mod ghostty_ffi;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+pub use support::{
+    build_support_message, functional_vt_available, nonfunctional_build_error, vt_engine_label, vt_engine_status, BUILD_SUPPORT_MESSAGE,
+    FUNCTIONAL_ENGINE_NAME, FUNCTIONAL_ENGINE_STATUS, NONFUNCTIONAL_BUILD_MESSAGE, PLACEHOLDER_ENGINE_STATUS, VT_ENGINE_HELP,
+    VT_SUPPORT_POLICY,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]

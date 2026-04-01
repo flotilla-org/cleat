@@ -38,7 +38,7 @@ impl VtEngine for PassthroughVtEngine {
     }
 
     fn screen_text(&self) -> Result<String, String> {
-        Err("screen text capture is unsupported for vt engine passthrough".to_string())
+        Err("screen text capture is unavailable because vt engine passthrough is a placeholder/test-only engine, not a functional VT engine".to_string())
     }
 
     fn size(&self) -> (u16, u16) {

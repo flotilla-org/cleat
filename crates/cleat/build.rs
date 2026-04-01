@@ -7,12 +7,19 @@ use std::{
 compile_error!("ghostty-vt feature requires Linux or macOS");
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+
     if env::var_os("CARGO_FEATURE_GHOSTTY_VT").is_none() {
+        println!("cargo:rustc-env=CLEAT_FUNCTIONAL_VT_AVAILABLE=0");
+        println!("cargo:warning=building cleat without ghostty-vt; this binary is non-functional for real terminal usage");
+        println!("cargo:warning=Ghostty is currently the only functional VT engine");
+        println!("cargo:warning=passthrough is a placeholder/testing engine only");
+        println!("cargo:warning=run ./tools/prepare-ghostty-vt.sh and rebuild with --features ghostty-vt for a functional binary");
         return;
     }
 
     println!("cargo:rerun-if-env-changed=CLEAT_GHOSTTY_PREFIX");
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-env=CLEAT_FUNCTIONAL_VT_AVAILABLE=1");
 
     let repo_root = repo_root().unwrap_or_else(|err| panic!("{err}"));
     let install = ghostty_install(&repo_root).unwrap_or_else(|err| panic!("{err}"));

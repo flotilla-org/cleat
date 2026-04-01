@@ -11,6 +11,8 @@ use crate::vt::{ClientCapabilities, ColorLevel, VtEngineKind};
 pub struct SessionInfo {
     pub id: String,
     pub vt_engine: VtEngineKind,
+    pub vt_engine_status: String,
+    pub functional_vt_available: bool,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
     pub status: SessionStatus,
@@ -36,6 +38,8 @@ pub struct SessionInspect {
     pub id: String,
     pub state: String,
     pub vt_engine: String,
+    pub vt_engine_status: String,
+    pub functional_vt_available: bool,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
 }

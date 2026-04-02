@@ -440,6 +440,9 @@ fn execute_wait(
 }
 
 fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
+    if let Some(ref err) = session.error {
+        return format!("{}\t<inspect failed: {}>", session.id, err);
+    }
     let mut fields =
         vec![session.id.clone(), format_session_status(&session.status).to_string(), crate::vt::vt_engine_label(session.vt_engine)];
     if let Some(cwd) = &session.cwd {

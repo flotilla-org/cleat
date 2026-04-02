@@ -16,6 +16,8 @@ pub struct SessionInfo {
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
     pub status: SessionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

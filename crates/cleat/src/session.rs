@@ -973,7 +973,7 @@ fn resolve_cleat_executable() -> Result<PathBuf, String> {
     }
 
     let sibling = current_exe_sibling("cleat");
-    let path_var = std::env::var_os("PATH").ok_or_else(|| "PATH is not set; cannot locate cleat executable".to_string())?;
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
 
     resolve_cleat_with_sibling(sibling.as_deref(), &path_var)
 }

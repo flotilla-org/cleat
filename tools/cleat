@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LIB_DIR="$REPO_ROOT/.tools/ghostty-install/lib"
+
+if [[ ! -d "$LIB_DIR" ]]; then
+    echo "error: ghostty libraries not found at $LIB_DIR" >&2
+    echo "Run: ./tools/prepare-ghostty-vt.sh" >&2
+    exit 1
+fi
+
+# Detect platform and set library path
+case "$(uname -s)" in
+    Darwin) export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:+$DYLD_LIBRARY_PATH:}$LIB_DIR" ;;
+    *)      export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$LIB_DIR" ;;
+esac
+
+# Prefer a pre-built binary (release > debug)
+for candidate in \
+    "$REPO_ROOT/target/release/cleat" \
+    "$REPO_ROOT/target/debug/cleat"; do
+    if [[ -x "$candidate" ]]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+# Fall back to cargo run
+exec cargo run -p cleat --features ghostty-vt -q -- "$@"

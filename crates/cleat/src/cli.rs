@@ -78,14 +78,21 @@ pub enum Command {
         json: bool,
     },
     /// Capture terminal screen content
-    #[command(after_long_help = "Without --since/--since-marker: returns current rendered screen from\n\
-                           the VT engine (requires a functional VT engine, not passthrough).\n\
+    #[command(after_long_help = "Returns the current rendered screen from the VT engine.\n\
+                           Requires a functional VT engine (not passthrough).\n\
                            \n\
-                           With --since or --since-marker: returns recorded output after the\n\
-                           given byte offset. Requires recording to be active.\n\
+                           For recorded output since a checkpoint, use the transcript command.")]
+    Capture { id: String },
+    /// Read recorded output since a checkpoint
+    #[command(after_long_help = "Returns recorded PTY output after the given byte offset or named\n\
+                           marker. Requires an active recording.\n\
                            \n\
-                           --raw is accepted but currently produces the same output as non-raw.")]
-    Capture {
+                           Use mark to set a named checkpoint, then transcript --since-marker\n\
+                           to read output produced after that point.\n\
+                           \n\
+                           --raw is accepted but currently produces the same output as non-raw.\n\
+                           VT-rendered replay for the non-raw path is planned.")]
+    Transcript {
         id: String,
         /// Byte offset in .cast file; return output events after this position
         #[arg(long, conflicts_with = "since_marker")]
@@ -93,7 +100,7 @@ pub enum Command {
         /// Named marker to use as the start offset
         #[arg(long, conflicts_with = "since")]
         since_marker: Option<String>,
-        /// Return raw event data instead of VT-rendered text (requires --since or --since-marker)
+        /// Return raw event data instead of VT-rendered text
         #[arg(long)]
         raw: bool,
     },
@@ -137,7 +144,7 @@ pub enum Command {
     Record { id: String },
     /// Set a named marker in the recording
     #[command(after_long_help = "Returns the byte offset in the .cast file. Named markers can be\n\
-                           used with capture --since-marker to get output recorded after\n\
+                           used with transcript --since-marker to get output recorded after\n\
                            that point. Requires an active recording.")]
     Mark {
         id: String,
@@ -290,11 +297,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
-        Command::Capture { id, since, since_marker, raw } => {
-            if raw && since.is_none() && since_marker.is_none() {
-                return ExecResult::Err("--raw requires --since or --since-marker".to_string());
-            }
-            // --since and --since-marker mutual exclusion enforced by clap conflicts_with
+        Command::Capture { id } => match service.capture(&id) {
+            Ok(s) => ExecResult::Ok(Some(s)),
+            Err(e) => ExecResult::Err(e),
+        },
+        Command::Transcript { id, since, since_marker, raw } => {
             let offset = match (since, &since_marker) {
                 (Some(o), _) => Some(o),
                 (_, Some(name)) => match service.resolve_marker(&id, name) {
@@ -303,19 +310,15 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 },
                 _ => None,
             };
-            let result = match offset {
+            match offset {
                 Some(o) => {
-                    if raw {
-                        service.capture_since_raw(&id, o)
-                    } else {
-                        service.capture_since_text(&id, o)
+                    let result = if raw { service.capture_since_raw(&id, o) } else { service.capture_since_text(&id, o) };
+                    match result {
+                        Ok(s) => ExecResult::Ok(Some(s)),
+                        Err(e) => ExecResult::Err(e),
                     }
                 }
-                None => service.capture(&id),
-            };
-            match result {
-                Ok(s) => ExecResult::Ok(Some(s)),
-                Err(e) => ExecResult::Err(e),
+                None => ExecResult::Err("transcript requires --since or --since-marker".to_string()),
             }
         }
         Command::Detach { id } => match service.detach(&id) {

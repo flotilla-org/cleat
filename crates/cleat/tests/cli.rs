@@ -15,6 +15,7 @@ fn help_lists_expected_subcommands() {
         "launch",
         "list",
         "capture",
+        "transcript",
         "detach",
         "kill",
         "send-keys",
@@ -131,7 +132,7 @@ fn list_command_parses_json() {
 #[test]
 fn capture_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "capture", "session-1"]).expect("capture parses");
-    assert_eq!(cli.command, Command::Capture { id: "session-1".into(), since: None, since_marker: None, raw: false });
+    assert_eq!(cli.command, Command::Capture { id: "session-1".into() });
 }
 
 #[test]
@@ -265,37 +266,6 @@ fn send_keys_execute_reports_missing_session() {
 }
 
 #[test]
-fn capture_with_since_flag_parses() {
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "12345"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(12345), since_marker: None, raw: false });
-}
-
-#[test]
-fn capture_with_raw_flag_parses() {
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "0", "--raw"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(0), since_marker: None, raw: true });
-}
-
-#[test]
-fn capture_without_since_still_works() {
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, since_marker: None, raw: false });
-}
-
-#[test]
-fn capture_raw_without_since_is_rejected() {
-    let temp = tempfile::tempdir().unwrap();
-    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--raw"]).expect("parse");
-    let result = execute(cli, &service);
-    let err = match result {
-        ExecResult::Err(e) => e,
-        _ => panic!("--raw without --since should fail"),
-    };
-    assert!(err.contains("--raw requires --since or --since-marker"));
-}
-
-#[test]
 fn mark_with_name_parses() {
     let cli = Cli::try_parse_from(["cleat", "mark", "sess", "checkpoint"]).expect("parse");
     assert_eq!(cli.command, Command::Mark { id: "sess".into(), name: Some("checkpoint".into()) });
@@ -308,14 +278,39 @@ fn mark_without_name_still_works() {
 }
 
 #[test]
-fn capture_with_since_marker_parses() {
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since-marker", "checkpoint"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, since_marker: Some("checkpoint".into()), raw: false });
+fn transcript_with_since_marker_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "m1"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: None, since_marker: Some("m1".into()), raw: false });
 }
 
 #[test]
-fn capture_since_and_since_marker_are_mutually_exclusive() {
-    let result = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "100", "--since-marker", "foo"]);
+fn transcript_with_since_offset_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "500"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: Some(500), since_marker: None, raw: false });
+}
+
+#[test]
+fn transcript_with_raw_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "m1", "--raw"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: None, since_marker: Some("m1".into()), raw: true });
+}
+
+#[test]
+fn transcript_requires_since_or_since_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess"]).expect("parse");
+    let result = execute(cli, &service);
+    let err = match result {
+        ExecResult::Err(e) => e,
+        _ => panic!("transcript without --since should fail"),
+    };
+    assert!(err.contains("--since or --since-marker"));
+}
+
+#[test]
+fn transcript_since_and_since_marker_are_mutually_exclusive() {
+    let result = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "100", "--since-marker", "m1"]);
     assert!(result.is_err(), "--since and --since-marker should be mutually exclusive");
 }
 

@@ -230,19 +230,21 @@ story stabilizing.
 
 ## Phasing
 
-**Phase 1 — quick fixes (do now):**
-- Item 4: `--help` includes workflow snippet
-- Item 6: `./tools/cleat` wrapper script
+**Phase 1 — quick fix (do now):**
+- Item 6: `./tools/cleat` wrapper script (no dependencies)
 
 **Phase 2 — command split:**
 - Item 1: Split `capture` into `capture` + `transcript`
 - Item 2: Add `expect` command
-- Item 5: Document `wait --text` screen-state semantics
 
 **Phase 3 — atomic operations:**
 - Item 3: `send --mark-before` and `send-keys --mark-before`
 
-**Phase 4 — exploratory:**
+**Phase 4 — help text (depends on phases 2 and 3):**
+- Item 4: `--help` includes workflow snippet (references `transcript`, `--mark-before`)
+- Item 5: Document `wait --text` screen-state semantics (references `expect`)
+
+**Phase 5 — exploratory:**
 - Item 7: Batch/pipeline primitive
 - Item 8: Binary distribution
 

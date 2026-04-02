@@ -973,9 +973,7 @@ fn resolve_cleat_executable() -> Result<PathBuf, String> {
     }
 
     let sibling = current_exe_sibling("cleat");
-    let path_var = std::env::var_os("PATH")
-        .map(|v| v.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let path_var = std::env::var_os("PATH").map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
 
     resolve_cleat_with_sibling(sibling.as_deref(), &path_var)
 }
@@ -1434,8 +1432,7 @@ mod tests {
 
     #[test]
     fn resolve_cleat_exe_prefers_sibling_over_path() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
+        use std::{fs, os::unix::fs::PermissionsExt};
 
         let temp = tempfile::tempdir().expect("tempdir");
 
@@ -1453,18 +1450,14 @@ mod tests {
         fs::write(&path_exe, "#!/bin/sh\n").expect("write path");
         fs::set_permissions(&path_exe, fs::Permissions::from_mode(0o755)).expect("chmod path");
 
-        let result = super::resolve_cleat_with_sibling(
-            Some(&sibling_exe),
-            &path_dir.to_string_lossy(),
-        );
+        let result = super::resolve_cleat_with_sibling(Some(&sibling_exe), &path_dir.to_string_lossy());
 
         assert_eq!(result.unwrap(), sibling_exe);
     }
 
     #[test]
     fn resolve_cleat_exe_falls_back_to_path_when_no_sibling() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
+        use std::{fs, os::unix::fs::PermissionsExt};
 
         let temp = tempfile::tempdir().expect("tempdir");
 
@@ -1474,10 +1467,7 @@ mod tests {
         fs::write(&path_exe, "#!/bin/sh\n").expect("write path");
         fs::set_permissions(&path_exe, fs::Permissions::from_mode(0o755)).expect("chmod path");
 
-        let result = super::resolve_cleat_with_sibling(
-            None,
-            &path_dir.to_string_lossy(),
-        );
+        let result = super::resolve_cleat_with_sibling(None, &path_dir.to_string_lossy());
 
         assert_eq!(result.unwrap(), path_exe);
     }

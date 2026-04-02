@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser};
 use cleat::{
-    cli::{execute, Cli, Command, ExecResult},
+    cli::{self, execute, Cli, Command, ExecResult},
     runtime::RuntimeLayout,
     server::SessionService,
     vt::{self, VtEngineKind},
@@ -34,15 +34,16 @@ fn help_lists_expected_subcommands() {
 
 #[test]
 fn help_surfaces_vt_support_policy() {
-    let mut command = Cli::command();
+    let mut command = cli::command();
     let mut buffer = Vec::new();
     command.write_long_help(&mut buffer).expect("write help");
     let help = String::from_utf8(buffer).expect("help utf8");
 
     assert!(help.contains("Ghostty is currently the only functional VT engine"));
     assert!(help.contains(vt::BUILD_SUPPORT_MESSAGE));
+    assert!(help.contains("Typical agent workflow"));
 
-    let mut launch = Cli::command().find_subcommand_mut("launch").expect("launch command").clone();
+    let mut launch = cli::command().find_subcommand_mut("launch").expect("launch command").clone();
     let mut launch_buffer = Vec::new();
     launch.write_long_help(&mut launch_buffer).expect("write launch help");
     let launch_help = String::from_utf8(launch_buffer).expect("launch help utf8");

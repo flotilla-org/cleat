@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::{
     keys::encode_send_keys,
@@ -17,11 +17,16 @@ use crate::{
     about = "Session daemon with a structured control plane for agents and terminal persistence",
     after_help = "Typical agent workflow:\n\
                   \x20 cleat launch --record my-session --cmd bash\n\
-                  \x20 cleat send my-session 'make test'\n\
+                  \x20 cleat send my-session 'make test' --mark-before m1\n\
                   \x20 cleat wait my-session --idle-time 2\n\
-                  \x20 cleat capture my-session\n\
+                  \x20 cleat transcript my-session --since-marker m1\n\
                   \x20 cleat kill my-session",
-    after_long_help = crate::vt::BUILD_SUPPORT_MESSAGE
+    after_long_help = "Typical agent workflow:\n\
+                       \x20 cleat launch --record my-session --cmd bash\n\
+                       \x20 cleat send my-session 'make test' --mark-before m1\n\
+                       \x20 cleat wait my-session --idle-time 2\n\
+                       \x20 cleat transcript my-session --since-marker m1\n\
+                       \x20 cleat kill my-session"
 )]
 pub struct Cli {
     #[arg(long, hide = true)]
@@ -175,6 +180,11 @@ pub enum Command {
                            \n\
                            At least one of --idle-time or --text is required.\n\
                            \n\
+                           NOTE: --text matches against the current VT screen state. If the\n\
+                           text is already visible when wait is called, it returns immediately.\n\
+                           For edge-triggered text matching on new output, use the expect\n\
+                           command with --since-marker.\n\
+                           \n\
                            Exit codes:\n\
                            \x20 0  Condition met (ready)\n\
                            \x20 1  Timeout reached\n\
@@ -237,11 +247,14 @@ pub enum Command {
 }
 
 pub fn parse() -> Cli {
-    Cli::parse()
+    Cli::from_arg_matches(&command().get_matches()).expect("clap arg parsing should not fail after get_matches succeeds")
 }
 
 pub fn command() -> clap::Command {
-    Cli::command()
+    let cmd = Cli::command();
+    let existing = cmd.get_after_long_help().map(|s| s.to_string()).unwrap_or_default();
+    let combined = format!("{existing}\n\n{}", crate::vt::BUILD_SUPPORT_MESSAGE);
+    cmd.after_long_help(combined)
 }
 
 #[derive(Debug)]

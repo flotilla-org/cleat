@@ -151,7 +151,14 @@ fn kill_command_parses() {
 #[test]
 fn send_keys_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "send-keys", "demo", "Enter"]).expect("send-keys parses");
-    assert_eq!(cli.command, Command::SendKeys { id: "demo".into(), literal: false, hex: false, repeat: 1, keys: vec!["Enter".into()] });
+    assert_eq!(cli.command, Command::SendKeys {
+        id: "demo".into(),
+        literal: false,
+        hex: false,
+        repeat: 1,
+        keys: vec!["Enter".into()],
+        mark_before: None,
+    });
 }
 
 #[test]
@@ -162,7 +169,8 @@ fn send_keys_command_parses_literal_mode() {
         literal: true,
         hex: false,
         repeat: 1,
-        keys: vec!["hello".into(), "world".into()]
+        keys: vec!["hello".into(), "world".into()],
+        mark_before: None,
     });
 }
 
@@ -174,14 +182,22 @@ fn send_keys_command_parses_hex_mode() {
         literal: false,
         hex: true,
         repeat: 1,
-        keys: vec!["41".into(), "0a".into()]
+        keys: vec!["41".into(), "0a".into()],
+        mark_before: None,
     });
 }
 
 #[test]
 fn send_keys_command_parses_repeat() {
     let cli = Cli::try_parse_from(["cleat", "send-keys", "-N", "3", "demo", "C-l"]).expect("send-keys -N parses");
-    assert_eq!(cli.command, Command::SendKeys { id: "demo".into(), literal: false, hex: false, repeat: 3, keys: vec!["C-l".into()] });
+    assert_eq!(cli.command, Command::SendKeys {
+        id: "demo".into(),
+        literal: false,
+        hex: false,
+        repeat: 3,
+        keys: vec!["C-l".into()],
+        mark_before: None,
+    });
 }
 
 #[test]
@@ -254,7 +270,14 @@ fn mark_command_parses_session_id() {
 fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,
-        command: Command::SendKeys { id: "demo".into(), literal: false, hex: false, repeat: 1, keys: vec!["Enter".into()] },
+        command: Command::SendKeys {
+            id: "demo".into(),
+            literal: false,
+            hex: false,
+            repeat: 1,
+            keys: vec!["Enter".into()],
+            mark_before: None,
+        },
     };
     let service = SessionService::new(RuntimeLayout::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()));
 
@@ -318,13 +341,13 @@ fn transcript_since_and_since_marker_are_mutually_exclusive() {
 #[test]
 fn send_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "send", "demo", "echo hello"]).expect("send parses");
-    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "echo hello".into(), no_enter: false });
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "echo hello".into(), no_enter: false, mark_before: None });
 }
 
 #[test]
 fn send_command_parses_no_enter() {
     let cli = Cli::try_parse_from(["cleat", "send", "--no-enter", "demo", "partial"]).expect("send --no-enter parses");
-    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true });
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true, mark_before: None });
 }
 
 #[test]
@@ -431,4 +454,23 @@ fn expect_requires_since_or_since_marker() {
 fn expect_json_flag_parses() {
     let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "OK", "--since-marker", "m1", "--json"]).expect("parse");
     assert!(matches!(cli.command, Command::Expect { json: true, .. }));
+}
+
+#[test]
+fn send_mark_before_parses() {
+    let cli = Cli::try_parse_from(["cleat", "send", "--mark-before", "m1", "sess", "echo hi"]).expect("parse");
+    assert_eq!(cli.command, Command::Send { id: "sess".into(), text: "echo hi".into(), no_enter: false, mark_before: Some("m1".into()) });
+}
+
+#[test]
+fn send_keys_mark_before_parses() {
+    let cli = Cli::try_parse_from(["cleat", "send-keys", "--mark-before", "m1", "sess", "Enter"]).expect("parse");
+    assert_eq!(cli.command, Command::SendKeys {
+        id: "sess".into(),
+        literal: false,
+        hex: false,
+        repeat: 1,
+        keys: vec!["Enter".into()],
+        mark_before: Some("m1".into()),
+    });
 }

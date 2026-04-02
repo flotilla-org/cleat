@@ -123,6 +123,8 @@ pub enum Command {
         repeat: usize,
         #[arg(value_name = "KEY", required = true, num_args = 1..)]
         keys: Vec<String>,
+        #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
+        mark_before: Option<String>,
     },
     /// Show session state and process info
     Inspect {
@@ -159,6 +161,8 @@ pub enum Command {
         text: String,
         #[arg(long, help = "Do not append Enter after the text")]
         no_enter: bool,
+        #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
+        mark_before: Option<String>,
     },
     /// Send Ctrl-C to a session
     Interrupt { id: String },
@@ -358,14 +362,21 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
-        Command::SendKeys { id, literal, hex, repeat, keys } => {
+        Command::SendKeys { id, literal, hex, repeat, keys, mark_before } => {
             let bytes = match encode_send_keys(&keys, literal, hex, repeat) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
-            match service.send_keys(&id, &bytes) {
-                Ok(()) => ExecResult::Ok(None),
-                Err(e) => ExecResult::Err(e),
+            if let Some(marker_name) = mark_before {
+                match service.send_keys_with_mark(&id, &bytes, &marker_name) {
+                    Ok(offset) => ExecResult::Ok(Some(offset.to_string())),
+                    Err(e) => ExecResult::Err(e),
+                }
+            } else {
+                match service.send_keys(&id, &bytes) {
+                    Ok(()) => ExecResult::Ok(None),
+                    Err(e) => ExecResult::Err(e),
+                }
             }
         }
         Command::Inspect { id, json } => {
@@ -410,14 +421,21 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Send { id, text, no_enter } => {
+        Command::Send { id, text, no_enter, mark_before } => {
             let mut bytes = text.into_bytes();
             if !no_enter {
                 bytes.push(b'\r');
             }
-            match service.send_keys(&id, &bytes) {
-                Ok(()) => ExecResult::Ok(None),
-                Err(e) => ExecResult::Err(e),
+            if let Some(marker_name) = mark_before {
+                match service.send_keys_with_mark(&id, &bytes, &marker_name) {
+                    Ok(offset) => ExecResult::Ok(Some(offset.to_string())),
+                    Err(e) => ExecResult::Err(e),
+                }
+            } else {
+                match service.send_keys(&id, &bytes) {
+                    Ok(()) => ExecResult::Ok(None),
+                    Err(e) => ExecResult::Err(e),
+                }
             }
         }
         Command::Interrupt { id } => match service.send_keys(&id, &[0x03]) {

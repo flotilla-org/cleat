@@ -567,6 +567,22 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         }
+                        Ok(Frame::SendKeysWithMark { bytes, marker_name }) => {
+                            if let Some(ref mut rec) = recorder {
+                                rec.flush();
+                                rec.event(crate::asciicast::EventCode::Marker, &marker_name, epoch.elapsed());
+                                let offset = rec.bytes_written();
+                                markers.insert(marker_name, offset);
+                                rec.input(&bytes, epoch.elapsed());
+                                if let Err(err) = write_fd_all(pty_fd, &bytes) {
+                                    let _ = Frame::Error(err).write(&mut stream);
+                                } else {
+                                    let _ = Frame::MarkResult { offset }.write(&mut stream);
+                                }
+                            } else {
+                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
+                            }
+                        }
                         Ok(Frame::Inspect) => {
                             let result = build_inspect_result(session, vt_engine.as_ref(), &active_client, &pty_child, &recorder, &markers);
                             match serde_json::to_vec(&result) {

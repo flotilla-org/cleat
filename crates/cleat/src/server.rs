@@ -189,6 +189,22 @@ impl SessionService {
         Frame::SendKeys(bytes.to_vec()).write(&mut stream).map_err(|err| format!("write send-keys request: {err}"))
     }
 
+    pub fn send_keys_with_mark(&self, id: &str, bytes: &[u8], marker_name: &str) -> Result<u64, String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream = connect_session_socket(&socket_path)?;
+        Frame::SendKeysWithMark { bytes: bytes.to_vec(), marker_name: marker_name.to_string() }
+            .write(&mut stream)
+            .map_err(|err| format!("write send-keys-with-mark request: {err}"))?;
+        match Frame::read(&mut stream).map_err(|err| format!("read send-keys-with-mark response: {err}"))? {
+            Frame::MarkResult { offset } => Ok(offset),
+            Frame::Error(message) => Err(message),
+            other => Err(format!("unexpected send-keys-with-mark response: {other:?}")),
+        }
+    }
+
     pub fn attach(
         &self,
         name: Option<String>,

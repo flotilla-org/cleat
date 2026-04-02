@@ -100,6 +100,7 @@ const TAG_WAIT: u8 = 18;
 const TAG_WAIT_RESULT: u8 = 19;
 const TAG_EXPECT: u8 = 20;
 const TAG_EXPECT_RESULT: u8 = 21;
+const TAG_SEND_KEYS_WITH_MARK: u8 = 22;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
@@ -137,6 +138,7 @@ pub enum Frame {
     WaitResult { status: WaitStatus, elapsed_ms: u64 },
     Expect { text: String, since_offset: u64, timeout_ms: u64 },
     ExpectResult { status: WaitStatus, elapsed_ms: u64 },
+    SendKeysWithMark { bytes: Vec<u8>, marker_name: String },
 }
 
 impl Frame {
@@ -240,6 +242,13 @@ impl Frame {
                 payload.push(*status as u8);
                 payload.extend_from_slice(&elapsed_ms.to_le_bytes());
                 (TAG_EXPECT_RESULT, payload)
+            }
+            Frame::SendKeysWithMark { ref bytes, ref marker_name } => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&(marker_name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(marker_name.as_bytes());
+                payload.extend_from_slice(bytes);
+                (TAG_SEND_KEYS_WITH_MARK, payload)
             }
         }
     }
@@ -407,6 +416,19 @@ impl Frame {
                 let elapsed_ms =
                     u64::from_le_bytes([payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7], payload[8]]);
                 Ok(Frame::ExpectResult { status, elapsed_ms })
+            }
+            TAG_SEND_KEYS_WITH_MARK => {
+                if payload.len() < 4 {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid send-keys-with-mark frame: too short"));
+                }
+                let name_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                if payload.len() < 4 + name_len {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid send-keys-with-mark frame: truncated name"));
+                }
+                let marker_name = String::from_utf8(payload[4..4 + name_len].to_vec())
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("invalid marker name utf-8: {e}")))?;
+                let bytes = payload[4 + name_len..].to_vec();
+                Ok(Frame::SendKeysWithMark { bytes, marker_name })
             }
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
@@ -631,6 +653,15 @@ mod tests {
     #[test]
     fn expect_result_round_trip() {
         let frame = Frame::ExpectResult { status: WaitStatus::Ready, elapsed_ms: 42 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn send_keys_with_mark_round_trip() {
+        let frame = Frame::SendKeysWithMark { bytes: b"hello\r".to_vec(), marker_name: "m1".to_string() };
         let mut bytes = Vec::new();
         frame.write(&mut bytes).expect("write");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read");

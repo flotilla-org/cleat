@@ -973,12 +973,12 @@ fn resolve_cleat_executable() -> Result<PathBuf, String> {
     }
 
     let sibling = current_exe_sibling("cleat");
-    let path_var = std::env::var_os("PATH").map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
+    let path_var = std::env::var_os("PATH").ok_or_else(|| "PATH is not set; cannot locate cleat executable".to_string())?;
 
     resolve_cleat_with_sibling(sibling.as_deref(), &path_var)
 }
 
-fn resolve_cleat_with_sibling(sibling: Option<&Path>, path_var: &str) -> Result<PathBuf, String> {
+fn resolve_cleat_with_sibling(sibling: Option<&Path>, path_var: &std::ffi::OsStr) -> Result<PathBuf, String> {
     // Prefer sibling of current executable — strongest "same version" signal.
     if let Some(path) = sibling {
         if is_executable_file(path) {
@@ -987,7 +987,7 @@ fn resolve_cleat_with_sibling(sibling: Option<&Path>, path_var: &str) -> Result<
     }
 
     // Fall back to PATH search.
-    for dir in std::env::split_paths(&std::ffi::OsString::from(path_var)) {
+    for dir in std::env::split_paths(path_var) {
         let candidate = dir.join("cleat");
         if is_executable_file(&candidate) {
             return Ok(candidate);
@@ -1406,7 +1406,7 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&cleat, perms).expect("set executable");
 
-        let resolved = super::resolve_cleat_with_sibling(None, &bin_dir.to_string_lossy()).expect("resolve from path");
+        let resolved = super::resolve_cleat_with_sibling(None, std::ffi::OsStr::new(bin_dir.to_str().unwrap())).expect("resolve from path");
 
         assert_eq!(resolved, cleat);
         assert!(is_executable_file(&cleat));
@@ -1450,7 +1450,7 @@ mod tests {
         fs::write(&path_exe, "#!/bin/sh\n").expect("write path");
         fs::set_permissions(&path_exe, fs::Permissions::from_mode(0o755)).expect("chmod path");
 
-        let result = super::resolve_cleat_with_sibling(Some(&sibling_exe), &path_dir.to_string_lossy());
+        let result = super::resolve_cleat_with_sibling(Some(&sibling_exe), std::ffi::OsStr::new(path_dir.to_str().unwrap()));
 
         assert_eq!(result.unwrap(), sibling_exe);
     }
@@ -1467,7 +1467,7 @@ mod tests {
         fs::write(&path_exe, "#!/bin/sh\n").expect("write path");
         fs::set_permissions(&path_exe, fs::Permissions::from_mode(0o755)).expect("chmod path");
 
-        let result = super::resolve_cleat_with_sibling(None, &path_dir.to_string_lossy());
+        let result = super::resolve_cleat_with_sibling(None, std::ffi::OsStr::new(path_dir.to_str().unwrap()));
 
         assert_eq!(result.unwrap(), path_exe);
     }

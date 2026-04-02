@@ -101,8 +101,8 @@ impl SessionService {
                     sessions.push(SessionInfo {
                         id,
                         vt_engine: crate::vt::default_vt_engine_kind(),
-                        vt_engine_status: crate::vt::vt_engine_status(crate::vt::default_vt_engine_kind()).to_string(),
-                        functional_vt_available: crate::vt::functional_vt_available(),
+                        vt_engine_status: String::new(),
+                        functional_vt_available: false,
                         cwd: None,
                         cmd: None,
                         status: SessionStatus::Detached,

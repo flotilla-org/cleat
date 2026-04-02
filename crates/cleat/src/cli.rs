@@ -84,8 +84,7 @@ pub enum Command {
                            With --since or --since-marker: returns recorded output after the\n\
                            given byte offset. Requires recording to be active.\n\
                            \n\
-                           --raw currently returns the same output as non-raw. VT-rendered\n\
-                           replay for the non-raw path is planned.")]
+                           --raw is accepted but currently produces the same output as non-raw.")]
     Capture {
         id: String,
         /// Byte offset in .cast file; return output events after this position

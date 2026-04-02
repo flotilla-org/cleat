@@ -694,11 +694,11 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
                             pending_waits.push(PendingWait { stream, conditions, timeout_ms, registered_at: Instant::now() });
                         }
-                        Ok(_) => {
-                            let _ = Frame::Busy.write(&mut stream);
+                        Ok(other) => {
+                            let _ = Frame::Error(format!("unrecognized request: {other:?}")).write(&mut stream);
                         }
-                        Err(_) => {
-                            let _ = Frame::Busy.write(&mut stream);
+                        Err(err) => {
+                            let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
                         }
                     }
                 }

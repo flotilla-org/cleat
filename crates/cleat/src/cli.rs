@@ -15,7 +15,13 @@ use crate::{
     name = "cleat",
     version,
     about = "Session daemon with a structured control plane for agents and terminal persistence",
-    after_help = crate::vt::BUILD_SUPPORT_MESSAGE
+    after_help = "Typical agent workflow:\n\
+                  \x20 cleat launch --record my-session --cmd bash\n\
+                  \x20 cleat send my-session 'make test'\n\
+                  \x20 cleat wait my-session --idle-time 2\n\
+                  \x20 cleat capture my-session\n\
+                  \x20 cleat kill my-session",
+    after_long_help = crate::vt::BUILD_SUPPORT_MESSAGE
 )]
 pub struct Cli {
     #[arg(long, hide = true)]
@@ -28,6 +34,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand, PartialEq)]
 pub enum Command {
     /// Attach to a session interactively
+    #[command(after_long_help = "By default, creates a new session if the ID does not exist (equivalent\n\
+                           to launch + attach). Use --no-create to fail if the session is missing.\n\
+                           \n\
+                           Unlike launch, attach enters interactive foreground mode — your terminal\n\
+                           is connected to the session's PTY until you detach.")]
     Attach {
         #[arg(value_name = "ID")]
         id: Option<String>,
@@ -67,6 +78,13 @@ pub enum Command {
         json: bool,
     },
     /// Capture terminal screen content
+    #[command(after_long_help = "Without --since/--since-marker: returns current rendered screen from\n\
+                           the VT engine (requires a functional VT engine, not passthrough).\n\
+                           \n\
+                           With --since or --since-marker: returns recorded output after the\n\
+                           given byte offset. Requires recording to be active.\n\
+                           \n\
+                           --raw is accepted but currently produces the same output as non-raw.")]
     Capture {
         id: String,
         /// Byte offset in .cast file; return output events after this position
@@ -113,8 +131,14 @@ pub enum Command {
         target: String,
     },
     /// Enable output recording
+    #[command(after_long_help = "Starts recording PTY output to an asciicast v3 .cast file.\n\
+                           Recording can also be enabled at launch time with --record.\n\
+                           Markers (via the mark command) require an active recording.")]
     Record { id: String },
     /// Set a named marker in the recording
+    #[command(after_long_help = "Returns the byte offset in the .cast file. Named markers can be\n\
+                           used with capture --since-marker to get output recorded after\n\
+                           that point. Requires an active recording.")]
     Mark {
         id: String,
         /// Optional marker name — stores the current offset with this label
@@ -134,6 +158,18 @@ pub enum Command {
     /// Send Escape to a session
     Escape { id: String },
     /// Wait for a condition before continuing
+    #[command(after_long_help = "Conditions (OR semantics — any match wins):\n\
+                           \x20 --idle-time N  Wait until no PTY output for N seconds\n\
+                           \x20 --text STR     Wait until STR appears on the VT screen\n\
+                           \n\
+                           At least one of --idle-time or --text is required.\n\
+                           \n\
+                           Exit codes:\n\
+                           \x20 0  Condition met (ready)\n\
+                           \x20 1  Timeout reached\n\
+                           \x20 2  Error or session exited\n\
+                           \n\
+                           JSON output (--json): {\"status\": \"ready|timeout|session_gone\", \"elapsed_ms\": N}")]
     Wait {
         id: String,
         #[arg(long, help = "Wait until output settles for this many seconds")]
@@ -440,6 +476,9 @@ fn execute_wait(
 }
 
 fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
+    if let Some(ref err) = session.error {
+        return format!("{}\t<inspect failed: {}>", session.id, err);
+    }
     let mut fields =
         vec![session.id.clone(), format_session_status(&session.status).to_string(), crate::vt::vt_engine_label(session.vt_engine)];
     if let Some(cwd) = &session.cwd {

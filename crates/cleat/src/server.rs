@@ -52,6 +52,7 @@ impl SessionService {
             cwd: session.cwd,
             cmd: session.cmd,
             status: SessionStatus::Detached,
+            error: None,
         })
     }
 
@@ -82,17 +83,32 @@ impl SessionService {
                 let _ = self.layout.remove_session(&id);
                 continue;
             }
-            if let Ok(result) = self.inspect(&id) {
-                let status = if result.attachments.is_empty() { SessionStatus::Detached } else { SessionStatus::Attached };
-                sessions.push(SessionInfo {
-                    id: result.session.id,
-                    vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
-                    vt_engine_status: result.session.vt_engine_status,
-                    functional_vt_available: result.session.functional_vt_available,
-                    cwd: result.session.cwd,
-                    cmd: result.session.cmd,
-                    status,
-                });
+            match self.inspect(&id) {
+                Ok(result) => {
+                    let status = if result.attachments.is_empty() { SessionStatus::Detached } else { SessionStatus::Attached };
+                    sessions.push(SessionInfo {
+                        id: result.session.id,
+                        vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+                        vt_engine_status: result.session.vt_engine_status,
+                        functional_vt_available: result.session.functional_vt_available,
+                        cwd: result.session.cwd,
+                        cmd: result.session.cmd,
+                        status,
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    sessions.push(SessionInfo {
+                        id,
+                        vt_engine: crate::vt::default_vt_engine_kind(),
+                        vt_engine_status: String::new(),
+                        functional_vt_available: false,
+                        cwd: None,
+                        cmd: None,
+                        status: SessionStatus::Detached,
+                        error: Some(err),
+                    });
+                }
             }
         }
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
@@ -208,6 +224,7 @@ impl SessionService {
                 cwd: session.cwd,
                 cmd: session.cmd,
                 status: SessionStatus::Attached,
+                error: None,
             }
         };
         let attach = attach_foreground(&self.layout, &info.id)?;
@@ -335,6 +352,7 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         cwd: result.session.cwd,
         cmd: result.session.cmd,
         status,
+        error: None,
     }
 }
 
@@ -439,6 +457,31 @@ mod tests {
 
         reader.join().expect("join reader");
         assert_eq!(frame, Frame::SendKeys(b"hello\r".to_vec()));
+    }
+
+    #[test]
+    fn list_includes_sessions_with_inspect_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+        // Create a session directory with a live socket that accepts but immediately closes
+        // the connection, simulating a daemon that doesn't respond to inspect.
+        let session_dir = temp.path().join("broken-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let socket_path = session_socket_path(temp.path(), "broken-session");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        // Spawn a thread that accepts and immediately drops connections (simulates broken daemon).
+        thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        // No PID file means is_session_daemon_alive returns true (assumes starting up).
+
+        let sessions = service.list().expect("list sessions");
+        assert_eq!(sessions.len(), 1, "broken session should appear in list");
+        assert_eq!(sessions[0].id, "broken-session");
+        assert!(sessions[0].error.is_some(), "should have error field set");
     }
 
     #[test]

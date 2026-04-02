@@ -39,21 +39,6 @@ fn wait_for_socket(path: &std::path::Path) {
     panic!("timed out waiting for socket {}", path.display());
 }
 
-#[cfg(feature = "ghostty-vt")]
-fn require_python3() -> bool {
-    let available = Command::new("python3")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if !available {
-        eprintln!("skipping test: python3 not found");
-    }
-    available
-}
-
 struct EnvVarGuard {
     key: &'static str,
     original: Option<std::ffi::OsString>,
@@ -209,21 +194,19 @@ fn capture_rejects_passthrough_sessions() {
 #[test]
 fn capture_returns_text_for_ghostty_sessions() {
     use cleat::cli::ExecResult;
-    if !require_python3() {
-        return;
-    }
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service
-        .create(
-            Some("alpha".into()),
-            Some(VtEngineKind::Ghostty),
-            None,
-            Some("python3 -c 'import sys, time; sys.stdout.write(\"hello capture\"); sys.stdout.flush(); time.sleep(5)'".into()),
-            false,
-        )
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
         .expect("create alpha");
+
+    // Wait for sh + stty + exec cat to start
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Send text via send-keys — cat echoes it back in raw mode
+    service.send_keys("alpha", b"hello capture").expect("send keys");
+
     let deadline = Instant::now() + Duration::from_secs(2);
     let output = loop {
         let cli = Cli::try_parse_from(["cleat", "capture", "alpha"]).expect("parse capture");

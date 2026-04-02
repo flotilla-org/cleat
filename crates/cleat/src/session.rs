@@ -451,6 +451,14 @@ struct PendingWait {
     registered_at: Instant,
 }
 
+struct PendingExpect {
+    stream: UnixStream,
+    text: String,
+    since_offset: u64,
+    timeout_ms: u64,
+    registered_at: Instant,
+}
+
 #[cfg(unix)]
 pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
     let id = &session.id;
@@ -492,6 +500,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     }
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
+    let mut pending_expects: Vec<PendingExpect> = Vec::new();
     let mut last_pty_output_at: Option<Instant> = None;
     loop {
         let poll_result = poll_ready(
@@ -694,6 +703,32 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
                             pending_waits.push(PendingWait { stream, conditions, timeout_ms, registered_at: Instant::now() });
                         }
+                        Ok(Frame::Expect { text, since_offset, timeout_ms }) => 'expect: {
+                            if recorder.is_none() {
+                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
+                                break 'expect;
+                            }
+                            // Check immediately — text may already be in the recording
+                            let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
+                            if let Some(ref mut rec) = recorder {
+                                rec.flush();
+                            }
+                            if cast_path.exists() {
+                                if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, since_offset) {
+                                    let output: String = events.iter().map(|e| e.data.as_str()).collect();
+                                    if output.contains(&text) {
+                                        let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
+                                            .write(&mut stream);
+                                        break 'expect;
+                                    }
+                                }
+                            }
+                            if let Err(err) = stream.set_nonblocking(true) {
+                                let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
+                                break 'expect;
+                            }
+                            pending_expects.push(PendingExpect { stream, text, since_offset, timeout_ms, registered_at: Instant::now() });
+                        }
                         Ok(other) => {
                             let _ = Frame::Error(format!("unrecognized request: {other:?}")).write(&mut stream);
                         }
@@ -864,10 +899,44 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             true // keep waiting
         });
 
+        // Evaluate pending expects by scanning the cast file for text matches.
+        if !pending_expects.is_empty() {
+            if let Some(ref mut rec) = recorder {
+                rec.flush();
+            }
+            let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
+            pending_expects.retain_mut(|expect| {
+                let elapsed = expect.registered_at.elapsed();
+                let elapsed_ms = elapsed.as_millis() as u64;
+
+                if elapsed_ms >= expect.timeout_ms {
+                    let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Timeout, elapsed_ms }.write(&mut expect.stream);
+                    return false;
+                }
+
+                if cast_path.exists() {
+                    if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, expect.since_offset) {
+                        let output: String = events.iter().map(|e| e.data.as_str()).collect();
+                        if output.contains(&expect.text) {
+                            let _ =
+                                Frame::ExpectResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut expect.stream);
+                            return false;
+                        }
+                    }
+                }
+
+                true
+            });
+        }
+
         if let Some(status) = child_exited(pty_child.pid)? {
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
                 let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut wait.stream);
+            }
+            for mut expect in pending_expects.drain(..) {
+                let elapsed_ms = expect.registered_at.elapsed().as_millis() as u64;
+                let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut expect.stream);
             }
             if let Some(ref mut rec) = recorder {
                 let code = exit_code_from_wait_status(&status);

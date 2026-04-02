@@ -26,7 +26,8 @@ fn help_lists_expected_subcommands() {
         "send",
         "interrupt",
         "escape",
-        "wait"
+        "wait",
+        "expect"
     ]);
     assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
 }
@@ -384,4 +385,50 @@ fn wait_execute_rejects_no_conditions() {
         }
         other => panic!("wait without conditions should exit 2, got: {other:?}"),
     }
+}
+
+#[test]
+fn expect_with_since_marker_parses() {
+    let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "PASS", "--since-marker", "m1", "--timeout", "10"]).expect("parse");
+    assert_eq!(cli.command, Command::Expect {
+        id: "sess".into(),
+        text: "PASS".into(),
+        since: None,
+        since_marker: Some("m1".into()),
+        timeout: 10.0,
+        json: false,
+    });
+}
+
+#[test]
+fn expect_with_since_offset_parses() {
+    let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "DONE", "--since", "100"]).expect("parse");
+    assert_eq!(cli.command, Command::Expect {
+        id: "sess".into(),
+        text: "DONE".into(),
+        since: Some(100),
+        since_marker: None,
+        timeout: 30.0,
+        json: false,
+    });
+}
+
+#[test]
+fn expect_requires_since_or_since_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "PASS"]).expect("parse");
+    let result = execute(cli, &service);
+    match result {
+        ExecResult::Exit { code: 2, message: Some(msg), .. } => {
+            assert!(msg.contains("--since or --since-marker"));
+        }
+        other => panic!("expect without checkpoint should exit 2, got: {other:?}"),
+    }
+}
+
+#[test]
+fn expect_json_flag_parses() {
+    let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "OK", "--since-marker", "m1", "--json"]).expect("parse");
+    assert!(matches!(cli.command, Command::Expect { json: true, .. }));
 }

@@ -98,6 +98,8 @@ const TAG_MARK_RESULT: u8 = 16;
 const TAG_RESOLVE_MARKER: u8 = 17;
 const TAG_WAIT: u8 = 18;
 const TAG_WAIT_RESULT: u8 = 19;
+const TAG_EXPECT: u8 = 20;
+const TAG_EXPECT_RESULT: u8 = 21;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
@@ -133,6 +135,8 @@ pub enum Frame {
     ResolveMarker { name: String },
     Wait { conditions: Vec<WaitCondition>, timeout_ms: u64 },
     WaitResult { status: WaitStatus, elapsed_ms: u64 },
+    Expect { text: String, since_offset: u64, timeout_ms: u64 },
+    ExpectResult { status: WaitStatus, elapsed_ms: u64 },
 }
 
 impl Frame {
@@ -222,6 +226,20 @@ impl Frame {
                 payload.push(*status as u8);
                 payload.extend_from_slice(&elapsed_ms.to_le_bytes());
                 (TAG_WAIT_RESULT, payload)
+            }
+            Frame::Expect { ref text, since_offset, timeout_ms } => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&timeout_ms.to_le_bytes());
+                payload.extend_from_slice(&since_offset.to_le_bytes());
+                payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                payload.extend_from_slice(text.as_bytes());
+                (TAG_EXPECT, payload)
+            }
+            Frame::ExpectResult { status, elapsed_ms } => {
+                let mut payload = Vec::with_capacity(9);
+                payload.push(*status as u8);
+                payload.extend_from_slice(&elapsed_ms.to_le_bytes());
+                (TAG_EXPECT_RESULT, payload)
             }
         }
     }
@@ -351,6 +369,44 @@ impl Frame {
                 let elapsed_ms =
                     u64::from_le_bytes([payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7], payload[8]]);
                 Ok(Frame::WaitResult { status, elapsed_ms })
+            }
+            TAG_EXPECT => {
+                if payload.len() < 20 {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid expect frame: too short"));
+                }
+                let timeout_ms =
+                    u64::from_le_bytes([payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]]);
+                let since_offset = u64::from_le_bytes([
+                    payload[8],
+                    payload[9],
+                    payload[10],
+                    payload[11],
+                    payload[12],
+                    payload[13],
+                    payload[14],
+                    payload[15],
+                ]);
+                let text_len = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]) as usize;
+                if payload.len() < 20 + text_len {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid expect frame: truncated text"));
+                }
+                let text = String::from_utf8(payload[20..20 + text_len].to_vec())
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("invalid expect text utf-8: {e}")))?;
+                Ok(Frame::Expect { text, since_offset, timeout_ms })
+            }
+            TAG_EXPECT_RESULT => {
+                if payload.len() != 9 {
+                    return Err(Error::new(ErrorKind::InvalidData, "invalid expect result frame"));
+                }
+                let status = match payload[0] {
+                    0 => WaitStatus::Ready,
+                    1 => WaitStatus::Timeout,
+                    2 => WaitStatus::SessionGone,
+                    _ => return Err(Error::new(ErrorKind::InvalidData, format!("invalid expect status: {}", payload[0]))),
+                };
+                let elapsed_ms =
+                    u64::from_le_bytes([payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7], payload[8]]);
+                Ok(Frame::ExpectResult { status, elapsed_ms })
             }
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
@@ -557,6 +613,24 @@ mod tests {
     #[test]
     fn wait_result_session_gone_round_trip() {
         let frame = Frame::WaitResult { status: WaitStatus::SessionGone, elapsed_ms: 1234 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn expect_round_trip() {
+        let frame = Frame::Expect { text: "PASS".to_string(), since_offset: 12345, timeout_ms: 5000 };
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes).expect("write");
+        let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn expect_result_round_trip() {
+        let frame = Frame::ExpectResult { status: WaitStatus::Ready, elapsed_ms: 42 };
         let mut bytes = Vec::new();
         frame.write(&mut bytes).expect("write");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read");

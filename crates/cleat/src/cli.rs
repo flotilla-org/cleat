@@ -188,6 +188,35 @@ pub enum Command {
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
+    /// Wait for text in recorded output since a checkpoint
+    #[command(after_long_help = "Edge-triggered text wait: blocks until the given text appears in\n\
+                           recorded output after the specified checkpoint. Unlike wait --text,\n\
+                           which checks the current VT screen, expect only matches NEW output\n\
+                           recorded since the marker.\n\
+                           \n\
+                           Requires an active recording and --since or --since-marker.\n\
+                           \n\
+                           Exit codes:\n\
+                           \x20 0  Text found\n\
+                           \x20 1  Timeout reached\n\
+                           \x20 2  Error or session exited\n\
+                           \n\
+                           JSON output (--json): {\"status\": \"ready|timeout|session_gone\", \"elapsed_ms\": N}")]
+    Expect {
+        id: String,
+        #[arg(long, required = true, help = "Text pattern to search for in recorded output")]
+        text: String,
+        /// Byte offset in .cast file to start searching from
+        #[arg(long, conflicts_with = "since_marker")]
+        since: Option<u64>,
+        /// Named marker to use as the start offset
+        #[arg(long, conflicts_with = "since")]
+        since_marker: Option<String>,
+        #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
+        timeout: f64,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
     #[command(hide = true)]
     Serve {
         #[arg(long)]
@@ -400,6 +429,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Err(e) => ExecResult::Err(e),
         },
         Command::Wait { id, idle_time, text, timeout, json } => execute_wait(service, id, idle_time, text, timeout, json),
+        Command::Expect { id, text, since, since_marker, timeout, json } => {
+            execute_expect(service, id, text, since, since_marker, timeout, json)
+        }
         Command::Serve { id, vt, cmd, cwd, record } => {
             let session = SessionMetadata { id, vt_engine: vt, cwd, cmd, record };
             match service.serve(&session) {
@@ -462,6 +494,65 @@ fn execute_wait(
                 ExecResult::Exit { code: 1, message: None, output: Some(format!(r#"{{"status":"timeout","elapsed_ms":{elapsed_ms}}}"#)) }
             } else {
                 ExecResult::Exit { code: 1, message: Some("wait timed out".to_string()), output: None }
+            }
+        }
+        WaitStatus::SessionGone => {
+            if json {
+                ExecResult::Exit {
+                    code: 2,
+                    message: None,
+                    output: Some(format!(r#"{{"status":"session_gone","elapsed_ms":{elapsed_ms}}}"#)),
+                }
+            } else {
+                ExecResult::Exit { code: 2, message: Some("session exited while waiting".to_string()), output: None }
+            }
+        }
+    }
+}
+
+fn execute_expect(
+    service: &SessionService,
+    id: String,
+    text: String,
+    since: Option<u64>,
+    since_marker: Option<String>,
+    timeout: f64,
+    json: bool,
+) -> ExecResult {
+    let offset = match (since, &since_marker) {
+        (Some(o), _) => o,
+        (_, Some(name)) => match service.resolve_marker(&id, name) {
+            Ok(o) => o,
+            Err(e) => return ExecResult::Exit { code: 2, message: Some(e), output: None },
+        },
+        _ => {
+            return ExecResult::Exit { code: 2, message: Some("expect requires --since or --since-marker".to_string()), output: None };
+        }
+    };
+
+    if !timeout.is_finite() || !(0.0..=86_400.0).contains(&timeout) {
+        return ExecResult::Exit { code: 2, message: Some(format!("invalid timeout: {timeout} (max 86400)")), output: None };
+    }
+    let timeout_ms = (timeout * 1000.0) as u64;
+
+    let (status, elapsed_ms) = match service.expect(&id, &text, offset, timeout_ms) {
+        Ok(v) => v,
+        Err(e) => return ExecResult::Exit { code: 2, message: Some(e), output: None },
+    };
+
+    match status {
+        WaitStatus::Ready => {
+            if json {
+                ExecResult::Ok(Some(format!(r#"{{"status":"ready","elapsed_ms":{elapsed_ms}}}"#)))
+            } else {
+                ExecResult::Ok(None)
+            }
+        }
+        WaitStatus::Timeout => {
+            if json {
+                ExecResult::Exit { code: 1, message: None, output: Some(format!(r#"{{"status":"timeout","elapsed_ms":{elapsed_ms}}}"#)) }
+            } else {
+                ExecResult::Exit { code: 1, message: Some("expect timed out".to_string()), output: None }
             }
         }
         WaitStatus::SessionGone => {

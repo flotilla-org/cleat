@@ -81,7 +81,8 @@ impl CoalesceBuffer {
 
     /// Drain and return the pending event, resetting the buffer.
     /// Holds back any trailing incomplete UTF-8 sequence so it can be
-    /// completed by the next push+drain cycle.
+    /// completed by the next push+drain cycle. Held-back bytes retain
+    /// their original timestamp.
     fn drain(&mut self) -> Option<Event> {
         if self.bytes.is_empty() {
             return None;
@@ -95,13 +96,7 @@ impl CoalesceBuffer {
         let code = if self.is_input { EventCode::Input } else { EventCode::Output };
         let event = Event { time: self.first_time, code, data };
         // Move any trailing incomplete bytes to the front.
-        if split < self.bytes.len() {
-            let tail = self.bytes[split..].to_vec();
-            self.bytes.clear();
-            self.bytes.extend_from_slice(&tail);
-        } else {
-            self.bytes.clear();
-        }
+        self.bytes.drain(..split);
         Some(event)
     }
 
@@ -415,8 +410,11 @@ mod tests {
         buf.push(&[0xE2, 0x82], Duration::ZERO, false);
         // drain holds them back:
         assert!(buf.drain().is_none());
-        // The incomplete bytes are still in the buffer:
         assert!(!buf.is_empty());
+        // drain_final emits them with lossy conversion:
+        let event = buf.drain_final().expect("drain_final should produce event");
+        assert!(event.data.contains('\u{FFFD}'), "incomplete bytes should become replacement char");
+        assert!(buf.is_empty());
     }
 
     #[test]

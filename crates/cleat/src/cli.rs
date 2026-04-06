@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::{
     keys::encode_send_keys,
@@ -17,11 +17,17 @@ use crate::{
     about = "Session daemon with a structured control plane for agents and terminal persistence",
     after_help = "Typical agent workflow:\n\
                   \x20 cleat launch --record my-session --cmd bash\n\
-                  \x20 cleat send my-session 'make test'\n\
+                  \x20 cleat send my-session 'make test' --mark-before m1\n\
                   \x20 cleat wait my-session --idle-time 2\n\
-                  \x20 cleat capture my-session\n\
+                  \x20 cleat transcript my-session --since-marker m1\n\
                   \x20 cleat kill my-session",
-    after_long_help = crate::vt::BUILD_SUPPORT_MESSAGE
+    // Mirrors after_help; BUILD_SUPPORT_MESSAGE appended at runtime via command().
+    after_long_help = "Typical agent workflow:\n\
+                       \x20 cleat launch --record my-session --cmd bash\n\
+                       \x20 cleat send my-session 'make test' --mark-before m1\n\
+                       \x20 cleat wait my-session --idle-time 2\n\
+                       \x20 cleat transcript my-session --since-marker m1\n\
+                       \x20 cleat kill my-session"
 )]
 pub struct Cli {
     #[arg(long, hide = true)]
@@ -78,14 +84,21 @@ pub enum Command {
         json: bool,
     },
     /// Capture terminal screen content
-    #[command(after_long_help = "Without --since/--since-marker: returns current rendered screen from\n\
-                           the VT engine (requires a functional VT engine, not passthrough).\n\
+    #[command(after_long_help = "Returns the current rendered screen from the VT engine.\n\
+                           Requires a functional VT engine (not passthrough).\n\
                            \n\
-                           With --since or --since-marker: returns recorded output after the\n\
-                           given byte offset. Requires recording to be active.\n\
+                           For recorded output since a checkpoint, use the transcript command.")]
+    Capture { id: String },
+    /// Read recorded output since a checkpoint
+    #[command(after_long_help = "Returns recorded PTY output after the given byte offset or named\n\
+                           marker. Requires an active recording.\n\
                            \n\
-                           --raw is accepted but currently produces the same output as non-raw.")]
-    Capture {
+                           Use mark to set a named checkpoint, then transcript --since-marker\n\
+                           to read output produced after that point.\n\
+                           \n\
+                           --raw is accepted but currently produces the same output as non-raw.\n\
+                           VT-rendered replay for the non-raw path is planned.")]
+    Transcript {
         id: String,
         /// Byte offset in .cast file; return output events after this position
         #[arg(long, conflicts_with = "since_marker")]
@@ -93,7 +106,7 @@ pub enum Command {
         /// Named marker to use as the start offset
         #[arg(long, conflicts_with = "since")]
         since_marker: Option<String>,
-        /// Return raw event data instead of VT-rendered text (requires --since or --since-marker)
+        /// Return raw event data instead of VT-rendered text
         #[arg(long)]
         raw: bool,
     },
@@ -116,6 +129,8 @@ pub enum Command {
         repeat: usize,
         #[arg(value_name = "KEY", required = true, num_args = 1..)]
         keys: Vec<String>,
+        #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
+        mark_before: Option<String>,
     },
     /// Show session state and process info
     Inspect {
@@ -137,7 +152,7 @@ pub enum Command {
     Record { id: String },
     /// Set a named marker in the recording
     #[command(after_long_help = "Returns the byte offset in the .cast file. Named markers can be\n\
-                           used with capture --since-marker to get output recorded after\n\
+                           used with transcript --since-marker to get output recorded after\n\
                            that point. Requires an active recording.")]
     Mark {
         id: String,
@@ -152,6 +167,8 @@ pub enum Command {
         text: String,
         #[arg(long, help = "Do not append Enter after the text")]
         no_enter: bool,
+        #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
+        mark_before: Option<String>,
     },
     /// Send Ctrl-C to a session
     Interrupt { id: String },
@@ -163,6 +180,11 @@ pub enum Command {
                            \x20 --text STR     Wait until STR appears on the VT screen\n\
                            \n\
                            At least one of --idle-time or --text is required.\n\
+                           \n\
+                           NOTE: --text matches against the current VT screen state. If the\n\
+                           text is already visible when wait is called, it returns immediately.\n\
+                           For edge-triggered text matching on new output, use the expect\n\
+                           command with --since-marker.\n\
                            \n\
                            Exit codes:\n\
                            \x20 0  Condition met (ready)\n\
@@ -176,6 +198,35 @@ pub enum Command {
         idle_time: Option<f64>,
         #[arg(long, help = "Wait until this text appears on screen")]
         text: Option<String>,
+        #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
+        timeout: f64,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    /// Wait for text in recorded output since a checkpoint
+    #[command(after_long_help = "Edge-triggered text wait: blocks until the given text appears in\n\
+                           recorded output after the specified checkpoint. Unlike wait --text,\n\
+                           which checks the current VT screen, expect only matches NEW output\n\
+                           recorded since the marker.\n\
+                           \n\
+                           Requires an active recording and --since or --since-marker.\n\
+                           \n\
+                           Exit codes:\n\
+                           \x20 0  Text found\n\
+                           \x20 1  Timeout reached\n\
+                           \x20 2  Error or session exited\n\
+                           \n\
+                           JSON output (--json): {\"status\": \"ready|timeout|session_gone\", \"elapsed_ms\": N}")]
+    Expect {
+        id: String,
+        #[arg(long, required = true, help = "Text pattern to search for in recorded output")]
+        text: String,
+        /// Byte offset in .cast file to start searching from
+        #[arg(long, conflicts_with = "since_marker")]
+        since: Option<u64>,
+        /// Named marker to use as the start offset
+        #[arg(long, conflicts_with = "since")]
+        since_marker: Option<String>,
         #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
         timeout: f64,
         #[arg(long, help = "Output as JSON")]
@@ -196,12 +247,18 @@ pub enum Command {
     },
 }
 
+/// Uses `command()` instead of `Cli::parse()` so --help renders the workflow
+/// snippet alongside BUILD_SUPPORT_MESSAGE (which can't be concatenated at
+/// compile time since it's a const &str, not a literal).
 pub fn parse() -> Cli {
-    Cli::parse()
+    Cli::from_arg_matches(&command().get_matches()).expect("clap arg parsing should not fail after get_matches succeeds")
 }
 
 pub fn command() -> clap::Command {
-    Cli::command()
+    let cmd = Cli::command();
+    let existing = cmd.get_after_long_help().map(|s| s.to_string()).unwrap_or_default();
+    let combined = format!("{existing}\n\n{}", crate::vt::BUILD_SUPPORT_MESSAGE);
+    cmd.after_long_help(combined)
 }
 
 #[derive(Debug)]
@@ -290,11 +347,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
-        Command::Capture { id, since, since_marker, raw } => {
-            if raw && since.is_none() && since_marker.is_none() {
-                return ExecResult::Err("--raw requires --since or --since-marker".to_string());
-            }
-            // --since and --since-marker mutual exclusion enforced by clap conflicts_with
+        Command::Capture { id } => match service.capture(&id) {
+            Ok(s) => ExecResult::Ok(Some(s)),
+            Err(e) => ExecResult::Err(e),
+        },
+        Command::Transcript { id, since, since_marker, raw } => {
             let offset = match (since, &since_marker) {
                 (Some(o), _) => Some(o),
                 (_, Some(name)) => match service.resolve_marker(&id, name) {
@@ -303,19 +360,15 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 },
                 _ => None,
             };
-            let result = match offset {
+            match offset {
                 Some(o) => {
-                    if raw {
-                        service.capture_since_raw(&id, o)
-                    } else {
-                        service.capture_since_text(&id, o)
+                    let result = if raw { service.capture_since_raw(&id, o) } else { service.capture_since_text(&id, o) };
+                    match result {
+                        Ok(s) => ExecResult::Ok(Some(s)),
+                        Err(e) => ExecResult::Err(e),
                     }
                 }
-                None => service.capture(&id),
-            };
-            match result {
-                Ok(s) => ExecResult::Ok(Some(s)),
-                Err(e) => ExecResult::Err(e),
+                None => ExecResult::Err("transcript requires --since or --since-marker".to_string()),
             }
         }
         Command::Detach { id } => match service.detach(&id) {
@@ -326,14 +379,21 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
-        Command::SendKeys { id, literal, hex, repeat, keys } => {
+        Command::SendKeys { id, literal, hex, repeat, keys, mark_before } => {
             let bytes = match encode_send_keys(&keys, literal, hex, repeat) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
-            match service.send_keys(&id, &bytes) {
-                Ok(()) => ExecResult::Ok(None),
-                Err(e) => ExecResult::Err(e),
+            if let Some(marker_name) = mark_before {
+                match service.send_keys_with_mark(&id, &bytes, &marker_name) {
+                    Ok(offset) => ExecResult::Ok(Some(offset.to_string())),
+                    Err(e) => ExecResult::Err(e),
+                }
+            } else {
+                match service.send_keys(&id, &bytes) {
+                    Ok(()) => ExecResult::Ok(None),
+                    Err(e) => ExecResult::Err(e),
+                }
             }
         }
         Command::Inspect { id, json } => {
@@ -378,14 +438,21 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Send { id, text, no_enter } => {
+        Command::Send { id, text, no_enter, mark_before } => {
             let mut bytes = text.into_bytes();
             if !no_enter {
                 bytes.push(b'\r');
             }
-            match service.send_keys(&id, &bytes) {
-                Ok(()) => ExecResult::Ok(None),
-                Err(e) => ExecResult::Err(e),
+            if let Some(marker_name) = mark_before {
+                match service.send_keys_with_mark(&id, &bytes, &marker_name) {
+                    Ok(offset) => ExecResult::Ok(Some(offset.to_string())),
+                    Err(e) => ExecResult::Err(e),
+                }
+            } else {
+                match service.send_keys(&id, &bytes) {
+                    Ok(()) => ExecResult::Ok(None),
+                    Err(e) => ExecResult::Err(e),
+                }
             }
         }
         Command::Interrupt { id } => match service.send_keys(&id, &[0x03]) {
@@ -397,6 +464,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Err(e) => ExecResult::Err(e),
         },
         Command::Wait { id, idle_time, text, timeout, json } => execute_wait(service, id, idle_time, text, timeout, json),
+        Command::Expect { id, text, since, since_marker, timeout, json } => {
+            execute_expect(service, id, text, since, since_marker, timeout, json)
+        }
         Command::Serve { id, vt, cmd, cwd, record } => {
             let session = SessionMetadata { id, vt_engine: vt, cwd, cmd, record };
             match service.serve(&session) {
@@ -459,6 +529,65 @@ fn execute_wait(
                 ExecResult::Exit { code: 1, message: None, output: Some(format!(r#"{{"status":"timeout","elapsed_ms":{elapsed_ms}}}"#)) }
             } else {
                 ExecResult::Exit { code: 1, message: Some("wait timed out".to_string()), output: None }
+            }
+        }
+        WaitStatus::SessionGone => {
+            if json {
+                ExecResult::Exit {
+                    code: 2,
+                    message: None,
+                    output: Some(format!(r#"{{"status":"session_gone","elapsed_ms":{elapsed_ms}}}"#)),
+                }
+            } else {
+                ExecResult::Exit { code: 2, message: Some("session exited while waiting".to_string()), output: None }
+            }
+        }
+    }
+}
+
+fn execute_expect(
+    service: &SessionService,
+    id: String,
+    text: String,
+    since: Option<u64>,
+    since_marker: Option<String>,
+    timeout: f64,
+    json: bool,
+) -> ExecResult {
+    let offset = match (since, &since_marker) {
+        (Some(o), _) => o,
+        (_, Some(name)) => match service.resolve_marker(&id, name) {
+            Ok(o) => o,
+            Err(e) => return ExecResult::Exit { code: 2, message: Some(e), output: None },
+        },
+        _ => {
+            return ExecResult::Exit { code: 2, message: Some("expect requires --since or --since-marker".to_string()), output: None };
+        }
+    };
+
+    if !timeout.is_finite() || !(0.0..=86_400.0).contains(&timeout) {
+        return ExecResult::Exit { code: 2, message: Some(format!("invalid timeout: {timeout} (max 86400)")), output: None };
+    }
+    let timeout_ms = (timeout * 1000.0) as u64;
+
+    let (status, elapsed_ms) = match service.expect(&id, &text, offset, timeout_ms) {
+        Ok(v) => v,
+        Err(e) => return ExecResult::Exit { code: 2, message: Some(e), output: None },
+    };
+
+    match status {
+        WaitStatus::Ready => {
+            if json {
+                ExecResult::Ok(Some(format!(r#"{{"status":"ready","elapsed_ms":{elapsed_ms}}}"#)))
+            } else {
+                ExecResult::Ok(None)
+            }
+        }
+        WaitStatus::Timeout => {
+            if json {
+                ExecResult::Exit { code: 1, message: None, output: Some(format!(r#"{{"status":"timeout","elapsed_ms":{elapsed_ms}}}"#)) }
+            } else {
+                ExecResult::Exit { code: 1, message: Some("expect timed out".to_string()), output: None }
             }
         }
         WaitStatus::SessionGone => {

@@ -936,3 +936,41 @@ fn signal_missing_session_is_an_error() {
     let err = service.signal("missing", libc::SIGINT, cleat::protocol::SignalTarget::Foreground).expect_err("missing session should error");
     assert!(err.contains("missing"));
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn expect_finds_text_in_recorded_output_after_marker() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create alpha");
+
+    // Wait for sh + stty + exec cat to start
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Set a marker, then send text that cat will echo
+    let offset = service.named_mark("alpha", "m1").expect("mark");
+    service.send_keys("alpha", b"HELLO_EXPECT\n").expect("send keys");
+
+    // expect should find the text in recorded output
+    let (status, _elapsed) = service.expect("alpha", "HELLO_EXPECT", offset, 5000).expect("expect call");
+    assert_eq!(status, cleat::protocol::WaitStatus::Ready, "expect should find text in recording");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn expect_times_out_when_text_not_in_recording() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create alpha");
+
+    // Wait for sh + stty + exec cat to start
+    std::thread::sleep(Duration::from_secs(1));
+
+    let offset = service.named_mark("alpha", "m1").expect("mark");
+
+    // expect for text that will never appear — should timeout
+    let (status, _elapsed) = service.expect("alpha", "NEVER_APPEARS", offset, 500).expect("expect call");
+    assert_eq!(status, cleat::protocol::WaitStatus::Timeout, "expect should timeout when text absent");
+}

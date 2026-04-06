@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser};
 use cleat::{
-    cli::{execute, Cli, Command, ExecResult},
+    cli::{self, execute, Cli, Command, ExecResult},
     runtime::RuntimeLayout,
     server::SessionService,
     vt::{self, VtEngineKind},
@@ -15,6 +15,7 @@ fn help_lists_expected_subcommands() {
         "launch",
         "list",
         "capture",
+        "transcript",
         "detach",
         "kill",
         "send-keys",
@@ -25,22 +26,24 @@ fn help_lists_expected_subcommands() {
         "send",
         "interrupt",
         "escape",
-        "wait"
+        "wait",
+        "expect"
     ]);
     assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
 }
 
 #[test]
 fn help_surfaces_vt_support_policy() {
-    let mut command = Cli::command();
+    let mut command = cli::command();
     let mut buffer = Vec::new();
     command.write_long_help(&mut buffer).expect("write help");
     let help = String::from_utf8(buffer).expect("help utf8");
 
     assert!(help.contains("Ghostty is currently the only functional VT engine"));
     assert!(help.contains(vt::BUILD_SUPPORT_MESSAGE));
+    assert!(help.contains("Typical agent workflow"));
 
-    let mut launch = Cli::command().find_subcommand_mut("launch").expect("launch command").clone();
+    let mut launch = cli::command().find_subcommand_mut("launch").expect("launch command").clone();
     let mut launch_buffer = Vec::new();
     launch.write_long_help(&mut launch_buffer).expect("write launch help");
     let launch_help = String::from_utf8(launch_buffer).expect("launch help utf8");
@@ -131,7 +134,7 @@ fn list_command_parses_json() {
 #[test]
 fn capture_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "capture", "session-1"]).expect("capture parses");
-    assert_eq!(cli.command, Command::Capture { id: "session-1".into(), since: None, since_marker: None, raw: false });
+    assert_eq!(cli.command, Command::Capture { id: "session-1".into() });
 }
 
 #[test]
@@ -149,7 +152,14 @@ fn kill_command_parses() {
 #[test]
 fn send_keys_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "send-keys", "demo", "Enter"]).expect("send-keys parses");
-    assert_eq!(cli.command, Command::SendKeys { id: "demo".into(), literal: false, hex: false, repeat: 1, keys: vec!["Enter".into()] });
+    assert_eq!(cli.command, Command::SendKeys {
+        id: "demo".into(),
+        literal: false,
+        hex: false,
+        repeat: 1,
+        keys: vec!["Enter".into()],
+        mark_before: None,
+    });
 }
 
 #[test]
@@ -160,7 +170,8 @@ fn send_keys_command_parses_literal_mode() {
         literal: true,
         hex: false,
         repeat: 1,
-        keys: vec!["hello".into(), "world".into()]
+        keys: vec!["hello".into(), "world".into()],
+        mark_before: None,
     });
 }
 
@@ -172,14 +183,22 @@ fn send_keys_command_parses_hex_mode() {
         literal: false,
         hex: true,
         repeat: 1,
-        keys: vec!["41".into(), "0a".into()]
+        keys: vec!["41".into(), "0a".into()],
+        mark_before: None,
     });
 }
 
 #[test]
 fn send_keys_command_parses_repeat() {
     let cli = Cli::try_parse_from(["cleat", "send-keys", "-N", "3", "demo", "C-l"]).expect("send-keys -N parses");
-    assert_eq!(cli.command, Command::SendKeys { id: "demo".into(), literal: false, hex: false, repeat: 3, keys: vec!["C-l".into()] });
+    assert_eq!(cli.command, Command::SendKeys {
+        id: "demo".into(),
+        literal: false,
+        hex: false,
+        repeat: 3,
+        keys: vec!["C-l".into()],
+        mark_before: None,
+    });
 }
 
 #[test]
@@ -252,7 +271,14 @@ fn mark_command_parses_session_id() {
 fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,
-        command: Command::SendKeys { id: "demo".into(), literal: false, hex: false, repeat: 1, keys: vec!["Enter".into()] },
+        command: Command::SendKeys {
+            id: "demo".into(),
+            literal: false,
+            hex: false,
+            repeat: 1,
+            keys: vec!["Enter".into()],
+            mark_before: None,
+        },
     };
     let service = SessionService::new(RuntimeLayout::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()));
 
@@ -262,37 +288,6 @@ fn send_keys_execute_reports_missing_session() {
         _ => panic!("missing session should fail"),
     };
     assert!(err.contains("missing"));
-}
-
-#[test]
-fn capture_with_since_flag_parses() {
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "12345"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(12345), since_marker: None, raw: false });
-}
-
-#[test]
-fn capture_with_raw_flag_parses() {
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "0", "--raw"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: Some(0), since_marker: None, raw: true });
-}
-
-#[test]
-fn capture_without_since_still_works() {
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, since_marker: None, raw: false });
-}
-
-#[test]
-fn capture_raw_without_since_is_rejected() {
-    let temp = tempfile::tempdir().unwrap();
-    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--raw"]).expect("parse");
-    let result = execute(cli, &service);
-    let err = match result {
-        ExecResult::Err(e) => e,
-        _ => panic!("--raw without --since should fail"),
-    };
-    assert!(err.contains("--raw requires --since or --since-marker"));
 }
 
 #[test]
@@ -308,27 +303,52 @@ fn mark_without_name_still_works() {
 }
 
 #[test]
-fn capture_with_since_marker_parses() {
-    let cli = Cli::try_parse_from(["cleat", "capture", "sess", "--since-marker", "checkpoint"]).expect("parse");
-    assert_eq!(cli.command, Command::Capture { id: "sess".into(), since: None, since_marker: Some("checkpoint".into()), raw: false });
+fn transcript_with_since_marker_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "m1"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: None, since_marker: Some("m1".into()), raw: false });
 }
 
 #[test]
-fn capture_since_and_since_marker_are_mutually_exclusive() {
-    let result = Cli::try_parse_from(["cleat", "capture", "sess", "--since", "100", "--since-marker", "foo"]);
+fn transcript_with_since_offset_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "500"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: Some(500), since_marker: None, raw: false });
+}
+
+#[test]
+fn transcript_with_raw_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "m1", "--raw"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: None, since_marker: Some("m1".into()), raw: true });
+}
+
+#[test]
+fn transcript_requires_since_or_since_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess"]).expect("parse");
+    let result = execute(cli, &service);
+    let err = match result {
+        ExecResult::Err(e) => e,
+        _ => panic!("transcript without --since should fail"),
+    };
+    assert!(err.contains("--since or --since-marker"));
+}
+
+#[test]
+fn transcript_since_and_since_marker_are_mutually_exclusive() {
+    let result = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "100", "--since-marker", "m1"]);
     assert!(result.is_err(), "--since and --since-marker should be mutually exclusive");
 }
 
 #[test]
 fn send_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "send", "demo", "echo hello"]).expect("send parses");
-    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "echo hello".into(), no_enter: false });
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "echo hello".into(), no_enter: false, mark_before: None });
 }
 
 #[test]
 fn send_command_parses_no_enter() {
     let cli = Cli::try_parse_from(["cleat", "send", "--no-enter", "demo", "partial"]).expect("send --no-enter parses");
-    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true });
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true, mark_before: None });
 }
 
 #[test]
@@ -389,4 +409,69 @@ fn wait_execute_rejects_no_conditions() {
         }
         other => panic!("wait without conditions should exit 2, got: {other:?}"),
     }
+}
+
+#[test]
+fn expect_with_since_marker_parses() {
+    let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "PASS", "--since-marker", "m1", "--timeout", "10"]).expect("parse");
+    assert_eq!(cli.command, Command::Expect {
+        id: "sess".into(),
+        text: "PASS".into(),
+        since: None,
+        since_marker: Some("m1".into()),
+        timeout: 10.0,
+        json: false,
+    });
+}
+
+#[test]
+fn expect_with_since_offset_parses() {
+    let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "DONE", "--since", "100"]).expect("parse");
+    assert_eq!(cli.command, Command::Expect {
+        id: "sess".into(),
+        text: "DONE".into(),
+        since: Some(100),
+        since_marker: None,
+        timeout: 30.0,
+        json: false,
+    });
+}
+
+#[test]
+fn expect_requires_since_or_since_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "PASS"]).expect("parse");
+    let result = execute(cli, &service);
+    match result {
+        ExecResult::Exit { code: 2, message: Some(msg), .. } => {
+            assert!(msg.contains("--since or --since-marker"));
+        }
+        other => panic!("expect without checkpoint should exit 2, got: {other:?}"),
+    }
+}
+
+#[test]
+fn expect_json_flag_parses() {
+    let cli = Cli::try_parse_from(["cleat", "expect", "sess", "--text", "OK", "--since-marker", "m1", "--json"]).expect("parse");
+    assert!(matches!(cli.command, Command::Expect { json: true, .. }));
+}
+
+#[test]
+fn send_mark_before_parses() {
+    let cli = Cli::try_parse_from(["cleat", "send", "--mark-before", "m1", "sess", "echo hi"]).expect("parse");
+    assert_eq!(cli.command, Command::Send { id: "sess".into(), text: "echo hi".into(), no_enter: false, mark_before: Some("m1".into()) });
+}
+
+#[test]
+fn send_keys_mark_before_parses() {
+    let cli = Cli::try_parse_from(["cleat", "send-keys", "--mark-before", "m1", "sess", "Enter"]).expect("parse");
+    assert_eq!(cli.command, Command::SendKeys {
+        id: "sess".into(),
+        literal: false,
+        hex: false,
+        repeat: 1,
+        keys: vec!["Enter".into()],
+        mark_before: Some("m1".into()),
+    });
 }

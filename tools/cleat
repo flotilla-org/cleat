@@ -17,11 +17,14 @@ case "$(uname -s)" in
     *)      export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$LIB_DIR" ;;
 esac
 
-# Prefer a pre-built binary (release > debug)
+# Prefer a pre-built binary (release > debug), but only if built with ghostty-vt
 for candidate in \
     "$REPO_ROOT/target/release/cleat" \
     "$REPO_ROOT/target/debug/cleat"; do
     if [[ -x "$candidate" ]]; then
+        if "$candidate" --help 2>&1 | grep -q "built without ghostty-vt"; then
+            continue
+        fi
         exec "$candidate" "$@"
     fi
 done

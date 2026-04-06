@@ -11,6 +11,44 @@ pub const CAST_FILE_NAME: &str = "session.cast";
 
 const COALESCE_SIZE_THRESHOLD: usize = 4096;
 
+/// Return the byte length of the longest prefix of `bytes` that is complete
+/// UTF-8 (i.e. does not end with a partial multi-byte sequence).
+fn utf8_complete_len(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let len = bytes.len();
+    // Find the last leading byte (non-continuation).
+    let mut i = len;
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+        if b & 0b1100_0000 != 0b1000_0000 {
+            // Found a leading byte (or ASCII). Check if the sequence is complete.
+            let expected_len = if b < 0x80 {
+                1
+            } else if b & 0b1110_0000 == 0b1100_0000 {
+                2
+            } else if b & 0b1111_0000 == 0b1110_0000 {
+                3
+            } else if b & 0b1111_1000 == 0b1111_0000 {
+                4
+            } else {
+                // Invalid byte — treat as complete (lossy will handle it).
+                return len;
+            };
+            let available = len - i;
+            if available >= expected_len {
+                return len;
+            } else {
+                return i;
+            }
+        }
+    }
+    // All bytes are continuation bytes — treat as complete (lossy will handle it).
+    len
+}
+
 /// Internal coalescing buffer for consecutive same-type events.
 struct CoalesceBuffer {
     bytes: Vec<u8>,
@@ -42,7 +80,35 @@ impl CoalesceBuffer {
     }
 
     /// Drain and return the pending event, resetting the buffer.
+    /// Holds back any trailing incomplete UTF-8 sequence so it can be
+    /// completed by the next push+drain cycle.
     fn drain(&mut self) -> Option<Event> {
+        if self.bytes.is_empty() {
+            return None;
+        }
+        let split = utf8_complete_len(&self.bytes);
+        if split == 0 {
+            // Only incomplete bytes in the buffer — hold everything back.
+            return None;
+        }
+        let data = String::from_utf8_lossy(&self.bytes[..split]).into_owned();
+        let code = if self.is_input { EventCode::Input } else { EventCode::Output };
+        let event = Event { time: self.first_time, code, data };
+        // Move any trailing incomplete bytes to the front.
+        if split < self.bytes.len() {
+            let tail = self.bytes[split..].to_vec();
+            self.bytes.clear();
+            self.bytes.extend_from_slice(&tail);
+        } else {
+            self.bytes.clear();
+        }
+        Some(event)
+    }
+
+    /// Drain all bytes unconditionally, using lossy conversion for any
+    /// incomplete trailing sequence. Called on session exit when no more
+    /// bytes will arrive.
+    fn drain_final(&mut self) -> Option<Event> {
         if self.bytes.is_empty() {
             return None;
         }
@@ -194,6 +260,15 @@ impl SessionRecorder {
         }
     }
 
+    /// Final flush — emits all remaining bytes, including incomplete UTF-8
+    /// sequences (using lossy conversion). Call once when the session is
+    /// ending and no more bytes will arrive.
+    pub fn flush_final(&mut self) {
+        if let Some(event) = self.coalesce.drain_final() {
+            self.write_event(&event);
+        }
+    }
+
     /// Current byte offset in the .cast file (matches file size).
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
@@ -231,8 +306,9 @@ impl SessionRecorder {
 
 #[cfg(test)]
 mod tests {
-    use super::CoalesceBuffer;
     use std::time::Duration;
+
+    use super::CoalesceBuffer;
 
     #[test]
     fn drain_complete_utf8_emits_all_bytes() {
@@ -248,7 +324,7 @@ mod tests {
         let mut buf = CoalesceBuffer::new();
         // é is U+00E9, encoded as [0xC3, 0xA9]
         let bytes = "café".as_bytes(); // [99, 97, 102, 195, 169]
-        // Push everything except the last byte
+                                       // Push everything except the last byte
         buf.push(&bytes[..4], Duration::ZERO, false);
         let event = buf.drain().expect("should produce event");
         assert_eq!(event.data, "caf");

@@ -970,7 +970,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             if let Some(ref mut rec) = recorder {
                 let code = exit_code_from_wait_status(&status);
                 rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());
-                rec.flush();
+                rec.flush_final();
             }
             break;
         }

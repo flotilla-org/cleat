@@ -21,6 +21,7 @@ use crate::{
                   \x20 cleat wait my-session --idle-time 2\n\
                   \x20 cleat transcript my-session --since-marker m1\n\
                   \x20 cleat kill my-session",
+    // Mirrors after_help; BUILD_SUPPORT_MESSAGE appended at runtime via command().
     after_long_help = "Typical agent workflow:\n\
                        \x20 cleat launch --record my-session --cmd bash\n\
                        \x20 cleat send my-session 'make test' --mark-before m1\n\
@@ -246,6 +247,9 @@ pub enum Command {
     },
 }
 
+/// Uses `command()` instead of `Cli::parse()` so --help renders the workflow
+/// snippet alongside BUILD_SUPPORT_MESSAGE (which can't be concatenated at
+/// compile time since it's a const &str, not a literal).
 pub fn parse() -> Cli {
     Cli::from_arg_matches(&command().get_matches()).expect("clap arg parsing should not fail after get_matches succeeds")
 }

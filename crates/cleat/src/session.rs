@@ -744,11 +744,12 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
                                 break 'expect;
                             }
+                            let initial_file_size = std::fs::metadata(&cast_path).map(|m| m.len()).unwrap_or(0);
                             pending_expects.push(PendingExpect {
                                 stream,
                                 text,
                                 since_offset,
-                                last_checked_file_size: 0,
+                                last_checked_file_size: initial_file_size,
                                 timeout_ms,
                                 registered_at: Instant::now(),
                             });

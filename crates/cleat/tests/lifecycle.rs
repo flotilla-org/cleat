@@ -996,11 +996,7 @@ fn inspect_reports_dynamic_leader_cwd() {
 
     // On macOS /tmp is a symlink to /private/tmp
     let expected = std::fs::canonicalize("/tmp").expect("canonicalize /tmp");
-    assert_eq!(
-        std::fs::canonicalize(&leader_cwd).unwrap_or_else(|_| leader_cwd.clone()),
-        expected,
-        "leader_cwd should reflect cd /tmp"
-    );
+    assert_eq!(std::fs::canonicalize(&leader_cwd).unwrap_or_else(|_| leader_cwd.clone()), expected, "leader_cwd should reflect cd /tmp");
 
     // When shell is in foreground, foreground_cwd should match leader_cwd
     let fg_cwd = result.process.foreground_cwd.expect("foreground_cwd should be Some");

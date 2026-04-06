@@ -455,6 +455,7 @@ struct PendingExpect {
     stream: UnixStream,
     text: String,
     since_offset: u64,
+    last_checked_file_size: u64,
     timeout_ms: u64,
     registered_at: Instant,
 }
@@ -743,7 +744,14 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
                                 break 'expect;
                             }
-                            pending_expects.push(PendingExpect { stream, text, since_offset, timeout_ms, registered_at: Instant::now() });
+                            pending_expects.push(PendingExpect {
+                                stream,
+                                text,
+                                since_offset,
+                                last_checked_file_size: 0,
+                                timeout_ms,
+                                registered_at: Instant::now(),
+                            });
                         }
                         Ok(other) => {
                             let _ = Frame::Error(format!("unrecognized request: {other:?}")).write(&mut stream);
@@ -931,12 +939,16 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 }
 
                 if cast_path.exists() {
-                    if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, expect.since_offset) {
-                        let output: String = events.iter().map(|e| e.data.as_str()).collect();
-                        if output.contains(&expect.text) {
-                            let _ =
-                                Frame::ExpectResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut expect.stream);
-                            return false;
+                    let file_size = std::fs::metadata(&cast_path).map(|m| m.len()).unwrap_or(0);
+                    if file_size > expect.last_checked_file_size {
+                        expect.last_checked_file_size = file_size;
+                        if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, expect.since_offset) {
+                            let output: String = events.iter().map(|e| e.data.as_str()).collect();
+                            if output.contains(&expect.text) {
+                                let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }
+                                    .write(&mut expect.stream);
+                                return false;
+                            }
                         }
                     }
                 }

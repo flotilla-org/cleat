@@ -228,3 +228,136 @@ impl SessionRecorder {
         self.bytes_written += line.len() as u64;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CoalesceBuffer;
+    use std::time::Duration;
+
+    #[test]
+    fn drain_complete_utf8_emits_all_bytes() {
+        let mut buf = CoalesceBuffer::new();
+        buf.push("hello café".as_bytes(), Duration::ZERO, false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "hello café");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_split_2byte_char_holds_back_incomplete() {
+        let mut buf = CoalesceBuffer::new();
+        // é is U+00E9, encoded as [0xC3, 0xA9]
+        let bytes = "café".as_bytes(); // [99, 97, 102, 195, 169]
+        // Push everything except the last byte
+        buf.push(&bytes[..4], Duration::ZERO, false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "caf");
+        // The leading byte 0xC3 should be held back
+        assert!(!buf.is_empty());
+
+        // Now push the continuation byte
+        buf.push(&bytes[4..], Duration::from_secs(1), false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "é");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_split_3byte_char_at_first_boundary() {
+        let mut buf = CoalesceBuffer::new();
+        // € is U+20AC, encoded as [0xE2, 0x82, 0xAC]
+        let euro = "€".as_bytes();
+        // Push only the lead byte
+        buf.push(&euro[..1], Duration::ZERO, false);
+        let event = buf.drain();
+        assert!(event.is_none(), "single lead byte with no complete chars should produce no event");
+        assert!(!buf.is_empty());
+
+        // Push remaining two bytes
+        buf.push(&euro[1..], Duration::from_secs(1), false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "€");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_split_3byte_char_at_second_boundary() {
+        let mut buf = CoalesceBuffer::new();
+        // "A€" = [0x41, 0xE2, 0x82, 0xAC]
+        let bytes = "A€".as_bytes();
+        // Push "A" + lead byte + first continuation
+        buf.push(&bytes[..3], Duration::ZERO, false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "A");
+        assert!(!buf.is_empty());
+
+        // Push final continuation byte
+        buf.push(&bytes[3..], Duration::from_secs(1), false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "€");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_split_4byte_char_at_each_boundary() {
+        let mut buf = CoalesceBuffer::new();
+        // 😀 is U+1F600, encoded as [0xF0, 0x9F, 0x98, 0x80]
+        let emoji = "😀".as_bytes();
+
+        // Split after 1 byte
+        buf.push(&emoji[..1], Duration::ZERO, false);
+        assert!(buf.drain().is_none());
+
+        buf.push(&emoji[1..], Duration::from_secs(1), false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "😀");
+        assert!(buf.is_empty());
+
+        // Split after 2 bytes
+        buf.push(&emoji[..2], Duration::ZERO, false);
+        assert!(buf.drain().is_none());
+
+        buf.push(&emoji[2..], Duration::from_secs(1), false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "😀");
+        assert!(buf.is_empty());
+
+        // Split after 3 bytes
+        buf.push(&emoji[..3], Duration::ZERO, false);
+        assert!(buf.drain().is_none());
+
+        buf.push(&emoji[3..], Duration::from_secs(1), false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "😀");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_final_flush_with_incomplete_bytes_emits_replacement() {
+        let mut buf = CoalesceBuffer::new();
+        // Push just a 3-byte lead + one continuation (incomplete €)
+        buf.push(&[0xE2, 0x82], Duration::ZERO, false);
+        // drain holds them back:
+        assert!(buf.drain().is_none());
+        // The incomplete bytes are still in the buffer:
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn drain_ascii_only_emits_everything() {
+        let mut buf = CoalesceBuffer::new();
+        buf.push(b"hello world 123", Duration::ZERO, false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "hello world 123");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_mixed_complete_multibyte_emits_all() {
+        let mut buf = CoalesceBuffer::new();
+        buf.push("hello 日本語 café 😀".as_bytes(), Duration::ZERO, false);
+        let event = buf.drain().expect("should produce event");
+        assert_eq!(event.data, "hello 日本語 café 😀");
+        assert!(buf.is_empty());
+    }
+}

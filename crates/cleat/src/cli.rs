@@ -44,7 +44,9 @@ pub enum Command {
                            to launch + attach). Use --no-create to fail if the session is missing.\n\
                            \n\
                            Unlike launch, attach enters interactive foreground mode — your terminal\n\
-                           is connected to the session's PTY until you detach.")]
+                           is connected to the session's PTY until you detach.\n\
+                           \n\
+                           To detach, run 'cleat detach <ID>' from another terminal.")]
     Attach {
         #[arg(value_name = "ID")]
         id: Option<String>,
@@ -133,6 +135,11 @@ pub enum Command {
         mark_before: Option<String>,
     },
     /// Show session state and process info
+    #[command(after_long_help = "Returns session metadata: state, terminal dimensions, process info\n\
+                           (leader PID, foreground PGID), attachment status, and recording info.\n\
+                           \n\
+                           NOTE: The cwd field reflects the working directory at launch time.\n\
+                           It does not track the shell's current directory after cd commands.")]
     Inspect {
         id: String,
         #[arg(long, help = "Output as JSON")]
@@ -161,6 +168,18 @@ pub enum Command {
         name: Option<String>,
     },
     /// Send text to a session
+    #[command(after_long_help = "Sends text as PTY input — the same as typing on a keyboard.\n\
+                           By default, Enter is appended (disable with --no-enter).\n\
+                           \n\
+                           In interactive shells, the sent text will be echoed back in the\n\
+                           terminal output before any command results appear. This means\n\
+                           recorded output (transcript, expect) includes both the echoed\n\
+                           command and its output.\n\
+                           \n\
+                           Recommended pattern for capturing command output:\n\
+                           \x20 cleat send my-session 'make test' --mark-before m1\n\
+                           \x20 cleat expect my-session --since-marker m1 --text 'pattern'\n\
+                           \x20 cleat transcript my-session --since-marker m1")]
     Send {
         id: String,
         #[arg(value_name = "TEXT", help = "Text to send")]
@@ -210,6 +229,13 @@ pub enum Command {
                            recorded since the marker.\n\
                            \n\
                            Requires an active recording and --since or --since-marker.\n\
+                           \n\
+                           WARNING: In interactive shells, recorded output includes the echoed\n\
+                           command text. If you send 'make test; echo DONE' and then expect\n\
+                           --text DONE, it may match the echoed command line before the actual\n\
+                           output appears. To avoid false positives, wait for text that does\n\
+                           NOT appear in the command you sent, or use wait --idle-time first\n\
+                           to let the command complete.\n\
                            \n\
                            Exit codes:\n\
                            \x20 0  Text found\n\

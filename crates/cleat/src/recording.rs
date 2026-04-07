@@ -197,9 +197,13 @@ impl SessionRecorder {
         if self.paused {
             return;
         }
-        // Flush if switching from input to output.
+        // Flush if switching from input to output. If drain() held back
+        // incomplete UTF-8 bytes, force them out to avoid type contamination.
         if !self.coalesce.is_empty() && self.coalesce.is_input {
             self.flush();
+            if !self.coalesce.is_empty() {
+                self.flush_final();
+            }
         }
         self.coalesce.push(bytes, time, false);
         self.output_bytes_since_snapshot += bytes.len() as u64;
@@ -214,9 +218,13 @@ impl SessionRecorder {
         if self.paused {
             return;
         }
-        // Flush if switching from output to input.
+        // Flush if switching from output to input. If drain() held back
+        // incomplete UTF-8 bytes, force them out to avoid type contamination.
         if !self.coalesce.is_empty() && !self.coalesce.is_input {
             self.flush();
+            if !self.coalesce.is_empty() {
+                self.flush_final();
+            }
         }
         self.coalesce.push(bytes, time, true);
         if self.coalesce.exceeds_threshold() {

@@ -968,9 +968,11 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut expect.stream);
             }
             if let Some(ref mut rec) = recorder {
+                // Flush any held-back incomplete UTF-8 bytes before the exit
+                // event so they appear in the correct order in the cast file.
+                rec.flush_final();
                 let code = exit_code_from_wait_status(&status);
                 rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());
-                rec.flush_final();
             }
             break;
         }
@@ -1054,6 +1056,7 @@ fn build_inspect_result(
             leader_pid: pty_child.pid.as_raw() as u32,
             foreground_pgid,
             leader_cwd: resolve_cwd(pty_child.pid.as_raw() as u32),
+            // PGID equals the group leader's PID, so resolve_cwd works here.
             foreground_cwd: foreground_pgid.and_then(resolve_cwd),
         },
         attachments: if active_client.is_some() {

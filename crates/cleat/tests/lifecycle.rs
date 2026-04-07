@@ -974,3 +974,37 @@ fn expect_times_out_when_text_not_in_recording() {
     let (status, _elapsed) = service.expect("alpha", "NEVER_APPEARS", offset, 500).expect("expect call");
     assert_eq!(status, cleat::protocol::WaitStatus::Timeout, "expect should timeout when text absent");
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn inspect_reports_dynamic_leader_cwd() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("cwd-test".into()), None, None, Some("bash".into()), false).expect("create");
+
+    // Wait for shell to start
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Change directory
+    service.send_keys("cwd-test", b"cd /tmp\n").expect("send cd");
+    // Wait for command to complete
+    let _ = service.wait("cwd-test", vec![cleat::protocol::WaitCondition::OutputIdle { quiet_ms: 500 }], 5000);
+
+    let result = service.inspect("cwd-test").expect("inspect");
+    let leader_cwd = result.process.leader_cwd.expect("leader_cwd should be Some");
+
+    // On macOS /tmp is a symlink to /private/tmp
+    let expected = std::fs::canonicalize("/tmp").expect("canonicalize /tmp");
+    assert_eq!(std::fs::canonicalize(&leader_cwd).unwrap_or_else(|_| leader_cwd.clone()), expected, "leader_cwd should reflect cd /tmp");
+
+    // When shell is in foreground, foreground_cwd should match leader_cwd
+    let fg_cwd = result.process.foreground_cwd.expect("foreground_cwd should be Some");
+    assert_eq!(
+        std::fs::canonicalize(&fg_cwd).unwrap_or_else(|_| fg_cwd.clone()),
+        expected,
+        "foreground_cwd should match leader_cwd when shell is in foreground"
+    );
+
+    service.kill("cwd-test").expect("kill");
+}

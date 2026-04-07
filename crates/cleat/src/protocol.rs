@@ -58,6 +58,10 @@ pub struct TerminalInspect {
 pub struct ProcessInspect {
     pub leader_pid: u32,
     pub foreground_pgid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

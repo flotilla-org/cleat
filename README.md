@@ -50,3 +50,27 @@ The `ghostty-vt` build path defaults to the repo-local prefix at `.tools/ghostty
 ```bash
 find .tools/ghostty-install -maxdepth 3 | sort
 ```
+
+## Session Model
+
+**One daemon per session.** Each `cleat launch` (or `cleat attach` to a new ID) spawns a dedicated daemon process that owns the session's PTY. The daemon exits when the child process exits.
+
+**Session IDs.** You choose the ID (`cleat launch my-session`) or let cleat generate one (`session-<uuid>`). IDs are directory names under the runtime root, so use filesystem-safe characters. Launching with an ID that already has a running daemon reuses the existing session — no error, no duplicate.
+
+**Runtime directory.** Discovered in priority order:
+
+1. `$CLEAT_RUNTIME_DIR` (if set)
+2. `$XDG_RUNTIME_DIR/cleat` (if `XDG_RUNTIME_DIR` is set)
+3. `$TMPDIR/cleat-<uid>`
+4. `/tmp/cleat-<uid>`
+
+Each session gets a subdirectory containing:
+- `socket` — Unix domain socket for client-daemon communication
+- `daemon.pid` — daemon process ID
+- `session.cast` — asciicast v3 recording (only if recording is enabled)
+
+**Liveness.** The socket file is the liveness indicator. If it exists, the daemon is running and accepting connections.
+
+**Cleanup.** When the child process exits, the daemon removes the socket and PID file, then exits. If recording was active, the session directory and `.cast` file are preserved. Otherwise the entire session directory is removed.
+
+**No persistence across restarts.** Sessions do not survive daemon crashes or host reboots — the PTY and process state are gone. Recording files survive if they were flushed to disk.

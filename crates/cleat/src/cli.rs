@@ -666,6 +666,12 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
     if let Some(fg) = result.process.foreground_pgid {
         table.add_row(vec!["fg_pgid", &fg.to_string()]);
     }
+    if let Some(ref cwd) = result.process.leader_cwd {
+        table.add_row(vec!["leader_cwd", &cwd.display().to_string()]);
+    }
+    if let Some(ref cwd) = result.process.foreground_cwd {
+        table.add_row(vec!["fg_cwd", &cwd.display().to_string()]);
+    }
     table.add_row(vec!["recording", if result.recording.active { "active" } else { "off" }]);
     if !result.recording.markers.is_empty() {
         let markers_str = result.recording.markers.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ");

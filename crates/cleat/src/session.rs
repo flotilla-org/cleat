@@ -968,9 +968,11 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut expect.stream);
             }
             if let Some(ref mut rec) = recorder {
+                // Flush any held-back incomplete UTF-8 bytes before the exit
+                // event so they appear in the correct order in the cast file.
+                rec.flush_final();
                 let code = exit_code_from_wait_status(&status);
                 rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());
-                rec.flush();
             }
             break;
         }
@@ -989,6 +991,41 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 #[cfg(not(unix))]
 pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<(), String> {
     Err("session daemon is only supported on unix".into())
+}
+
+/// Resolve the current working directory for a given process ID.
+/// Returns `None` if the pid is invalid or the cwd cannot be determined.
+#[cfg(target_os = "linux")]
+fn resolve_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    use std::mem;
+    // SAFETY: we zero-initialize the struct and pass valid arguments to proc_pidinfo.
+    // proc_pidinfo is a well-known macOS API for querying process info.
+    unsafe {
+        let mut vnode_info: libc::proc_vnodepathinfo = mem::zeroed();
+        let size = mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        let ret =
+            libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDVNODEPATHINFO, 0, &mut vnode_info as *mut _ as *mut libc::c_void, size);
+        if ret <= 0 {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(vnode_info.pvi_cdir.vip_path.as_ptr() as *const libc::c_char);
+        let path = std::path::PathBuf::from(cstr.to_string_lossy().into_owned());
+        if path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(path)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn resolve_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+    None
 }
 
 fn build_inspect_result(
@@ -1015,7 +1052,13 @@ fn build_inspect_result(
             cmd: session.cmd.clone(),
         },
         terminal: crate::protocol::TerminalInspect { rows, cols },
-        process: crate::protocol::ProcessInspect { leader_pid: pty_child.pid.as_raw() as u32, foreground_pgid },
+        process: crate::protocol::ProcessInspect {
+            leader_pid: pty_child.pid.as_raw() as u32,
+            foreground_pgid,
+            leader_cwd: resolve_cwd(pty_child.pid.as_raw() as u32),
+            // PGID equals the group leader's PID, so resolve_cwd works here.
+            foreground_cwd: foreground_pgid.and_then(resolve_cwd),
+        },
         attachments: if active_client.is_some() {
             vec![crate::protocol::AttachmentInspect { role: "controller".to_string() }]
         } else {

@@ -295,11 +295,19 @@ pub struct GhosttyRenderStateColors {
 
 impl GhosttyRenderStateColors {
     pub fn init() -> Self {
+        // Safety: zero-init is valid for this repr(C) struct (all numeric/bool fields);
+        // we then set the size field for the sized-struct ABI.
         let mut s: Self = unsafe { std::mem::zeroed() };
         s.size = std::mem::size_of::<Self>();
         s
     }
 }
+
+// Static asserts: verify Rust layouts match Ghostty's C ABI (from ghostty_type_json()).
+const _: () = assert!(std::mem::size_of::<GhosttyStyleColor>() == 16);
+const _: () = assert!(std::mem::size_of::<GhosttyStyle>() == 72);
+const _: () = assert!(std::mem::size_of::<GhosttyColorRgb>() == 3);
+const _: () = assert!(std::mem::size_of::<GhosttyRenderStateColors>() == 792);
 
 pub enum GhosttyRenderStateOpaque {}
 pub enum GhosttyRowIteratorOpaque {}

@@ -11,6 +11,8 @@ const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
 pub struct GhosttyVtEngine {
     terminal: TerminalHandle,
     render_state: RenderStateHandle,
+    row_iter: RowIteratorHandle,
+    row_cells: RowCellsHandle,
     cols: u16,
     rows: u16,
     saw_output: bool,
@@ -20,7 +22,9 @@ impl GhosttyVtEngine {
     pub fn new(cols: u16, rows: u16) -> Self {
         let terminal = TerminalHandle::new(cols, rows, DEFAULT_MAX_SCROLLBACK).expect("create ghostty terminal");
         let render_state = RenderStateHandle::new().expect("create ghostty render state");
-        Self { terminal, render_state, cols, rows, saw_output: false }
+        let row_iter = RowIteratorHandle::new().expect("create ghostty row iterator");
+        let row_cells = RowCellsHandle::new().expect("create ghostty row cells");
+        Self { terminal, render_state, row_iter, row_cells, cols, rows, saw_output: false }
     }
 
     fn read_cursor_state(&self) -> Result<CursorState, String> {
@@ -106,35 +110,33 @@ impl VtEngine for GhosttyVtEngine {
 
         let mut cells = Vec::with_capacity((cols as usize) * (rows as usize));
 
-        let mut row_iter = RowIteratorHandle::new()?;
-        self.render_state.populate_row_iterator(&mut row_iter)?;
+        self.render_state.populate_row_iterator(&mut self.row_iter)?;
 
-        let mut row_cells = RowCellsHandle::new()?;
-        while row_iter.next() {
-            row_iter.populate_cells(&mut row_cells)?;
-            while row_cells.next() {
-                let graphemes_len = row_cells.get_graphemes_len()?;
+        while self.row_iter.next() {
+            self.row_iter.populate_cells(&mut self.row_cells)?;
+            while self.row_cells.next() {
+                let graphemes_len = self.row_cells.get_graphemes_len()?;
                 let graphemes = if graphemes_len > 0 {
                     let mut buf = vec![0u32; graphemes_len as usize];
-                    row_cells.get_graphemes_buf(&mut buf)?;
+                    self.row_cells.get_graphemes_buf(&mut buf)?;
                     buf
                 } else {
                     Vec::new()
                 };
 
-                let fg = match row_cells.get_fg_color()? {
+                let fg = match self.row_cells.get_fg_color()? {
                     Some(c) => Rgb { r: c.r, g: c.g, b: c.b },
                     None => default_fg,
                 };
-                let bg = match row_cells.get_bg_color()? {
+                let bg = match self.row_cells.get_bg_color()? {
                     Some(c) => Rgb { r: c.r, g: c.g, b: c.b },
                     None => default_bg,
                 };
 
-                let style = row_cells.get_style()?;
+                let style = self.row_cells.get_style()?;
                 let flags = flags_from_ghostty_style(&style);
 
-                let width = match row_cells.get_wide()? {
+                let width = match self.row_cells.get_wide()? {
                     GhosttyCellWide::Narrow => CellWidth::Narrow,
                     GhosttyCellWide::Wide => CellWidth::Wide,
                     GhosttyCellWide::SpacerTail => CellWidth::SpacerTail,
@@ -185,6 +187,7 @@ fn flags_from_ghostty_style(style: &GhosttyStyle) -> CellFlags {
         flags |= CellFlags::OVERLINE;
     }
     if style.underline != 0 {
+        // 0 = no underline; non-zero values are single/double/curly/dotted/dashed
         flags |= CellFlags::UNDERLINE;
     }
     flags

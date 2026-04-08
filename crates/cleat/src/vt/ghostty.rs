@@ -1,6 +1,6 @@
 use super::{
     ghostty_ffi::{self, GhosttyFormatterFormat, GhosttyFormatterTerminalOptions, TerminalHandle},
-    ClientCapabilities, ColorLevel, VtEngine,
+    ClientCapabilities, ColorLevel, ScreenGrid, VtEngine,
 };
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
@@ -66,6 +66,10 @@ impl VtEngine for GhosttyVtEngine {
         options.emit = GhosttyFormatterFormat::Plain;
         let payload = ghostty_ffi::format_terminal_alloc(self.terminal.raw(), options)?;
         String::from_utf8(payload).map_err(|err| format!("ghostty plain-text snapshot was not valid utf-8: {err}"))
+    }
+
+    fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
+        todo!("screen_grid: real implementation in Task 3")
     }
 
     fn size(&self) -> (u16, u16) {

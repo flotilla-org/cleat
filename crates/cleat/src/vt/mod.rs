@@ -108,10 +108,19 @@ impl ScreenGrid {
         }
         let start = (row as usize) * (self.cols as usize);
         let end = start + (self.cols as usize);
-        self.cells[start..end]
-            .iter()
-            .map(|cell| if cell.graphemes.is_empty() { ' ' } else { char::from_u32(cell.graphemes[0]).unwrap_or(' ') })
-            .collect()
+        let mut s = String::with_capacity(self.cols as usize);
+        for cell in &self.cells[start..end] {
+            if cell.graphemes.is_empty() {
+                s.push(' ');
+            } else {
+                for &cp in &cell.graphemes {
+                    if let Some(ch) = char::from_u32(cp) {
+                        s.push(ch);
+                    }
+                }
+            }
+        }
+        s
     }
 }
 

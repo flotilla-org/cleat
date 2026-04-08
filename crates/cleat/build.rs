@@ -28,7 +28,6 @@ fn main() {
     println!("cargo:rustc-env=CLEAT_GHOSTTY_PREFIX={}", install.prefix.display());
     println!("cargo:rustc-link-search=native={}", install.lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=ghostty-vt");
-    #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", install.lib_dir.display());
 }
 

@@ -101,6 +101,19 @@ fn vt_ghostty_blank_engine_does_not_emit_replay_payload() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_screen_grid_returns_correct_dimensions() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    engine.feed(b"hello grid").expect("feed bytes");
+
+    let grid = engine.screen_grid().expect("screen grid");
+    assert_eq!(grid.cols, 40);
+    assert_eq!(grid.rows, 5);
+    assert_eq!(grid.cells.len(), 40 * 5);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_links_against_shared_library() {
     let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
     let lib_name = shared_library_filename();

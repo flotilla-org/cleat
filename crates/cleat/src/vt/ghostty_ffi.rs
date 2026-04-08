@@ -312,6 +312,7 @@ unsafe extern "C" {
         data: GhosttyRenderStateRowData,
         out: *mut c_void,
     ) -> GhosttyResult;
+    #[allow(dead_code)]
     fn ghostty_render_state_row_set(
         iterator: GhosttyRenderStateRowIterator,
         option: GhosttyRenderStateRowOption,
@@ -322,6 +323,7 @@ unsafe extern "C" {
     fn ghostty_render_state_row_cells_new(allocator: *const c_void, out_cells: *mut GhosttyRenderStateRowCells) -> GhosttyResult;
     fn ghostty_render_state_row_cells_free(cells: GhosttyRenderStateRowCells);
     fn ghostty_render_state_row_cells_next(cells: GhosttyRenderStateRowCells) -> bool;
+    #[allow(dead_code)]
     fn ghostty_render_state_row_cells_select(cells: GhosttyRenderStateRowCells, x: u16) -> GhosttyResult;
     fn ghostty_render_state_row_cells_get(
         cells: GhosttyRenderStateRowCells,
@@ -432,6 +434,7 @@ impl RenderStateHandle {
         Ok(rows)
     }
 
+    #[allow(dead_code)]
     pub fn get_dirty(&self) -> Result<GhosttyRenderStateDirty, String> {
         let mut dirty = GhosttyRenderStateDirty::False;
         let result = unsafe {
@@ -535,6 +538,7 @@ impl RowIteratorHandle {
         unsafe { ghostty_render_state_row_iterator_next(self.raw) }
     }
 
+    #[allow(dead_code)]
     pub fn get_dirty(&self) -> Result<bool, String> {
         let mut dirty = false;
         let result =
@@ -554,6 +558,7 @@ impl RowIteratorHandle {
         check_result(result, "ghostty_render_state_row_get(Cells)")
     }
 
+    #[allow(dead_code)]
     pub fn set_dirty(&mut self, dirty: bool) -> Result<(), String> {
         let result =
             unsafe { ghostty_render_state_row_set(self.raw, GhosttyRenderStateRowOption::Dirty, &dirty as *const bool as *const c_void) };

@@ -40,63 +40,45 @@ The core insight: **a terminal screen is not a grid of characters — it is a la
 
 ## Design
 
-### Layer 0: Ghostty C API additions
+### Layer 0: Ghostty Render State C API
 
-Ghostty's internal renderer accesses the terminal via `RenderState` — a module in `src/terminal/render.zig` that copies dirty rows from pages, resolves style IDs into concrete styles (colors, attributes), and presents flat arrays of cells+styles. This is terminal-module functionality, not renderer-module — it lives alongside the screen and page code.
+Ghostty's upstream C API (`include/ghostty/vt/render.h`) already exposes a full render state API. This is included in cleat's pinned ghostty ref and available in `libghostty-vt`. No fork or upstream contribution is needed.
 
-Cleat needs the same access. New C API functions wrapping RenderState:
+The API uses an iterator-based pattern rather than bulk cell copies:
 
-```c
-// Opaque handle to a render state (one per terminal)
-typedef struct GhosttyRenderState* GhosttyRenderState;
+**Lifecycle:**
+- `ghostty_render_state_new()` / `ghostty_render_state_free()` — create/destroy render state
+- `ghostty_render_state_update(state, terminal)` — snapshot terminal state, consumes terminal dirty flags
 
-// Cell data with resolved style — no indirection through style IDs
-typedef struct {
-    uint32_t codepoint;       // Unicode codepoint (21 bits used)
-    uint8_t wide;             // 0=narrow, 1=wide, 2=spacer_head, 3=spacer_tail
-    uint8_t fg_r, fg_g, fg_b; // Resolved foreground color
-    uint8_t bg_r, bg_g, bg_b; // Resolved background color
-    uint16_t flags;           // bold, italic, inverse, underline, etc.
-    // Exact layout TBD — this is the shape, not the ABI
-} GhosttyResolvedCell;
+**Global state** (via `ghostty_render_state_get()`):
+- Viewport dimensions (cols, rows)
+- Dirty state (false / partial / full)
+- Colors: background, foreground, cursor, full 256-color palette
+- Cursor: position, visibility, blinking, visual style (bar/block/underline/hollow), password input, wide-char-tail
 
-// Create a render state for a terminal
-GhosttyResult ghostty_render_state_new(
-    const GhosttyAllocator* allocator,
-    GhosttyRenderState* state,
-    GhosttyTerminal terminal);
+**Row iteration:**
+- `ghostty_render_state_row_iterator_new/free()` — allocate reusable iterator
+- `ghostty_render_state_row_iterator_next()` — advance to next row
+- `ghostty_render_state_row_get()` — query per-row dirty flag, get cells handle
 
-// Update render state — copies dirty rows, resolves styles
-// Returns which rows are dirty via out_dirty_flags (bool per row)
-GhosttyResult ghostty_render_state_update(
-    GhosttyRenderState state,
-    bool* out_dirty_flags,
-    uint16_t num_rows);
+**Cell iteration** (per row):
+- `ghostty_render_state_row_cells_new/free()` — allocate reusable cells container
+- `ghostty_render_state_row_cells_next()` / `_select(x)` — iterate or jump to column
+- `ghostty_render_state_row_cells_get()` — query cell data:
+  - **Grapheme clusters**: `GRAPHEMES_LEN` (codepoint count) + `GRAPHEMES_BUF` (codepoint array) — full multi-codepoint grapheme support, not single codepoints
+  - **Style**: `GhosttyStyle` sized struct with tagged-union colors (none/palette/rgb) for fg, bg, underline; bool flags for bold, italic, faint, blink, inverse, invisible, strikethrough, overline; underline enum (single/double/curly/dotted/dashed)
+  - **Resolved colors**: `BG_COLOR` / `FG_COLOR` as `GhosttyColorRgb` — palette lookups already performed
 
-// Read resolved cells for a range of rows
-// Cells are written contiguously: row0[0..cols], row1[0..cols], ...
-GhosttyResult ghostty_render_state_get_cells(
-    GhosttyRenderState state,
-    uint16_t start_row,
-    uint16_t num_rows,
-    GhosttyResolvedCell* out_cells,
-    size_t out_cells_len);
+**Dirty tracking:**
+- Two-layer: global (false/partial/full) + per-row (bool)
+- Caller is responsible for resetting both layers after reading
+- `ghostty_render_state_set()` to reset global, `ghostty_render_state_row_set()` to reset per-row
 
-// Get cursor state
-GhosttyResult ghostty_render_state_get_cursor(
-    GhosttyRenderState state,
-    uint16_t* out_col,
-    uint16_t* out_row,
-    bool* out_visible,
-    uint8_t* out_style);  // block, bar, underline
+**Key difference from original spec assumption:** The original spec proposed a flat `GhosttyResolvedCell` struct with bulk `get_cells()`. The actual API uses opaque iterators with per-field getters. This is more flexible (forward-compatible via sized structs) but means cleat must iterate and copy into its own types rather than memcpy rows.
 
-// Free render state
-void ghostty_render_state_free(GhosttyRenderState state);
-```
+A complete working example exists at `ghostty/example/c-vt-render/src/main.c` in the ghostty repo.
 
-This mirrors the internal rendering contract: update() detects dirty rows and copies/resolves cells, get_cells() reads the resolved data, and dirty flags are cleared as part of update(). Cleat calls update() on each PTY read cycle (or lazily on inspect).
-
-**Upstream strategy:** Maintain as a fork initially. Submit PR to Ghostty with working cleat usage as motivation. The API shape follows their internal patterns (RenderState is already how the Zig renderer works), so the ask is "expose what you already have" not "build something new."
+See also: [libghostty render state docs](https://libghostty.tip.ghostty.org/group__render.html)
 
 ### Layer 1: Screen grid (in cleat daemon)
 
@@ -107,20 +89,35 @@ pub struct ScreenGrid {
     cells: Vec<ResolvedCell>,  // cols * rows, row-major
     cols: u16,
     rows: u16,
-    cursor_col: u16,
-    cursor_row: u16,
-    cursor_visible: bool,
+    cursor: CursorState,
     generation: u64,           // Incremented on each update
-    row_generations: Vec<u64>, // Per-row generation for change tracking
+}
+
+pub struct ResolvedCell {
+    pub graphemes: Vec<u32>,   // Full grapheme cluster (multiple codepoints)
+    pub fg: Rgb,               // Resolved foreground color
+    pub bg: Rgb,               // Resolved background color
+    pub flags: CellFlags,      // bold, italic, inverse, underline, etc.
+}
+
+pub struct CursorState {
+    pub col: u16,
+    pub row: u16,
+    pub visible: bool,
+    pub style: CursorStyle,    // bar, block, underline, hollow
+    pub blinking: bool,
 }
 ```
 
-On each PTY read cycle (or lazily on first inspect request), the daemon:
-1. Calls `ghostty_render_state_update()` to get dirty flags
-2. Calls `ghostty_render_state_get_cells()` for dirty rows only
-3. Updates its `ScreenGrid`, bumping row generations
+On each update, the daemon:
+1. Calls `ghostty_render_state_update()` to snapshot terminal state
+2. Checks global dirty state — skip if clean
+3. Uses Ghostty's per-row dirty flags as a fast path to identify which rows to check
+4. Iterates dirty rows and copies cell data into the `ScreenGrid`
 
 The `ScreenGrid` is the stable interface that the analysis crate works against. If the Ghostty FFI changes shape, only this update code changes.
+
+**Change tracking (future design needed):** Ghostty provides row-level dirty flags, which tell cleat which rows changed since the last update. But for region detection via temporal co-change analysis (rows that change together are likely in the same region), cleat will need cell-level change tracking — diffing the actual cell content against the previous frame, not just trusting Ghostty's row-dirty hint. Ghostty's row-dirty serves as an optimization to limit which rows to diff, but cleat owns the diff and the change history. The exact model (per-cell generation stamps, ring buffer of change sets, co-change clustering) should be designed when the analysis layer (#23) is built, not prematurely specified here.
 
 ### Layer 2: Screen analysis crate (`crates/terminal-screen`)
 
@@ -252,28 +249,21 @@ This extends the existing inspect infrastructure. The `--screen` flag triggers a
 
 ### VtEngine trait extension
 
-The `VtEngine` trait gets a single new method that atomically updates the screen grid and returns dirty information:
+The `VtEngine` trait gets a method to read the current screen as a grid of resolved cells:
 
 ```rust
-pub struct ScreenUpdate {
-    pub grid: ScreenGrid,
-    pub dirty_rows: Vec<bool>,
-    pub resized: bool,  // true if dimensions changed since last call
-}
-
 pub trait VtEngine {
     // ... existing methods ...
 
-    /// Update the screen grid with current terminal state.
-    /// Returns the full grid, per-row dirty flags, and whether a resize occurred.
-    /// Dirty flags are cleared after this call (cleat is the renderer).
-    fn update_screen(&mut self) -> Result<ScreenUpdate, String>;
+    /// Snapshot the current screen as a grid of resolved cells.
+    /// The engine owns the render state internally; this copies data out.
+    fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
 }
 ```
 
-A single method avoids ambiguous call ordering between separate `screen_grid()` and `dirty_rows()` calls — since dirty flags are cleared during the Ghostty RenderState update, splitting these would create a footgun.
+The Ghostty engine calls `render_state_update()` internally, iterates cells, and populates a `ScreenGrid`. The passthrough engine returns an error. The `ScreenGrid` is an owned snapshot — callers can hold it, diff it against previous snapshots, or pass it to the analysis layer without lifetime concerns.
 
-The passthrough engine returns empty/default results. The Ghostty engine delegates to the new C API. This keeps the VT engine abstraction clean.
+This is intentionally a simple "give me the screen" method. Change tracking, dirty optimization, and incremental update logic belong in the layer above (the daemon or analysis crate), not in the trait itself — different consumers will have different change-tracking needs.
 
 ## Future work
 
@@ -318,9 +308,11 @@ Record inferred regions as a parallel track alongside raw VT output. New frame t
 
 ## Phasing
 
-1. **Ghostty C API** — RenderState wrapper with resolved cells, dirty flags, cursor
-2. **`crates/terminal-screen`** — ScreenGrid type, text search, band detection, box detection
-3. **Wire into cleat** — VtEngine trait extension, `inspect --screen`
-4. **Iterate** — Add detectors, tune confidence, test against real TUIs
-5. **Region tracking** — Stable IDs, matching heuristics (follow-on spec)
-6. **Semantics + events** — Roles, focus, test DSL (follow-on spec)
+1. ~~**Ghostty C API**~~ — Already exists upstream, included in cleat's pinned ref
+2. **FFI bindings + `screen_grid()`** — Rust FFI for render state API, `ScreenGrid`/`ResolvedCell` types, `VtEngine::screen_grid()` method on Ghostty engine
+3. **Transcoding (#29)** — First consumer. Use `screen_grid()` to render `capture --since-marker` as clean text instead of ANSI soup. Validates the FFI bindings against a real use case without needing the analysis layer.
+4. **`crates/terminal-screen`** — ScreenGrid analysis: text search, band detection, box detection. Design the change-tracking model here when we understand the actual access patterns.
+5. **`inspect --screen`** — Wire analysis into the CLI
+6. **Iterate** — Add detectors, tune confidence, test against real TUIs
+7. **Region tracking** — Stable IDs, temporal co-change analysis, matching heuristics (follow-on spec)
+8. **Semantics + events** — Roles, focus, test DSL (follow-on spec)

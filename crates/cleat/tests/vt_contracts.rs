@@ -1,6 +1,6 @@
 #[cfg(feature = "ghostty-vt")]
 use cleat::vt::ghostty::GhosttyVtEngine;
-use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, VtEngine};
+use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, ScreenGrid, VtEngine};
 
 pub trait EngineFixture {
     type Engine: VtEngine;
@@ -71,6 +71,10 @@ impl VtEngine for PlaceholderReplayVtEngine {
 
     fn screen_text(&self) -> Result<String, String> {
         Ok("placeholder".to_string())
+    }
+
+    fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
+        Ok(ScreenGrid::default())
     }
 
     fn size(&self) -> (u16, u16) {

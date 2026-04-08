@@ -34,7 +34,7 @@ use crate::{
     da::DeviceAttributeTracker,
     protocol::Frame,
     runtime::{RuntimeLayout, SessionMetadata},
-    vt::{self, VtEngine, VtEngineKind},
+    vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
 
 const SOCKET_NAME: &str = "socket";
@@ -415,6 +415,10 @@ impl VtEngine for TestReplayProbeVtEngine {
 
     fn screen_text(&self) -> Result<String, String> {
         Ok(format!("probe:{}x{}", self.cols, self.rows))
+    }
+
+    fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
+        Ok(ScreenGrid::default())
     }
 
     fn size(&self) -> (u16, u16) {

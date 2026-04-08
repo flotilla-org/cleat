@@ -184,6 +184,28 @@ fn vt_passthrough_screen_grid_returns_error() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_screen_grid_wide_chars_not_doubled_in_row_text() {
+    use cleat::vt::CellWidth;
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    // CJK character 字 is a wide (2-column) glyph
+    engine.feed("字ab".as_bytes()).expect("feed bytes");
+
+    let grid = engine.screen_grid().expect("screen grid");
+
+    // Col 0 should be the wide char, col 1 should be the spacer tail
+    assert_eq!(grid.cell(0, 0).unwrap().width, CellWidth::Wide);
+    assert_eq!(grid.cell(1, 0).unwrap().width, CellWidth::SpacerTail);
+    assert_eq!(grid.cell(2, 0).unwrap().width, CellWidth::Narrow);
+
+    // row_text should produce "字ab" not "字 ab"
+    let text = grid.row_text(0);
+    assert!(text.starts_with("字ab"), "expected row_text to start with '字ab', got: {text:?}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_links_against_shared_library() {
     let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
     let lib_name = shared_library_filename();

@@ -192,6 +192,36 @@ pub enum GhosttyRenderStateRowCellsData {
     FgColor = 6,
 }
 
+pub type GhosttyCell = u64;
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyCellData {
+    Invalid = 0,
+    Codepoint = 1,
+    ContentTag = 2,
+    Wide = 3,
+    HasText = 4,
+    HasStyling = 5,
+    StyleId = 6,
+    HasHyperlink = 7,
+    Protected = 8,
+    SemanticContent = 9,
+    ColorPalette = 10,
+    ColorRgb = 11,
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyCellWide {
+    Narrow = 0,
+    Wide = 1,
+    SpacerTail = 2,
+    SpacerHead = 3,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GhosttyColorRgb {
@@ -330,6 +360,9 @@ unsafe extern "C" {
         data: GhosttyRenderStateRowCellsData,
         out: *mut c_void,
     ) -> GhosttyResult;
+
+    // --- Cell data ---
+    fn ghostty_cell_get(cell: GhosttyCell, data: GhosttyCellData, out: *mut c_void) -> GhosttyResult;
 }
 
 pub struct TerminalHandle {
@@ -504,6 +537,15 @@ impl RenderStateHandle {
         Ok(style)
     }
 
+    pub fn get_cursor_viewport_wide_tail(&self) -> Result<bool, String> {
+        let mut wide_tail = false;
+        let result = unsafe {
+            ghostty_render_state_get(self.raw, GhosttyRenderStateData::CursorViewportWideTail, &mut wide_tail as *mut bool as *mut c_void)
+        };
+        check_result(result, "ghostty_render_state_get(CursorViewportWideTail)")?;
+        Ok(wide_tail)
+    }
+
     pub fn populate_row_iterator(&self, iterator: &mut RowIteratorHandle) -> Result<(), String> {
         let result = unsafe {
             ghostty_render_state_get(
@@ -647,6 +689,23 @@ impl RowCellsHandle {
             GhosttyResult::InvalidValue => Ok(None),
             other => check_result(other, "ghostty_render_state_row_cells_get(FgColor)").map(|_| None),
         }
+    }
+
+    pub fn get_raw_cell(&self) -> Result<GhosttyCell, String> {
+        let mut cell: GhosttyCell = 0;
+        let result = unsafe {
+            ghostty_render_state_row_cells_get(self.raw, GhosttyRenderStateRowCellsData::Raw, &mut cell as *mut GhosttyCell as *mut c_void)
+        };
+        check_result(result, "ghostty_render_state_row_cells_get(Raw)")?;
+        Ok(cell)
+    }
+
+    pub fn get_wide(&self) -> Result<GhosttyCellWide, String> {
+        let cell = self.get_raw_cell()?;
+        let mut wide = GhosttyCellWide::Narrow;
+        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::Wide, &mut wide as *mut GhosttyCellWide as *mut c_void) };
+        check_result(result, "ghostty_cell_get(Wide)")?;
+        Ok(wide)
     }
 }
 

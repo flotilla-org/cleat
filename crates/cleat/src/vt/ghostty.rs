@@ -1,9 +1,9 @@
 use super::{
     ghostty_ffi::{
-        self, GhosttyFormatterFormat, GhosttyFormatterTerminalOptions, GhosttyRenderStateCursorVisualStyle, GhosttyRenderStateDirty,
-        GhosttyStyle, RenderStateHandle, RowCellsHandle, RowIteratorHandle, TerminalHandle,
+        self, GhosttyCellWide, GhosttyFormatterFormat, GhosttyFormatterTerminalOptions, GhosttyRenderStateCursorVisualStyle,
+        GhosttyRenderStateDirty, GhosttyStyle, RenderStateHandle, RowCellsHandle, RowIteratorHandle, TerminalHandle,
     },
-    CellFlags, ClientCapabilities, ColorLevel, CursorState, CursorStyle, ResolvedCell, Rgb, ScreenGrid, VtEngine,
+    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, ResolvedCell, Rgb, ScreenGrid, VtEngine,
 };
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
@@ -40,7 +40,9 @@ impl GhosttyVtEngine {
             GhosttyRenderStateCursorVisualStyle::BlockHollow => CursorStyle::BlockHollow,
         };
 
-        Ok(CursorState { col, row, visible, style })
+        let wide_tail = self.render_state.get_cursor_viewport_wide_tail()?;
+
+        Ok(CursorState { col, row, visible, style, wide_tail })
     }
 }
 
@@ -132,7 +134,14 @@ impl VtEngine for GhosttyVtEngine {
                 let style = row_cells.get_style()?;
                 let flags = flags_from_ghostty_style(&style);
 
-                cells.push(ResolvedCell { graphemes, fg, bg, flags });
+                let width = match row_cells.get_wide()? {
+                    GhosttyCellWide::Narrow => CellWidth::Narrow,
+                    GhosttyCellWide::Wide => CellWidth::Wide,
+                    GhosttyCellWide::SpacerTail => CellWidth::SpacerTail,
+                    GhosttyCellWide::SpacerHead => CellWidth::SpacerHead,
+                };
+
+                cells.push(ResolvedCell { graphemes, fg, bg, flags, width });
             }
         }
 

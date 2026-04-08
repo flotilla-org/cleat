@@ -60,12 +60,22 @@ bitflags::bitflags! {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CellWidth {
+    #[default]
+    Narrow,
+    Wide,
+    SpacerTail,
+    SpacerHead,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolvedCell {
     pub graphemes: Vec<u32>,
     pub fg: Rgb,
     pub bg: Rgb,
     pub flags: CellFlags,
+    pub width: CellWidth,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -83,6 +93,7 @@ pub struct CursorState {
     pub row: u16,
     pub visible: bool,
     pub style: CursorStyle,
+    pub wide_tail: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -110,6 +121,9 @@ impl ScreenGrid {
         let end = start + (self.cols as usize);
         let mut s = String::with_capacity(self.cols as usize);
         for cell in &self.cells[start..end] {
+            if matches!(cell.width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                continue;
+            }
             if cell.graphemes.is_empty() {
                 s.push(' ');
             } else {

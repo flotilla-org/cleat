@@ -1,12 +1,18 @@
 use super::{
-    ghostty_ffi::{self, GhosttyFormatterFormat, GhosttyFormatterTerminalOptions, TerminalHandle},
-    ClientCapabilities, ColorLevel, VtEngine,
+    ghostty_ffi::{
+        self, GhosttyCellWide, GhosttyFormatterFormat, GhosttyFormatterTerminalOptions, GhosttyRenderStateCursorVisualStyle,
+        GhosttyRenderStateDirty, GhosttyStyle, RenderStateHandle, RowCellsHandle, RowIteratorHandle, TerminalHandle,
+    },
+    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, ResolvedCell, Rgb, ScreenGrid, VtEngine,
 };
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
 
 pub struct GhosttyVtEngine {
     terminal: TerminalHandle,
+    render_state: RenderStateHandle,
+    row_iter: RowIteratorHandle,
+    row_cells: RowCellsHandle,
     cols: u16,
     rows: u16,
     saw_output: bool,
@@ -15,7 +21,32 @@ pub struct GhosttyVtEngine {
 impl GhosttyVtEngine {
     pub fn new(cols: u16, rows: u16) -> Self {
         let terminal = TerminalHandle::new(cols, rows, DEFAULT_MAX_SCROLLBACK).expect("create ghostty terminal");
-        Self { terminal, cols, rows, saw_output: false }
+        let render_state = RenderStateHandle::new().expect("create ghostty render state");
+        let row_iter = RowIteratorHandle::new().expect("create ghostty row iterator");
+        let row_cells = RowCellsHandle::new().expect("create ghostty row cells");
+        Self { terminal, render_state, row_iter, row_cells, cols, rows, saw_output: false }
+    }
+
+    fn read_cursor_state(&self) -> Result<CursorState, String> {
+        let visible = self.render_state.get_cursor_visible()?;
+        let in_viewport = self.render_state.get_cursor_viewport_has_value()?;
+
+        if !visible || !in_viewport {
+            return Ok(CursorState { visible, ..CursorState::default() });
+        }
+
+        let col = self.render_state.get_cursor_viewport_x()?;
+        let row = self.render_state.get_cursor_viewport_y()?;
+        let style = match self.render_state.get_cursor_visual_style()? {
+            GhosttyRenderStateCursorVisualStyle::Bar => CursorStyle::Bar,
+            GhosttyRenderStateCursorVisualStyle::Block => CursorStyle::Block,
+            GhosttyRenderStateCursorVisualStyle::Underline => CursorStyle::Underline,
+            GhosttyRenderStateCursorVisualStyle::BlockHollow => CursorStyle::BlockHollow,
+        };
+
+        let wide_tail = self.render_state.get_cursor_viewport_wide_tail()?;
+
+        Ok(CursorState { col, row, visible, style, wide_tail })
     }
 }
 
@@ -68,7 +99,96 @@ impl VtEngine for GhosttyVtEngine {
         String::from_utf8(payload).map_err(|err| format!("ghostty plain-text snapshot was not valid utf-8: {err}"))
     }
 
+    fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
+        self.render_state.update(&self.terminal)?;
+        let cols = self.render_state.get_cols()?;
+        let rows = self.render_state.get_rows()?;
+        let colors = self.render_state.get_colors()?;
+
+        let default_fg = Rgb { r: colors.foreground.r, g: colors.foreground.g, b: colors.foreground.b };
+        let default_bg = Rgb { r: colors.background.r, g: colors.background.g, b: colors.background.b };
+
+        let mut cells = Vec::with_capacity((cols as usize) * (rows as usize));
+
+        self.render_state.populate_row_iterator(&mut self.row_iter)?;
+
+        while self.row_iter.next() {
+            self.row_iter.populate_cells(&mut self.row_cells)?;
+            while self.row_cells.next() {
+                let graphemes_len = self.row_cells.get_graphemes_len()?;
+                let graphemes = if graphemes_len > 0 {
+                    let mut buf = vec![0u32; graphemes_len as usize];
+                    self.row_cells.get_graphemes_buf(&mut buf)?;
+                    buf
+                } else {
+                    Vec::new()
+                };
+
+                let fg = match self.row_cells.get_fg_color()? {
+                    Some(c) => Rgb { r: c.r, g: c.g, b: c.b },
+                    None => default_fg,
+                };
+                let bg = match self.row_cells.get_bg_color()? {
+                    Some(c) => Rgb { r: c.r, g: c.g, b: c.b },
+                    None => default_bg,
+                };
+
+                let style = self.row_cells.get_style()?;
+                let flags = flags_from_ghostty_style(&style);
+
+                let width = match self.row_cells.get_wide()? {
+                    GhosttyCellWide::Narrow => CellWidth::Narrow,
+                    GhosttyCellWide::Wide => CellWidth::Wide,
+                    GhosttyCellWide::SpacerTail => CellWidth::SpacerTail,
+                    GhosttyCellWide::SpacerHead => CellWidth::SpacerHead,
+                };
+
+                cells.push(ResolvedCell { graphemes, fg, bg, flags, width });
+            }
+        }
+
+        let cursor = self.read_cursor_state()?;
+
+        // Clear dirty state — cleat is the renderer.
+        self.render_state.set_dirty(GhosttyRenderStateDirty::False)?;
+
+        Ok(ScreenGrid { cells, cols, rows, cursor })
+    }
+
     fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
+}
+
+fn flags_from_ghostty_style(style: &GhosttyStyle) -> CellFlags {
+    let mut flags = CellFlags::empty();
+    if style.bold {
+        flags |= CellFlags::BOLD;
+    }
+    if style.italic {
+        flags |= CellFlags::ITALIC;
+    }
+    if style.faint {
+        flags |= CellFlags::FAINT;
+    }
+    if style.blink {
+        flags |= CellFlags::BLINK;
+    }
+    if style.inverse {
+        flags |= CellFlags::INVERSE;
+    }
+    if style.invisible {
+        flags |= CellFlags::INVISIBLE;
+    }
+    if style.strikethrough {
+        flags |= CellFlags::STRIKETHROUGH;
+    }
+    if style.overline {
+        flags |= CellFlags::OVERLINE;
+    }
+    if style.underline != 0 {
+        // 0 = no underline; non-zero values are single/double/curly/dotted/dashed
+        flags |= CellFlags::UNDERLINE;
+    }
+    flags
 }

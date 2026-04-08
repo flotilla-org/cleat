@@ -1,4 +1,4 @@
-use super::{ClientCapabilities, VtEngine};
+use super::{ClientCapabilities, ScreenGrid, VtEngine};
 
 #[derive(Debug, Clone)]
 pub struct PassthroughVtEngine {
@@ -39,6 +39,11 @@ impl VtEngine for PassthroughVtEngine {
 
     fn screen_text(&self) -> Result<String, String> {
         Err("screen text capture is unavailable because vt engine passthrough is a placeholder/test-only engine, not a functional VT engine".to_string())
+    }
+
+    fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
+        Err("screen grid is unavailable because vt engine passthrough is a placeholder/test-only engine, not a functional VT engine"
+            .to_string())
     }
 
     fn size(&self) -> (u16, u16) {

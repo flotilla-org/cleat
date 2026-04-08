@@ -38,6 +38,106 @@ pub enum ColorLevel {
     TrueColor,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct CellFlags: u16 {
+        const BOLD          = 1 << 0;
+        const ITALIC        = 1 << 1;
+        const FAINT         = 1 << 2;
+        const BLINK         = 1 << 3;
+        const INVERSE       = 1 << 4;
+        const INVISIBLE     = 1 << 5;
+        const STRIKETHROUGH = 1 << 6;
+        const OVERLINE      = 1 << 7;
+        const UNDERLINE     = 1 << 8;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CellWidth {
+    #[default]
+    Narrow,
+    Wide,
+    SpacerTail,
+    SpacerHead,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolvedCell {
+    pub graphemes: Vec<u32>,
+    pub fg: Rgb,
+    pub bg: Rgb,
+    pub flags: CellFlags,
+    pub width: CellWidth,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CursorStyle {
+    Bar,
+    #[default]
+    Block,
+    Underline,
+    BlockHollow,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CursorState {
+    pub col: u16,
+    pub row: u16,
+    pub visible: bool,
+    pub style: CursorStyle,
+    pub wide_tail: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScreenGrid {
+    pub cells: Vec<ResolvedCell>,
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor: CursorState,
+}
+
+impl ScreenGrid {
+    pub fn cell(&self, col: u16, row: u16) -> Option<&ResolvedCell> {
+        if col < self.cols && row < self.rows {
+            self.cells.get((row as usize) * (self.cols as usize) + (col as usize))
+        } else {
+            None
+        }
+    }
+
+    pub fn row_text(&self, row: u16) -> String {
+        if row >= self.rows {
+            return String::new();
+        }
+        let start = (row as usize) * (self.cols as usize);
+        let end = start + (self.cols as usize);
+        let mut s = String::with_capacity(self.cols as usize);
+        for cell in &self.cells[start..end] {
+            if matches!(cell.width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                continue;
+            }
+            if cell.graphemes.is_empty() {
+                s.push(' ');
+            } else {
+                for &cp in &cell.graphemes {
+                    if let Some(ch) = char::from_u32(cp) {
+                        s.push(ch);
+                    }
+                }
+            }
+        }
+        s
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum VtEngineKind {
@@ -78,6 +178,7 @@ pub trait VtEngine {
     fn supports_replay(&self) -> bool;
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;
     fn screen_text(&self) -> Result<String, String>;
+    fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
     fn size(&self) -> (u16, u16);
 }
 

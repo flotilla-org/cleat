@@ -10,6 +10,7 @@ default = []
 ghostty-vt = []
 
 [dependencies]
+bitflags = "2"
 clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 serde = { workspace = true }

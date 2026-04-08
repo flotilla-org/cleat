@@ -114,6 +114,76 @@ fn vt_ghostty_screen_grid_returns_correct_dimensions() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_screen_grid_captures_cell_text() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    engine.feed(b"Hello").expect("feed bytes");
+
+    let grid = engine.screen_grid().expect("screen grid");
+    let text: String = (0..5)
+        .map(|col| {
+            let cell = grid.cell(col, 0).unwrap();
+            if cell.graphemes.is_empty() {
+                ' '
+            } else {
+                char::from_u32(cell.graphemes[0]).unwrap_or('?')
+            }
+        })
+        .collect();
+    assert_eq!(text, "Hello");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_captures_bold_style() {
+    use cleat::vt::CellFlags;
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    engine.feed(b"\x1b[1mbold\x1b[0m plain").expect("feed bytes");
+
+    let grid = engine.screen_grid().expect("screen grid");
+    // 'b' at col 0 should be bold
+    assert!(grid.cell(0, 0).unwrap().flags.contains(CellFlags::BOLD));
+    // 'p' at col 5 (after "bold ") should not be bold
+    assert!(!grid.cell(5, 0).unwrap().flags.contains(CellFlags::BOLD));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_captures_cursor_position() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    engine.feed(b"Hello").expect("feed bytes");
+
+    let grid = engine.screen_grid().expect("screen grid");
+    assert!(grid.cursor.visible);
+    assert_eq!(grid.cursor.col, 5);
+    assert_eq!(grid.cursor.row, 0);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_row_text_returns_row_content() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(10, 3);
+
+    engine.feed(b"line one\r\nline two").expect("feed bytes");
+
+    let grid = engine.screen_grid().expect("screen grid");
+    assert_eq!(grid.row_text(0).trim_end(), "line one");
+    assert_eq!(grid.row_text(1).trim_end(), "line two");
+    assert_eq!(grid.row_text(2).trim_end(), "");
+}
+
+#[test]
+fn vt_passthrough_screen_grid_returns_error() {
+    let mut engine = cleat::vt::passthrough::PassthroughVtEngine::new(80, 24);
+    let err = engine.screen_grid().expect_err("passthrough should fail");
+    assert!(err.contains("placeholder/test-only"));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_links_against_shared_library() {
     let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
     let lib_name = shared_library_filename();

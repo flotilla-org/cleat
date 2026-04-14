@@ -206,6 +206,87 @@ fn vt_ghostty_screen_grid_wide_chars_not_doubled_in_row_text() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_screen_grid_returns_cached_when_clean() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    engine.feed(b"hello").expect("feed bytes");
+
+    let grid1 = engine.screen_grid().expect("first screen_grid");
+    assert_eq!(grid1.row_text(0).trim_end(), "hello");
+
+    // Second call with no new input should return cached result
+    let grid2 = engine.screen_grid().expect("second screen_grid (cached)");
+    assert_eq!(grid1, grid2);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_updates_after_new_input() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    engine.feed(b"aaa").expect("feed bytes");
+    let grid1 = engine.screen_grid().expect("first screen_grid");
+    assert_eq!(grid1.row_text(0).trim_end(), "aaa");
+
+    engine.feed(b"bbb").expect("feed more bytes");
+    let grid2 = engine.screen_grid().expect("second screen_grid after new input");
+    assert_eq!(grid2.row_text(0).trim_end(), "aaabbb");
+    assert_ne!(grid1, grid2);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_resolves_explicit_fg_and_bg_colors() {
+    use cleat::vt::Rgb;
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    // True-color SGR: red fg on green bg for "R", then blue fg for "B", then reset
+    engine.feed(b"\x1b[38;2;255;0;0m\x1b[48;2;0;255;0mR\x1b[38;2;0;0;255mB\x1b[0m").expect("feed SGR color sequence");
+
+    let grid = engine.screen_grid().expect("screen grid");
+
+    let r_cell = grid.cell(0, 0).unwrap();
+    assert_eq!(r_cell.fg, Rgb { r: 255, g: 0, b: 0 }, "R cell foreground should be red");
+    assert_eq!(r_cell.bg, Rgb { r: 0, g: 255, b: 0 }, "R cell background should be green");
+
+    let b_cell = grid.cell(1, 0).unwrap();
+    assert_eq!(b_cell.fg, Rgb { r: 0, g: 0, b: 255 }, "B cell foreground should be blue");
+    assert_eq!(b_cell.bg, Rgb { r: 0, g: 255, b: 0 }, "B cell background should still be green");
+
+    // A cell after reset should have default colors (not the explicit ones)
+    let default_cell = grid.cell(2, 0).unwrap();
+    assert_ne!(default_cell.fg, Rgb { r: 255, g: 0, b: 0 }, "post-reset cell should not have red fg");
+    assert_ne!(default_cell.bg, Rgb { r: 0, g: 255, b: 0 }, "post-reset cell should not have green bg");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_multi_codepoint_grapheme() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    // e + combining acute accent (U+0065 U+0301) → single grapheme cluster "é"
+    engine.feed("e\u{0301}AB".as_bytes()).expect("feed combining character sequence");
+
+    let grid = engine.screen_grid().expect("screen grid");
+
+    // The combined grapheme should occupy col 0 with two codepoints
+    let combined_cell = grid.cell(0, 0).unwrap();
+    assert!(combined_cell.graphemes.len() > 1, "combined é should have multiple codepoints, got {:?}", combined_cell.graphemes);
+    assert_eq!(combined_cell.graphemes[0], 'e' as u32);
+    assert_eq!(combined_cell.graphemes[1], 0x0301, "second codepoint should be combining acute accent");
+
+    // 'A' should follow at col 1
+    let a_cell = grid.cell(1, 0).unwrap();
+    assert_eq!(a_cell.graphemes, vec!['A' as u32]);
+
+    // row_text should reconstruct the full grapheme cluster
+    let text = grid.row_text(0);
+    assert!(text.starts_with("e\u{0301}AB"), "row_text should contain the full grapheme cluster, got: {text:?}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_links_against_shared_library() {
     let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
     let lib_name = shared_library_filename();

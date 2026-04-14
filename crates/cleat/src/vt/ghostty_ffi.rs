@@ -475,7 +475,6 @@ impl RenderStateHandle {
         Ok(rows)
     }
 
-    #[allow(dead_code)]
     pub fn get_dirty(&self) -> Result<GhosttyRenderStateDirty, String> {
         let mut dirty = GhosttyRenderStateDirty::False;
         let result = unsafe {
@@ -588,7 +587,6 @@ impl RowIteratorHandle {
         unsafe { ghostty_render_state_row_iterator_next(self.raw) }
     }
 
-    #[allow(dead_code)]
     pub fn get_dirty(&self) -> Result<bool, String> {
         let mut dirty = false;
         let result =

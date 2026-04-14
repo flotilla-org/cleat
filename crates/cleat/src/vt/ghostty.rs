@@ -16,6 +16,7 @@ pub struct GhosttyVtEngine {
     cols: u16,
     rows: u16,
     saw_output: bool,
+    cached_grid: Option<ScreenGrid>,
 }
 
 impl GhosttyVtEngine {
@@ -24,7 +25,7 @@ impl GhosttyVtEngine {
         let render_state = RenderStateHandle::new().expect("create ghostty render state");
         let row_iter = RowIteratorHandle::new().expect("create ghostty row iterator");
         let row_cells = RowCellsHandle::new().expect("create ghostty row cells");
-        Self { terminal, render_state, row_iter, row_cells, cols, rows, saw_output: false }
+        Self { terminal, render_state, row_iter, row_cells, cols, rows, saw_output: false, cached_grid: None }
     }
 
     fn read_cursor_state(&self) -> Result<CursorState, String> {
@@ -101,6 +102,14 @@ impl VtEngine for GhosttyVtEngine {
 
     fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
         self.render_state.update(&self.terminal)?;
+
+        let dirty = self.render_state.get_dirty()?;
+        if dirty == GhosttyRenderStateDirty::False {
+            if let Some(ref cached) = self.cached_grid {
+                return Ok(cached.clone());
+            }
+        }
+
         let cols = self.render_state.get_cols()?;
         let rows = self.render_state.get_rows()?;
         let colors = self.render_state.get_colors()?;
@@ -108,12 +117,30 @@ impl VtEngine for GhosttyVtEngine {
         let default_fg = Rgb { r: colors.foreground.r, g: colors.foreground.g, b: colors.foreground.b };
         let default_bg = Rgb { r: colors.background.r, g: colors.background.g, b: colors.background.b };
 
-        let mut cells = Vec::with_capacity((cols as usize) * (rows as usize));
+        let partial = dirty == GhosttyRenderStateDirty::Partial;
+        let row_stride = cols as usize;
+
+        // Reuse the cached cell vec when doing a partial update.
+        let mut cells = if partial { self.cached_grid.take().map(|g| g.cells).unwrap_or_default() } else { Vec::new() };
+        if cells.len() != row_stride * (rows as usize) {
+            // Dimensions changed or no cache — full rebuild.
+            cells.clear();
+            cells.reserve(row_stride * (rows as usize));
+        }
 
         self.render_state.populate_row_iterator(&mut self.row_iter)?;
 
+        let mut row_idx: usize = 0;
         while self.row_iter.next() {
+            let skip = partial && !self.row_iter.get_dirty().unwrap_or(true);
+            if skip {
+                row_idx += 1;
+                continue;
+            }
+
             self.row_iter.populate_cells(&mut self.row_cells)?;
+            let row_start = row_idx * row_stride;
+            let mut col_idx: usize = 0;
             while self.row_cells.next() {
                 let graphemes_len = self.row_cells.get_graphemes_len()?;
                 let graphemes = if graphemes_len > 0 {
@@ -143,16 +170,25 @@ impl VtEngine for GhosttyVtEngine {
                     GhosttyCellWide::SpacerHead => CellWidth::SpacerHead,
                 };
 
-                cells.push(ResolvedCell { graphemes, fg, bg, flags, width });
+                let cell = ResolvedCell { graphemes, fg, bg, flags, width };
+                let idx = row_start + col_idx;
+                if idx < cells.len() {
+                    cells[idx] = cell;
+                } else {
+                    cells.push(cell);
+                }
+                col_idx += 1;
             }
+            row_idx += 1;
         }
 
         let cursor = self.read_cursor_state()?;
 
-        // Clear dirty state — cleat is the renderer.
         self.render_state.set_dirty(GhosttyRenderStateDirty::False)?;
 
-        Ok(ScreenGrid { cells, cols, rows, cursor })
+        let grid = ScreenGrid { cells, cols, rows, cursor };
+        self.cached_grid = Some(grid.clone());
+        Ok(grid)
     }
 
     fn size(&self) -> (u16, u16) {

@@ -254,10 +254,11 @@ fn vt_ghostty_screen_grid_resolves_explicit_fg_and_bg_colors() {
     assert_eq!(b_cell.fg, Rgb { r: 0, g: 0, b: 255 }, "B cell foreground should be blue");
     assert_eq!(b_cell.bg, Rgb { r: 0, g: 255, b: 0 }, "B cell background should still be green");
 
-    // A cell after reset should have default colors (not the explicit ones)
+    // A cell after reset should have default colors, matching an untouched cell
     let default_cell = grid.cell(2, 0).unwrap();
-    assert_ne!(default_cell.fg, Rgb { r: 255, g: 0, b: 0 }, "post-reset cell should not have red fg");
-    assert_ne!(default_cell.bg, Rgb { r: 0, g: 255, b: 0 }, "post-reset cell should not have green bg");
+    let untouched_cell = grid.cell(39, 4).unwrap();
+    assert_eq!(default_cell.fg, untouched_cell.fg, "post-reset fg should match untouched cell default");
+    assert_eq!(default_cell.bg, untouched_cell.bg, "post-reset bg should match untouched cell default");
 }
 
 #[cfg(feature = "ghostty-vt")]

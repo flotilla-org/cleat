@@ -117,13 +117,14 @@ impl VtEngine for GhosttyVtEngine {
         let default_fg = Rgb { r: colors.foreground.r, g: colors.foreground.g, b: colors.foreground.b };
         let default_bg = Rgb { r: colors.background.r, g: colors.background.g, b: colors.background.b };
 
-        let partial = dirty == GhosttyRenderStateDirty::Partial;
+        let mut partial = dirty == GhosttyRenderStateDirty::Partial;
         let row_stride = cols as usize;
 
         // Reuse the cached cell vec when doing a partial update.
         let mut cells = if partial { self.cached_grid.take().map(|g| g.cells).unwrap_or_default() } else { Vec::new() };
         if cells.len() != row_stride * (rows as usize) {
-            // Dimensions changed or no cache — full rebuild.
+            // Dimensions changed or no cache — force a full rebuild.
+            partial = false;
             cells.clear();
             cells.reserve(row_stride * (rows as usize));
         }

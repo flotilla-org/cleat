@@ -500,8 +500,7 @@ impl TerminalHandle {
         let result = unsafe { ghostty_terminal_new(ptr::null(), &mut raw, GhosttyTerminalOptions { cols, rows, max_scrollback }) };
         check_result(result, "ghostty_terminal_new")?;
 
-        #[allow(clippy::box_default)]
-        let mut reply_buf: Box<Vec<u8>> = Box::new(Vec::new());
+        let mut reply_buf: Box<Vec<u8>> = Box::<Vec<u8>>::default();
         // The raw pointer to the *inner* Vec<u8> is what we pass as userdata.
         let userdata_ptr: *mut c_void = (&mut *reply_buf as *mut Vec<u8>).cast();
 

@@ -18,7 +18,7 @@ A new `VtEngine::drain_replies(&mut self) -> Vec<u8>` seam pulls the buffered by
 **Tech Stack:** Rust 1.x (stable), libghostty C FFI, zig-built static library, `#[cfg(feature = "ghostty-vt")]` gated code path. Feature-on test commands use `--features ghostty-vt`.
 
 **Conventions:**
-- Run commands from repo root `/Users/robert/dev/cleat` unless otherwise stated.
+- Run commands from the repo root unless otherwise stated.
 - All commits on the current branch; author squashes/splits at end if needed.
 - Per `CLAUDE.md`, always run: `cargo build --locked`, `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`.
 - For feature-on validation additionally: `cargo test -p cleat --features ghostty-vt --locked`.
@@ -223,7 +223,7 @@ impl TerminalHandle {
         let result = unsafe { ghostty_terminal_new(ptr::null(), &mut raw, GhosttyTerminalOptions { cols, rows, max_scrollback }) };
         check_result(result, "ghostty_terminal_new")?;
 
-        let reply_buf: Box<Vec<u8>> = Box::new(Vec::new());
+        let mut reply_buf: Box<Vec<u8>> = Box::<Vec<u8>>::default();
         // The raw pointer to the *inner* Vec<u8> is what we pass as userdata.
         let userdata_ptr = (&*reply_buf) as *const Vec<u8> as *mut c_void;
 
@@ -240,7 +240,7 @@ impl TerminalHandle {
             ghostty_terminal_set(
                 raw,
                 GhosttyTerminalOption::WritePty,
-                &write_pty_cb as *const GhosttyTerminalWritePtyFn as *const c_void,
+                write_pty_cb as *const c_void,
             )
         };
         if let Err(err) = check_result(set_wp, "ghostty_terminal_set(WritePty)") {
@@ -281,7 +281,9 @@ impl Drop for TerminalHandle {
 }
 ```
 
-Note: `ghostty_terminal_set` expects a pointer to the callback value (a pointer-to-a-pointer pattern for function pointers). Writing `&write_pty_cb as *const _` takes the address of the local variable holding the function pointer. Because `ghostty_terminal_set` copies the pointer internally, it's safe for `write_pty_cb` to go out of scope after the call.
+Note: `ghostty_terminal_set` expects the function pointer **by value** (`write_pty_cb as *const c_void`). The `let write_pty_cb: GhosttyTerminalWritePtyFn = ...` binding exists purely to force a coercion check against the typedef'd fn-pointer type, so any mismatch in the trampoline's signature fails to compile here. Passing `&write_pty_cb as *const _ as *const c_void` instead causes a SIGBUS at runtime because libghostty stores the pointer directly as the callback rather than dereferencing it once.
+
+Also: remove `#[allow(dead_code)]` from `GhosttyTerminalWritePtyFn` and the `ghostty_terminal_set` extern — this task makes them live. Leave the DA attribute-suppressions alone; Task 3 will remove those.
 
 - [ ] **Step 4: Run the test again — expect pass.**
 
@@ -289,8 +291,7 @@ Run: `cargo test --features ghostty-vt -p cleat --locked vt::ghostty_ffi::tests:
 
 Expected: PASS. If it fails with an empty reply, the likely causes (in order of likelihood):
 1. `ghostty_terminal_set` rejected one of the values — inspect the error string.
-2. The function-pointer indirection is wrong (libghostty may expect the function pointer *by value*, not pointer-to-pointer). If so, change `&write_pty_cb as *const _ as *const c_void` to `write_pty_cb as *const c_void`.
-3. The CPR reply format uses `\x1b\\` instead of `\x1b[` — unlikely but check the actual bytes returned.
+2. The CPR reply format uses `\x1b\\` instead of `\x1b[` — unlikely but check the actual bytes returned.
 
 - [ ] **Step 5: Commit.**
 
@@ -386,7 +387,7 @@ Then in `TerminalHandle::new`, after the `WritePty` registration block (and befo
             ghostty_terminal_set(
                 raw,
                 GhosttyTerminalOption::DeviceAttributes,
-                &da_cb as *const GhosttyTerminalDeviceAttributesFn as *const c_void,
+                da_cb as *const c_void,
             )
         };
         if let Err(err) = check_result(set_da, "ghostty_terminal_set(DeviceAttributes)") {

@@ -303,6 +303,75 @@ impl GhosttyRenderStateColors {
     }
 }
 
+/// Selector for `ghostty_terminal_set`. C defines more variants (PWD and color options)
+/// that cleat does not currently configure.
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyTerminalOption {
+    Userdata = 0,
+    WritePty = 1,
+    Bell = 2,
+    Enquiry = 3,
+    Xtversion = 4,
+    TitleChanged = 5,
+    Size = 6,
+    ColorScheme = 7,
+    DeviceAttributes = 8,
+    Title = 9,
+}
+
+/// Callback fired synchronously from `ghostty_terminal_vt_write` when the
+/// terminal wants to send reply bytes back to the pty (DSR, DECRQM, DA, ...).
+#[allow(dead_code)]
+pub type GhosttyTerminalWritePtyFn = unsafe extern "C" fn(terminal: GhosttyTerminal, userdata: *mut c_void, data: *const u8, len: usize);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyDeviceAttributesPrimary {
+    pub conformance_level: u16,
+    pub features: [u16; 64],
+    pub num_features: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyDeviceAttributesSecondary {
+    pub device_type: u16,
+    pub firmware_version: u16,
+    pub rom_cartridge: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyDeviceAttributesTertiary {
+    pub unit_id: u32,
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyDeviceAttributes {
+    pub primary: GhosttyDeviceAttributesPrimary,
+    pub secondary: GhosttyDeviceAttributesSecondary,
+    pub tertiary: GhosttyDeviceAttributesTertiary,
+}
+
+/// Callback fired when ghostty receives a DA1/DA2/DA3 query. The app fills
+/// `*out_attrs` with the response shape it wants to advertise. Return true
+/// to emit, false to silently drop.
+#[allow(dead_code)]
+pub type GhosttyTerminalDeviceAttributesFn =
+    unsafe extern "C" fn(terminal: GhosttyTerminal, userdata: *mut c_void, out_attrs: *mut GhosttyDeviceAttributes) -> bool;
+
+// Computed for 64-bit targets: 2 (u16) + 128 ([u16; 64]) + 6 bytes trailing padding
+// to re-align to usize (8) + 8 (usize num_features) = 144. 32-bit targets would be 136.
+// This assert targets 64-bit (cleat's supported build targets).
+const _: () = assert!(std::mem::size_of::<GhosttyDeviceAttributesPrimary>() == 144);
+const _: () = assert!(std::mem::size_of::<GhosttyDeviceAttributesSecondary>() == 6);
+const _: () = assert!(std::mem::size_of::<GhosttyDeviceAttributesTertiary>() == 4);
+const _: () = assert!(std::mem::size_of::<GhosttyDeviceAttributes>() == 160);
+
 // Static asserts: verify Rust layouts match Ghostty's C ABI (from ghostty_type_json()).
 const _: () = assert!(std::mem::size_of::<GhosttyStyleColor>() == 16);
 const _: () = assert!(std::mem::size_of::<GhosttyStyle>() == 72);
@@ -323,6 +392,8 @@ unsafe extern "C" {
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> GhosttyResult;
     fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
+    #[allow(dead_code)]
+    fn ghostty_terminal_set(terminal: GhosttyTerminal, option: GhosttyTerminalOption, value: *const c_void) -> GhosttyResult;
 
     fn ghostty_formatter_terminal_new(
         allocator: *const c_void,

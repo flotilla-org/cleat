@@ -323,7 +323,6 @@ pub enum GhosttyTerminalOption {
 
 /// Callback fired synchronously from `ghostty_terminal_vt_write` when the
 /// terminal wants to send reply bytes back to the pty (DSR, DECRQM, DA, ...).
-#[allow(dead_code)]
 pub type GhosttyTerminalWritePtyFn = unsafe extern "C" fn(terminal: GhosttyTerminal, userdata: *mut c_void, data: *const u8, len: usize);
 
 #[repr(C)]
@@ -392,7 +391,6 @@ unsafe extern "C" {
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> GhosttyResult;
     fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
-    #[allow(dead_code)]
     fn ghostty_terminal_set(terminal: GhosttyTerminal, option: GhosttyTerminalOption, value: *const c_void) -> GhosttyResult;
 
     fn ghostty_formatter_terminal_new(
@@ -446,6 +444,24 @@ unsafe extern "C" {
 
 pub struct TerminalHandle {
     raw: GhosttyTerminal,
+    /// Heap-allocated so the address stays stable while the C side holds
+    /// a pointer to it via userdata. The callback pushes reply bytes here.
+    /// `Box<Vec<_>>` is deliberate — `Box` gives a stable heap slot for the
+    /// `Vec` header (ptr/len/cap), which is what we hand to libghostty.
+    #[allow(clippy::box_collection, dead_code)]
+    reply_buf: Box<Vec<u8>>,
+}
+
+unsafe extern "C" fn write_pty_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void, data: *const u8, len: usize) {
+    if userdata.is_null() || data.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: userdata is the raw pointer to a Box<Vec<u8>> we registered
+    // when constructing this terminal; ghostty calls us synchronously from
+    // vt_write, so the Box is live for the duration of the call.
+    let buf = unsafe { &mut *(userdata as *mut Vec<u8>) };
+    let slice = unsafe { std::slice::from_raw_parts(data, len) };
+    buf.extend_from_slice(slice);
 }
 
 impl TerminalHandle {
@@ -453,7 +469,30 @@ impl TerminalHandle {
         let mut raw = ptr::null_mut();
         let result = unsafe { ghostty_terminal_new(ptr::null(), &mut raw, GhosttyTerminalOptions { cols, rows, max_scrollback }) };
         check_result(result, "ghostty_terminal_new")?;
-        Ok(Self { raw })
+
+        #[allow(clippy::box_default)]
+        let reply_buf: Box<Vec<u8>> = Box::new(Vec::new());
+        // The raw pointer to the *inner* Vec<u8> is what we pass as userdata.
+        let userdata_ptr = (&*reply_buf) as *const Vec<u8> as *mut c_void;
+
+        let set_user = unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::Userdata, userdata_ptr as *const c_void) };
+        if let Err(err) = check_result(set_user, "ghostty_terminal_set(Userdata)") {
+            unsafe { ghostty_terminal_free(raw) };
+            return Err(err);
+        }
+
+        let write_pty_cb: GhosttyTerminalWritePtyFn = write_pty_trampoline;
+        // Libghostty's WritePty option takes the function pointer *by value*
+        // (coerced through *const c_void), not a pointer to a function pointer.
+        // Passing &cb as *const _ here triggers a SIGBUS from a bogus fn-ptr
+        // dereference inside vt_write.
+        let set_wp = unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::WritePty, write_pty_cb as *const c_void) };
+        if let Err(err) = check_result(set_wp, "ghostty_terminal_set(WritePty)") {
+            unsafe { ghostty_terminal_free(raw) };
+            return Err(err);
+        }
+
+        Ok(Self { raw, reply_buf })
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
@@ -468,11 +507,21 @@ impl TerminalHandle {
     pub fn raw(&self) -> GhosttyTerminal {
         self.raw
     }
+
+    /// Take all reply bytes libghostty has accumulated since the last drain.
+    #[allow(dead_code)]
+    pub fn drain_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.reply_buf)
+    }
 }
 
 impl Drop for TerminalHandle {
     fn drop(&mut self) {
+        // Free the terminal BEFORE the reply_buf Box drops. libghostty will not
+        // call our callback after this point, so the raw pointer stored in its
+        // userdata becomes dead at the same instant the Box is released.
         unsafe { ghostty_terminal_free(self.raw) };
+        // reply_buf drops automatically afterwards.
     }
 }
 
@@ -789,5 +838,19 @@ impl RowCellsHandle {
 impl Drop for RowCellsHandle {
     fn drop(&mut self) {
         unsafe { ghostty_render_state_row_cells_free(self.raw) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_captures_dsr_reply_into_drain_buffer() {
+        let mut term = TerminalHandle::new(80, 24, 1024).expect("new terminal");
+        // CSI 6 n = DSR Cursor Position Report — should produce CSI <row> ; <col> R
+        term.feed(b"\x1b[6n");
+        let reply = term.drain_replies();
+        assert!(reply.starts_with(b"\x1b[") && reply.ends_with(b"R"), "expected CPR reply, got {reply:?}",);
     }
 }

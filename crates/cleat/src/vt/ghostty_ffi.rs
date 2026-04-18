@@ -471,9 +471,9 @@ impl TerminalHandle {
         check_result(result, "ghostty_terminal_new")?;
 
         #[allow(clippy::box_default)]
-        let reply_buf: Box<Vec<u8>> = Box::new(Vec::new());
+        let mut reply_buf: Box<Vec<u8>> = Box::new(Vec::new());
         // The raw pointer to the *inner* Vec<u8> is what we pass as userdata.
-        let userdata_ptr = (&*reply_buf) as *const Vec<u8> as *mut c_void;
+        let userdata_ptr: *mut c_void = (&mut *reply_buf as *mut Vec<u8>).cast();
 
         let set_user = unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::Userdata, userdata_ptr as *const c_void) };
         if let Err(err) = check_result(set_user, "ghostty_terminal_set(Userdata)") {

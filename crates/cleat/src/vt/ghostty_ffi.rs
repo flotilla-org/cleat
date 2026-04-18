@@ -347,7 +347,6 @@ pub struct GhosttyDeviceAttributesTertiary {
     pub unit_id: u32,
 }
 
-#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct GhosttyDeviceAttributes {
@@ -359,7 +358,6 @@ pub struct GhosttyDeviceAttributes {
 /// Callback fired when ghostty receives a DA1/DA2/DA3 query. The app fills
 /// `*out_attrs` with the response shape it wants to advertise. Return true
 /// to emit, false to silently drop.
-#[allow(dead_code)]
 pub type GhosttyTerminalDeviceAttributesFn =
     unsafe extern "C" fn(terminal: GhosttyTerminal, userdata: *mut c_void, out_attrs: *mut GhosttyDeviceAttributes) -> bool;
 
@@ -452,6 +450,38 @@ pub struct TerminalHandle {
     reply_buf: Box<Vec<u8>>,
 }
 
+/// DA1 feature code for ANSI color (see device.h: GHOSTTY_DA_FEATURE_ANSI_COLOR).
+const DA_FEATURE_ANSI_COLOR: u16 = 22;
+/// VT220 conformance (see device.h: GHOSTTY_DA_CONFORMANCE_VT220).
+const DA_CONFORMANCE_VT220: u16 = 62;
+/// VT220 device type for DA2 (see device.h: GHOSTTY_DA_DEVICE_TYPE_VT220).
+const DA_DEVICE_TYPE_VT220: u16 = 1;
+/// DA2 firmware version. Matches cleat's pre-existing synthetic reply.
+const DA_FIRMWARE_VERSION: u16 = 10;
+
+unsafe extern "C" fn device_attributes_trampoline(
+    _terminal: GhosttyTerminal,
+    _userdata: *mut c_void,
+    out_attrs: *mut GhosttyDeviceAttributes,
+) -> bool {
+    if out_attrs.is_null() {
+        return false;
+    }
+    let mut features = [0u16; 64];
+    features[0] = DA_FEATURE_ANSI_COLOR;
+    let attrs = GhosttyDeviceAttributes {
+        primary: GhosttyDeviceAttributesPrimary { conformance_level: DA_CONFORMANCE_VT220, features, num_features: 1 },
+        secondary: GhosttyDeviceAttributesSecondary {
+            device_type: DA_DEVICE_TYPE_VT220,
+            firmware_version: DA_FIRMWARE_VERSION,
+            rom_cartridge: 0,
+        },
+        tertiary: GhosttyDeviceAttributesTertiary { unit_id: 0 },
+    };
+    unsafe { *out_attrs = attrs };
+    true
+}
+
 unsafe extern "C" fn write_pty_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void, data: *const u8, len: usize) {
     if userdata.is_null() || data.is_null() || len == 0 {
         return;
@@ -488,6 +518,13 @@ impl TerminalHandle {
         // dereference inside vt_write.
         let set_wp = unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::WritePty, write_pty_cb as *const c_void) };
         if let Err(err) = check_result(set_wp, "ghostty_terminal_set(WritePty)") {
+            unsafe { ghostty_terminal_free(raw) };
+            return Err(err);
+        }
+
+        let da_cb: GhosttyTerminalDeviceAttributesFn = device_attributes_trampoline;
+        let set_da = unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::DeviceAttributes, da_cb as *const c_void) };
+        if let Err(err) = check_result(set_da, "ghostty_terminal_set(DeviceAttributes)") {
             unsafe { ghostty_terminal_free(raw) };
             return Err(err);
         }
@@ -852,5 +889,21 @@ mod tests {
         term.feed(b"\x1b[6n");
         let reply = term.drain_replies();
         assert!(reply.starts_with(b"\x1b[") && reply.ends_with(b"R"), "expected CPR reply, got {reply:?}",);
+    }
+
+    #[test]
+    fn terminal_answers_da1_with_vt220_and_ansi_color() {
+        let mut term = TerminalHandle::new(80, 24, 1024).expect("new terminal");
+        term.feed(b"\x1b[c");
+        let reply = term.drain_replies();
+        assert_eq!(reply, b"\x1b[?62;22c".to_vec());
+    }
+
+    #[test]
+    fn terminal_answers_da2_with_vt220_firmware_10() {
+        let mut term = TerminalHandle::new(80, 24, 1024).expect("new terminal");
+        term.feed(b"\x1b[>c");
+        let reply = term.drain_replies();
+        assert_eq!(reply, b"\x1b[>1;10;0c".to_vec());
     }
 }

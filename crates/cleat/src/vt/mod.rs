@@ -180,6 +180,12 @@ pub trait VtEngine {
     fn screen_text(&self) -> Result<String, String>;
     fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
     fn size(&self) -> (u16, u16);
+
+    /// Reply bytes (DSR, DECRQM, DA, ...) the engine has buffered since the
+    /// last call. Default is empty for engines that don't synthesize replies.
+    fn drain_replies(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

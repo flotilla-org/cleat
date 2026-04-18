@@ -446,7 +446,7 @@ pub struct TerminalHandle {
     /// a pointer to it via userdata. The callback pushes reply bytes here.
     /// `Box<Vec<_>>` is deliberate — `Box` gives a stable heap slot for the
     /// `Vec` header (ptr/len/cap), which is what we hand to libghostty.
-    #[allow(clippy::box_collection, dead_code)]
+    #[allow(clippy::box_collection)]
     reply_buf: Box<Vec<u8>>,
 }
 
@@ -546,7 +546,6 @@ impl TerminalHandle {
     }
 
     /// Take all reply bytes libghostty has accumulated since the last drain.
-    #[allow(dead_code)]
     pub fn drain_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut *self.reply_buf)
     }

@@ -259,4 +259,15 @@ mod tests {
         };
         assert!(err.contains("not compiled"));
     }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn ghostty_engine_drains_da1_reply_after_feed() {
+        let mut engine = super::make_default_vt_engine(80, 24);
+        engine.feed(b"\x1b[c").expect("feed DA1");
+        let reply = engine.drain_replies();
+        assert_eq!(reply, b"\x1b[?62;22c".to_vec());
+        // Second drain is empty — buffer is consumed.
+        assert!(engine.drain_replies().is_empty());
+    }
 }

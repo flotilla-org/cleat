@@ -60,6 +60,10 @@ impl VtEngine for GhosttyVtEngine {
         Ok(())
     }
 
+    fn drain_replies(&mut self) -> Vec<u8> {
+        self.terminal.drain_replies()
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
         self.terminal.resize(cols, rows)?;
         self.cols = cols;

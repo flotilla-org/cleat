@@ -180,6 +180,12 @@ pub trait VtEngine {
     fn screen_text(&self) -> Result<String, String>;
     fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
     fn size(&self) -> (u16, u16);
+
+    /// Reply bytes (DSR, DECRQM, DA, ...) the engine has buffered since the
+    /// last call. Default is empty for engines that don't synthesize replies.
+    fn drain_replies(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -252,5 +258,27 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.contains("not compiled"));
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn ghostty_engine_drains_da1_reply_after_feed() {
+        let mut engine = super::make_default_vt_engine(80, 24);
+        engine.feed(b"\x1b[c").expect("feed DA1");
+        let reply = engine.drain_replies();
+        assert_eq!(reply, b"\x1b[?62;22c".to_vec());
+        // Second drain is empty — buffer is consumed.
+        assert!(engine.drain_replies().is_empty());
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn ghostty_engine_answers_cursor_position_report() {
+        let mut engine = super::make_default_vt_engine(80, 24);
+        // Move cursor to row 5, col 10 (1-based in CPR output), then ask.
+        // ESC[5;10H = CUP, ESC[6n = DSR CPR.
+        engine.feed(b"\x1b[5;10H\x1b[6n").expect("feed CUP+DSR");
+        let reply = engine.drain_replies();
+        assert_eq!(reply, b"\x1b[5;10R".to_vec());
     }
 }

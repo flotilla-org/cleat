@@ -483,7 +483,13 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let pty_fd = pty_child.master_fd;
     set_nonblocking(pty_fd)?;
     let mut vt_engine = default_vt_engine(session.vt_engine)?;
-    let mut detached_da = DeviceAttributeTracker::new();
+    // The DA tracker is the only DA source for the passthrough engine.
+    // The ghostty engine answers DA itself via its DeviceAttributes callback,
+    // so we skip the tracker there to avoid double replies.
+    let mut detached_da = match session.vt_engine {
+        vt::VtEngineKind::Passthrough => Some(DeviceAttributeTracker::new()),
+        vt::VtEngineKind::Ghostty => None,
+    };
 
     let mut active_client: Option<ActiveClient> = None;
     let mut recorder: Option<crate::recording::SessionRecorder> = None;
@@ -860,8 +866,14 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
                         }
                         if active_client.is_none() {
-                            for reply in detached_da.push(&buf[..n]) {
-                                write_fd_all(pty_fd, &reply)?;
+                            if let Some(ref mut tracker) = detached_da {
+                                for reply in tracker.push(&buf[..n]) {
+                                    write_fd_all(pty_fd, &reply)?;
+                                }
+                            }
+                            let engine_reply = vt_engine.drain_replies();
+                            if !engine_reply.is_empty() {
+                                write_fd_all(pty_fd, &engine_reply)?;
                             }
                         }
                         if let Some(client) = active_client.as_mut() {

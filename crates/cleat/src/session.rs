@@ -865,13 +865,16 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 }
                             }
                         }
+                        // Drain engine replies every iteration so the buffer never accumulates
+                        // stale replies across an attach→detach transition. When attached, the
+                        // host terminal is authoritative for query responses, so we discard.
+                        let engine_reply = vt_engine.drain_replies();
                         if active_client.is_none() {
                             if let Some(ref mut tracker) = detached_da {
                                 for reply in tracker.push(&buf[..n]) {
                                     write_fd_all(pty_fd, &reply)?;
                                 }
                             }
-                            let engine_reply = vt_engine.drain_replies();
                             if !engine_reply.is_empty() {
                                 write_fd_all(pty_fd, &engine_reply)?;
                             }

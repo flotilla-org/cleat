@@ -110,8 +110,8 @@ Currently answered by the VT engine in detached mode:
 
 | Query | Reply |
 |---|---|
-| DA1 (`CSI c`) | `\x1b[?62;22c` (VT220 + ANSI color) |
-| DA2 (`CSI > c`) | `\x1b[>1;10;0c` (VT220, firmware 10) |
+| DA1 (`CSI c`) | `\x1b[?62;22c` (conformance level 62 = VT220, feature 22 = ANSI color) |
+| DA2 (`CSI > c`) | `\x1b[>1;10;0c` (device type 1 = VT220, firmware 10, cartridge 0) |
 | DA3 (`CSI = c`) | DECRPTUI response with unit ID 0 |
 | DSR, including Cursor Position Report (`CSI 6 n`) | computed from VT state (e.g. `\x1b[row;colR`) |
 | DECRQM (mode reports) | computed from VT mode state |

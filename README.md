@@ -74,3 +74,63 @@ Each session gets a subdirectory containing:
 **Cleanup.** When the child process exits, the daemon removes the socket and PID file, then exits. If recording was active, the session directory and `.cast` file are preserved. Otherwise the entire session directory is removed.
 
 **No persistence across restarts.** Sessions do not survive daemon crashes or host reboots — the PTY and process state are gone. Recording files survive if they were flushed to disk.
+
+## Behavioral Model
+
+Three layers cooperate during a session. Knowing which layer is authoritative for which behavior is the main thing to internalize before debugging with cleat — it's the most common source of confusion.
+
+### Layers
+
+- **Host terminal** — your real terminal emulator (kitty, ghostty, iTerm, Terminal.app, etc). In play *only while a client is attached*. Renders output to you, supplies keyboard input, and answers the child's capability queries (DA, DSR, kitty/sixel protocol queries) with whatever the host terminal actually supports.
+- **VT engine** — cleat's internal terminal emulator (libghostty with `--features ghostty-vt`; the `passthrough` engine is a placeholder for testing). Always active. Parses child PTY output into a structured screen grid, tracks modes/cursor/styles, and — when *detached* — synthesizes replies to capability queries so the child's detection logic doesn't stall.
+- **Recording** — optional raw PTY output tee, stored as asciicast v3 in `session.cast`. Authoritative source for `transcript` and `expect`. Enabled per-session with `--record` or globally via `CLEAT_RECORD=1`.
+
+### Command → layer map
+
+| Command | Exercises | Notes |
+|---|---|---|
+| `launch` | daemon + VT engine | Creates session, spawns daemon, initializes VT engine |
+| `attach` / `detach` | host terminal + daemon | While attached, host terminal is authoritative for query replies |
+| `list`, `inspect`, `kill`, `signal` | daemon state | No VT / recording involvement |
+| `capture` | VT engine | Renders the current screen grid to text; errors on the `passthrough` engine |
+| `transcript`, `expect` | recording | Reads raw bytes from asciicast; no re-rendering |
+| `send`, `send-keys`, `interrupt`, `escape` | daemon → PTY | Writes to child stdin via the PTY master |
+| `record`, `mark` | recording | Mutates recording state |
+| `wait --idle-time` | daemon | PTY-output idle timer |
+| `wait --text` | VT engine | Consults the rendered screen grid |
+
+### Queries and capabilities
+
+When the child emits a capability query, the reply source depends on attach state:
+
+- **Attached** — the host terminal replies. Whatever your real terminal actually supports is what the child sees. Behavior matches running the child outside cleat.
+- **Detached** — the VT engine (libghostty) synthesizes replies.
+
+Currently answered by the VT engine in detached mode:
+
+| Query | Reply |
+|---|---|
+| DA1 (`CSI c`) | `\x1b[?62;22c` (conformance level 62 = VT220, feature 22 = ANSI color) |
+| DA2 (`CSI > c`) | `\x1b[>1;10;0c` (device type 1 = VT220, firmware 10, cartridge 0) |
+| DA3 (`CSI = c`) | DECRPTUI response with unit ID 0 |
+| DSR, including Cursor Position Report (`CSI 6 n`) | computed from VT state (e.g. `\x1b[row;colR`) |
+| DECRQM (mode reports) | computed from VT mode state |
+
+Currently dropped (no reply sent, even in detached mode):
+
+- ENQ (`0x05`)
+- XTVERSION (`CSI > q`)
+- XTWINOPS size queries (`CSI 14/16/18 t`)
+- Color-scheme query (`CSI ? 996 n`)
+- Kitty keyboard protocol queries (`CSI ? u`)
+- Kitty graphics protocol queries (`APC G ... q=... ST`)
+- XTGETTCAP (`DCS + q ... ST`)
+
+The first four have structurally identical fixes to the DA/DSR wiring and will likely land as a follow-up. The kitty-protocol and XTGETTCAP entries need upstream libghostty work or a cleat-side sniffer — tracked in the issue list.
+
+### Common surprises
+
+- **`capture` shows what the VT engine parsed** from the output stream — not necessarily what your real terminal would display. Usually identical, but diverges for kitty graphics: the VT engine doesn't surface image content today, while an attached host terminal would render the images.
+- **Attached and detached sessions may behave differently for the same child program** if the child branches on capability-query responses. A TUI that probes for kitty graphics via `APC G ... q=... ST` sees support when attached to kitty and no support when detached (the query is currently dropped). Reproducible behavior for protocol-sensitive stages requires picking the right mode. This asymmetry is a known design question, not a target — see [#58](https://github.com/flotilla-org/cleat/issues/58) for the direction (VT engine always authoritative, host terminal as a derived view).
+- **Recording is raw PTY output** with escape sequences intact. `transcript` emits them verbatim; use `capture` to get human-readable text from the current screen state.
+- **Non-Ghostty builds return errors** for `capture` and other VT-dependent operations. The `passthrough` engine is a test seam, not a real VT. A functional binary requires `--features ghostty-vt`.

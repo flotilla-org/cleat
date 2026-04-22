@@ -13,6 +13,7 @@ ghostty-vt = []
 bitflags = "2"
 clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
+humantime = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"

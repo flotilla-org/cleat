@@ -19,7 +19,7 @@ Agents debugging with cleat repeatedly need to replay recorded output at human-v
 
 - New `replay` subcommand.
 - Positional path argument (common case) or `--session <id>` flag (runtime lookup).
-- Full parity with `transcript`'s 6 bound flags (`--since`, `--since-marker`, `--until`, `--until-marker`, `--until-next-marker`, `--until-idle`).
+- The same 6 bound flags `transcript` accepts (`--since`, `--since-marker`, `--until`, `--until-marker`, `--until-next-marker`, `--until-idle`), with one restriction: marker-based flags require `--session` (markers are resolved through the daemon socket). Raw offset and `--until-idle` work with either the positional path or `--session`.
 - `--speed <f64>` — gap multiplier. Validated positive finite.
 - `--max-idle <duration>` — clamp gaps after speed scaling. Humantime format shared with `--until-idle` / `wait --idle-time`.
 - Streaming event reader in `cast_reader` so replay doesn't buffer the whole file.
@@ -49,9 +49,9 @@ cleat replay <path> --since-marker a --until-marker b     # slice
 
 ### `--session` marker resolution
 
-For `--session <id>` with `--since-marker` / `--until-marker` / `--until-next-marker`, marker resolution uses the existing daemon socket path (`SessionService::resolve_marker` / `resolve_next_marker_after`). If the daemon is gone (session ended), these fail with the existing error messages. A future improvement would be a cast-file marker scanner that reads `EventCode::Marker` events directly — out of scope here, but filed as a follow-up.
+For `--session <id>` with `--since-marker` / `--until-marker` / `--until-next-marker`, marker resolution uses the existing daemon socket path (`SessionService::resolve_marker` / `resolve_next_marker_after`). **The session's daemon must be alive when replay runs** — markers live in the daemon's in-memory map, not the cast file (markers ARE written to the cast file as `EventCode::Marker` events, so a cast-file marker scanner could support offline `--session` replay in the future, but that's out of scope here).
 
-For positional path (no session context), marker flags error at dispatch time with `--since-marker requires --session (markers are resolved through the daemon)`. Raw `--since` / `--until` / `--until-idle` work with positional path.
+Marker flags with a positional path (no `--session`) are rejected by clap via `requires = "session"` on each marker flag. Raw `--since` / `--until` / `--until-idle` work with either form.
 
 ## Event handling policy
 
@@ -83,7 +83,17 @@ for event in iter_output_between(path, start, end)? {
 }
 ```
 
-Gap of the first event from the start bound is relative to the recording's zero time, which — post the existing `read_output_between` seek semantics — is reset to zero at the seek point. So the first event's scaled gap is `event.time / speed`, which is correct: play the first event at its natural offset from the slice start.
+### Timing with arbitrary start offsets
+
+The existing `cast_reader` seek semantics (documented on `read_output_since`) reset delta accumulation to zero at the seek point. Consequence for replay: when a `--since <offset>` or `--since-marker <name>` seek lands between two events in the cast file, the first decoded event's `event.time` is the delta from the *previous* event that was written to the file — which may or may not be inside our slice range.
+
+Practical effects:
+
+- **Start at marker / offset-right-after-marker** (common case): the first output event's `event.time` is the natural inter-event delay from whatever output the child emitted most recently before the mark. Replay pauses by that amount before the first output. Usually what users want — it preserves the "rhythm" of the session starting from the mark.
+- **Start at arbitrary offset that lands in a long idle period**: first event's `event.time` can be many seconds, producing an initial pause before any output. Users wanting to skip this supply `--max-idle`, which clamps exactly this case.
+- **`prev_time` initialization**: the replay loop starts with `prev_time = Duration::ZERO` to match the reader's post-seek reset. First event's gap is therefore `event.time - 0 = event.time`.
+
+This matches what `transcript` does (concatenates output without regard to timing) and is the simplest semantics to reason about. If a more sophisticated mode is ever needed (e.g. "start immediately, no leading pause"), `--max-idle 0ms` is the knob.
 
 ## Architecture
 
@@ -157,11 +167,12 @@ pub(crate) fn resolve_slice_range(
 ### Error handling
 
 - **Path doesn't exist** → `replay: no such file: <path>`
-- **Not a valid asciicast v3** → existing `decode_event` errors surface; replay reports `replay: invalid cast file at <path>: <reason>`
+- **File I/O errors** (seek fail, read fail) → surface with file-path context.
+- **Malformed lines mid-stream** → silently skipped, matching the existing `cast_reader` behavior used by `transcript` and `capture`. The `iter_output_between` iterator yields only successfully-decoded events; decode errors are swallowed inside the iterator to preserve this invariant. Changing that reader-wide would be a separate design concern with knock-on effects for the merged `capture_slice_*` path, so it stays out of this spec.
 - **Broken pipe** (stdout consumer hangs up) → handle cleanly, exit 0. Rust's default behavior is to return `ErrorKind::BrokenPipe`; the replay loop treats it as end-of-replay.
-- **SIGINT** (Ctrl-C during sleep) → standard exit code 130. `std::thread::sleep` is interruptible by signal; signal handler is not added specially — the runtime's default behavior handles it.
-- **Speed ≤ 0 or non-finite** → clap value-parser rejects at parse time with the error string above.
-- **`--since-marker` / `--until-marker` / `--until-next-marker` with positional path** (no session) → dispatch-time error: `marker flags require --session`.
+- **SIGINT** (Ctrl-C during sleep) → standard exit code 130. `std::thread::sleep` is interruptible by signal; no special handler.
+- **Speed ≤ 0 or non-finite** → clap value-parser rejects at parse time with `invalid speed: <value>`.
+- **Marker flags with positional path** (`--since-marker` / `--until-marker` / `--until-next-marker` with no `--session`) → enforced at the clap layer via `requires = "session"`; clap emits the standard `the argument '--since-marker <...>' requires '--session <...>'` message. No runtime check needed.
 
 ## Testing
 
@@ -181,14 +192,18 @@ In `cast_reader.rs`:
 In `tests/replay.rs` (new file):
 - Fixture cast file with known events. Run replay with `--speed 1000` (fast), capture stdout, verify byte-for-byte match with the output-event concatenation.
 - Same but with `--max-idle 0ms` — expect zero sleeps, output identical.
-- Slice test: replay with `--since-offset` / `--until-offset` on the fixture, verify only the sliced output appears.
+- Slice test: replay with `--since <offset>` / `--until <offset>` on the fixture, verify only the sliced output appears.
 
 ### Lifecycle test (one)
 
-In `tests/lifecycle.rs`:
-- Create a session, mark A, send a few lines with short sleeps, mark B, send more, end.
-- Run `replay --session <id> --since-marker A --until-marker B --speed 1000`.
+In `tests/lifecycle.rs`, with the session daemon kept alive for the duration:
+
+- Create a session with recording, named_mark A, send a few lines with short sleeps, named_mark B, send more.
+- **While the daemon is still running**, invoke `replay --session <id> --since-marker A --until-marker B --speed 1000`.
 - Assert stdout contains the expected middle bytes and not the trailing bytes.
+- After the assertion, kill the session.
+
+This specifically exercises the socket-backed marker-resolution path. Offline `--session` replay (post-daemon-exit) is out of scope — a cast-file marker scanner would be needed, and that's its own follow-up.
 
 Timing-sensitive; use a fast speed multiplier to keep the test under a second.
 

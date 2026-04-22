@@ -11,7 +11,7 @@ use clap::Parser;
 #[cfg(feature = "ghostty-vt")]
 use cleat::session::{daemon_pid_path, foreground_path};
 use cleat::{
-    cli::{self, Cli},
+    cli::{self, Cli, ExecResult},
     protocol::{Frame, SessionInfo},
     runtime::RuntimeLayout,
     server::{EndBound, SessionService, StartBound},
@@ -193,7 +193,6 @@ fn capture_rejects_passthrough_sessions() {
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn capture_returns_text_for_ghostty_sessions() {
-    use cleat::cli::ExecResult;
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
@@ -1034,4 +1033,55 @@ fn inspect_reports_dynamic_leader_cwd() {
     );
 
     service.kill("cwd-test").expect("kill");
+}
+
+#[test]
+fn transcript_between_two_named_markers_returns_exact_range() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    service.named_mark("alpha", "m1").expect("mark m1");
+    service.send_keys("alpha", b"first").expect("send first");
+    std::thread::sleep(Duration::from_millis(300));
+    service.named_mark("alpha", "m2").expect("mark m2");
+    service.send_keys("alpha", b"second").expect("send second");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let cli = Cli::try_parse_from(["cleat", "transcript", "alpha", "--since-marker", "m1", "--until-marker", "m2"]).expect("parse");
+    let result = cli::execute(cli, &service);
+    let output = match result {
+        ExecResult::Ok(Some(s)) => s,
+        other => panic!("expected Ok(Some(...)), got {other:?}"),
+    };
+    assert!(output.contains("first"), "expected 'first' in output, got: {output:?}");
+    assert!(!output.contains("second"), "did not expect 'second', got: {output:?}");
+}
+
+#[test]
+fn transcript_until_idle_terminates_at_quiet_period() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    service.named_mark("alpha", "start").expect("mark start");
+    service.send_keys("alpha", b"burst").expect("send burst");
+    std::thread::sleep(Duration::from_millis(1000));
+    service.send_keys("alpha", b"after").expect("send after");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let cli = Cli::try_parse_from(["cleat", "transcript", "alpha", "--since-marker", "start", "--until-idle", "500ms"]).expect("parse");
+    let result = cli::execute(cli, &service);
+    let output = match result {
+        ExecResult::Ok(Some(s)) => s,
+        other => panic!("expected Ok(Some(...)), got {other:?}"),
+    };
+    assert!(output.contains("burst"), "expected 'burst' in output");
+    assert!(!output.contains("after"), "idle gap should have terminated slice before 'after'");
 }

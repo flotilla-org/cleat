@@ -305,19 +305,46 @@ fn mark_without_name_still_works() {
 #[test]
 fn transcript_with_since_marker_parses() {
     let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "m1"]).expect("parse");
-    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: None, since_marker: Some("m1".into()), raw: false });
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: None,
+        since_marker: Some("m1".into()),
+        until: None,
+        until_marker: None,
+        until_next_marker: false,
+        until_idle: None,
+        raw: false,
+    });
 }
 
 #[test]
 fn transcript_with_since_offset_parses() {
     let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "500"]).expect("parse");
-    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: Some(500), since_marker: None, raw: false });
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: Some(500),
+        since_marker: None,
+        until: None,
+        until_marker: None,
+        until_next_marker: false,
+        until_idle: None,
+        raw: false,
+    });
 }
 
 #[test]
 fn transcript_with_raw_parses() {
     let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "m1", "--raw"]).expect("parse");
-    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: None, since_marker: Some("m1".into()), raw: true });
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: None,
+        since_marker: Some("m1".into()),
+        until: None,
+        until_marker: None,
+        until_next_marker: false,
+        until_idle: None,
+        raw: true,
+    });
 }
 
 #[test]

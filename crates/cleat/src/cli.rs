@@ -108,6 +108,18 @@ pub enum Command {
         /// Named marker to use as the start offset
         #[arg(long, conflicts_with = "since")]
         since_marker: Option<String>,
+        /// Byte offset in .cast file; slice ends at this position.
+        #[arg(long, conflicts_with_all = ["until_marker", "until_next_marker", "until_idle"])]
+        until: Option<u64>,
+        /// Named marker to use as the end offset.
+        #[arg(long, conflicts_with_all = ["until", "until_next_marker", "until_idle"])]
+        until_marker: Option<String>,
+        /// Slice until the chronologically-next named marker after the start.
+        #[arg(long, conflicts_with_all = ["until", "until_marker", "until_idle"])]
+        until_next_marker: bool,
+        /// Slice until the recording is idle for this duration (e.g., 500ms, 2s).
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds, conflicts_with_all = ["until", "until_marker", "until_next_marker"])]
+        until_idle: Option<std::time::Duration>,
         /// Return raw event data instead of VT-rendered text
         #[arg(long)]
         raw: bool,
@@ -377,7 +389,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(s) => ExecResult::Ok(Some(s)),
             Err(e) => ExecResult::Err(e),
         },
-        Command::Transcript { id, since, since_marker, raw } => {
+        Command::Transcript { id, since, since_marker, until, until_marker, until_next_marker, until_idle, raw } => {
             let start = match (since, since_marker) {
                 (Some(o), None) => StartBound::Offset(o),
                 (None, Some(name)) => StartBound::Marker(name),
@@ -386,13 +398,26 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 }
                 _ => unreachable!("clap conflicts_with prevents this"),
             };
-            let result = if raw {
-                service.capture_slice_raw(&id, start, EndBound::EndOfRecording)
-            } else {
-                service.capture_slice_text(&id, start, EndBound::EndOfRecording)
+
+            let end = match (until, until_marker, until_next_marker, until_idle) {
+                (Some(o), None, false, None) => EndBound::Offset(o),
+                (None, Some(name), false, None) => EndBound::Marker(name),
+                (None, None, true, None) => EndBound::NextMarker,
+                (None, None, false, Some(d)) => EndBound::IdleGap(d),
+                (None, None, false, None) => EndBound::EndOfRecording,
+                _ => unreachable!("clap conflicts_with prevents this"),
             };
+
+            let result = if raw { service.capture_slice_raw(&id, start, end) } else { service.capture_slice_text(&id, start, end) };
             match result {
-                Ok((s, _outcome)) => ExecResult::Ok(Some(s)),
+                Ok((s, outcome)) => {
+                    if !outcome.hit_intended_end {
+                        if let Some(reason) = &outcome.fallback_reason {
+                            eprintln!("# bounded by EOF ({reason})");
+                        }
+                    }
+                    ExecResult::Ok(Some(s))
+                }
                 Err(e) => ExecResult::Err(e),
             }
         }

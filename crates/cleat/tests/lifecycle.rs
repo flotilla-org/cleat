@@ -11,10 +11,10 @@ use clap::Parser;
 #[cfg(feature = "ghostty-vt")]
 use cleat::session::{daemon_pid_path, foreground_path};
 use cleat::{
-    cli::{self, Cli},
+    cli::{self, Cli, ExecResult},
     protocol::{Frame, SessionInfo},
     runtime::RuntimeLayout,
-    server::SessionService,
+    server::{EndBound, SessionService, StartBound},
     session::session_socket_path,
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
@@ -193,7 +193,6 @@ fn capture_rejects_passthrough_sessions() {
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn capture_returns_text_for_ghostty_sessions() {
-    use cleat::cli::ExecResult;
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
@@ -455,7 +454,8 @@ fn detached_session_answers_da_queries() {
     std::thread::sleep(Duration::from_secs(1));
 
     // Read recorded output since the mark
-    let output = service.capture_since_raw("alpha", offset).expect("capture since");
+    let (output, _outcome) =
+        service.capture_slice_raw("alpha", StartBound::Offset(offset), EndBound::EndOfRecording).expect("capture slice");
 
     assert!(output.contains("\x1b[?62;22c"), "detached session should inject DA1 response in recorded output, got: {output:?}");
 }
@@ -506,6 +506,31 @@ fn attached_session_does_not_get_synthetic_da_reply() {
         !output.windows(b"\x1b[?62;22c".len()).any(|w| w == b"\x1b[?62;22c"),
         "attached session should NOT inject DA1 response, but got one in output"
     );
+}
+
+#[test]
+fn resolve_next_marker_returns_minimum_offset_above() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Named marks register offsets in the daemon's marker map; unnamed `mark`
+    // does not. `resolve_next_marker_after` searches that map, so we need
+    // named marks here.
+    let off_a = service.named_mark("alpha", "a").expect("mark a");
+    service.send_keys("alpha", b"x").expect("send x");
+    std::thread::sleep(Duration::from_millis(300));
+    let off_b = service.named_mark("alpha", "b").expect("mark b");
+    service.send_keys("alpha", b"y").expect("send y");
+    std::thread::sleep(Duration::from_millis(300));
+    let off_c = service.named_mark("alpha", "c").expect("mark c");
+
+    assert_eq!(service.resolve_next_marker_after("alpha", off_a).expect("resolve"), Some(off_b), "next after A should be B");
+    assert_eq!(service.resolve_next_marker_after("alpha", off_b).expect("resolve"), Some(off_c), "next after B should be C");
+    assert_eq!(service.resolve_next_marker_after("alpha", off_c).expect("resolve"), None, "no marker after C should return None");
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -1007,4 +1032,84 @@ fn inspect_reports_dynamic_leader_cwd() {
     );
 
     service.kill("cwd-test").expect("kill");
+}
+
+#[test]
+fn transcript_between_two_named_markers_returns_exact_range() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    service.named_mark("alpha", "m1").expect("mark m1");
+    service.send_keys("alpha", b"first").expect("send first");
+    std::thread::sleep(Duration::from_millis(300));
+    service.named_mark("alpha", "m2").expect("mark m2");
+    service.send_keys("alpha", b"second").expect("send second");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let cli = Cli::try_parse_from(["cleat", "transcript", "alpha", "--since-marker", "m1", "--until-marker", "m2"]).expect("parse");
+    let result = cli::execute(cli, &service);
+    let output = match result {
+        ExecResult::Ok(Some(s)) => s,
+        other => panic!("expected Ok(Some(...)), got {other:?}"),
+    };
+    assert!(output.contains("first"), "expected 'first' in output, got: {output:?}");
+    assert!(!output.contains("second"), "did not expect 'second', got: {output:?}");
+}
+
+#[test]
+fn transcript_until_idle_terminates_at_quiet_period() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    service.named_mark("alpha", "start").expect("mark start");
+    service.send_keys("alpha", b"burst").expect("send burst");
+    std::thread::sleep(Duration::from_millis(1500));
+    service.send_keys("alpha", b"after").expect("send after");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let cli = Cli::try_parse_from(["cleat", "transcript", "alpha", "--since-marker", "start", "--until-idle", "500ms"]).expect("parse");
+    let result = cli::execute(cli, &service);
+    let output = match result {
+        ExecResult::Ok(Some(s)) => s,
+        other => panic!("expected Ok(Some(...)), got {other:?}"),
+    };
+    assert!(output.contains("burst"), "expected 'burst' in output");
+    assert!(!output.contains("after"), "idle gap should have terminated slice before 'after'");
+}
+
+#[test]
+fn transcript_until_raw_offset_returns_exact_range() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    let off_a = service.named_mark("alpha", "a").expect("mark a");
+    service.send_keys("alpha", b"middle").expect("send middle");
+    std::thread::sleep(Duration::from_millis(300));
+    let off_b = service.named_mark("alpha", "b").expect("mark b");
+    service.send_keys("alpha", b"trailing").expect("send trailing");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Raw offsets via --since / --until should slice exactly the same as
+    // --since-marker a / --until-marker b — proves the raw-offset code path.
+    let cli =
+        Cli::try_parse_from(["cleat", "transcript", "alpha", "--since", &off_a.to_string(), "--until", &off_b.to_string()]).expect("parse");
+    let result = cli::execute(cli, &service);
+    let output = match result {
+        ExecResult::Ok(Some(s)) => s,
+        other => panic!("expected Ok(Some(...)), got {other:?}"),
+    };
+    assert!(output.contains("middle"), "expected 'middle' in output, got: {output:?}");
+    assert!(!output.contains("trailing"), "did not expect 'trailing', got: {output:?}");
 }

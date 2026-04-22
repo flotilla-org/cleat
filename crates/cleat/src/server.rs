@@ -13,6 +13,42 @@ use crate::{
     vt::VtEngineKind,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartBound {
+    Offset(u64),
+    Marker(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EndBound {
+    Offset(u64),
+    Marker(String),
+    NextMarker,
+    IdleGap(Duration),
+    EndOfRecording,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// `--until-next-marker` hit EOF without finding another marker.
+    NoMarkerAfterStart,
+    /// `--until-idle <dur>` hit EOF without finding a gap of that duration.
+    NoIdleGap(Duration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceOutcome {
+    /// Byte offset where the slice started (resolved from `StartBound`).
+    pub start_offset: u64,
+    /// Byte offset where the slice ended, exclusive (resolved from `EndBound`,
+    /// or file size if the soft ceiling fell back to EOF).
+    pub end_offset: u64,
+    /// `None` if the intended end bound was reached. `Some(reason)` when a
+    /// soft-ceiling fallback to EOF kicked in. Primarily for future JSON
+    /// output; the CLI uses it to decide whether to emit a stderr note.
+    pub end_status: Option<FallbackReason>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionService {
     layout: RuntimeLayout,
@@ -157,26 +193,60 @@ impl SessionService {
         }
     }
 
-    pub fn capture_since_raw(&self, id: &str, offset: u64) -> Result<String, String> {
-        let cast_path = self.layout.root().join(id).join(crate::recording::CAST_FILE_NAME);
-        if !cast_path.exists() {
-            return Err(format!("no recording for session {id}"));
-        }
-        let events = crate::cast_reader::read_output_since(&cast_path, offset)?;
-        let output: String = events.iter().map(|e| e.data.as_str()).collect();
-        Ok(output)
+    pub fn capture_slice_raw(&self, id: &str, start: StartBound, end: EndBound) -> Result<(String, SliceOutcome), String> {
+        self.capture_slice_inner(id, start, end)
     }
 
-    pub fn capture_since_text(&self, id: &str, offset: u64) -> Result<String, String> {
+    pub fn capture_slice_text(&self, id: &str, start: StartBound, end: EndBound) -> Result<(String, SliceOutcome), String> {
+        // Today raw and text produce the same output; separation is for
+        // future VT-rendered transcripts.
+        self.capture_slice_inner(id, start, end)
+    }
+
+    fn capture_slice_inner(&self, id: &str, start: StartBound, end: EndBound) -> Result<(String, SliceOutcome), String> {
         let cast_path = self.layout.root().join(id).join(crate::recording::CAST_FILE_NAME);
         if !cast_path.exists() {
             return Err(format!("no recording for session {id}"));
         }
-        let events = crate::cast_reader::read_output_since(&cast_path, offset)?;
-        // Phase 1: concatenate output event data directly.
-        // Full VT replay (snapshot + engine) is a future enhancement.
+
+        let start_offset = match start {
+            StartBound::Offset(o) => o,
+            StartBound::Marker(name) => self.resolve_marker(id, &name)?,
+        };
+
+        let file_size = std::fs::metadata(&cast_path).map_err(|e| format!("stat cast file: {e}"))?.len();
+
+        let (end_offset, end_status) = match end {
+            EndBound::EndOfRecording => (file_size, None),
+            EndBound::Offset(o) => {
+                if o < start_offset {
+                    return Err(format!("end offset {o} precedes start offset {start_offset}"));
+                }
+                (o, None)
+            }
+            EndBound::Marker(name) => {
+                let o = self.resolve_marker(id, &name)?;
+                // Strict "after start" for named markers — equal-offset is almost
+                // always a typo (e.g. `--since-marker m1 --until-marker m1`).
+                // Raw offsets keep `<` so `--since 0 --until 0` is a legal empty slice.
+                if o <= start_offset {
+                    return Err(format!("marker '{name}' at offset {o} is not after start offset {start_offset}"));
+                }
+                (o, None)
+            }
+            EndBound::NextMarker => match self.resolve_next_marker_after(id, start_offset)? {
+                Some(o) => (o, None),
+                None => (file_size, Some(FallbackReason::NoMarkerAfterStart)),
+            },
+            EndBound::IdleGap(duration) => match crate::cast_reader::find_idle_gap_after(&cast_path, start_offset, duration)? {
+                Some(o) => (o, None),
+                None => (file_size, Some(FallbackReason::NoIdleGap(duration))),
+            },
+        };
+
+        let events = crate::cast_reader::read_output_between(&cast_path, start_offset, end_offset)?;
         let output: String = events.iter().map(|e| e.data.as_str()).collect();
-        Ok(output)
+        Ok((output, SliceOutcome { start_offset, end_offset, end_status }))
     }
 
     pub fn send_keys(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -308,6 +378,21 @@ impl SessionService {
             Frame::MarkResult { offset } => Ok(offset),
             Frame::Error(msg) => Err(msg),
             other => Err(format!("unexpected resolve response: {other:?}")),
+        }
+    }
+
+    pub fn resolve_next_marker_after(&self, id: &str, after: u64) -> Result<Option<u64>, String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream = connect_session_socket(&socket_path)?;
+        Frame::ResolveNextMarker { after }.write(&mut stream).map_err(|e| format!("write resolve-next: {e}"))?;
+        match Frame::read(&mut stream).map_err(|e| format!("read resolve-next response: {e}"))? {
+            Frame::MarkResult { offset } => Ok(Some(offset)),
+            Frame::MarkNotFound => Ok(None),
+            Frame::Error(msg) => Err(msg),
+            other => Err(format!("unexpected resolve-next response: {other:?}")),
         }
     }
 

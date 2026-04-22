@@ -2,6 +2,7 @@ pub mod asciicast;
 pub mod cast_reader;
 pub mod cli;
 pub mod da;
+pub mod duration_parser;
 pub mod keys;
 pub mod protocol;
 pub mod recording;

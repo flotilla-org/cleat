@@ -305,19 +305,46 @@ fn mark_without_name_still_works() {
 #[test]
 fn transcript_with_since_marker_parses() {
     let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "m1"]).expect("parse");
-    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: None, since_marker: Some("m1".into()), raw: false });
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: None,
+        since_marker: Some("m1".into()),
+        until: None,
+        until_marker: None,
+        until_next_marker: false,
+        until_idle: None,
+        raw: false,
+    });
 }
 
 #[test]
 fn transcript_with_since_offset_parses() {
     let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "500"]).expect("parse");
-    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: Some(500), since_marker: None, raw: false });
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: Some(500),
+        since_marker: None,
+        until: None,
+        until_marker: None,
+        until_next_marker: false,
+        until_idle: None,
+        raw: false,
+    });
 }
 
 #[test]
 fn transcript_with_raw_parses() {
     let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "m1", "--raw"]).expect("parse");
-    assert_eq!(cli.command, Command::Transcript { id: "sess".into(), since: None, since_marker: Some("m1".into()), raw: true });
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: None,
+        since_marker: Some("m1".into()),
+        until: None,
+        until_marker: None,
+        until_next_marker: false,
+        until_idle: None,
+        raw: true,
+    });
 }
 
 #[test]
@@ -337,6 +364,79 @@ fn transcript_requires_since_or_since_marker() {
 fn transcript_since_and_since_marker_are_mutually_exclusive() {
     let result = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "100", "--since-marker", "m1"]);
     assert!(result.is_err(), "--since and --since-marker should be mutually exclusive");
+}
+
+#[test]
+fn transcript_with_until_offset_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "0", "--until", "1000"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: Some(0),
+        since_marker: None,
+        until: Some(1000),
+        until_marker: None,
+        until_next_marker: false,
+        until_idle: None,
+        raw: false,
+    });
+}
+
+#[test]
+fn transcript_with_until_marker_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "a", "--until-marker", "b"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: None,
+        since_marker: Some("a".into()),
+        until: None,
+        until_marker: Some("b".into()),
+        until_next_marker: false,
+        until_idle: None,
+        raw: false,
+    });
+}
+
+#[test]
+fn transcript_with_until_next_marker_parses() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since-marker", "a", "--until-next-marker"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: None,
+        since_marker: Some("a".into()),
+        until: None,
+        until_marker: None,
+        until_next_marker: true,
+        until_idle: None,
+        raw: false,
+    });
+}
+
+#[test]
+fn transcript_with_until_idle_parses_humantime() {
+    let cli = Cli::try_parse_from(["cleat", "transcript", "sess", "--since", "0", "--until-idle", "500ms"]).expect("parse");
+    assert_eq!(cli.command, Command::Transcript {
+        id: "sess".into(),
+        since: Some(0),
+        since_marker: None,
+        until: None,
+        until_marker: None,
+        until_next_marker: false,
+        until_idle: Some(std::time::Duration::from_millis(500)),
+        raw: false,
+    });
+}
+
+#[test]
+fn transcript_end_bounds_are_mutually_exclusive() {
+    for args in [
+        &["cleat", "transcript", "sess", "--since", "0", "--until", "100", "--until-marker", "m1"][..],
+        &["cleat", "transcript", "sess", "--since", "0", "--until", "100", "--until-next-marker"][..],
+        &["cleat", "transcript", "sess", "--since", "0", "--until-marker", "m1", "--until-idle", "1s"][..],
+        &["cleat", "transcript", "sess", "--since", "0", "--until-next-marker", "--until-idle", "1s"][..],
+    ] {
+        let result = Cli::try_parse_from(args.iter().copied());
+        assert!(result.is_err(), "end bounds should be mutually exclusive: {args:?}");
+    }
 }
 
 #[test]
@@ -374,7 +474,7 @@ fn wait_requires_at_least_one_condition() {
 #[test]
 fn wait_idle_time_parses() {
     let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "2.0"]).expect("parse");
-    assert!(matches!(cli.command, Command::Wait { idle_time: Some(t), text: None, .. } if (t - 2.0).abs() < f64::EPSILON));
+    assert!(matches!(cli.command, Command::Wait { idle_time: Some(t), text: None, .. } if t == std::time::Duration::from_secs_f64(2.0)));
 }
 
 #[test]
@@ -408,6 +508,21 @@ fn wait_execute_rejects_no_conditions() {
             assert!(msg.contains("at least one of --idle-time or --text"));
         }
         other => panic!("wait without conditions should exit 2, got: {other:?}"),
+    }
+}
+
+#[test]
+fn wait_idle_time_accepts_humantime_and_seconds() {
+    // Both forms parse to the same Duration.
+    let humantime_form = Cli::try_parse_from(["cleat", "wait", "x", "--idle-time", "500ms"]).expect("humantime parse");
+    let seconds_form = Cli::try_parse_from(["cleat", "wait", "x", "--idle-time", "0.5"]).expect("seconds parse");
+
+    match (&humantime_form.command, &seconds_form.command) {
+        (Command::Wait { idle_time: Some(a), .. }, Command::Wait { idle_time: Some(b), .. }) => {
+            assert_eq!(*a, std::time::Duration::from_millis(500));
+            assert_eq!(*b, std::time::Duration::from_millis(500));
+        }
+        _ => panic!("expected both forms to parse as Wait with idle_time set"),
     }
 }
 

@@ -105,6 +105,8 @@ const TAG_WAIT_RESULT: u8 = 19;
 const TAG_EXPECT: u8 = 20;
 const TAG_EXPECT_RESULT: u8 = 21;
 const TAG_SEND_KEYS_WITH_MARK: u8 = 22;
+const TAG_RESOLVE_NEXT_MARKER: u8 = 23;
+const TAG_MARK_NOT_FOUND: u8 = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
@@ -137,7 +139,9 @@ pub enum Frame {
     RecordControl { enable: bool },
     Mark { name: Option<String> },
     MarkResult { offset: u64 },
+    MarkNotFound,
     ResolveMarker { name: String },
+    ResolveNextMarker { after: u64 },
     Wait { conditions: Vec<WaitCondition>, timeout_ms: u64 },
     WaitResult { status: WaitStatus, elapsed_ms: u64 },
     Expect { text: String, since_offset: u64, timeout_ms: u64 },
@@ -205,7 +209,13 @@ impl Frame {
                 (TAG_MARK, payload)
             }
             Frame::MarkResult { offset } => (TAG_MARK_RESULT, offset.to_le_bytes().to_vec()),
+            Frame::MarkNotFound => (TAG_MARK_NOT_FOUND, vec![]),
             Frame::ResolveMarker { ref name } => (TAG_RESOLVE_MARKER, name.as_bytes().to_vec()),
+            Frame::ResolveNextMarker { after } => {
+                let mut payload = Vec::with_capacity(8);
+                payload.extend_from_slice(&after.to_le_bytes());
+                (TAG_RESOLVE_NEXT_MARKER, payload)
+            }
             Frame::Wait { ref conditions, timeout_ms } => {
                 debug_assert!(conditions.len() <= 255, "wait frame supports at most 255 conditions");
                 let mut payload = Vec::new();
@@ -305,6 +315,16 @@ impl Frame {
                     String::from_utf8(payload).map_err(|e| Error::new(ErrorKind::InvalidData, format!("invalid marker name: {e}")))?;
                 Ok(Frame::ResolveMarker { name })
             }
+            TAG_RESOLVE_NEXT_MARKER => {
+                if payload.len() != 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("ResolveNextMarker payload must be 8 bytes, got {}", payload.len()),
+                    ));
+                }
+                let after = u64::from_le_bytes(payload[..8].try_into().expect("len checked"));
+                Ok(Frame::ResolveNextMarker { after })
+            }
             TAG_MARK_RESULT => {
                 if payload.len() != 8 {
                     return Err(Error::new(ErrorKind::InvalidData, "invalid mark result frame"));
@@ -312,6 +332,12 @@ impl Frame {
                 let offset =
                     u64::from_le_bytes([payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]]);
                 Ok(Frame::MarkResult { offset })
+            }
+            TAG_MARK_NOT_FOUND => {
+                if !payload.is_empty() {
+                    return Err(Error::new(ErrorKind::InvalidData, "mark not found frame must have empty payload"));
+                }
+                Ok(Frame::MarkNotFound)
             }
             TAG_WAIT => {
                 if payload.len() < 9 {
@@ -586,6 +612,24 @@ mod tests {
         frame.write(&mut bytes).expect("write");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
         assert_eq!(decoded, Frame::ResolveMarker { name: "checkpoint".to_string() });
+    }
+
+    #[test]
+    fn resolve_next_marker_round_trip() {
+        let frame = Frame::ResolveNextMarker { after: 12345 };
+        let mut buf = Vec::new();
+        frame.write(&mut buf).expect("write");
+        let decoded = Frame::read(&mut std::io::Cursor::new(buf)).expect("read");
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn mark_not_found_round_trip() {
+        let frame = Frame::MarkNotFound;
+        let mut buf = Vec::new();
+        frame.write(&mut buf).expect("write");
+        let decoded = Frame::read(&mut std::io::Cursor::new(buf)).expect("read");
+        assert_eq!(frame, decoded);
     }
 
     #[test]

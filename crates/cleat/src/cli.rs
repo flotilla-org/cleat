@@ -6,7 +6,7 @@ use crate::{
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
     runtime::SessionMetadata,
-    server::SessionService,
+    server::{EndBound, FallbackReason, SessionService, StartBound},
     vt::VtEngineKind,
 };
 
@@ -99,7 +99,12 @@ pub enum Command {
                            to read output produced after that point.\n\
                            \n\
                            --raw is accepted but currently produces the same output as non-raw.\n\
-                           VT-rendered replay for the non-raw path is planned.")]
+                           VT-rendered replay for the non-raw path is planned.\n\
+                           \n\
+                           When the chosen end bound cannot be reached (e.g. --until-idle with\n\
+                           no matching gap, --until-next-marker with no later marker), the slice\n\
+                           falls back to end-of-recording and a line of the form\n\
+                           `# bounded by EOF (<reason>)` is written to stderr.")]
     Transcript {
         id: String,
         /// Byte offset in .cast file; return output events after this position
@@ -108,6 +113,18 @@ pub enum Command {
         /// Named marker to use as the start offset
         #[arg(long, conflicts_with = "since")]
         since_marker: Option<String>,
+        /// Byte offset in .cast file; slice ends at this position.
+        #[arg(long, conflicts_with_all = ["until_marker", "until_next_marker", "until_idle"])]
+        until: Option<u64>,
+        /// Named marker to use as the end offset.
+        #[arg(long, conflicts_with_all = ["until", "until_next_marker", "until_idle"])]
+        until_marker: Option<String>,
+        /// Slice until the chronologically-next named marker after the start.
+        #[arg(long, conflicts_with_all = ["until", "until_marker", "until_idle"])]
+        until_next_marker: bool,
+        /// Slice until the recording is idle for this duration (e.g., 500ms, 2s).
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds, conflicts_with_all = ["until", "until_marker", "until_next_marker"])]
+        until_idle: Option<std::time::Duration>,
         /// Return raw event data instead of VT-rendered text
         #[arg(long)]
         raw: bool,
@@ -213,8 +230,9 @@ pub enum Command {
                            JSON output (--json): {\"status\": \"ready|timeout|session_gone\", \"elapsed_ms\": N}")]
     Wait {
         id: String,
-        #[arg(long, help = "Wait until output settles for this many seconds")]
-        idle_time: Option<f64>,
+        /// Wait until output settles for this duration (e.g., 500ms, 2s, or plain seconds).
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
+        idle_time: Option<std::time::Duration>,
         #[arg(long, help = "Wait until this text appears on screen")]
         text: Option<String>,
         #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
@@ -377,24 +395,38 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(s) => ExecResult::Ok(Some(s)),
             Err(e) => ExecResult::Err(e),
         },
-        Command::Transcript { id, since, since_marker, raw } => {
-            let offset = match (since, &since_marker) {
-                (Some(o), _) => Some(o),
-                (_, Some(name)) => match service.resolve_marker(&id, name) {
-                    Ok(o) => Some(o),
-                    Err(e) => return ExecResult::Err(e),
-                },
-                _ => None,
-            };
-            match offset {
-                Some(o) => {
-                    let result = if raw { service.capture_since_raw(&id, o) } else { service.capture_since_text(&id, o) };
-                    match result {
-                        Ok(s) => ExecResult::Ok(Some(s)),
-                        Err(e) => ExecResult::Err(e),
-                    }
+        Command::Transcript { id, since, since_marker, until, until_marker, until_next_marker, until_idle, raw } => {
+            let start = match (since, since_marker) {
+                (Some(o), None) => StartBound::Offset(o),
+                (None, Some(name)) => StartBound::Marker(name),
+                (None, None) => {
+                    return ExecResult::Err("transcript requires --since or --since-marker".to_string());
                 }
-                None => ExecResult::Err("transcript requires --since or --since-marker".to_string()),
+                _ => unreachable!("clap conflicts_with prevents this"),
+            };
+
+            let end = match (until, until_marker, until_next_marker, until_idle) {
+                (Some(o), None, false, None) => EndBound::Offset(o),
+                (None, Some(name), false, None) => EndBound::Marker(name),
+                (None, None, true, None) => EndBound::NextMarker,
+                (None, None, false, Some(d)) => EndBound::IdleGap(d),
+                (None, None, false, None) => EndBound::EndOfRecording,
+                _ => unreachable!("clap conflicts_with prevents this"),
+            };
+
+            let result = if raw { service.capture_slice_raw(&id, start, end) } else { service.capture_slice_text(&id, start, end) };
+            match result {
+                Ok((s, outcome)) => {
+                    if let Some(reason) = &outcome.end_status {
+                        let reason_str = match reason {
+                            FallbackReason::NoMarkerAfterStart => "no marker after start".to_string(),
+                            FallbackReason::NoIdleGap(d) => format!("no {} idle found", humantime::format_duration(*d)),
+                        };
+                        eprintln!("# bounded by EOF ({reason_str})");
+                    }
+                    ExecResult::Ok(Some(s))
+                }
+                Err(e) => ExecResult::Err(e),
             }
         }
         Command::Detach { id } => match service.detach(&id) {
@@ -506,7 +538,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
 fn execute_wait(
     service: &SessionService,
     id: String,
-    idle_time: Option<f64>,
+    idle_time: Option<std::time::Duration>,
     text: Option<String>,
     timeout: f64,
     json: bool,
@@ -524,8 +556,9 @@ fn execute_wait(
     }
 
     let mut conditions = Vec::new();
-    if let Some(secs) = idle_time {
-        if !secs.is_finite() || !(0.0..=86_400.0).contains(&secs) {
+    if let Some(dur) = idle_time {
+        let secs = dur.as_secs_f64();
+        if !(0.0..=86_400.0).contains(&secs) {
             return ExecResult::Exit { code: 2, message: Some(format!("invalid idle-time: {secs} (max 86400)")), output: None };
         }
         conditions.push(WaitCondition::OutputIdle { quiet_ms: (secs * 1000.0) as u64 });

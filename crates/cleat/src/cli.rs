@@ -6,7 +6,7 @@ use crate::{
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
     runtime::SessionMetadata,
-    server::SessionService,
+    server::{EndBound, SessionService, StartBound},
     vt::VtEngineKind,
 };
 
@@ -378,23 +378,22 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Err(e) => ExecResult::Err(e),
         },
         Command::Transcript { id, since, since_marker, raw } => {
-            let offset = match (since, &since_marker) {
-                (Some(o), _) => Some(o),
-                (_, Some(name)) => match service.resolve_marker(&id, name) {
-                    Ok(o) => Some(o),
-                    Err(e) => return ExecResult::Err(e),
-                },
-                _ => None,
-            };
-            match offset {
-                Some(o) => {
-                    let result = if raw { service.capture_since_raw(&id, o) } else { service.capture_since_text(&id, o) };
-                    match result {
-                        Ok(s) => ExecResult::Ok(Some(s)),
-                        Err(e) => ExecResult::Err(e),
-                    }
+            let start = match (since, since_marker) {
+                (Some(o), None) => StartBound::Offset(o),
+                (None, Some(name)) => StartBound::Marker(name),
+                (None, None) => {
+                    return ExecResult::Err("transcript requires --since or --since-marker".to_string());
                 }
-                None => ExecResult::Err("transcript requires --since or --since-marker".to_string()),
+                _ => unreachable!("clap conflicts_with prevents this"),
+            };
+            let result = if raw {
+                service.capture_slice_raw(&id, start, EndBound::EndOfRecording)
+            } else {
+                service.capture_slice_text(&id, start, EndBound::EndOfRecording)
+            };
+            match result {
+                Ok((s, _outcome)) => ExecResult::Ok(Some(s)),
+                Err(e) => ExecResult::Err(e),
             }
         }
         Command::Detach { id } => match service.detach(&id) {

@@ -14,7 +14,7 @@ use cleat::{
     cli::{self, Cli},
     protocol::{Frame, SessionInfo},
     runtime::RuntimeLayout,
-    server::SessionService,
+    server::{EndBound, SessionService, StartBound},
     session::session_socket_path,
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
@@ -455,7 +455,8 @@ fn detached_session_answers_da_queries() {
     std::thread::sleep(Duration::from_secs(1));
 
     // Read recorded output since the mark
-    let output = service.capture_since_raw("alpha", offset).expect("capture since");
+    let (output, _outcome) =
+        service.capture_slice_raw("alpha", StartBound::Offset(offset), EndBound::EndOfRecording).expect("capture slice");
 
     assert!(output.contains("\x1b[?62;22c"), "detached session should inject DA1 response in recorded output, got: {output:?}");
 }

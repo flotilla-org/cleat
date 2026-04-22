@@ -4,7 +4,7 @@ use cleat::{
     asciicast::{encode_event, encode_header, Event, EventCode, Header},
     recording::CAST_FILE_NAME,
     runtime::RuntimeLayout,
-    server::SessionService,
+    server::{EndBound, SessionService, StartBound},
 };
 
 fn setup_session_with_cast(root: &std::path::Path, id: &str, events: &[Event]) {
@@ -32,7 +32,7 @@ fn capture_since_text_returns_concatenated_output() {
     }];
     setup_session_with_cast(temp.path(), "sess", &events);
 
-    let result = service.capture_since_text("sess", 0).unwrap();
+    let (result, _outcome) = service.capture_slice_text("sess", StartBound::Offset(0), EndBound::EndOfRecording).unwrap();
     assert!(result.contains("hello "));
     assert!(result.contains("world"));
 }
@@ -49,7 +49,7 @@ fn capture_since_text_skips_non_output_events() {
     ];
     setup_session_with_cast(temp.path(), "sess", &events);
 
-    let result = service.capture_since_text("sess", 0).unwrap();
+    let (result, _outcome) = service.capture_slice_text("sess", StartBound::Offset(0), EndBound::EndOfRecording).unwrap();
     assert!(result.contains("visible"));
     assert!(!result.contains("typed"));
     assert!(!result.contains("signal"));
@@ -64,7 +64,7 @@ fn capture_since_text_returns_empty_at_eof() {
     setup_session_with_cast(temp.path(), "sess", &events);
 
     let file_size = std::fs::metadata(temp.path().join("sess").join(CAST_FILE_NAME)).unwrap().len();
-    let result = service.capture_since_text("sess", file_size).unwrap();
+    let (result, _outcome) = service.capture_slice_text("sess", StartBound::Offset(file_size), EndBound::EndOfRecording).unwrap();
     assert!(result.is_empty());
 }
 
@@ -76,14 +76,12 @@ fn capture_since_errors_when_no_recording() {
     // Create session dir but no .cast file
     std::fs::create_dir_all(temp.path().join("no-rec")).unwrap();
 
-    let err = service.capture_since_text("no-rec", 0).unwrap_err();
+    let err = service.capture_slice_text("no-rec", StartBound::Offset(0), EndBound::EndOfRecording).unwrap_err();
     assert!(err.contains("no recording"), "error should mention missing recording: {err}");
 }
 
 #[test]
 fn capture_slice_text_returns_bytes_through_eof_with_start_at_zero() {
-    use cleat::server::{EndBound, StartBound};
-
     let temp = tempfile::tempdir().unwrap();
     let events = vec![Event { time: Duration::from_millis(100), code: EventCode::Output, data: "hello ".into() }, Event {
         time: Duration::from_millis(200),
@@ -103,8 +101,6 @@ fn capture_slice_text_returns_bytes_through_eof_with_start_at_zero() {
 
 #[test]
 fn capture_slice_text_idle_fallback_to_eof_populates_fallback_reason() {
-    use cleat::server::{EndBound, StartBound};
-
     let temp = tempfile::tempdir().unwrap();
     let events = vec![Event { time: Duration::from_millis(100), code: EventCode::Output, data: "a".into() }, Event {
         time: Duration::from_millis(200),

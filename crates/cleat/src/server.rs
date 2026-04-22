@@ -180,28 +180,6 @@ impl SessionService {
         }
     }
 
-    pub fn capture_since_raw(&self, id: &str, offset: u64) -> Result<String, String> {
-        let cast_path = self.layout.root().join(id).join(crate::recording::CAST_FILE_NAME);
-        if !cast_path.exists() {
-            return Err(format!("no recording for session {id}"));
-        }
-        let events = crate::cast_reader::read_output_since(&cast_path, offset)?;
-        let output: String = events.iter().map(|e| e.data.as_str()).collect();
-        Ok(output)
-    }
-
-    pub fn capture_since_text(&self, id: &str, offset: u64) -> Result<String, String> {
-        let cast_path = self.layout.root().join(id).join(crate::recording::CAST_FILE_NAME);
-        if !cast_path.exists() {
-            return Err(format!("no recording for session {id}"));
-        }
-        let events = crate::cast_reader::read_output_since(&cast_path, offset)?;
-        // Phase 1: concatenate output event data directly.
-        // Full VT replay (snapshot + engine) is a future enhancement.
-        let output: String = events.iter().map(|e| e.data.as_str()).collect();
-        Ok(output)
-    }
-
     pub fn capture_slice_raw(&self, id: &str, start: StartBound, end: EndBound) -> Result<(String, SliceOutcome), String> {
         self.capture_slice_inner(id, start, end)
     }

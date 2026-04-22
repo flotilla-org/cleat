@@ -225,8 +225,9 @@ pub enum Command {
                            JSON output (--json): {\"status\": \"ready|timeout|session_gone\", \"elapsed_ms\": N}")]
     Wait {
         id: String,
-        #[arg(long, help = "Wait until output settles for this many seconds")]
-        idle_time: Option<f64>,
+        /// Wait until output settles for this duration (e.g., 500ms, 2s, or plain seconds).
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
+        idle_time: Option<std::time::Duration>,
         #[arg(long, help = "Wait until this text appears on screen")]
         text: Option<String>,
         #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
@@ -530,7 +531,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
 fn execute_wait(
     service: &SessionService,
     id: String,
-    idle_time: Option<f64>,
+    idle_time: Option<std::time::Duration>,
     text: Option<String>,
     timeout: f64,
     json: bool,
@@ -548,8 +549,9 @@ fn execute_wait(
     }
 
     let mut conditions = Vec::new();
-    if let Some(secs) = idle_time {
-        if !secs.is_finite() || !(0.0..=86_400.0).contains(&secs) {
+    if let Some(dur) = idle_time {
+        let secs = dur.as_secs_f64();
+        if !(0.0..=86_400.0).contains(&secs) {
             return ExecResult::Exit { code: 2, message: Some(format!("invalid idle-time: {secs} (max 86400)")), output: None };
         }
         conditions.push(WaitCondition::OutputIdle { quiet_ms: (secs * 1000.0) as u64 });

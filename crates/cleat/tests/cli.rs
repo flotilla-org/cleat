@@ -401,7 +401,7 @@ fn wait_requires_at_least_one_condition() {
 #[test]
 fn wait_idle_time_parses() {
     let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "2.0"]).expect("parse");
-    assert!(matches!(cli.command, Command::Wait { idle_time: Some(t), text: None, .. } if (t - 2.0).abs() < f64::EPSILON));
+    assert!(matches!(cli.command, Command::Wait { idle_time: Some(t), text: None, .. } if t == std::time::Duration::from_secs_f64(2.0)));
 }
 
 #[test]
@@ -435,6 +435,21 @@ fn wait_execute_rejects_no_conditions() {
             assert!(msg.contains("at least one of --idle-time or --text"));
         }
         other => panic!("wait without conditions should exit 2, got: {other:?}"),
+    }
+}
+
+#[test]
+fn wait_idle_time_accepts_humantime_and_seconds() {
+    // Both forms parse to the same Duration.
+    let humantime_form = Cli::try_parse_from(["cleat", "wait", "x", "--idle-time", "500ms"]).expect("humantime parse");
+    let seconds_form = Cli::try_parse_from(["cleat", "wait", "x", "--idle-time", "0.5"]).expect("seconds parse");
+
+    match (&humantime_form.command, &seconds_form.command) {
+        (Command::Wait { idle_time: Some(a), .. }, Command::Wait { idle_time: Some(b), .. }) => {
+            assert_eq!(*a, std::time::Duration::from_millis(500));
+            assert_eq!(*b, std::time::Duration::from_millis(500));
+        }
+        _ => panic!("expected both forms to parse as Wait with idle_time set"),
     }
 }
 

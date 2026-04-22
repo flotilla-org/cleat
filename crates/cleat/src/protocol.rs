@@ -105,6 +105,7 @@ const TAG_WAIT_RESULT: u8 = 19;
 const TAG_EXPECT: u8 = 20;
 const TAG_EXPECT_RESULT: u8 = 21;
 const TAG_SEND_KEYS_WITH_MARK: u8 = 22;
+const TAG_RESOLVE_NEXT_MARKER: u8 = 23;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
@@ -138,6 +139,7 @@ pub enum Frame {
     Mark { name: Option<String> },
     MarkResult { offset: u64 },
     ResolveMarker { name: String },
+    ResolveNextMarker { after: u64 },
     Wait { conditions: Vec<WaitCondition>, timeout_ms: u64 },
     WaitResult { status: WaitStatus, elapsed_ms: u64 },
     Expect { text: String, since_offset: u64, timeout_ms: u64 },
@@ -206,6 +208,11 @@ impl Frame {
             }
             Frame::MarkResult { offset } => (TAG_MARK_RESULT, offset.to_le_bytes().to_vec()),
             Frame::ResolveMarker { ref name } => (TAG_RESOLVE_MARKER, name.as_bytes().to_vec()),
+            Frame::ResolveNextMarker { after } => {
+                let mut payload = Vec::with_capacity(8);
+                payload.extend_from_slice(&after.to_le_bytes());
+                (TAG_RESOLVE_NEXT_MARKER, payload)
+            }
             Frame::Wait { ref conditions, timeout_ms } => {
                 debug_assert!(conditions.len() <= 255, "wait frame supports at most 255 conditions");
                 let mut payload = Vec::new();
@@ -304,6 +311,16 @@ impl Frame {
                 let name =
                     String::from_utf8(payload).map_err(|e| Error::new(ErrorKind::InvalidData, format!("invalid marker name: {e}")))?;
                 Ok(Frame::ResolveMarker { name })
+            }
+            TAG_RESOLVE_NEXT_MARKER => {
+                if payload.len() != 8 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("ResolveNextMarker payload must be 8 bytes, got {}", payload.len()),
+                    ));
+                }
+                let after = u64::from_le_bytes(payload[..8].try_into().expect("len checked"));
+                Ok(Frame::ResolveNextMarker { after })
             }
             TAG_MARK_RESULT => {
                 if payload.len() != 8 {
@@ -586,6 +603,15 @@ mod tests {
         frame.write(&mut bytes).expect("write");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read");
         assert_eq!(decoded, Frame::ResolveMarker { name: "checkpoint".to_string() });
+    }
+
+    #[test]
+    fn resolve_next_marker_round_trip() {
+        let frame = Frame::ResolveNextMarker { after: 12345 };
+        let mut buf = Vec::new();
+        frame.write(&mut buf).expect("write");
+        let decoded = Frame::read(&mut std::io::Cursor::new(buf)).expect("read");
+        assert_eq!(frame, decoded);
     }
 
     #[test]

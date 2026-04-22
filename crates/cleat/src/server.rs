@@ -29,11 +29,24 @@ pub enum EndBound {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// `--until-next-marker` hit EOF without finding another marker.
+    NoMarkerAfterStart,
+    /// `--until-idle <dur>` hit EOF without finding a gap of that duration.
+    NoIdleGap(Duration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SliceOutcome {
+    /// Byte offset where the slice started (resolved from `StartBound`).
     pub start_offset: u64,
+    /// Byte offset where the slice ended, exclusive (resolved from `EndBound`,
+    /// or file size if the soft ceiling fell back to EOF).
     pub end_offset: u64,
-    pub hit_intended_end: bool,
-    pub fallback_reason: Option<String>,
+    /// `None` if the intended end bound was reached. `Some(reason)` when a
+    /// soft-ceiling fallback to EOF kicked in. Primarily for future JSON
+    /// output; the CLI uses it to decide whether to emit a stderr note.
+    pub end_status: Option<FallbackReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,39 +214,31 @@ impl SessionService {
             StartBound::Marker(name) => self.resolve_marker(id, &name)?,
         };
 
-        let (end_offset, hit_intended_end, fallback_reason) = match end {
-            EndBound::EndOfRecording => {
-                let size = std::fs::metadata(&cast_path).map_err(|e| format!("stat cast file: {e}"))?.len();
-                (size, true, None)
-            }
-            EndBound::Offset(o) => (o, true, None),
+        let file_size = std::fs::metadata(&cast_path).map_err(|e| format!("stat cast file: {e}"))?.len();
+
+        let (end_offset, end_status) = match end {
+            EndBound::EndOfRecording => (file_size, None),
+            EndBound::Offset(o) => (o, None),
             EndBound::Marker(name) => {
                 let o = self.resolve_marker(id, &name)?;
                 if o < start_offset {
                     return Err(format!("marker '{name}' precedes start"));
                 }
-                (o, true, None)
+                (o, None)
             }
-            EndBound::NextMarker => match self.resolve_next_marker_after(id, start_offset) {
-                Ok(o) => (o, true, None),
-                Err(msg) if msg.contains("no marker") => {
-                    let size = std::fs::metadata(&cast_path).map_err(|e| format!("stat cast file: {e}"))?.len();
-                    (size, false, Some("no marker after start".to_string()))
-                }
-                Err(msg) => return Err(msg),
+            EndBound::NextMarker => match self.resolve_next_marker_after(id, start_offset)? {
+                Some(o) => (o, None),
+                None => (file_size, Some(FallbackReason::NoMarkerAfterStart)),
             },
             EndBound::IdleGap(duration) => match crate::cast_reader::find_idle_gap_after(&cast_path, start_offset, duration)? {
-                Some(o) => (o, true, None),
-                None => {
-                    let size = std::fs::metadata(&cast_path).map_err(|e| format!("stat cast file: {e}"))?.len();
-                    (size, false, Some(format!("no {} idle found", humantime::format_duration(duration))))
-                }
+                Some(o) => (o, None),
+                None => (file_size, Some(FallbackReason::NoIdleGap(duration))),
             },
         };
 
         let events = crate::cast_reader::read_output_between(&cast_path, start_offset, end_offset)?;
         let output: String = events.iter().map(|e| e.data.as_str()).collect();
-        Ok((output, SliceOutcome { start_offset, end_offset, hit_intended_end, fallback_reason }))
+        Ok((output, SliceOutcome { start_offset, end_offset, end_status }))
     }
 
     pub fn send_keys(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -368,7 +373,7 @@ impl SessionService {
         }
     }
 
-    pub fn resolve_next_marker_after(&self, id: &str, after: u64) -> Result<u64, String> {
+    pub fn resolve_next_marker_after(&self, id: &str, after: u64) -> Result<Option<u64>, String> {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
@@ -376,7 +381,8 @@ impl SessionService {
         let mut stream = connect_session_socket(&socket_path)?;
         Frame::ResolveNextMarker { after }.write(&mut stream).map_err(|e| format!("write resolve-next: {e}"))?;
         match Frame::read(&mut stream).map_err(|e| format!("read resolve-next response: {e}"))? {
-            Frame::MarkResult { offset } => Ok(offset),
+            Frame::MarkResult { offset } => Ok(Some(offset)),
+            Frame::MarkNotFound => Ok(None),
             Frame::Error(msg) => Err(msg),
             other => Err(format!("unexpected resolve-next response: {other:?}")),
         }

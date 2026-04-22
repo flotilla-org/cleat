@@ -6,7 +6,7 @@ use crate::{
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
     runtime::SessionMetadata,
-    server::{EndBound, SessionService, StartBound},
+    server::{EndBound, FallbackReason, SessionService, StartBound},
     vt::VtEngineKind,
 };
 
@@ -99,7 +99,12 @@ pub enum Command {
                            to read output produced after that point.\n\
                            \n\
                            --raw is accepted but currently produces the same output as non-raw.\n\
-                           VT-rendered replay for the non-raw path is planned.")]
+                           VT-rendered replay for the non-raw path is planned.\n\
+                           \n\
+                           When the chosen end bound cannot be reached (e.g. --until-idle with\n\
+                           no matching gap, --until-next-marker with no later marker), the slice\n\
+                           falls back to end-of-recording and a line of the form\n\
+                           `# bounded by EOF (<reason>)` is written to stderr.")]
     Transcript {
         id: String,
         /// Byte offset in .cast file; return output events after this position
@@ -412,10 +417,12 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             let result = if raw { service.capture_slice_raw(&id, start, end) } else { service.capture_slice_text(&id, start, end) };
             match result {
                 Ok((s, outcome)) => {
-                    if !outcome.hit_intended_end {
-                        if let Some(reason) = &outcome.fallback_reason {
-                            eprintln!("# bounded by EOF ({reason})");
-                        }
+                    if let Some(reason) = &outcome.end_status {
+                        let reason_str = match reason {
+                            FallbackReason::NoMarkerAfterStart => "no marker after start".to_string(),
+                            FallbackReason::NoIdleGap(d) => format!("no {} idle found", humantime::format_duration(*d)),
+                        };
+                        eprintln!("# bounded by EOF ({reason_str})");
                     }
                     ExecResult::Ok(Some(s))
                 }

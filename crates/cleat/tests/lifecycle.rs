@@ -528,10 +528,9 @@ fn resolve_next_marker_returns_minimum_offset_above() {
     std::thread::sleep(Duration::from_millis(300));
     let off_c = service.named_mark("alpha", "c").expect("mark c");
 
-    assert_eq!(service.resolve_next_marker_after("alpha", off_a).expect("resolve"), off_b, "next after A should be B");
-    assert_eq!(service.resolve_next_marker_after("alpha", off_b).expect("resolve"), off_c, "next after B should be C");
-    let err = service.resolve_next_marker_after("alpha", off_c).unwrap_err();
-    assert!(err.contains("no marker"), "expected not-found error, got: {err}");
+    assert_eq!(service.resolve_next_marker_after("alpha", off_a).expect("resolve"), Some(off_b), "next after A should be B");
+    assert_eq!(service.resolve_next_marker_after("alpha", off_b).expect("resolve"), Some(off_c), "next after B should be C");
+    assert_eq!(service.resolve_next_marker_after("alpha", off_c).expect("resolve"), None, "no marker after C should return None");
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -1072,7 +1071,7 @@ fn transcript_until_idle_terminates_at_quiet_period() {
 
     service.named_mark("alpha", "start").expect("mark start");
     service.send_keys("alpha", b"burst").expect("send burst");
-    std::thread::sleep(Duration::from_millis(1000));
+    std::thread::sleep(Duration::from_millis(1500));
     service.send_keys("alpha", b"after").expect("send after");
     std::thread::sleep(Duration::from_millis(300));
 

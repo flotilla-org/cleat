@@ -4,7 +4,7 @@ use cleat::{
     asciicast::{encode_event, encode_header, Event, EventCode, Header},
     recording::CAST_FILE_NAME,
     runtime::RuntimeLayout,
-    server::{EndBound, SessionService, StartBound},
+    server::{EndBound, FallbackReason, SessionService, StartBound},
 };
 
 fn setup_session_with_cast(root: &std::path::Path, id: &str, events: &[Event]) {
@@ -21,7 +21,7 @@ fn setup_session_with_cast(root: &std::path::Path, id: &str, events: &[Event]) {
 }
 
 #[test]
-fn capture_since_text_returns_concatenated_output() {
+fn capture_slice_text_returns_concatenated_output() {
     let temp = tempfile::tempdir().unwrap();
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
 
@@ -38,7 +38,7 @@ fn capture_since_text_returns_concatenated_output() {
 }
 
 #[test]
-fn capture_since_text_skips_non_output_events() {
+fn capture_slice_text_skips_non_output_events() {
     let temp = tempfile::tempdir().unwrap();
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
 
@@ -56,7 +56,7 @@ fn capture_since_text_skips_non_output_events() {
 }
 
 #[test]
-fn capture_since_text_returns_empty_at_eof() {
+fn capture_slice_text_returns_empty_at_eof() {
     let temp = tempfile::tempdir().unwrap();
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
 
@@ -69,7 +69,7 @@ fn capture_since_text_returns_empty_at_eof() {
 }
 
 #[test]
-fn capture_since_errors_when_no_recording() {
+fn capture_slice_errors_when_no_recording() {
     let temp = tempfile::tempdir().unwrap();
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
 
@@ -93,7 +93,7 @@ fn capture_slice_text_returns_bytes_through_eof_with_start_at_zero() {
 
     let (text, outcome) = service.capture_slice_text("sess", StartBound::Offset(0), EndBound::EndOfRecording).expect("slice");
     assert_eq!(text, "hello world");
-    assert!(outcome.hit_intended_end);
+    assert_eq!(outcome.end_status, None);
     assert_eq!(outcome.start_offset, 0);
     let file_size = std::fs::metadata(temp.path().join("sess").join(CAST_FILE_NAME)).unwrap().len();
     assert_eq!(outcome.end_offset, file_size);
@@ -113,6 +113,5 @@ fn capture_slice_text_idle_fallback_to_eof_populates_fallback_reason() {
     let (text, outcome) =
         service.capture_slice_text("sess", StartBound::Offset(0), EndBound::IdleGap(Duration::from_secs(10))).expect("slice");
     assert_eq!(text, "ab");
-    assert!(!outcome.hit_intended_end);
-    assert_eq!(outcome.fallback_reason.as_deref(), Some("no 10s idle found"));
+    assert_eq!(outcome.end_status, Some(FallbackReason::NoIdleGap(Duration::from_secs(10))));
 }

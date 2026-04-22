@@ -508,6 +508,32 @@ fn attached_session_does_not_get_synthetic_da_reply() {
     );
 }
 
+#[test]
+fn resolve_next_marker_returns_minimum_offset_above() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Named marks register offsets in the daemon's marker map; unnamed `mark`
+    // does not. `resolve_next_marker_after` searches that map, so we need
+    // named marks here.
+    let off_a = service.named_mark("alpha", "a").expect("mark a");
+    service.send_keys("alpha", b"x").expect("send x");
+    std::thread::sleep(Duration::from_millis(300));
+    let off_b = service.named_mark("alpha", "b").expect("mark b");
+    service.send_keys("alpha", b"y").expect("send y");
+    std::thread::sleep(Duration::from_millis(300));
+    let off_c = service.named_mark("alpha", "c").expect("mark c");
+
+    assert_eq!(service.resolve_next_marker_after("alpha", off_a).expect("resolve"), off_b, "next after A should be B");
+    assert_eq!(service.resolve_next_marker_after("alpha", off_b).expect("resolve"), off_c, "next after B should be C");
+    let err = service.resolve_next_marker_after("alpha", off_c).unwrap_err();
+    assert!(err.contains("no marker"), "expected not-found error, got: {err}");
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn replay_reattach_delivers_restore_before_new_live_output() {

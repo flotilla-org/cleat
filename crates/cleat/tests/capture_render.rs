@@ -79,3 +79,44 @@ fn capture_since_errors_when_no_recording() {
     let err = service.capture_since_text("no-rec", 0).unwrap_err();
     assert!(err.contains("no recording"), "error should mention missing recording: {err}");
 }
+
+#[test]
+fn capture_slice_text_returns_bytes_through_eof_with_start_at_zero() {
+    use cleat::server::{EndBound, StartBound};
+
+    let temp = tempfile::tempdir().unwrap();
+    let events = vec![Event { time: Duration::from_millis(100), code: EventCode::Output, data: "hello ".into() }, Event {
+        time: Duration::from_millis(200),
+        code: EventCode::Output,
+        data: "world".into(),
+    }];
+    setup_session_with_cast(temp.path(), "sess", &events);
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+    let (text, outcome) = service.capture_slice_text("sess", StartBound::Offset(0), EndBound::EndOfRecording).expect("slice");
+    assert_eq!(text, "hello world");
+    assert!(outcome.hit_intended_end);
+    assert_eq!(outcome.start_offset, 0);
+    let file_size = std::fs::metadata(temp.path().join("sess").join(CAST_FILE_NAME)).unwrap().len();
+    assert_eq!(outcome.end_offset, file_size);
+}
+
+#[test]
+fn capture_slice_text_idle_fallback_to_eof_populates_fallback_reason() {
+    use cleat::server::{EndBound, StartBound};
+
+    let temp = tempfile::tempdir().unwrap();
+    let events = vec![Event { time: Duration::from_millis(100), code: EventCode::Output, data: "a".into() }, Event {
+        time: Duration::from_millis(200),
+        code: EventCode::Output,
+        data: "b".into(),
+    }];
+    setup_session_with_cast(temp.path(), "sess", &events);
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+    let (text, outcome) =
+        service.capture_slice_text("sess", StartBound::Offset(0), EndBound::IdleGap(Duration::from_secs(10))).expect("slice");
+    assert_eq!(text, "ab");
+    assert!(!outcome.hit_intended_end);
+    assert_eq!(outcome.fallback_reason.as_deref(), Some("no 10s idle found"));
+}

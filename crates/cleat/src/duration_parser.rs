@@ -13,7 +13,13 @@ pub fn parse_humantime_or_seconds(s: &str) -> Result<Duration, String> {
     if let Ok(d) = humantime::parse_duration(s) {
         return Ok(d);
     }
-    s.parse::<f64>().map(Duration::from_secs_f64).map_err(|_| format!("invalid duration: {s}"))
+    // `Duration::from_secs_f64` panics on negative / NaN / infinite values, so
+    // validate the float before converting.
+    let f: f64 = s.parse().map_err(|_| format!("invalid duration: {s}"))?;
+    if !f.is_finite() || f < 0.0 {
+        return Err(format!("invalid duration: {s}"));
+    }
+    Ok(Duration::from_secs_f64(f))
 }
 
 #[cfg(test)]
@@ -54,5 +60,17 @@ mod tests {
     #[test]
     fn rejects_empty_string() {
         assert!(parse_humantime_or_seconds("").is_err());
+    }
+
+    #[test]
+    fn rejects_negative_seconds_without_panic() {
+        let err = parse_humantime_or_seconds("-1").unwrap_err();
+        assert!(err.contains("invalid duration"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_nan_and_infinity_without_panic() {
+        assert!(parse_humantime_or_seconds("NaN").is_err());
+        assert!(parse_humantime_or_seconds("inf").is_err());
     }
 }

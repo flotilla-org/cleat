@@ -121,16 +121,11 @@ fn read_events_between(path: &Path, start: u64, end: u64, filter: Option<EventCo
         if n == 0 {
             break;
         }
-        let line_start = byte_pos;
         byte_pos += n as u64;
 
         if first_line {
             first_line = false;
             continue;
-        }
-
-        if line_start >= end {
-            break;
         }
 
         let trimmed = line.trim_end_matches('\n');

@@ -218,7 +218,12 @@ impl SessionService {
 
         let (end_offset, end_status) = match end {
             EndBound::EndOfRecording => (file_size, None),
-            EndBound::Offset(o) => (o, None),
+            EndBound::Offset(o) => {
+                if o < start_offset {
+                    return Err(format!("end offset {o} precedes start offset {start_offset}"));
+                }
+                (o, None)
+            }
             EndBound::Marker(name) => {
                 let o = self.resolve_marker(id, &name)?;
                 if o < start_offset {

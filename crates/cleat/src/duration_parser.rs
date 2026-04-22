@@ -13,8 +13,10 @@ pub fn parse_humantime_or_seconds(s: &str) -> Result<Duration, String> {
     if let Ok(d) = humantime::parse_duration(s) {
         return Ok(d);
     }
-    // `Duration::from_secs_f64` panics on negative / NaN / infinite values, so
-    // validate the float before converting.
+    // `Duration::from_secs_f64` panics on negative / NaN / infinite values.
+    // `humantime::parse_duration` does its own validation and would have
+    // returned Ok above for anything it accepts, so we only need to guard the
+    // float fallback branch here.
     let f: f64 = s.parse().map_err(|_| format!("invalid duration: {s}"))?;
     if !f.is_finite() || f < 0.0 {
         return Err(format!("invalid duration: {s}"));

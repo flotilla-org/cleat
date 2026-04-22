@@ -1084,3 +1084,32 @@ fn transcript_until_idle_terminates_at_quiet_period() {
     assert!(output.contains("burst"), "expected 'burst' in output");
     assert!(!output.contains("after"), "idle gap should have terminated slice before 'after'");
 }
+
+#[test]
+fn transcript_until_raw_offset_returns_exact_range() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    let off_a = service.named_mark("alpha", "a").expect("mark a");
+    service.send_keys("alpha", b"middle").expect("send middle");
+    std::thread::sleep(Duration::from_millis(300));
+    let off_b = service.named_mark("alpha", "b").expect("mark b");
+    service.send_keys("alpha", b"trailing").expect("send trailing");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Raw offsets via --since / --until should slice exactly the same as
+    // --since-marker a / --until-marker b — proves the raw-offset code path.
+    let cli =
+        Cli::try_parse_from(["cleat", "transcript", "alpha", "--since", &off_a.to_string(), "--until", &off_b.to_string()]).expect("parse");
+    let result = cli::execute(cli, &service);
+    let output = match result {
+        ExecResult::Ok(Some(s)) => s,
+        other => panic!("expected Ok(Some(...)), got {other:?}"),
+    };
+    assert!(output.contains("middle"), "expected 'middle' in output, got: {output:?}");
+    assert!(!output.contains("trailing"), "did not expect 'trailing', got: {output:?}");
+}

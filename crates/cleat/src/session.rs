@@ -649,6 +649,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
                         }
                         Ok(Frame::ResolveNextMarker { after }) => {
+                            // Markers are appended at the current recording offset, so byte-offset
+                            // order matches creation order. min(offset > after) picks the
+                            // chronologically-next marker. Back-filling markers would break this.
                             let next = markers.iter().filter(|(_, &offset)| offset > after).map(|(_, &offset)| offset).min();
                             let reply = match next {
                                 Some(offset) => Frame::MarkResult { offset },

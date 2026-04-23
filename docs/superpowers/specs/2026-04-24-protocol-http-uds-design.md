@@ -79,15 +79,54 @@ Mainstream Rust async web framework. Plays cleanly with utoipa later. hyper unde
 
 No HTTP idle-timeout middleware: we control all installs, no surprise reverse-proxy interference. Connection lifetime is governed by the request's own `timeout_ms` parameter.
 
-Wait/expect timing out is `200 OK` with body `{status: "timeout", elapsed_ms: N}` — the request succeeded; the wait result is "timeout."
+Both endpoints have three terminal states (matching today's `WaitStatus` in `crates/cleat/src/protocol.rs`):
+
+- `ready` — a condition matched
+- `timeout` — `timeout_ms` elapsed without a match
+- `session_gone` — the child process exited (or session was killed) before a match or timeout
+
+All three are HTTP `200 OK`. The HTTP request succeeded; the result is in the body:
+
+```json
+{
+  "status": "ready" | "timeout" | "session_gone",
+  "elapsed_ms": 123,
+  "matched": <which condition matched, only present when status = "ready">
+}
+```
+
+**Wait condition semantics:** OR — first match wins. Conditions are evaluated immediately against the current state on request receipt, then on every subsequent event from the session. Matches today's `wait` behavior in `crates/cleat/src/cli.rs:259` and `crates/cleat/src/session.rs:707`.
+
+**Expect semantics:** matches a single text pattern from `since_offset` forward. Same three terminal states.
 
 ### Multi-attach: mirror today's behavior
 
 A second attach to a session that already has a controller returns `409 Conflict`. Today's `Frame::Busy` translates directly. The future zellij-like N-controller/M-watcher design (size intersection across viewers, etc.) is a separate spec.
 
+## Runtime layout
+
+**v1 keeps today's daemon-per-session layout exactly.** The directory tree from `crates/cleat/src/runtime.rs:26` is unchanged:
+
+```
+<root>/<session-id>/socket   # UDS the daemon listens on
+<root>/<session-id>/...      # session state files
+```
+
+Each daemon owns exactly one session. The daemon's `/sessions` collection always has length 1. Cross-daemon listing = client scans `<root>/*/socket` (today's `cleat list` behavior, unchanged).
+
+The URL shape `/sessions/{id}/...` works trivially because `{id}` is unambiguous within a single-session daemon. The `{id}` in the URL must match the daemon's owned session — non-matching IDs return `404 Not Found`. Clients are expected to talk to the right daemon (chosen by directory scan); they don't try to route through one daemon to a session it doesn't own.
+
+**Why design the API as a collection instead of root-level (`/keys`, `/screen`, etc.) given v1 only owns one session:** the URL shape is what we'd want when a daemon owns multiple sessions (M-N future). Locking it in now means the M-N transition is purely a runtime-layout change (daemon directory naming, ownership tracking) with no URL or client-code change. The cost today is one extra path segment per request — negligible.
+
+**M-N future (out of scope, but the API is designed for it):**
+- A daemon would own a directory containing multiple sessions (e.g. `<root>/<group-id>/socket` + per-session subdirs).
+- `GET /sessions` would return all members.
+- Cross-daemon listing would still be a client-side scan.
+- No URL changes required.
+
 ## URL/resource shape
 
-Per-daemon collection. A daemon owns 1+ sessions; cross-daemon listing stays in the client (scan known directory tree for UDS files).
+Per-daemon collection. A daemon owns 1+ sessions (1 in v1); cross-daemon listing stays in the client (scan `<root>/*/socket`).
 
 ### Sessions
 
@@ -129,7 +168,33 @@ Per-daemon collection. A daemon owns 1+ sessions; cross-daemon listing stays in 
 
 | Method | Path | Replaces |
 |---|---|---|
-| `GET`  | `/sessions/{id}/transcript?since=N&until=...&since_marker=...&until_marker=...&until_idle=...` | `capture_slice_*` |
+| `GET`  | `/sessions/{id}/transcript?<bounds>&mode=raw\|rendered&format=bytes\|json` | `capture_slice_*` |
+
+**Bound query params** (carried over from today's CLI flags): `since=N`, `since_marker=NAME`, `until=N`, `until_marker=NAME`, `until_next_marker=NAME`, `until_idle=DURATION`. Same XOR rules apply (one start bound, one end bound).
+
+**`mode` parameter (raw vs rendered):**
+- `mode=raw` — concatenated `Output` event bytes from the cast file. Today's only behavior.
+- `mode=rendered` — VT-replayed plain text via the transcoder (#29). Not implementable in v1; reserved.
+- **Default:** `raw` for v1. Flips to `rendered` once #29 lands. Document that the default is mode-dependent on server capability; clients that need a stable answer should pass `mode=raw` explicitly.
+
+**`format` parameter and content negotiation:** the same bytes can be returned as raw octets or wrapped in JSON for clients that want the metadata. Standard HTTP `Accept` negotiation, with a `?format=` query-param shortcut for curl convenience.
+
+| Selection | Response |
+|---|---|
+| `Accept: application/octet-stream` (or `?format=bytes`, default) | Raw response body. Metadata in HTTP headers (see below). |
+| `Accept: application/json` (or `?format=json`) | JSON envelope: `{bytes_b64, end_status, mode, range: {since: N, until: M}}` |
+
+If both `Accept` and `?format=` are present and disagree, `?format=` wins (explicit query intent overrides default headers).
+
+**Metadata headers (octet-stream responses):**
+- `X-Cleat-End-Status: complete` — both bounds resolved exactly
+- `X-Cleat-End-Status: fallback-eof; reason=no-idle-gap` — `until_idle` requested but no qualifying gap; fell back to EOF
+- `X-Cleat-End-Status: fallback-eof; reason=marker-not-found` — `until_next_marker` requested but no later marker; fell back to EOF
+- `X-Cleat-Range: since=N; until=M` — actual byte range emitted
+
+These mirror the `SliceOutcome.end_status` enum in `crates/cleat/src/server.rs:31`. JSON envelope responses carry the same fields in the body.
+
+**Default response shape rationale:** today's `cleat transcript` CLI pipes raw bytes to stdout; matching that as the HTTP default keeps `curl --unix-socket .../transcript?...` clean and pipe-friendly. JSON is opt-in for clients that want metadata in-body.
 
 ### Attach (HTTP Upgrade — see below)
 
@@ -167,6 +232,36 @@ Server checks "is busy" (single-attach today) at the HTTP layer:
 ### Post-101: existing frame protocol verbatim
 
 The socket speaks the existing wire format: 1-byte tag + 4-byte LE length + payload. `AttachInit`/`Ack`/`Input`/`Output`/`Resize`/`Detach` etc. are unchanged.
+
+**Required first frame:** the client MUST send `Frame::AttachInit { cols, rows, capabilities }` as the first frame after the 101 response. The daemon uses this to:
+- Resize the PTY to the client's geometry
+- Pick the replay payload tailored to the client's capabilities (color level, kitty keyboard, etc.)
+
+This matches today's behavior in `crates/cleat/src/session.rs:532` — the daemon waits for `AttachInit` before doing anything else and replies with `Frame::Ack` once it has applied the geometry and capability state.
+
+```
+Client                                 Daemon
+  |  GET /sessions/{id}/attach          |
+  |  Upgrade: cleat-attach/1            |
+  |------------------------------------>|
+  |                                     | (busy-check)
+  |  101 Switching Protocols            |
+  |  Upgrade: cleat-attach/1            |
+  |<------------------------------------|
+  |                                     |
+  |  Frame::AttachInit{cols,rows,caps}  | (required first frame)
+  |------------------------------------>|
+  |                                     | (apply geometry, choose replay)
+  |  Frame::Ack                         |
+  |<------------------------------------|
+  |  Frame::Output(bytes)               | (replay snapshot, then live)
+  |<------------------------------------|
+  |  Frame::Input(bytes)                |
+  |------------------------------------>|
+  |             ...                     |
+```
+
+If the client sends any frame other than `AttachInit` first, the daemon closes the connection.
 
 What changes vs today:
 - Attach is initiated via HTTP `Upgrade` instead of opening a raw UDS socket and writing `AttachInit` immediately.
@@ -245,8 +340,8 @@ For things that fall out — e.g. `transcript --raw` becomes meaningful once #29
 - **Output backpressure on attach** — design TBD; mirror today's behavior, document during implementation.
 - **Test porting load** — `lifecycle.rs` and other integration tests are substantial. The cutover PR's size depends heavily on how mechanical the port is.
 - **utoipa retrofit** — when we want OpenAPI, sprinkling annotations on existing axum handlers is the canonical low-disruption path. No structural concern; just future work.
-- **Discovery of UDS paths** — cross-daemon listing stays client-side (scan known directory tree). Today's behavior; document but no new design.
 - **Session ID URL safety** — today's IDs are UUID-based directory names; URL-safe, no escaping needed. Document as part of the API.
+- **`mode=rendered` default flip** — when #29 lands and `mode=rendered` becomes implementable, the default may flip. Documented as version-dependent server behavior; clients wanting stability pass `mode=raw` explicitly. Worth a server-version header so clients can detect.
 
 ## What this design does NOT decide
 

@@ -16,6 +16,7 @@ fn help_lists_expected_subcommands() {
         "list",
         "capture",
         "transcript",
+        "replay",
         "detach",
         "kill",
         "send-keys",
@@ -589,4 +590,69 @@ fn send_keys_mark_before_parses() {
         keys: vec!["Enter".into()],
         mark_before: Some("m1".into()),
     });
+}
+
+#[test]
+fn replay_with_positional_path_parses() {
+    let cli = Cli::try_parse_from(["cleat", "replay", "/tmp/demo.cast"]).expect("parse");
+    match cli.command {
+        Command::Replay { path, session, since, speed, max_idle, .. } => {
+            assert_eq!(path.as_deref().and_then(std::path::Path::to_str), Some("/tmp/demo.cast"));
+            assert_eq!(session, None);
+            assert_eq!(since, None);
+            assert_eq!(speed, 1.0);
+            assert_eq!(max_idle, None);
+        }
+        other => panic!("expected Replay, got {other:?}"),
+    }
+}
+
+#[test]
+fn replay_with_session_parses() {
+    let cli = Cli::try_parse_from(["cleat", "replay", "--session", "alpha"]).expect("parse");
+    match cli.command {
+        Command::Replay { path, session, .. } => {
+            assert_eq!(path, None);
+            assert_eq!(session.as_deref(), Some("alpha"));
+        }
+        other => panic!("expected Replay, got {other:?}"),
+    }
+}
+
+#[test]
+fn replay_path_and_session_are_mutually_exclusive() {
+    let result = Cli::try_parse_from(["cleat", "replay", "/tmp/x.cast", "--session", "alpha"]);
+    assert!(result.is_err(), "path and --session should be mutually exclusive");
+}
+
+#[test]
+fn replay_requires_path_or_session() {
+    let result = Cli::try_parse_from(["cleat", "replay"]);
+    assert!(result.is_err(), "replay with no path or --session should error");
+}
+
+#[test]
+fn replay_since_marker_requires_session() {
+    let result = Cli::try_parse_from(["cleat", "replay", "/tmp/x.cast", "--since-marker", "a"]);
+    assert!(result.is_err(), "--since-marker without --session should error");
+}
+
+#[test]
+fn replay_speed_validates() {
+    let bad_speeds = ["0", "-1", "NaN", "inf"];
+    for s in bad_speeds {
+        let result = Cli::try_parse_from(["cleat", "replay", "/tmp/x.cast", "--speed", s]);
+        assert!(result.is_err(), "--speed {s} should be rejected");
+    }
+}
+
+#[test]
+fn replay_humantime_max_idle_parses() {
+    let cli = Cli::try_parse_from(["cleat", "replay", "/tmp/x.cast", "--max-idle", "500ms"]).expect("parse");
+    match cli.command {
+        Command::Replay { max_idle, .. } => {
+            assert_eq!(max_idle, Some(std::time::Duration::from_millis(500)));
+        }
+        other => panic!("expected Replay, got {other:?}"),
+    }
 }

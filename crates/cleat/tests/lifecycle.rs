@@ -1113,3 +1113,44 @@ fn transcript_until_raw_offset_returns_exact_range() {
     assert!(output.contains("middle"), "expected 'middle' in output, got: {output:?}");
     assert!(!output.contains("trailing"), "did not expect 'trailing', got: {output:?}");
 }
+
+#[test]
+fn replay_with_session_and_markers_while_daemon_alive() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    service.named_mark("alpha", "m1").expect("mark m1");
+    service.send_keys("alpha", b"middle").expect("send middle");
+    std::thread::sleep(Duration::from_millis(300));
+    service.named_mark("alpha", "m2").expect("mark m2");
+    service.send_keys("alpha", b"trailing").expect("send trailing");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Resolve range via the live daemon (socket-backed marker lookup), then
+    // play into a buffer so we can assert the actual bytes rather than just
+    // ExecResult::Ok.
+    let cast_path = service.layout_root().join("alpha").join(cleat::recording::CAST_FILE_NAME);
+    let (so, eo, _status) = service
+        .resolve_slice_range(
+            "alpha",
+            cleat::server::StartBound::Marker("m1".into()),
+            cleat::server::EndBound::Marker("m2".into()),
+            &cast_path,
+        )
+        .expect("resolve");
+
+    let opts = cleat::replay::ReplayOptions { speed: 1_000_000.0, max_idle: Some(Duration::ZERO) };
+    let mut buf: Vec<u8> = Vec::new();
+    cleat::replay::run_replay(&cast_path, so, eo, &opts, &mut buf, |_| {}).expect("run_replay");
+
+    let output = String::from_utf8(buf).expect("utf-8");
+    assert!(output.contains("middle"), "expected 'middle' between m1 and m2, got {output:?}");
+    assert!(!output.contains("trailing"), "did not expect 'trailing' before m2, got {output:?}");
+
+    // Cleanup.
+    let _ = service.kill("alpha");
+}

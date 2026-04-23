@@ -208,6 +208,77 @@ pub fn find_idle_gap_after(path: &Path, start: u64, threshold: Duration) -> Resu
     Ok(None)
 }
 
+/// Streaming counterpart to [`read_output_between`]. Yields Output-coded
+/// events whose line starts in `[start, end)` without loading them all into
+/// memory. Malformed lines and non-Output events are silently skipped to
+/// match `read_output_between`.
+///
+/// Returns `Err` only on file-open or seek failures; mid-stream read or
+/// decode errors are folded into the iterator (decode errors skipped, read
+/// errors surface as `Err` items).
+pub fn iter_output_between(path: &Path, start: u64, end: u64) -> Result<OutputEventIter<std::fs::File>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
+    let mut reader = BufReader::new(file);
+    if start > 0 {
+        reader.seek(SeekFrom::Start(start)).map_err(|e| format!("seek: {e}"))?;
+    }
+    Ok(OutputEventIter { reader, byte_pos: start, end, prev_time: Duration::ZERO, first_line: start == 0, exhausted: start >= end })
+}
+
+pub struct OutputEventIter<R: std::io::Read> {
+    reader: BufReader<R>,
+    byte_pos: u64,
+    end: u64,
+    prev_time: Duration,
+    /// True iff iteration started at byte 0 of the file. The first read in
+    /// that case is the asciicast header, which is skipped exactly once.
+    /// When the iterator is constructed mid-file (post-seek), this is false
+    /// and the first read is treated as a regular event line.
+    first_line: bool,
+    exhausted: bool,
+}
+
+impl<R: std::io::Read> Iterator for OutputEventIter<R> {
+    type Item = Result<Event, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.exhausted || self.byte_pos >= self.end {
+                return None;
+            }
+            let mut line = String::new();
+            let n = match self.reader.read_line(&mut line) {
+                Ok(0) => {
+                    self.exhausted = true;
+                    return None;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    self.exhausted = true;
+                    return Some(Err(format!("read line: {e}")));
+                }
+            };
+            self.byte_pos += n as u64;
+
+            if self.first_line {
+                self.first_line = false;
+                continue;
+            }
+
+            let trimmed = line.trim_end_matches('\n');
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            match decode_event(trimmed, &mut self.prev_time) {
+                Ok(event) if event.code == EventCode::Output => return Some(Ok(event)),
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
 /// Internal helper: read events from `path` starting at `offset`.
 ///
 /// If `filter` is `Some(code)`, only events matching that code are returned.
@@ -340,5 +411,46 @@ mod tests_between_and_idle {
         let header_len = (HEADER.len() + 1) as u64;
         let end = find_idle_gap_after(f.path(), header_len, Duration::from_millis(100)).expect("find gap");
         assert_eq!(end, None);
+    }
+
+    #[test]
+    fn iter_output_between_yields_same_events_as_read_output_between() {
+        let f = write_cast(&[HEADER, EVT_A, EVT_B, EVT_C]);
+        let header_len = (HEADER.len() + 1) as u64;
+        let file_size = std::fs::metadata(f.path()).unwrap().len();
+
+        let vec_events = read_output_between(f.path(), header_len, file_size).expect("vec read");
+        let iter_events: Vec<Event> =
+            iter_output_between(f.path(), header_len, file_size).expect("iter open").collect::<Result<Vec<_>, _>>().expect("iter items");
+
+        assert_eq!(vec_events.len(), iter_events.len());
+        for (a, b) in vec_events.iter().zip(iter_events.iter()) {
+            assert_eq!(a.data, b.data, "data mismatch");
+            assert_eq!(a.code, b.code, "code mismatch");
+            assert_eq!(a.time, b.time, "time mismatch");
+        }
+    }
+
+    #[test]
+    fn iter_output_between_skips_non_output_events() {
+        let f = write_cast(&[HEADER, r#"[0.1,"o","a"]"#, r#"[0.05,"m","mark-1"]"#, r#"[0.05,"o","b"]"#]);
+        let header_len = (HEADER.len() + 1) as u64;
+        let file_size = std::fs::metadata(f.path()).unwrap().len();
+
+        let events: Vec<Event> =
+            iter_output_between(f.path(), header_len, file_size).expect("iter open").collect::<Result<Vec<_>, _>>().expect("iter items");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data, "a");
+        assert_eq!(events[1].data, "b");
+    }
+
+    #[test]
+    fn iter_output_between_empty_when_start_equals_end() {
+        let f = write_cast(&[HEADER, EVT_A]);
+        let header_len = (HEADER.len() + 1) as u64;
+        let events: Vec<Event> =
+            iter_output_between(f.path(), header_len, header_len).expect("iter").collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(events.is_empty());
     }
 }

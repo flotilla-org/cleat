@@ -129,6 +129,52 @@ pub enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Play back a recorded cast file (or slice) at controlled speed.
+    #[command(long_about = "\
+Play a cast file to stdout at controlled speed. The positional argument is a \
+path to a .cast file; alternatively use --session <id> to replay a running \
+session's recording. \n\
+\n\
+Slice bounds (--since, --since-marker, --until, --until-marker, \
+--until-next-marker, --until-idle) match the `transcript` command's \
+semantics. Marker-based flags require --session because markers are \
+resolved through the live daemon socket. \n\
+")]
+    Replay {
+        /// Path to the .cast file. Mutually exclusive with --session.
+        #[arg(conflicts_with = "session", required_unless_present = "session")]
+        path: Option<std::path::PathBuf>,
+        /// Session ID whose recording should be replayed.
+        #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+        session: Option<String>,
+
+        /// Byte offset in the cast file; slice starts at this position.
+        #[arg(long, conflicts_with = "since_marker")]
+        since: Option<u64>,
+        /// Named marker to use as the start offset (requires --session).
+        #[arg(long, conflicts_with_all = ["since", "path"])]
+        since_marker: Option<String>,
+
+        /// Byte offset in the cast file; slice ends at this position.
+        #[arg(long, conflicts_with_all = ["until_marker", "until_next_marker", "until_idle"])]
+        until: Option<u64>,
+        /// Named marker to use as the end offset (requires --session).
+        #[arg(long, conflicts_with_all = ["until", "until_next_marker", "until_idle", "path"])]
+        until_marker: Option<String>,
+        /// Slice until the chronologically-next named marker after the start (requires --session).
+        #[arg(long, conflicts_with_all = ["until", "until_marker", "until_idle", "path"])]
+        until_next_marker: bool,
+        /// Slice until the recording is idle for this duration (e.g., 500ms, 2s).
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds, conflicts_with_all = ["until", "until_marker", "until_next_marker"])]
+        until_idle: Option<std::time::Duration>,
+
+        /// Gap multiplier; >1 faster, <1 slower (default: 1.0).
+        #[arg(long, value_parser = crate::replay::parse_speed, default_value = "1.0")]
+        speed: f64,
+        /// Clamp any inter-event gap to this maximum after speed scaling.
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
+        max_idle: Option<std::time::Duration>,
+    },
     /// Detach from a session
     Detach { id: String },
     /// Terminate a session
@@ -426,6 +472,63 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                     }
                     ExecResult::Ok(Some(s))
                 }
+                Err(e) => ExecResult::Err(e),
+            }
+        }
+        Command::Replay { path, session, since, since_marker, until, until_marker, until_next_marker, until_idle, speed, max_idle } => {
+            let start = match (since, since_marker) {
+                (Some(o), None) => crate::server::StartBound::Offset(o),
+                (None, Some(name)) => crate::server::StartBound::Marker(name),
+                (None, None) => crate::server::StartBound::Offset(0),
+                _ => unreachable!("clap conflicts_with prevents this"),
+            };
+
+            let end = match (until, until_marker, until_next_marker, until_idle) {
+                (Some(o), None, false, None) => crate::server::EndBound::Offset(o),
+                (None, Some(name), false, None) => crate::server::EndBound::Marker(name),
+                (None, None, true, None) => crate::server::EndBound::NextMarker,
+                (None, None, false, Some(d)) => crate::server::EndBound::IdleGap(d),
+                (None, None, false, None) => crate::server::EndBound::EndOfRecording,
+                _ => unreachable!("clap conflicts_with prevents this"),
+            };
+
+            let (cast_path, start_offset, end_offset, end_status) = match (path, session) {
+                (Some(p), None) => {
+                    if !p.exists() {
+                        return ExecResult::Err(format!("replay: no such file: {}", p.display()));
+                    }
+                    match crate::server::resolve_range_for_path(&p, start, end) {
+                        Ok((so, eo, status)) => (p, so, eo, status),
+                        Err(e) => return ExecResult::Err(e),
+                    }
+                }
+                (None, Some(id)) => {
+                    let cast_path = service.layout_root().join(&id).join(crate::recording::CAST_FILE_NAME);
+                    if !cast_path.exists() {
+                        return ExecResult::Err(format!("replay: no recording for session {id}"));
+                    }
+                    match service.resolve_slice_range(&id, start, end, &cast_path) {
+                        Ok((so, eo, status)) => (cast_path, so, eo, status),
+                        Err(e) => return ExecResult::Err(e),
+                    }
+                }
+                _ => unreachable!("clap enforces exactly one of path or --session"),
+            };
+
+            if let Some(reason) = &end_status {
+                let reason_str = match reason {
+                    crate::server::FallbackReason::NoMarkerAfterStart => "no marker after start".to_string(),
+                    crate::server::FallbackReason::NoIdleGap(d) => {
+                        format!("no {} idle found", humantime::format_duration(*d))
+                    }
+                };
+                eprintln!("# bounded by EOF ({reason_str})");
+            }
+
+            let opts = crate::replay::ReplayOptions { speed, max_idle };
+            let mut stdout = std::io::stdout().lock();
+            match crate::replay::run_replay(&cast_path, start_offset, end_offset, &opts, &mut stdout, std::thread::sleep) {
+                Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),
             }
         }

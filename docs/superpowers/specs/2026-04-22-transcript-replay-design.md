@@ -51,7 +51,7 @@ cleat replay <path> --since-marker a --until-marker b     # slice
 
 For `--session <id>` with `--since-marker` / `--until-marker` / `--until-next-marker`, marker resolution uses the existing daemon socket path (`SessionService::resolve_marker` / `resolve_next_marker_after`). **The session's daemon must be alive when replay runs** — markers live in the daemon's in-memory map, not the cast file (markers ARE written to the cast file as `EventCode::Marker` events, so a cast-file marker scanner could support offline `--session` replay in the future, but that's out of scope here).
 
-Marker flags with a positional path (no `--session`) are rejected by clap via `requires = "session"` on each marker flag. Raw `--since` / `--until` / `--until-idle` work with either form.
+Marker flags with a positional path (no `--session`) are rejected by clap via `conflicts_with = "path"` on each marker flag (originally planned as `requires = "session"`, but clap 4.6.1 treats `requires` as satisfied when the required arg has `required_unless_present` elsewhere — `conflicts_with = "path"` is semantically equivalent given `path` ↔ `--session` are strict XOR with one required). Raw `--since` / `--until` / `--until-idle` work with either form.
 
 ## Event handling policy
 
@@ -172,7 +172,7 @@ pub(crate) fn resolve_slice_range(
 - **Broken pipe** (stdout consumer hangs up) → handle cleanly, exit 0. Rust's default behavior is to return `ErrorKind::BrokenPipe`; the replay loop treats it as end-of-replay.
 - **SIGINT** (Ctrl-C during sleep) → standard exit code 130. `std::thread::sleep` is interruptible by signal; no special handler.
 - **Speed ≤ 0 or non-finite** → clap value-parser rejects at parse time with `invalid speed: <value>`.
-- **Marker flags with positional path** (`--since-marker` / `--until-marker` / `--until-next-marker` with no `--session`) → enforced at the clap layer via `requires = "session"`; clap emits the standard `the argument '--since-marker <...>' requires '--session <...>'` message. No runtime check needed.
+- **Marker flags with positional path** (`--since-marker` / `--until-marker` / `--until-next-marker` with no `--session`) → enforced at the clap layer via `conflicts_with = "path"`; clap emits the standard "cannot be used with" error. No runtime check needed. (See the `--session` marker resolution section above for why this is `conflicts_with` rather than the originally-planned `requires`.)
 
 ## Testing
 

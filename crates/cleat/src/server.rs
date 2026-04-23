@@ -209,7 +209,7 @@ impl SessionService {
     ///
     /// Used by both `capture_slice_inner` (which then reads the byte range)
     /// and `replay` (which streams it).
-    pub(crate) fn resolve_slice_range(
+    pub fn resolve_slice_range(
         &self,
         id: &str,
         start: StartBound,
@@ -467,6 +467,46 @@ impl SessionService {
     pub fn serve(&self, session: &crate::runtime::SessionMetadata) -> Result<(), String> {
         run_session_daemon(self.layout.root(), session)
     }
+}
+
+/// Resolve start and end bounds into byte offsets against a cast file without
+/// going through the daemon. Marker-based bounds are rejected; the CLI is
+/// expected to prevent these combinations via clap's `conflicts_with = "path"`
+/// on the marker flags.
+///
+/// Mirrors [`SessionService::resolve_slice_range`] for path-based callers.
+pub fn resolve_range_for_path(
+    cast_path: &std::path::Path,
+    start: StartBound,
+    end: EndBound,
+) -> Result<(u64, u64, Option<FallbackReason>), String> {
+    let start_offset = match start {
+        StartBound::Offset(o) => o,
+        StartBound::Marker(_) => {
+            return Err("path-based replay does not support marker start bounds".to_string());
+        }
+    };
+
+    let file_size = std::fs::metadata(cast_path).map_err(|e| format!("stat cast file: {e}"))?.len();
+
+    let (end_offset, end_status) = match end {
+        EndBound::EndOfRecording => (file_size, None),
+        EndBound::Offset(o) => {
+            if o < start_offset {
+                return Err(format!("end offset {o} precedes start offset {start_offset}"));
+            }
+            (o, None)
+        }
+        EndBound::Marker(_) | EndBound::NextMarker => {
+            return Err("path-based replay does not support marker end bounds".to_string());
+        }
+        EndBound::IdleGap(duration) => match crate::cast_reader::find_idle_gap_after(cast_path, start_offset, duration)? {
+            Some(o) => (o, None),
+            None => (file_size, Some(FallbackReason::NoIdleGap(duration))),
+        },
+    };
+
+    Ok((start_offset, end_offset, end_status))
 }
 
 fn parse_vt_engine_kind(s: &str) -> VtEngineKind {

@@ -492,51 +492,27 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 _ => unreachable!("clap conflicts_with prevents this"),
             };
 
-            let (cast_path, start_offset, end_offset, end_status) = match (&path, &session) {
+            let (cast_path, start_offset, end_offset, end_status) = match (path, session) {
                 (Some(p), None) => {
                     if !p.exists() {
                         return ExecResult::Err(format!("replay: no such file: {}", p.display()));
                     }
-                    let file_size = match std::fs::metadata(p) {
-                        Ok(m) => m.len(),
-                        Err(e) => return ExecResult::Err(format!("replay: stat {}: {e}", p.display())),
-                    };
-                    let so = match start {
-                        crate::server::StartBound::Offset(o) => o,
-                        crate::server::StartBound::Marker(_) => {
-                            unreachable!("clap `conflicts_with = path` prevents marker with path")
-                        }
-                    };
-                    let (eo, status): (u64, Option<crate::server::FallbackReason>) = match end {
-                        crate::server::EndBound::EndOfRecording => (file_size, None),
-                        crate::server::EndBound::Offset(o) => {
-                            if o < so {
-                                return ExecResult::Err(format!("end offset {o} precedes start offset {so}"));
-                            }
-                            (o, None)
-                        }
-                        crate::server::EndBound::IdleGap(duration) => match crate::cast_reader::find_idle_gap_after(p, so, duration) {
-                            Ok(Some(o)) => (o, None),
-                            Ok(None) => (file_size, Some(crate::server::FallbackReason::NoIdleGap(duration))),
-                            Err(e) => return ExecResult::Err(e),
-                        },
-                        crate::server::EndBound::Marker(_) | crate::server::EndBound::NextMarker => {
-                            unreachable!("clap `conflicts_with = path` prevents marker with path")
-                        }
-                    };
-                    (p.clone(), so, eo, status)
+                    match crate::server::resolve_range_for_path(&p, start, end) {
+                        Ok((so, eo, status)) => (p, so, eo, status),
+                        Err(e) => return ExecResult::Err(e),
+                    }
                 }
                 (None, Some(id)) => {
-                    let cast_path = service.layout_root().join(id).join(crate::recording::CAST_FILE_NAME);
+                    let cast_path = service.layout_root().join(&id).join(crate::recording::CAST_FILE_NAME);
                     if !cast_path.exists() {
                         return ExecResult::Err(format!("replay: no recording for session {id}"));
                     }
-                    match service.resolve_slice_range(id, start, end, &cast_path) {
+                    match service.resolve_slice_range(&id, start, end, &cast_path) {
                         Ok((so, eo, status)) => (cast_path, so, eo, status),
                         Err(e) => return ExecResult::Err(e),
                     }
                 }
-                _ => unreachable!("clap enforces exactly one of --path or --session"),
+                _ => unreachable!("clap enforces exactly one of path or --session"),
             };
 
             if let Some(reason) = &end_status {
@@ -549,13 +525,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 eprintln!("# bounded by EOF ({reason_str})");
             }
 
-            let iter = match crate::cast_reader::iter_output_between(&cast_path, start_offset, end_offset) {
-                Ok(it) => it,
-                Err(e) => return ExecResult::Err(e),
-            };
             let opts = crate::replay::ReplayOptions { speed, max_idle };
             let mut stdout = std::io::stdout().lock();
-            match crate::replay::play(iter, &opts, &mut stdout, std::thread::sleep) {
+            match crate::replay::run_replay(&cast_path, start_offset, end_offset, &opts, &mut stdout, std::thread::sleep) {
                 Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),
             }

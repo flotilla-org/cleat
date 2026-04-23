@@ -1130,27 +1130,26 @@ fn replay_with_session_and_markers_while_daemon_alive() {
     service.send_keys("alpha", b"trailing").expect("send trailing");
     std::thread::sleep(Duration::from_millis(300));
 
-    // While daemon still alive, run replay through the CLI dispatch.
-    // --speed 1000 keeps the test well under a second.
-    // --max-idle 0ms removes any residual sleep.
-    let cli = Cli::try_parse_from([
-        "cleat",
-        "replay",
-        "--session",
-        "alpha",
-        "--since-marker",
-        "m1",
-        "--until-marker",
-        "m2",
-        "--speed",
-        "1000",
-        "--max-idle",
-        "0ms",
-    ])
-    .expect("parse");
+    // Resolve range via the live daemon (socket-backed marker lookup), then
+    // play into a buffer so we can assert the actual bytes rather than just
+    // ExecResult::Ok.
+    let cast_path = service.layout_root().join("alpha").join(cleat::recording::CAST_FILE_NAME);
+    let (so, eo, _status) = service
+        .resolve_slice_range(
+            "alpha",
+            cleat::server::StartBound::Marker("m1".into()),
+            cleat::server::EndBound::Marker("m2".into()),
+            &cast_path,
+        )
+        .expect("resolve");
 
-    let result = cli::execute(cli, &service);
-    assert!(matches!(result, ExecResult::Ok(_)), "expected Ok, got {result:?}");
+    let opts = cleat::replay::ReplayOptions { speed: 1_000_000.0, max_idle: Some(Duration::ZERO) };
+    let mut buf: Vec<u8> = Vec::new();
+    cleat::replay::run_replay(&cast_path, so, eo, &opts, &mut buf, |_| {}).expect("run_replay");
+
+    let output = String::from_utf8(buf).expect("utf-8");
+    assert!(output.contains("middle"), "expected 'middle' between m1 and m2, got {output:?}");
+    assert!(!output.contains("trailing"), "did not expect 'trailing' before m2, got {output:?}");
 
     // Cleanup.
     let _ = service.kill("alpha");

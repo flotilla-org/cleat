@@ -24,8 +24,18 @@ impl Default for ReplayOptions {
 
 /// Compute the sleep duration before the next event given the raw inter-event
 /// gap and the replay options.
+///
+/// Saturates at `Duration::MAX` if the scaled gap would overflow (e.g. an
+/// extreme speed value combined with a large gap).
 pub fn sleep_for_gap(gap: Duration, opts: &ReplayOptions) -> Duration {
-    let scaled = Duration::from_secs_f64(gap.as_secs_f64() / opts.speed);
+    let scaled_secs = gap.as_secs_f64() / opts.speed;
+    let scaled = if !scaled_secs.is_finite() || scaled_secs < 0.0 {
+        Duration::ZERO
+    } else if scaled_secs >= u64::MAX as f64 {
+        Duration::MAX
+    } else {
+        Duration::from_secs_f64(scaled_secs)
+    };
     match opts.max_idle {
         Some(clamp) => scaled.min(clamp),
         None => scaled,
@@ -62,6 +72,29 @@ where
         prev_time = event.time;
     }
     Ok(())
+}
+
+/// Play the resolved byte range of a cast file through to `writer`, honoring
+/// `opts`. `sleeper` is injected so tests can pass a no-op.
+///
+/// This is the testable core of the `replay` subcommand. The CLI dispatch
+/// resolves the range (via [`crate::server::SessionService::resolve_slice_range`]
+/// for session form or [`crate::server::resolve_range_for_path`] for path form)
+/// and then calls this function.
+pub fn run_replay<W, S>(
+    cast_path: &std::path::Path,
+    start_offset: u64,
+    end_offset: u64,
+    opts: &ReplayOptions,
+    writer: &mut W,
+    sleeper: S,
+) -> Result<(), String>
+where
+    W: Write,
+    S: FnMut(Duration),
+{
+    let iter = crate::cast_reader::iter_output_between(cast_path, start_offset, end_offset)?;
+    play(iter, opts, writer, sleeper)
 }
 
 /// Validate the speed value from clap. Called by the CLI value parser.
@@ -106,6 +139,20 @@ mod tests {
     fn sleep_for_gap_max_idle_does_not_expand_below_clamp() {
         let opts = ReplayOptions { speed: 1.0, max_idle: Some(Duration::from_millis(100)) };
         assert_eq!(sleep_for_gap(Duration::from_millis(50), &opts), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn sleep_for_gap_saturates_instead_of_panicking_on_extreme_speed() {
+        let opts = ReplayOptions { speed: 1e-20, max_idle: None };
+        let result = sleep_for_gap(Duration::from_secs(1), &opts);
+        assert_eq!(result, Duration::MAX);
+    }
+
+    #[test]
+    fn sleep_for_gap_max_idle_still_clamps_saturated_value() {
+        let opts = ReplayOptions { speed: 1e-20, max_idle: Some(Duration::from_millis(100)) };
+        let result = sleep_for_gap(Duration::from_secs(1), &opts);
+        assert_eq!(result, Duration::from_millis(100));
     }
 
     #[test]

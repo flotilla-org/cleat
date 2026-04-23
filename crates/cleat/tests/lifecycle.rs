@@ -1113,3 +1113,45 @@ fn transcript_until_raw_offset_returns_exact_range() {
     assert!(output.contains("middle"), "expected 'middle' in output, got: {output:?}");
     assert!(!output.contains("trailing"), "did not expect 'trailing', got: {output:?}");
 }
+
+#[test]
+fn replay_with_session_and_markers_while_daemon_alive() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sh -c 'stty raw; exec cat'".into()), true).expect("create");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    service.named_mark("alpha", "m1").expect("mark m1");
+    service.send_keys("alpha", b"middle").expect("send middle");
+    std::thread::sleep(Duration::from_millis(300));
+    service.named_mark("alpha", "m2").expect("mark m2");
+    service.send_keys("alpha", b"trailing").expect("send trailing");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // While daemon still alive, run replay through the CLI dispatch.
+    // --speed 1000 keeps the test well under a second.
+    // --max-idle 0ms removes any residual sleep.
+    let cli = Cli::try_parse_from([
+        "cleat",
+        "replay",
+        "--session",
+        "alpha",
+        "--since-marker",
+        "m1",
+        "--until-marker",
+        "m2",
+        "--speed",
+        "1000",
+        "--max-idle",
+        "0ms",
+    ])
+    .expect("parse");
+
+    let result = cli::execute(cli, &service);
+    assert!(matches!(result, ExecResult::Ok(_)), "expected Ok, got {result:?}");
+
+    // Cleanup.
+    let _ = service.kill("alpha");
+}

@@ -230,6 +230,10 @@ pub struct OutputEventIter<R: std::io::Read> {
     byte_pos: u64,
     end: u64,
     prev_time: Duration,
+    /// True iff iteration started at byte 0 of the file. The first read in
+    /// that case is the asciicast header, which is skipped exactly once.
+    /// When the iterator is constructed mid-file (post-seek), this is false
+    /// and the first read is treated as a regular event line.
     first_line: bool,
     exhausted: bool,
 }

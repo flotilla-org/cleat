@@ -233,6 +233,10 @@ impl SessionService {
             }
             EndBound::Marker(name) => {
                 let o = self.resolve_marker(id, &name)?;
+                // Strict "after start" for named markers — equal-offset is
+                // almost always a typo (e.g. `--since-marker m1 --until-marker m1`).
+                // Raw offsets keep `<` (above) so `--since 0 --until 0` is a
+                // legal empty slice.
                 if o <= start_offset {
                     return Err(format!("marker '{name}' at offset {o} is not after start offset {start_offset}"));
                 }

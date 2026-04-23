@@ -102,12 +102,8 @@ fn replay_rejects_marker_bounds_with_path_resolver() {
 }
 
 // Parse-level tests — verify clap configuration.
-
-#[test]
-fn replay_parse_requires_path_or_session() {
-    let result = Cli::try_parse_from(["cleat", "replay"]);
-    assert!(result.is_err(), "replay with no path or --session should error");
-}
+// (`replay_requires_path_or_session` lives in `tests/cli.rs` alongside the
+// other `replay_*` parse tests; not duplicated here.)
 
 #[test]
 fn replay_parse_rejects_since_marker_with_positional_path() {

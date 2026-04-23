@@ -203,18 +203,25 @@ impl SessionService {
         self.capture_slice_inner(id, start, end)
     }
 
-    fn capture_slice_inner(&self, id: &str, start: StartBound, end: EndBound) -> Result<(String, SliceOutcome), String> {
-        let cast_path = self.layout.root().join(id).join(crate::recording::CAST_FILE_NAME);
-        if !cast_path.exists() {
-            return Err(format!("no recording for session {id}"));
-        }
-
+    /// Resolve start and end bounds into byte offsets in the cast file.
+    /// Returns `(start_offset, end_offset, end_status)` where `end_status` is
+    /// `Some(FallbackReason)` when a soft-ceiling bound fell back to EOF.
+    ///
+    /// Used by both `capture_slice_inner` (which then reads the byte range)
+    /// and `replay` (which streams it).
+    pub(crate) fn resolve_slice_range(
+        &self,
+        id: &str,
+        start: StartBound,
+        end: EndBound,
+        cast_path: &std::path::Path,
+    ) -> Result<(u64, u64, Option<FallbackReason>), String> {
         let start_offset = match start {
             StartBound::Offset(o) => o,
             StartBound::Marker(name) => self.resolve_marker(id, &name)?,
         };
 
-        let file_size = std::fs::metadata(&cast_path).map_err(|e| format!("stat cast file: {e}"))?.len();
+        let file_size = std::fs::metadata(cast_path).map_err(|e| format!("stat cast file: {e}"))?.len();
 
         let (end_offset, end_status) = match end {
             EndBound::EndOfRecording => (file_size, None),
@@ -226,9 +233,6 @@ impl SessionService {
             }
             EndBound::Marker(name) => {
                 let o = self.resolve_marker(id, &name)?;
-                // Strict "after start" for named markers — equal-offset is almost
-                // always a typo (e.g. `--since-marker m1 --until-marker m1`).
-                // Raw offsets keep `<` so `--since 0 --until 0` is a legal empty slice.
                 if o <= start_offset {
                     return Err(format!("marker '{name}' at offset {o} is not after start offset {start_offset}"));
                 }
@@ -238,11 +242,22 @@ impl SessionService {
                 Some(o) => (o, None),
                 None => (file_size, Some(FallbackReason::NoMarkerAfterStart)),
             },
-            EndBound::IdleGap(duration) => match crate::cast_reader::find_idle_gap_after(&cast_path, start_offset, duration)? {
+            EndBound::IdleGap(duration) => match crate::cast_reader::find_idle_gap_after(cast_path, start_offset, duration)? {
                 Some(o) => (o, None),
                 None => (file_size, Some(FallbackReason::NoIdleGap(duration))),
             },
         };
+
+        Ok((start_offset, end_offset, end_status))
+    }
+
+    fn capture_slice_inner(&self, id: &str, start: StartBound, end: EndBound) -> Result<(String, SliceOutcome), String> {
+        let cast_path = self.layout.root().join(id).join(crate::recording::CAST_FILE_NAME);
+        if !cast_path.exists() {
+            return Err(format!("no recording for session {id}"));
+        }
+
+        let (start_offset, end_offset, end_status) = self.resolve_slice_range(id, start, end, &cast_path)?;
 
         let events = crate::cast_reader::read_output_between(&cast_path, start_offset, end_offset)?;
         let output: String = events.iter().map(|e| e.data.as_str()).collect();

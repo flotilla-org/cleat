@@ -38,6 +38,7 @@ The shift: REST over HTTP/1.1 on UDS for the control plane, HTTP `Upgrade` for t
 - **Multi-attach with N controllers / M watchers.** Mirror today's behavior — second attach gets `409 Conflict`. Future zellij-like model slots in cleanly when needed.
 - **FD passing implementation.** Design the seam, defer the work.
 - **Backwards compatibility.** Hard cutover. We control all installs (single user/team consumer).
+- **HTTP session creation.** `POST /sessions` is deferred. In v1's daemon-per-session runtime layout, sessions are created client-side (`cleat spawn` forks a daemon); there is no listener to receive a creation request. Added when a bootstrap daemon or M-N routing lands. `cleat spawn` CLI stays unchanged for v1.
 - **WebSocket as the attach framing.** Considered and rejected: adds tokio-tungstenite dep, per-frame overhead, reinvents `AttachInit`/`Input`/`Output` as JSON message types when they're already perfectly good binary frames. Easy to add later via a different `Upgrade:` token if browser/dashboard use cases emerge.
 - **Versioning prefix in URLs.** No `/v1/` for v1. Add `/v2/` only if a future breaking change requires it.
 
@@ -132,10 +133,17 @@ Per-daemon collection. A daemon owns 1+ sessions (1 in v1); cross-daemon listing
 
 | Method | Path | Replaces | Notes |
 |---|---|---|---|
-| `GET`    | `/sessions` | (CLI `list`) | List sessions this daemon owns |
-| `POST`   | `/sessions` | (CLI `spawn`) | Body `{cmd, args, cwd, cols, rows, vt_engine, recording}` → `SessionInfo` |
+| `GET`    | `/sessions` | (CLI `list`) | List sessions this daemon owns (always length 1 in v1) |
 | `GET`    | `/sessions/{id}` | `Inspect`  | Returns `InspectResult` |
 | `DELETE` | `/sessions/{id}` | (CLI `kill`) | Terminate child + clean up |
+
+**Session creation (`POST /sessions`) is deliberately out of v1.** In the v1 runtime layout, session creation happens client-side: `cleat spawn` creates the `<root>/<session-id>/` directory and forks the daemon process, which then listens on the UDS inside. There is no listener to receive a `POST /sessions` in v1 — by definition, a daemon only exists *after* its session directory has been created. `cleat spawn` stays as today; REST control plane operates only on existing sessions.
+
+`POST /sessions` lands later in one of two shapes:
+- A bootstrap/manager daemon at a well-known path (`<root>/bootstrap/socket`) that receives creation requests and forks session daemons.
+- The M-N future, where one daemon owns multiple sessions and its `/sessions` collection supports creation directly.
+
+Either way, it is additive — no API rework of v1 endpoints.
 
 ### Per-session ops
 
@@ -170,12 +178,12 @@ Per-daemon collection. A daemon owns 1+ sessions (1 in v1); cross-daemon listing
 |---|---|---|
 | `GET`  | `/sessions/{id}/transcript?<bounds>&mode=raw\|rendered&format=bytes\|json` | `capture_slice_*` |
 
-**Bound query params** (carried over from today's CLI flags): `since=N`, `since_marker=NAME`, `until=N`, `until_marker=NAME`, `until_next_marker=NAME`, `until_idle=DURATION`. Same XOR rules apply (one start bound, one end bound).
+**Bound query params** (carried over from today's CLI flags): `since=N`, `since_marker=NAME`, `until=N`, `until_marker=NAME`, `until_next_marker=true` (boolean — "slice until the chronologically-next named marker after the start"; see `crates/cleat/src/cli.rs:124`), `until_idle=DURATION`. Same XOR rules apply (one start bound, one end bound).
 
 **`mode` parameter (raw vs rendered):**
 - `mode=raw` — concatenated `Output` event bytes from the cast file. Today's only behavior.
 - `mode=rendered` — VT-replayed plain text via the transcoder (#29). Not implementable in v1; reserved.
-- **Default:** `raw` for v1. Flips to `rendered` once #29 lands. Document that the default is mode-dependent on server capability; clients that need a stable answer should pass `mode=raw` explicitly.
+- **Default:** `raw`, permanently. `mode=rendered` becomes available (opt-in only) when #29 lands, but the default never changes — same URL, same query params, same response semantics across server versions. Clients wanting rendered always pass `mode=rendered` explicitly.
 
 **`format` parameter and content negotiation:** the same bytes can be returned as raw octets or wrapped in JSON for clients that want the metadata. Standard HTTP `Accept` negotiation, with a `?format=` query-param shortcut for curl convenience.
 
@@ -341,7 +349,6 @@ For things that fall out — e.g. `transcript --raw` becomes meaningful once #29
 - **Test porting load** — `lifecycle.rs` and other integration tests are substantial. The cutover PR's size depends heavily on how mechanical the port is.
 - **utoipa retrofit** — when we want OpenAPI, sprinkling annotations on existing axum handlers is the canonical low-disruption path. No structural concern; just future work.
 - **Session ID URL safety** — today's IDs are UUID-based directory names; URL-safe, no escaping needed. Document as part of the API.
-- **`mode=rendered` default flip** — when #29 lands and `mode=rendered` becomes implementable, the default may flip. Documented as version-dependent server behavior; clients wanting stability pass `mode=raw` explicitly. Worth a server-version header so clients can detect.
 
 ## What this design does NOT decide
 

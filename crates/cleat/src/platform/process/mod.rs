@@ -4,6 +4,6 @@ mod unix;
 mod unsupported;
 
 #[cfg(unix)]
-pub use unix::*;
+pub(crate) use unix::*;
 #[cfg(not(unix))]
-pub use unsupported::*;
+pub(crate) use unsupported::*;

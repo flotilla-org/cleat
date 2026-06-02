@@ -4,6 +4,8 @@ use std::{
     mem::{size_of, zeroed},
     path::PathBuf,
     ptr::{null, null_mut},
+    thread,
+    time::Duration,
 };
 
 use windows_sys::Win32::{
@@ -21,7 +23,11 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{protocol::SignalTarget, runtime::SessionMetadata};
+use crate::{
+    platform::ipc::{handle_has_available_bytes, SessionListener, SessionStream},
+    protocol::SignalTarget,
+    runtime::SessionMetadata,
+};
 
 pub struct PtyChild {
     conpty: HPCON,
@@ -136,6 +142,10 @@ impl PtyChild {
             _ => Err(format!("signal {signal} is not supported on Windows")),
         }
     }
+
+    pub(crate) fn output_available(&self) -> Result<bool, String> {
+        handle_has_available_bytes(self.output_read)
+    }
 }
 
 impl Drop for PtyChild {
@@ -164,25 +174,25 @@ pub struct PollResult {
 }
 
 pub fn poll_session_ready(
-    _listener_fd: i32,
-    _client_fd: Option<i32>,
-    _client_needs_write: bool,
-    _pty_fd: i32,
-    _timeout_ms: i32,
+    _listener: &SessionListener,
+    client: Option<&SessionStream>,
+    client_needs_write: bool,
+    pty_child: &PtyChild,
+    timeout_ms: i32,
 ) -> Result<PollResult, String> {
-    Err("Windows session polling requires named-pipe IPC integration".to_string())
+    let client_readable = client.map(SessionStream::has_available_bytes).transpose()?.unwrap_or(false);
+    let pty_readable = pty_child.output_available()?;
+    let listener_readable = true;
+
+    if !client_readable && !pty_readable && timeout_ms > 0 {
+        thread::sleep(Duration::from_millis(timeout_ms as u64));
+    }
+
+    Ok(PollResult { listener_readable, client_readable, client_writable: client_needs_write, pty_readable })
 }
 
 pub fn exit_code_from_wait_status(status: &WindowsExitStatus) -> i32 {
     status.code as i32
-}
-
-pub fn stream_fd(_stream: &crate::platform::ipc::SessionStream) -> i32 {
-    -1
-}
-
-pub fn listener_fd(_listener: &crate::platform::ipc::SessionListener) -> i32 {
-    -1
 }
 
 struct Pipes {

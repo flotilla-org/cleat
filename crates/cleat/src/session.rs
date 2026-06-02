@@ -21,7 +21,7 @@ use crate::{
             bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
             set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
         },
-        pty::{exit_code_from_wait_status, listener_fd, poll_session_ready, stream_fd, PtyChild},
+        pty::{exit_code_from_wait_status, poll_session_ready, PtyChild},
         terminal::{
             attach_signal_exit_requested, current_terminal_size, poll_stdin_readable, stdout_is_tty, AttachSignalHandlers,
             TerminalModeGuard,
@@ -422,10 +422,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let mut last_pty_output_at: Option<Instant> = None;
     loop {
         let poll_result = poll_session_ready(
-            listener_fd(&listener),
-            active_client.as_ref().map(|client| stream_fd(&client.stream)),
+            &listener,
+            active_client.as_ref().map(|client| &client.stream),
             active_client.as_ref().map(|client| !client.pending_output.is_empty()).unwrap_or(false),
-            pty_child.master_fd(),
+            &pty_child,
             100,
         )?;
 

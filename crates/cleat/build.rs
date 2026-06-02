@@ -3,9 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("ghostty-vt feature requires Linux or macOS");
-
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -16,6 +13,9 @@ fn main() {
         println!("cargo:warning=passthrough is a placeholder/testing engine only");
         println!("cargo:warning=run ./tools/prepare-ghostty-vt.sh and rebuild with --features ghostty-vt for a functional binary");
         return;
+    }
+    if !ghostty_supported_target() {
+        panic!("ghostty-vt feature requires Linux or macOS");
     }
 
     println!("cargo:rerun-if-env-changed=CLEAT_GHOSTTY_PREFIX");
@@ -101,12 +101,15 @@ LD_LIBRARY_PATH=\"{}/lib\" cargo build -p cleat --locked --features ghostty-vt",
 }
 
 fn shared_library_filename() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
+    if cfg!(target_os = "linux") {
         "libghostty-vt.so"
-    }
-    #[cfg(target_os = "macos")]
-    {
+    } else if cfg!(target_os = "macos") {
         "libghostty-vt.dylib"
+    } else {
+        panic!("ghostty-vt feature requires Linux or macOS")
     }
+}
+
+fn ghostty_supported_target() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }

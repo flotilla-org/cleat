@@ -1,0 +1,229 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+use crate::runtime::SessionMetadata;
+
+const PID_NAME: &str = "daemon.pid";
+
+pub fn daemon_pid_path(root: &Path, id: &str) -> PathBuf {
+    root.join(id).join(PID_NAME)
+}
+
+pub fn spawn_daemon_process(root: &Path, session: &SessionMetadata) -> Result<(), String> {
+    let exe = resolve_cleat_executable()?;
+    let mut command = Command::new(exe);
+    command.arg("--runtime-root").arg(root).arg("serve").arg("--id").arg(&session.id).arg("--vt").arg(session.vt_engine.as_str());
+    if let Some(cmd) = &session.cmd {
+        command.arg("--cmd").arg(cmd);
+    }
+    if let Some(cwd) = &session.cwd {
+        command.arg("--cwd").arg(cwd);
+    }
+    if session.record {
+        command.arg("--record");
+    }
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let child = command.spawn().map_err(|err| format!("spawn session daemon for {}: {err}", session.id))?;
+    fs::write(daemon_pid_path(root, &session.id), child.id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
+    Ok(())
+}
+
+/// Returns true if the daemon is alive, or if no PID file exists yet because
+/// the daemon may still be starting. Returns false only for a definitive stale
+/// PID file.
+pub fn is_session_daemon_alive(root: &Path, id: &str) -> bool {
+    let pid_path = daemon_pid_path(root, id);
+    let Ok(contents) = fs::read_to_string(&pid_path) else {
+        return true;
+    };
+    let Some(pid) = contents.trim().parse::<i32>().ok() else {
+        return false;
+    };
+    is_expected_cleat_process(pid)
+}
+
+pub fn terminate_session_daemon_if_expected(root: &Path, id: &str) {
+    let pid_path = daemon_pid_path(root, id);
+    let Ok(Some(pid)) = fs::read_to_string(&pid_path).map(|value| value.trim().parse::<i32>().ok()) else {
+        return;
+    };
+    if !is_expected_cleat_process(pid) {
+        return;
+    }
+    terminate_process(pid);
+}
+
+fn is_expected_cleat_process(pid: i32) -> bool {
+    let mut sys = System::new();
+    let sysinfo_pid = Pid::from(pid as usize);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sysinfo_pid]), true, ProcessRefreshKind::nothing());
+    sys.process(sysinfo_pid).map(|process| process.name().to_string_lossy().contains("cleat")).unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: i32) {
+    // SAFETY: the pid was verified to belong to a cleat process before signaling it.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: i32) {}
+
+pub fn resolve_cleat_executable() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_cleat").map(PathBuf::from) {
+        return Ok(path);
+    }
+
+    let sibling = current_exe_sibling(executable_name());
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+
+    resolve_cleat_with_sibling(sibling.as_deref(), &path_var)
+}
+
+fn resolve_cleat_with_sibling(sibling: Option<&Path>, path_var: &std::ffi::OsStr) -> Result<PathBuf, String> {
+    // Prefer sibling of current executable: strongest "same version" signal.
+    if let Some(path) = sibling {
+        if is_executable_file(path) {
+            return Ok(path.to_path_buf());
+        }
+    }
+
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(executable_name());
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err("unable to locate cleat executable on PATH or next to current binary".into())
+}
+
+fn current_exe_sibling(name: &str) -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let current_dir = current_exe.parent()?;
+    let candidates = [current_dir.join(name), current_dir.parent().map(|parent| parent.join(name))?];
+    candidates.into_iter().find(|candidate| is_executable_file(candidate))
+}
+
+fn executable_name() -> &'static str {
+    if cfg!(windows) {
+        "cleat.exe"
+    } else {
+        "cleat"
+    }
+}
+
+pub fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        path.is_file() && fs::metadata(path).map(|metadata| metadata.permissions().mode() & 0o111 != 0).unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        sync::{Mutex, OnceLock},
+    };
+
+    use super::{is_executable_file, resolve_cleat_executable};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn resolve_cleat_executable_prefers_cargo_bin_env() {
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cleat = temp.path().join(super::executable_name());
+        fs::write(&cleat, b"#!/bin/sh\n").expect("write fake cleat");
+        let original = std::env::var_os("CARGO_BIN_EXE_cleat");
+        std::env::set_var("CARGO_BIN_EXE_cleat", &cleat);
+
+        let resolved = resolve_cleat_executable().expect("resolve cleat");
+
+        match original {
+            Some(value) => std::env::set_var("CARGO_BIN_EXE_cleat", value),
+            None => std::env::remove_var("CARGO_BIN_EXE_cleat"),
+        }
+        assert_eq!(resolved, cleat);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_cleat_executable_falls_back_to_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let cleat = bin_dir.join("cleat");
+        fs::write(&cleat, b"#!/bin/sh\n").expect("write fake cleat");
+        let mut perms = fs::metadata(&cleat).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&cleat, perms).expect("set executable");
+
+        let resolved = super::resolve_cleat_with_sibling(None, std::ffi::OsStr::new(bin_dir.to_str().unwrap())).expect("resolve from path");
+
+        assert_eq!(resolved, cleat);
+        assert!(is_executable_file(&cleat));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_cleat_exe_prefers_sibling_over_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let sibling_dir = temp.path().join("sibling");
+        fs::create_dir_all(&sibling_dir).expect("create sibling dir");
+        let sibling_exe = sibling_dir.join("cleat");
+        fs::write(&sibling_exe, "#!/bin/sh\n").expect("write sibling");
+        fs::set_permissions(&sibling_exe, fs::Permissions::from_mode(0o755)).expect("chmod sibling");
+
+        let path_dir = temp.path().join("path-bin");
+        fs::create_dir_all(&path_dir).expect("create path dir");
+        let path_exe = path_dir.join("cleat");
+        fs::write(&path_exe, "#!/bin/sh\n").expect("write path");
+        fs::set_permissions(&path_exe, fs::Permissions::from_mode(0o755)).expect("chmod path");
+
+        let result = super::resolve_cleat_with_sibling(Some(&sibling_exe), std::ffi::OsStr::new(path_dir.to_str().unwrap()));
+
+        assert_eq!(result.unwrap(), sibling_exe);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_cleat_exe_falls_back_to_path_when_no_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let path_dir = temp.path().join("path-bin");
+        fs::create_dir_all(&path_dir).expect("create path dir");
+        let path_exe = path_dir.join("cleat");
+        fs::write(&path_exe, "#!/bin/sh\n").expect("write path");
+        fs::set_permissions(&path_exe, fs::Permissions::from_mode(0o755)).expect("chmod path");
+
+        let result = super::resolve_cleat_with_sibling(None, std::ffi::OsStr::new(path_dir.to_str().unwrap()));
+
+        assert_eq!(result.unwrap(), path_exe);
+    }
+}

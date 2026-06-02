@@ -1,12 +1,13 @@
 use std::{
-    os::unix::net::UnixStream,
     path::Path,
     time::{Duration, Instant},
 };
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-
 use crate::{
+    platform::{
+        daemon::{is_session_daemon_alive, terminate_session_daemon_if_expected},
+        ipc::{try_connect_session_stream, SessionStream},
+    },
     protocol::{Frame, SessionInfo, SessionStatus},
     runtime::RuntimeLayout,
     session::{attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, ForegroundAttach},
@@ -155,15 +156,7 @@ impl SessionService {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let pid_path = crate::session::daemon_pid_path(self.layout.root(), id);
-        if let Ok(Some(pid)) = std::fs::read_to_string(&pid_path).map(|value| value.trim().parse::<i32>().ok()) {
-            if is_expected_bollard_process(pid) {
-                // SAFETY: the pid was verified to belong to a cleat process before signaling it.
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
-            }
-        }
+        terminate_session_daemon_if_expected(self.layout.root(), id);
         self.layout.remove_session(id)
     }
 
@@ -533,10 +526,10 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
     }
 }
 
-fn connect_session_socket(socket_path: &Path) -> Result<UnixStream, String> {
+fn connect_session_socket(socket_path: &Path) -> Result<SessionStream, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStream::connect(socket_path) {
+        match try_connect_session_stream(socket_path) {
             Ok(stream) => return Ok(stream),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
                 // Socket not yet created — daemon may still be starting up.
@@ -545,32 +538,6 @@ fn connect_session_socket(socket_path: &Path) -> Result<UnixStream, String> {
             Err(err) => return Err(format!("connect {}: {err}", socket_path.display())),
         }
     }
-}
-
-/// Check whether the daemon for a session is still alive by reading its PID file
-/// and verifying the process exists and is a cleat process.
-///
-/// Returns `true` if the daemon is alive OR if the PID file is missing (the daemon
-/// may still be starting up — the socket is bound before the PID file is written).
-/// Returns `false` only when the PID file exists and the process is dead, which is
-/// the definitive signal that the daemon has exited and the session is stale.
-fn is_session_daemon_alive(root: &Path, id: &str) -> bool {
-    let pid_path = crate::session::daemon_pid_path(root, id);
-    let Ok(contents) = std::fs::read_to_string(&pid_path) else {
-        // No PID file yet — daemon may still be starting up. Don't treat as stale.
-        return true;
-    };
-    let Some(pid) = contents.trim().parse::<i32>().ok() else {
-        return false;
-    };
-    is_expected_bollard_process(pid)
-}
-
-fn is_expected_bollard_process(pid: i32) -> bool {
-    let mut sys = System::new();
-    let sysinfo_pid = Pid::from(pid as usize);
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sysinfo_pid]), true, ProcessRefreshKind::nothing());
-    sys.process(sysinfo_pid).map(|process| process.name().to_string_lossy().contains("cleat")).unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -33,19 +33,27 @@ Use the repo-local helper to fetch the pinned Ghostty ref and build a local inst
 
 On **Linux**:
 ```bash
-LD_LIBRARY_PATH="$PWD/.tools/ghostty-install/lib" cargo build -p cleat --locked --features ghostty-vt
-LD_LIBRARY_PATH="$PWD/.tools/ghostty-install/lib" cargo test -p cleat --locked --features ghostty-vt
+cargo build -p cleat --locked --features ghostty-vt
+cargo test -p cleat --locked --features ghostty-vt
 ```
 
 On **macOS**:
 ```bash
-DYLD_LIBRARY_PATH="$PWD/.tools/ghostty-install/lib" cargo build -p cleat --locked --features ghostty-vt
-DYLD_LIBRARY_PATH="$PWD/.tools/ghostty-install/lib" cargo test -p cleat --locked --features ghostty-vt
+cargo build -p cleat --locked --features ghostty-vt
+cargo test -p cleat --locked --features ghostty-vt
 ```
 
-The helper reads pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verifies Zig `0.15.2`, clones or refreshes Ghostty into `.tools/ghostty-src`, and installs the Ghostty VT headers and shared library into `.tools/ghostty-install`.
+On **Windows**:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\prepare-ghostty-vt.ps1
+$env:CLEAT_GHOSTTY_PREFIX = (Resolve-Path .tools\ghostty-install).Path
+cargo build -p cleat --locked --features ghostty-vt
+cargo test -p cleat --locked --features ghostty-vt
+```
 
-The `ghostty-vt` build path defaults to the repo-local prefix at `.tools/ghostty-install`. You can still override it with `CLEAT_GHOSTTY_PREFIX`, but feature-on runs and tests must set the library path (`LD_LIBRARY_PATH` on Linux, `DYLD_LIBRARY_PATH` on macOS) so the loader can find the shared library.
+The helpers read pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verify or install Zig `0.15.2`, clone or refresh Ghostty into `.tools/ghostty-src`, and install the Ghostty VT headers and libraries into `.tools/ghostty-install`.
+
+The `ghostty-vt` build path defaults to the repo-local prefix at `.tools/ghostty-install`. You can still override it with `CLEAT_GHOSTTY_PREFIX`. Cleat prefers the static Ghostty VT library on Unix when present (`libghostty-vt.a`) and falls back to the shared library otherwise. On Windows, cleat links against `ghostty-vt.lib` and copies `ghostty-vt.dll` next to the built executable.
 
 ```bash
 find .tools/ghostty-install -maxdepth 3 | sort

@@ -383,7 +383,6 @@ pub type GhosttyRenderState = *mut GhosttyRenderStateOpaque;
 pub type GhosttyRenderStateRowIterator = *mut GhosttyRowIteratorOpaque;
 pub type GhosttyRenderStateRowCells = *mut GhosttyRowCellsOpaque;
 
-#[link(name = "ghostty-vt")]
 unsafe extern "C" {
     fn ghostty_terminal_new(allocator: *const c_void, terminal: *mut GhosttyTerminal, options: GhosttyTerminalOptions) -> GhosttyResult;
     fn ghostty_terminal_free(terminal: GhosttyTerminal);

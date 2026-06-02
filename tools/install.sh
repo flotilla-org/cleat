@@ -17,24 +17,26 @@ echo "Building cleat..."
   CLEAT_GHOSTTY_PREFIX="$GHOSTTY_PREFIX" \
   cargo build -p cleat --locked --features ghostty-vt --release)
 
-# Install binary and dylib
+# Install binary and, if dynamic Ghostty linkage is used, the dylib
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 
 cp "$REPO_ROOT/target/release/cleat" "$BIN_DIR/cleat"
 
-# Copy ghostty-vt dylib
-case "$(uname -s)" in
-  Darwin) DYLIB="libghostty-vt.dylib" ;;
-  Linux)  DYLIB="libghostty-vt.so" ;;
-  *)      echo "Unsupported OS" >&2; exit 1 ;;
-esac
+if [[ ! -f "$GHOSTTY_PREFIX/lib/libghostty-vt.a" ]]; then
+  case "$(uname -s)" in
+    Darwin) DYLIB="libghostty-vt.dylib" ;;
+    Linux)  DYLIB="libghostty-vt.so" ;;
+    *)      echo "Unsupported OS" >&2; exit 1 ;;
+  esac
 
-cp "$GHOSTTY_PREFIX/lib/$DYLIB" "$LIB_DIR/$DYLIB"
+  cp "$GHOSTTY_PREFIX/lib/$DYLIB" "$LIB_DIR/$DYLIB"
 
-# On macOS, add rpath so the binary finds the dylib in ../lib relative to itself
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  install_name_tool -add_rpath "@executable_path/../lib" "$BIN_DIR/cleat" 2>/dev/null || true
+  # On macOS, add rpath so the binary finds the dylib in ../lib relative to itself
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    install_name_tool -add_rpath "@executable_path/../lib" "$BIN_DIR/cleat" 2>/dev/null || true
+  fi
+
+  echo "Installed $DYLIB to $LIB_DIR/$DYLIB"
 fi
 
 echo "Installed cleat to $BIN_DIR/cleat"
-echo "Installed $DYLIB to $LIB_DIR/$DYLIB"

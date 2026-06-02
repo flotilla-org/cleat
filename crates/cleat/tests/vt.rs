@@ -3,7 +3,9 @@ use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel
 mod vt_contracts;
 
 #[cfg(feature = "ghostty-vt")]
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
+#[cfg(all(feature = "ghostty-vt", any(target_os = "linux", target_os = "macos")))]
+use std::process::Command;
 
 use vt_contracts::{assert_non_replay_contract, assert_replay_contract_placeholder, PassthroughFixture, PlaceholderReplayFixture};
 #[cfg(feature = "ghostty-vt")]
@@ -288,29 +290,59 @@ fn vt_ghostty_screen_grid_multi_codepoint_grapheme() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
-fn vt_ghostty_links_against_shared_library() {
+fn vt_ghostty_prepared_library_exists() {
     let prefix = PathBuf::from(env!("CLEAT_GHOSTTY_PREFIX"));
-    let lib_name = shared_library_filename();
-    let shared_library = prefix.join("lib").join(lib_name);
-    assert!(shared_library.exists(), "expected shared ghostty library at {}", shared_library.display());
+    #[cfg(target_os = "windows")]
+    {
+        let shared_library = shared_library_path(&prefix);
+        let import_library = prefix.join("lib").join("ghostty-vt.lib");
+        assert!(shared_library.exists(), "expected ghostty DLL at {}", shared_library.display());
+        assert!(import_library.exists(), "expected ghostty import library at {}", import_library.display());
+    }
 
-    let exe = std::env::current_exe().expect("current test binary");
-    let output = inspect_linkage(&exe);
-    let linkage = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "failed to inspect test binary linkage for {}\nstdout:\n{}\nstderr:\n{}",
-        exe.display(),
-        linkage,
-        stderr
-    );
-    assert!(
-        linkage.contains(lib_name),
-        "expected shared ghostty-vt linkage via {}, but test binary dependencies were:\n{}",
-        shared_library.display(),
-        linkage
-    );
+    #[cfg(not(target_os = "windows"))]
+    {
+        let static_library = prefix.join("lib").join(static_library_filename());
+        let shared_library = shared_library_path(&prefix);
+        assert!(
+            static_library.exists() || shared_library.exists(),
+            "expected static or shared ghostty library at {} or {}",
+            static_library.display(),
+            shared_library.display()
+        );
+
+        if static_library.exists() {
+            return;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let shared_library = shared_library_path(&prefix);
+        let lib_name = shared_library_filename();
+        let exe = std::env::current_exe().expect("current test binary");
+        let output = inspect_linkage(&exe);
+        let linkage = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "failed to inspect test binary linkage for {}\nstdout:\n{}\nstderr:\n{}",
+            exe.display(),
+            linkage,
+            stderr
+        );
+        assert!(
+            linkage.contains(lib_name),
+            "expected shared ghostty-vt linkage via {}, but test binary dependencies were:\n{}",
+            shared_library.display(),
+            linkage
+        );
+    }
+}
+
+#[cfg(all(feature = "ghostty-vt", not(target_os = "windows")))]
+fn static_library_filename() -> &'static str {
+    "libghostty-vt.a"
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -323,9 +355,25 @@ fn shared_library_filename() -> &'static str {
     {
         "libghostty-vt.dylib"
     }
+    #[cfg(target_os = "windows")]
+    {
+        "ghostty-vt.dll"
+    }
 }
 
 #[cfg(feature = "ghostty-vt")]
+fn shared_library_path(prefix: &std::path::Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let bin_path = prefix.join("bin").join(shared_library_filename());
+        if bin_path.exists() {
+            return bin_path;
+        }
+    }
+    prefix.join("lib").join(shared_library_filename())
+}
+
+#[cfg(all(feature = "ghostty-vt", any(target_os = "linux", target_os = "macos")))]
 fn inspect_linkage(exe: &std::path::Path) -> std::process::Output {
     #[cfg(target_os = "linux")]
     {

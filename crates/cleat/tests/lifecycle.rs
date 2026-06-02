@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 #[cfg(feature = "ghostty-vt")]
 use std::process::{Command, Stdio};
 use std::{

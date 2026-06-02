@@ -6,7 +6,7 @@ use std::{
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-use crate::runtime::SessionMetadata;
+use crate::{platform::process, runtime::SessionMetadata};
 
 const PID_NAME: &str = "daemon.pid";
 
@@ -55,7 +55,7 @@ pub fn terminate_session_daemon_if_expected(root: &Path, id: &str) {
     if !is_expected_cleat_process(pid) {
         return;
     }
-    terminate_process(pid);
+    process::terminate_process(pid);
 }
 
 fn is_expected_cleat_process(pid: i32) -> bool {
@@ -65,23 +65,12 @@ fn is_expected_cleat_process(pid: i32) -> bool {
     sys.process(sysinfo_pid).map(|process| process.name().to_string_lossy().contains("cleat")).unwrap_or(false)
 }
 
-#[cfg(unix)]
-fn terminate_process(pid: i32) {
-    // SAFETY: the pid was verified to belong to a cleat process before signaling it.
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_process(_pid: i32) {}
-
 pub fn resolve_cleat_executable() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_cleat").map(PathBuf::from) {
         return Ok(path);
     }
 
-    let sibling = current_exe_sibling(executable_name());
+    let sibling = current_exe_sibling(process::executable_name());
     let path_var = std::env::var_os("PATH").unwrap_or_default();
 
     resolve_cleat_with_sibling(sibling.as_deref(), &path_var)
@@ -90,14 +79,14 @@ pub fn resolve_cleat_executable() -> Result<PathBuf, String> {
 fn resolve_cleat_with_sibling(sibling: Option<&Path>, path_var: &std::ffi::OsStr) -> Result<PathBuf, String> {
     // Prefer sibling of current executable: strongest "same version" signal.
     if let Some(path) = sibling {
-        if is_executable_file(path) {
+        if process::is_executable_file(path) {
             return Ok(path.to_path_buf());
         }
     }
 
     for dir in std::env::split_paths(path_var) {
-        let candidate = dir.join(executable_name());
-        if is_executable_file(&candidate) {
+        let candidate = dir.join(process::executable_name());
+        if process::is_executable_file(&candidate) {
             return Ok(candidate);
         }
     }
@@ -109,28 +98,7 @@ fn current_exe_sibling(name: &str) -> Option<PathBuf> {
     let current_exe = std::env::current_exe().ok()?;
     let current_dir = current_exe.parent()?;
     let candidates = [current_dir.join(name), current_dir.parent().map(|parent| parent.join(name))?];
-    candidates.into_iter().find(|candidate| is_executable_file(candidate))
-}
-
-fn executable_name() -> &'static str {
-    if cfg!(windows) {
-        "cleat.exe"
-    } else {
-        "cleat"
-    }
-}
-
-pub fn is_executable_file(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        path.is_file() && fs::metadata(path).map(|metadata| metadata.permissions().mode() & 0o111 != 0).unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
+    candidates.into_iter().find(|candidate| process::is_executable_file(candidate))
 }
 
 #[cfg(test)]
@@ -140,7 +108,7 @@ mod tests {
         sync::{Mutex, OnceLock},
     };
 
-    use super::{is_executable_file, resolve_cleat_executable};
+    use super::resolve_cleat_executable;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -151,7 +119,7 @@ mod tests {
     fn resolve_cleat_executable_prefers_cargo_bin_env() {
         let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
-        let cleat = temp.path().join(super::executable_name());
+        let cleat = temp.path().join(crate::platform::process::executable_name());
         fs::write(&cleat, b"#!/bin/sh\n").expect("write fake cleat");
         let original = std::env::var_os("CARGO_BIN_EXE_cleat");
         std::env::set_var("CARGO_BIN_EXE_cleat", &cleat);
@@ -182,7 +150,7 @@ mod tests {
         let resolved = super::resolve_cleat_with_sibling(None, std::ffi::OsStr::new(bin_dir.to_str().unwrap())).expect("resolve from path");
 
         assert_eq!(resolved, cleat);
-        assert!(is_executable_file(&cleat));
+        assert!(crate::platform::process::is_executable_file(&cleat));
     }
 
     #[cfg(unix)]

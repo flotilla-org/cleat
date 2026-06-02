@@ -33,24 +33,7 @@ impl PtyChild {
         match result {
             ForkptyResult::Parent { master, child } => Ok(Self { master_fd: master.into_raw_fd(), pid: child }),
             ForkptyResult::Child => {
-                if let Some(cwd) = &session.cwd {
-                    let _ = chdir(cwd);
-                }
-                for key in STRIP_ENV_VARS {
-                    // SAFETY: child process is single-threaded here, before exec, so environment mutation is safe.
-                    unsafe {
-                        std::env::remove_var(key);
-                    }
-                }
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-                let shell_c = CString::new(shell.clone()).map_err(|_| "shell contains interior nul".to_string())?;
-                let mut args = vec![shell_c.clone()];
-                if let Some(cmd) = &session.cmd {
-                    args.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
-                    args.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
-                }
-                let _ = execvp(&shell_c, &args);
-                std::process::exit(127);
+                exec_child_or_exit(session);
             }
         }
     }
@@ -165,7 +148,37 @@ pub fn listener_fd(listener: &std::os::unix::net::UnixListener) -> RawFd {
     listener.as_raw_fd()
 }
 
-fn borrow_raw(fd: RawFd) -> BorrowedFd<'static> {
+fn exec_child_or_exit(session: &SessionMetadata) -> ! {
+    if let Err(err) = exec_child(session) {
+        eprintln!("{err}");
+    }
+    std::process::exit(127);
+}
+
+fn exec_child(session: &SessionMetadata) -> Result<(), String> {
+    if let Some(cwd) = &session.cwd {
+        let _ = chdir(cwd);
+    }
+    for key in STRIP_ENV_VARS {
+        // SAFETY: child process is single-threaded here, before exec, so environment mutation is safe.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell_c = CString::new(shell.clone()).map_err(|_| "shell contains interior nul".to_string())?;
+    let mut args = vec![shell_c.clone()];
+    if let Some(cmd) = &session.cmd {
+        args.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
+        args.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
+    }
+    match execvp(&shell_c, &args) {
+        Ok(_) => unreachable!("execvp only returns on error"),
+        Err(err) => Err(format!("execvp {shell}: {err}")),
+    }
+}
+
+fn borrow_raw<'fd>(fd: RawFd) -> BorrowedFd<'fd> {
     // SAFETY: callers only borrow fds owned by this process for the duration of immediate syscalls.
     unsafe { BorrowedFd::borrow_raw(fd) }
 }

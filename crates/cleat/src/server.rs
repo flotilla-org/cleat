@@ -6,7 +6,7 @@ use std::{
 use crate::{
     platform::{
         daemon::{is_session_daemon_alive, terminate_session_daemon_if_expected},
-        ipc::{try_connect_session_stream, SessionStream},
+        ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
     protocol::{Frame, SessionInfo, SessionStatus},
     runtime::RuntimeLayout,
@@ -435,7 +435,7 @@ impl SessionService {
         let mut stream = connect_session_socket(&socket_path)?;
         // The wait response can take up to timeout_ms plus some overhead.
         // Remove any default read timeout so the blocking read succeeds.
-        stream.set_read_timeout(Some(Duration::from_millis(timeout_ms + 5000))).map_err(|err| format!("set read timeout: {err}"))?;
+        set_stream_read_timeout(&stream, Some(Duration::from_millis(timeout_ms + 5000)))?;
         Frame::Wait { conditions, timeout_ms }.write(&mut stream).map_err(|err| format!("write wait request: {err}"))?;
         match Frame::read(&mut stream).map_err(|err| format!("read wait response: {err}"))? {
             Frame::WaitResult { status, elapsed_ms } => Ok((status, elapsed_ms)),
@@ -450,7 +450,7 @@ impl SessionService {
         }
         let socket_path = session_socket_path(self.layout.root(), id);
         let mut stream = connect_session_socket(&socket_path)?;
-        stream.set_read_timeout(Some(Duration::from_millis(timeout_ms + 5000))).map_err(|err| format!("set read timeout: {err}"))?;
+        set_stream_read_timeout(&stream, Some(Duration::from_millis(timeout_ms + 5000)))?;
         Frame::Expect { text: text.to_string(), since_offset, timeout_ms }
             .write(&mut stream)
             .map_err(|err| format!("write expect request: {err}"))?;
@@ -540,7 +540,7 @@ fn connect_session_socket(socket_path: &Path) -> Result<SessionStream, String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::{fs, os::unix::net::UnixListener, process::Command, sync::mpsc, thread, time::Duration};
 

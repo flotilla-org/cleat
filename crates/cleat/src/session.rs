@@ -903,6 +903,18 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         }
 
         if let Some(status) = pty_child.exited()? {
+            drain_pty_output_after_exit(
+                &pty_child,
+                vt_engine.as_mut(),
+                &mut recorder,
+                &mut active_client,
+                &mut detached_da,
+                root,
+                id,
+                session.vt_engine,
+                epoch,
+                &mut last_pty_output_at,
+            )?;
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
                 let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut wait.stream);
@@ -917,6 +929,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 rec.flush_final();
                 let code = exit_code_from_wait_status(&status);
                 rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());
+            }
+            if let Some(client) = active_client.as_mut() {
+                let _ = client.flush_pending_output();
             }
             break;
         }
@@ -977,6 +992,67 @@ fn build_inspect_result(
             markers: markers.clone(),
         },
     }
+}
+
+fn drain_pty_output_after_exit(
+    pty_child: &PtyChild,
+    vt_engine: &mut dyn VtEngine,
+    recorder: &mut Option<crate::recording::SessionRecorder>,
+    active_client: &mut Option<ActiveClient>,
+    detached_da: &mut Option<DeviceAttributeTracker>,
+    root: &Path,
+    id: &str,
+    vt_engine_kind: VtEngineKind,
+    epoch: Instant,
+    last_pty_output_at: &mut Option<Instant>,
+) -> Result<(), String> {
+    loop {
+        let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
+        match pty_child.read_output(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                *last_pty_output_at = Some(Instant::now());
+                record_pty_output(vt_engine, &buf[..n])?;
+                if let Some(ref mut rec) = recorder {
+                    let elapsed = epoch.elapsed();
+                    rec.output(&buf[..n], elapsed);
+                    if rec.output_bytes_since_snapshot() >= 256 * 1024 {
+                        if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
+                            let (cols, rows) = vt_engine.size();
+                            let state = String::from_utf8_lossy(&payload);
+                            rec.write_snapshot(&state, vt_engine_kind.as_str(), cols, rows, elapsed);
+                        } else {
+                            rec.reset_output_bytes_since_snapshot();
+                        }
+                    }
+                }
+
+                let engine_reply = vt_engine.drain_replies();
+                if active_client.is_none() {
+                    if let Some(ref mut tracker) = detached_da {
+                        for reply in tracker.push(&buf[..n]) {
+                            pty_child.write_all(&reply)?;
+                        }
+                    }
+                    if !engine_reply.is_empty() {
+                        pty_child.write_all(&engine_reply)?;
+                    }
+                }
+                if let Some(client) = active_client.as_mut() {
+                    if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
+                        let _ = fs::remove_file(foreground_path(root, id));
+                        if let Some(ref mut rec) = recorder {
+                            rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
+                        }
+                        *active_client = None;
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => return Err(format!("read pty output after exit: {err}")),
+        }
+    }
+    Ok(())
 }
 
 struct ActiveClient {

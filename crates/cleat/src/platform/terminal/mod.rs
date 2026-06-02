@@ -1,12 +1,16 @@
 #[cfg(unix)]
 mod unix;
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 mod unsupported;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(unix)]
 pub use unix::*;
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 pub use unsupported::*;
+#[cfg(windows)]
+pub use windows::*;
 
 pub fn current_terminal_size() -> (u16, u16) {
     if let Some(size) = os_terminal_size() {

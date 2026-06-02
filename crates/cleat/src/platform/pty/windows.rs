@@ -317,9 +317,41 @@ fn spawn_with_conpty(command_line: &str, conpty: HPCON, cwd: Option<&PathBuf>) -
 
 fn windows_shell_command(session: &SessionMetadata) -> String {
     match &session.cmd {
-        Some(cmd) => format!("powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command {cmd}"),
+        Some(cmd) => format!("cmd.exe /D /C {}", quote_windows_arg(cmd)),
         None => "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass".to_string(),
     }
+}
+
+fn quote_windows_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+
+    let needs_quotes = arg.chars().any(|ch| ch.is_whitespace() || ch == '"');
+    if !needs_quotes {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 fn write_handle_all(handle: HANDLE, mut bytes: &[u8]) -> Result<(), String> {
@@ -344,4 +376,49 @@ fn wide_null(value: &str) -> Vec<u16> {
 fn last_error(operation: &str) -> String {
     let code = unsafe { GetLastError() };
     format!("{operation} failed with Windows error {code}")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{runtime::SessionMetadata, vt::VtEngineKind};
+
+    use super::{quote_windows_arg, windows_shell_command};
+
+    #[test]
+    fn quotes_empty_argument() {
+        assert_eq!(quote_windows_arg(""), "\"\"");
+    }
+
+    #[test]
+    fn leaves_simple_argument_unquoted() {
+        assert_eq!(quote_windows_arg("Write-Output"), "Write-Output");
+    }
+
+    #[test]
+    fn quotes_script_as_single_argument() {
+        assert_eq!(
+            quote_windows_arg("Start-Sleep -Milliseconds 800; Write-Output ready"),
+            "\"Start-Sleep -Milliseconds 800; Write-Output ready\""
+        );
+    }
+
+    #[test]
+    fn escapes_quotes_and_trailing_backslashes() {
+        assert_eq!(quote_windows_arg("Write-Output \"C:\\tmp\\\""), "\"Write-Output \\\"C:\\tmp\\\\\\\"\"");
+    }
+
+    #[test]
+    fn command_uses_cmd_shell_for_batch_commands() {
+        let session = SessionMetadata {
+            id: "test".into(),
+            vt_engine: VtEngineKind::Passthrough,
+            cwd: None,
+            cmd: Some("echo ready".into()),
+            record: false,
+        };
+
+        let command = windows_shell_command(&session);
+
+        assert_eq!(command, "cmd.exe /D /C \"echo ready\"");
+    }
 }

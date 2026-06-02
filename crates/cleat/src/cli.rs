@@ -387,6 +387,7 @@ impl ExecResult {
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     match cli.command {
         Command::Attach { id, no_create, vt, cwd, cmd, record } => {
+            #[cfg(not(windows))]
             if !no_create && !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
             }

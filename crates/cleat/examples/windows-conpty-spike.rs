@@ -3,7 +3,7 @@ mod spike {
     use std::error::Error;
     use std::ffi::c_void;
     use std::fs::File;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::mem::{size_of, zeroed};
     use std::os::windows::io::FromRawHandle;
     use std::ptr::{null, null_mut};
@@ -22,11 +22,19 @@ mod spike {
     const READY_MARKER: &str = "cleat-conpty-ready";
 
     pub fn run() -> Result<(), Box<dyn Error>> {
+        run_probe("command-line", "cmd.exe /D /Q /C echo cleat-conpty-ready && exit /b 7", None)?;
+        run_probe("interactive", "cmd.exe /D /Q /K", Some(b"echo cleat-conpty-ready\r\nexit /b 7\r\n"))?;
+
+        Ok(())
+    }
+
+    fn run_probe(name: &str, command_line: &str, input_bytes: Option<&[u8]>) -> Result<(), Box<dyn Error>> {
         let pipes = Pipes::new()?;
         let conpty = PseudoConsole::new(80, 24, pipes.input_read, pipes.output_write)?;
 
-        let child = ChildProcess::spawn_with_conpty("cmd.exe /D /Q /C echo cleat-conpty-ready && exit /b 7", conpty.handle)?;
+        let child = ChildProcess::spawn_with_conpty(command_line, conpty.handle)?;
 
+        let mut input = input_bytes.map(|_| unsafe { File::from_raw_handle(pipes.input_write) });
         let mut output = unsafe { File::from_raw_handle(pipes.output_read) };
 
         let reader = thread::spawn(move || {
@@ -34,17 +42,27 @@ mod spike {
             output.read_to_end(&mut transcript).map(|_| transcript)
         });
 
+        if let Some(bytes) = input_bytes {
+            thread::sleep(std::time::Duration::from_millis(250));
+            let input = input.as_mut().expect("input file is created when input bytes exist");
+            input.write_all(bytes)?;
+            input.flush()?;
+        }
+
         let wait_status = unsafe { WaitForSingleObject(child.process, 5_000) };
+        drop(input);
         unsafe {
-            CloseHandle(pipes.input_write);
+            if input_bytes.is_none() {
+                CloseHandle(pipes.input_write);
+            }
             CloseHandle(pipes.input_read);
             CloseHandle(pipes.output_write);
         }
         if wait_status == WAIT_TIMEOUT {
-            return Err("timed out waiting for ConPTY child process".into());
+            return Err(format!("{name} probe timed out waiting for ConPTY child process").into());
         }
         if wait_status != WAIT_OBJECT_0 {
-            return Err(format!("unexpected WaitForSingleObject status {wait_status}").into());
+            return Err(format!("{name} probe got unexpected WaitForSingleObject status {wait_status}").into());
         }
 
         let mut exit_code = 0;
@@ -60,13 +78,14 @@ mod spike {
             reader.join().map_err(|_| "reader thread panicked")?.map_err(|err| format!("failed to read ConPTY output: {err}"))?;
         let transcript = String::from_utf8_lossy(&transcript);
 
+        println!("=== {name} ===");
         println!("{transcript}");
         println!("exit_code={exit_code}");
 
         let normalized_transcript = transcript.replace('\0', "");
         if !normalized_transcript.contains(READY_MARKER) {
             return Err(format!(
-                "ConPTY transcript did not contain {READY_MARKER:?}: {:?}",
+                "{name} probe ConPTY transcript did not contain {READY_MARKER:?}: {:?}",
                 normalized_transcript.escape_debug().to_string()
             )
             .into());

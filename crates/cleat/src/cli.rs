@@ -405,6 +405,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             }
         }
         Command::Launch { id, json, vt, cwd, cmd, record } => {
+            #[cfg(not(windows))]
             if !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
             }

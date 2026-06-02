@@ -108,7 +108,7 @@ fn create_uses_requested_vt_engine() {
     assert_eq!(created.vt_engine, VtEngineKind::Passthrough);
 }
 
-#[cfg(not(feature = "ghostty-vt"))]
+#[cfg(all(not(feature = "ghostty-vt"), not(windows)))]
 #[test]
 fn create_rejects_unavailable_vt_engine() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -122,7 +122,7 @@ fn create_rejects_unavailable_vt_engine() {
     assert!(err.contains("ghostty-vt"));
 }
 
-#[cfg(not(feature = "ghostty-vt"))]
+#[cfg(all(not(feature = "ghostty-vt"), not(windows)))]
 #[test]
 fn create_rejects_default_nonfunctional_build() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -148,14 +148,17 @@ fn list_reports_existing_sessions() {
     let output = cli::execute(cli, &service).expect("execute list").expect("list output");
     let lines: Vec<_> = output.lines().collect();
 
-    assert_eq!(lines, vec![
-        format!(
-            "alpha\tdetached\t{} ({})\t/repo",
-            vt::default_vt_engine_kind().as_str(),
-            vt::vt_engine_status(vt::default_vt_engine_kind())
-        ),
-        format!("beta\tdetached\tpassthrough ({})\tzsh", vt::vt_engine_status(VtEngineKind::Passthrough)),
-    ]);
+    assert_eq!(
+        lines,
+        vec![
+            format!(
+                "alpha\tdetached\t{} ({})\t/repo",
+                vt::default_vt_engine_kind().as_str(),
+                vt::vt_engine_status(vt::default_vt_engine_kind())
+            ),
+            format!("beta\tdetached\tpassthrough ({})\tzsh", vt::vt_engine_status(VtEngineKind::Passthrough)),
+        ]
+    );
 }
 
 #[test]

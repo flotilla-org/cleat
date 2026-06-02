@@ -67,6 +67,12 @@ impl PtyChild {
     }
 
     pub fn read_output(&self, buf: &mut [u8]) -> Result<usize, io::Error> {
+        match self.output_available() {
+            Ok(true) => {}
+            Ok(false) => return Err(io::Error::new(io::ErrorKind::WouldBlock, "ConPTY output pipe would block")),
+            Err(err) => return Err(io::Error::other(err)),
+        }
+
         let mut read = 0;
         let ok = unsafe { ReadFile(self.output_read, buf.as_mut_ptr(), buf.len() as u32, &mut read, null_mut()) };
         if ok == 0 {

@@ -373,7 +373,7 @@ struct PendingExpect {
     registered_at: Instant,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
     let id = &session.id;
     let session_dir = root.join(id);
@@ -434,8 +434,15 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 Ok((mut stream, _)) => {
                     // Accepted sockets inherit nonblocking mode from the listener on macOS/BSD.
                     // Reset to blocking so the initial frame read works correctly.
-                    set_stream_nonblocking(&stream, false).map_err(|err| format!("set accepted stream blocking: {err}"))?;
-                    let _ = set_stream_read_timeout(&stream, Some(Duration::from_millis(100)));
+                    #[cfg(unix)]
+                    {
+                        set_stream_nonblocking(&stream, false).map_err(|err| format!("set accepted stream blocking: {err}"))?;
+                        let _ = set_stream_read_timeout(&stream, Some(Duration::from_millis(100)));
+                    }
+                    #[cfg(windows)]
+                    {
+                        set_stream_nonblocking(&stream, true).map_err(|err| format!("set accepted stream nonblocking: {err}"))?;
+                    }
                     match Frame::read(&mut stream) {
                         Ok(Frame::AttachInit { cols, rows, capabilities }) => {
                             if active_client.is_none() {
@@ -814,7 +821,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         }
 
         if let Some(ref mut rec) = recorder {
-            if !poll_result.pty_readable && !poll_result.client_readable && !poll_result.listener_readable {
+            if !poll_result.pty_readable && !poll_result.client_readable {
                 rec.flush();
             }
         }
@@ -925,12 +932,12 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<(), String> {
     Err("session daemon is only supported on unix".into())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn build_inspect_result(
     session: &SessionMetadata,
     vt_engine: &dyn VtEngine,

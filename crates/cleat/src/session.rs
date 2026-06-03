@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -452,6 +452,8 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 pty_child.resize(cols, rows)?;
                                 let replay = apply_attach_state(vt_engine.as_mut(), cols, rows, &capabilities)?;
                                 Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
+                                #[cfg(unix)]
+                                set_stream_nonblocking(&stream, true).map_err(|err| format!("set client nonblocking: {err}"))?;
                                 let mut client = ActiveClient::new(stream)?;
                                 if let Some(payload) = replay {
                                     if !payload.is_empty() {
@@ -899,10 +901,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 &mut recorder,
                 &mut active_client,
                 &mut detached_da,
-                root,
-                id,
-                session.vt_engine,
-                epoch,
+                DrainExitContext { root, id, vt_engine_kind: session.vt_engine, epoch },
                 &mut last_pty_output_at,
             )?;
             for mut wait in pending_waits.drain(..) {
@@ -990,10 +989,7 @@ fn drain_pty_output_after_exit(
     recorder: &mut Option<crate::recording::SessionRecorder>,
     active_client: &mut Option<ActiveClient>,
     detached_da: &mut Option<DeviceAttributeTracker>,
-    root: &Path,
-    id: &str,
-    vt_engine_kind: VtEngineKind,
-    epoch: Instant,
+    context: DrainExitContext<'_>,
     last_pty_output_at: &mut Option<Instant>,
 ) -> Result<(), String> {
     loop {
@@ -1004,13 +1000,13 @@ fn drain_pty_output_after_exit(
                 *last_pty_output_at = Some(Instant::now());
                 record_pty_output(vt_engine, &buf[..n])?;
                 if let Some(ref mut rec) = recorder {
-                    let elapsed = epoch.elapsed();
+                    let elapsed = context.epoch.elapsed();
                     rec.output(&buf[..n], elapsed);
                     if rec.output_bytes_since_snapshot() >= 256 * 1024 {
                         if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
                             let (cols, rows) = vt_engine.size();
                             let state = String::from_utf8_lossy(&payload);
-                            rec.write_snapshot(&state, vt_engine_kind.as_str(), cols, rows, elapsed);
+                            rec.write_snapshot(&state, context.vt_engine_kind.as_str(), cols, rows, elapsed);
                         } else {
                             rec.reset_output_bytes_since_snapshot();
                         }
@@ -1030,9 +1026,9 @@ fn drain_pty_output_after_exit(
                 }
                 if let Some(client) = active_client.as_mut() {
                     if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
-                        let _ = fs::remove_file(foreground_path(root, id));
+                        let _ = fs::remove_file(foreground_path(context.root, context.id));
                         if let Some(ref mut rec) = recorder {
-                            rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
+                            rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, context.epoch.elapsed());
                         }
                         *active_client = None;
                     }
@@ -1045,16 +1041,23 @@ fn drain_pty_output_after_exit(
     Ok(())
 }
 
+struct DrainExitContext<'a> {
+    root: &'a Path,
+    id: &'a str,
+    vt_engine_kind: VtEngineKind,
+    epoch: Instant,
+}
+
 struct ActiveClient {
     stream: SessionStream,
     pending_output: Vec<u8>,
-    input_reader: crate::platform::ipc::OverlappedRead,
+    input_reader: ActiveClientReader,
     input_buffer: Vec<u8>,
 }
 
 impl ActiveClient {
     fn new(stream: SessionStream) -> Result<Self, String> {
-        let input_reader = stream.overlapped_reader(64 * 1024).map_err(|err| format!("create foreground client reader: {err}"))?;
+        let input_reader = ActiveClientReader::new(&stream)?;
         Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new() })
     }
 
@@ -1063,9 +1066,9 @@ impl ActiveClient {
         loop {
             let chunk = if first_poll {
                 first_poll = false;
-                self.input_reader.poll_timeout(timeout)?
+                self.input_reader.poll_timeout(&mut self.stream, timeout)?
             } else {
-                self.input_reader.poll()?
+                self.input_reader.poll(&mut self.stream)?
             };
             match chunk {
                 Some(bytes) if bytes.is_empty() => return Ok(false),
@@ -1103,6 +1106,54 @@ impl ActiveClient {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(windows)]
+struct ActiveClientReader {
+    reader: crate::platform::ipc::OverlappedRead,
+}
+
+#[cfg(windows)]
+impl ActiveClientReader {
+    fn new(stream: &SessionStream) -> Result<Self, String> {
+        let reader = stream.overlapped_reader(64 * 1024).map_err(|err| format!("create foreground client reader: {err}"))?;
+        Ok(Self { reader })
+    }
+
+    fn poll(&mut self, _stream: &mut SessionStream) -> Result<Option<Vec<u8>>, std::io::Error> {
+        self.reader.poll()
+    }
+
+    fn poll_timeout(&mut self, _stream: &mut SessionStream, timeout: Duration) -> Result<Option<Vec<u8>>, std::io::Error> {
+        self.reader.poll_timeout(timeout)
+    }
+}
+
+#[cfg(not(windows))]
+struct ActiveClientReader;
+
+#[cfg(not(windows))]
+impl ActiveClientReader {
+    fn new(_stream: &SessionStream) -> Result<Self, String> {
+        Ok(Self)
+    }
+
+    fn poll(&mut self, stream: &mut SessionStream) -> Result<Option<Vec<u8>>, std::io::Error> {
+        self.poll_timeout(stream, Duration::ZERO)
+    }
+
+    fn poll_timeout(&mut self, stream: &mut SessionStream, _timeout: Duration) -> Result<Option<Vec<u8>>, std::io::Error> {
+        let mut buf = vec![0; 64 * 1024];
+        match stream.read(&mut buf) {
+            Ok(0) => Ok(Some(Vec::new())),
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some(buf))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -1174,7 +1225,8 @@ mod tests {
     #[test]
     fn active_client_rejects_unbounded_output_backlog() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
-        let mut client = super::ActiveClient { stream, pending_output: vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1] };
+        let mut client = super::ActiveClient::new(stream).expect("create active client");
+        client.pending_output = vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1];
 
         let err = client.enqueue_frame(&super::Frame::Output(vec![1])).expect_err("backlog should overflow");
 

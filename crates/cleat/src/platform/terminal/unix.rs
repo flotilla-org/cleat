@@ -13,13 +13,13 @@ use nix::{
 
 static ATTACH_SIGNAL_EXIT: AtomicBool = AtomicBool::new(false);
 
-pub struct TerminalModeGuard {
+pub struct ForegroundTerminal {
     fd: RawFd,
     original: Option<termios::Termios>,
 }
 
-impl TerminalModeGuard {
-    pub fn activate() -> Result<Self, String> {
+impl ForegroundTerminal {
+    pub fn enter() -> Result<Self, String> {
         let fd = std::io::stdin().as_raw_fd();
         // SAFETY: stdin remains open for the lifetime of the guard; we only borrow its fd.
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -34,9 +34,16 @@ impl TerminalModeGuard {
 
         Ok(Self { fd, original: Some(original) })
     }
+
+    pub fn read_input(&mut self, timeout: Duration, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        if !poll_fd_readable(self.fd, timeout).map_err(std::io::Error::other)? {
+            return Ok(None);
+        }
+        std::io::Read::read(&mut std::io::stdin().lock(), buf).map(Some)
+    }
 }
 
-impl Drop for TerminalModeGuard {
+impl Drop for ForegroundTerminal {
     fn drop(&mut self) {
         if let Some(original) = self.original.as_ref() {
             // SAFETY: stdin remains open for the lifetime of the guard; we only borrow its fd.
@@ -96,11 +103,6 @@ pub fn stdout_is_tty() -> Result<bool, String> {
     // SAFETY: stdout remains open for the duration of this check; we only borrow its fd.
     let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
     isatty(borrowed_fd).map_err(|err| format!("detect terminal stdout: {err}"))
-}
-
-pub fn poll_stdin_readable(timeout: Duration) -> Result<bool, String> {
-    let fd = std::io::stdin().as_raw_fd();
-    poll_fd_readable(fd, timeout)
 }
 
 pub fn os_terminal_size() -> Option<(u16, u16)> {

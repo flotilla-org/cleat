@@ -19,10 +19,10 @@ pub struct PollResult {
 }
 
 pub fn poll_session_ready(
-    _listener_fd: i32,
-    _client_fd: Option<i32>,
+    _listener: &SessionListener,
+    _client: Option<&SessionStream>,
     _client_needs_write: bool,
-    _pty_fd: i32,
+    _pty_child: &PtyChild,
     _timeout_ms: i32,
 ) -> Result<PollResult, String> {
     Err("PTY sessions are only supported on Unix".to_string())
@@ -30,12 +30,4 @@ pub fn poll_session_ready(
 
 pub fn exit_code_from_wait_status(_status: &()) -> i32 {
     1
-}
-
-pub fn stream_fd(_stream: &SessionStream) -> i32 {
-    -1
-}
-
-pub fn listener_fd(_listener: &SessionListener) -> i32 {
-    -1
 }

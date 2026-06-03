@@ -21,11 +21,8 @@ use crate::{
             bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
             set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
         },
-        pty::{exit_code_from_wait_status, listener_fd, poll_session_ready, stream_fd, PtyChild},
-        terminal::{
-            attach_signal_exit_requested, current_terminal_size, poll_stdin_readable, stdout_is_tty, AttachSignalHandlers,
-            TerminalModeGuard,
-        },
+        pty::{exit_code_from_wait_status, poll_session_ready, PtyChild},
+        terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::Frame,
     runtime::{RuntimeLayout, SessionMetadata},
@@ -35,7 +32,8 @@ use crate::{
 const FOREGROUND_NAME: &str = "foreground";
 const DEFAULT_TERMINAL_COLS: u16 = 80;
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
-const DETACH_CLEANUP_SEQUENCE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h";
+const DETACH_CLEANUP_SEQUENCE: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -48,7 +46,7 @@ pub struct ForegroundAttach {
 impl ForegroundAttach {
     pub fn relay_stdio(self) -> Result<(), String> {
         let mut cleanup = AttachCleanupGuard::stdout();
-        let _tty_mode = TerminalModeGuard::activate()?;
+        let mut terminal = ForegroundTerminal::enter()?;
         let _signal_handlers = AttachSignalHandlers::install()?;
         let read_handle = {
             let stream = self.stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
@@ -93,21 +91,15 @@ impl ForegroundAttach {
             Ok(())
         });
 
-        let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 4096];
         let stdin_result = loop {
             if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
                 break Ok(());
             }
-            match poll_stdin_readable(Duration::from_millis(100)) {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(_err) if attach_signal_exit_requested() => break Ok(()),
-                Err(err) => break Err(err),
-            }
-            match stdin.read(&mut buf) {
-                Ok(0) => break Ok(()),
-                Ok(n) => {
+            match terminal.read_input(Duration::from_millis(100), &mut buf) {
+                Ok(None) => continue,
+                Ok(Some(0)) => break Ok(()),
+                Ok(Some(n)) => {
                     let mut stream = self.stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
                     if let Err(err) = Frame::Input(buf[..n].to_vec()).write(&mut *stream) {
                         if is_graceful_socket_shutdown(&err) {
@@ -115,6 +107,17 @@ impl ForegroundAttach {
                         }
                         break Err(format!("write input frame: {err}"));
                     }
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    break Ok(())
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => break Err(format!("read stdin: {err}")),
@@ -373,7 +376,7 @@ struct PendingExpect {
     registered_at: Instant,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
     let id = &session.id;
     let session_dir = root.join(id);
@@ -422,10 +425,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let mut last_pty_output_at: Option<Instant> = None;
     loop {
         let poll_result = poll_session_ready(
-            listener_fd(&listener),
-            active_client.as_ref().map(|client| stream_fd(&client.stream)),
+            &listener,
+            active_client.as_ref().map(|client| &client.stream),
             active_client.as_ref().map(|client| !client.pending_output.is_empty()).unwrap_or(false),
-            pty_child.master_fd(),
+            &pty_child,
             100,
         )?;
 
@@ -434,16 +437,24 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 Ok((mut stream, _)) => {
                     // Accepted sockets inherit nonblocking mode from the listener on macOS/BSD.
                     // Reset to blocking so the initial frame read works correctly.
-                    set_stream_nonblocking(&stream, false).map_err(|err| format!("set accepted stream blocking: {err}"))?;
-                    let _ = set_stream_read_timeout(&stream, Some(Duration::from_millis(100)));
+                    #[cfg(unix)]
+                    {
+                        set_stream_nonblocking(&stream, false).map_err(|err| format!("set accepted stream blocking: {err}"))?;
+                        let _ = set_stream_read_timeout(&stream, Some(Duration::from_millis(100)));
+                    }
+                    #[cfg(windows)]
+                    {
+                        set_stream_nonblocking(&stream, true).map_err(|err| format!("set accepted stream nonblocking: {err}"))?;
+                    }
                     match Frame::read(&mut stream) {
                         Ok(Frame::AttachInit { cols, rows, capabilities }) => {
                             if active_client.is_none() {
                                 pty_child.resize(cols, rows)?;
                                 let replay = apply_attach_state(vt_engine.as_mut(), cols, rows, &capabilities)?;
                                 Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
+                                #[cfg(unix)]
                                 set_stream_nonblocking(&stream, true).map_err(|err| format!("set client nonblocking: {err}"))?;
-                                let mut client = ActiveClient::new(stream);
+                                let mut client = ActiveClient::new(stream)?;
                                 if let Some(payload) = replay {
                                     if !payload.is_empty() {
                                         if had_foreground_client {
@@ -695,28 +706,16 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
         }
 
-        if poll_result.client_readable {
+        if active_client.is_some() {
             let mut client_disconnected = false;
             let mut pending = VecDeque::new();
-            if let Some(stream) = active_client.as_mut() {
-                loop {
-                    match Frame::read(&mut stream.stream) {
-                        Ok(frame) => pending.push_back(frame),
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(err)
-                            if matches!(
-                                err.kind(),
-                                std::io::ErrorKind::UnexpectedEof
-                                    | std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::ConnectionAborted
-                            ) =>
-                        {
-                            client_disconnected = true;
-                            break;
-                        }
-                        Err(err) => return Err(format!("read client frame: {err}")),
-                    }
+            let client_read_timeout =
+                if poll_result.pty_readable || poll_result.client_writable { Duration::ZERO } else { Duration::from_millis(100) };
+            if let Some(client) = active_client.as_mut() {
+                match client.drain_input_frames(&mut pending, client_read_timeout) {
+                    Ok(true) => {}
+                    Ok(false) => client_disconnected = true,
+                    Err(err) => return Err(format!("read client frame: {err}")),
                 }
             }
 
@@ -814,7 +813,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         }
 
         if let Some(ref mut rec) = recorder {
-            if !poll_result.pty_readable && !poll_result.client_readable && !poll_result.listener_readable {
+            if !poll_result.pty_readable && !poll_result.client_readable {
                 rec.flush();
             }
         }
@@ -896,6 +895,15 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         }
 
         if let Some(status) = pty_child.exited()? {
+            drain_pty_output_after_exit(
+                &pty_child,
+                vt_engine.as_mut(),
+                &mut recorder,
+                &mut active_client,
+                &mut detached_da,
+                DrainExitContext { root, id, vt_engine_kind: session.vt_engine, epoch },
+                &mut last_pty_output_at,
+            )?;
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
                 let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut wait.stream);
@@ -911,6 +919,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 let code = exit_code_from_wait_status(&status);
                 rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());
             }
+            if let Some(client) = active_client.as_mut() {
+                let _ = client.flush_pending_output();
+            }
             break;
         }
     }
@@ -925,12 +936,12 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<(), String> {
     Err("session daemon is only supported on unix".into())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn build_inspect_result(
     session: &SessionMetadata,
     vt_engine: &dyn VtEngine,
@@ -972,14 +983,116 @@ fn build_inspect_result(
     }
 }
 
+fn drain_pty_output_after_exit(
+    pty_child: &PtyChild,
+    vt_engine: &mut dyn VtEngine,
+    recorder: &mut Option<crate::recording::SessionRecorder>,
+    active_client: &mut Option<ActiveClient>,
+    detached_da: &mut Option<DeviceAttributeTracker>,
+    context: DrainExitContext<'_>,
+    last_pty_output_at: &mut Option<Instant>,
+) -> Result<(), String> {
+    loop {
+        let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
+        match pty_child.read_output(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                *last_pty_output_at = Some(Instant::now());
+                record_pty_output(vt_engine, &buf[..n])?;
+                if let Some(ref mut rec) = recorder {
+                    let elapsed = context.epoch.elapsed();
+                    rec.output(&buf[..n], elapsed);
+                    if rec.output_bytes_since_snapshot() >= 256 * 1024 {
+                        if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
+                            let (cols, rows) = vt_engine.size();
+                            let state = String::from_utf8_lossy(&payload);
+                            rec.write_snapshot(&state, context.vt_engine_kind.as_str(), cols, rows, elapsed);
+                        } else {
+                            rec.reset_output_bytes_since_snapshot();
+                        }
+                    }
+                }
+
+                let engine_reply = vt_engine.drain_replies();
+                if active_client.is_none() {
+                    if let Some(ref mut tracker) = detached_da {
+                        for reply in tracker.push(&buf[..n]) {
+                            pty_child.write_all(&reply)?;
+                        }
+                    }
+                    if !engine_reply.is_empty() {
+                        pty_child.write_all(&engine_reply)?;
+                    }
+                }
+                if let Some(client) = active_client.as_mut() {
+                    if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
+                        let _ = fs::remove_file(foreground_path(context.root, context.id));
+                        if let Some(ref mut rec) = recorder {
+                            rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, context.epoch.elapsed());
+                        }
+                        *active_client = None;
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || is_pty_eof_after_exit(&err) => break,
+            Err(err) => return Err(format!("read pty output after exit: {err}")),
+        }
+    }
+    Ok(())
+}
+
+fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+struct DrainExitContext<'a> {
+    root: &'a Path,
+    id: &'a str,
+    vt_engine_kind: VtEngineKind,
+    epoch: Instant,
+}
+
 struct ActiveClient {
     stream: SessionStream,
     pending_output: Vec<u8>,
+    input_reader: ActiveClientReader,
+    input_buffer: Vec<u8>,
 }
 
 impl ActiveClient {
-    fn new(stream: SessionStream) -> Self {
-        Self { stream, pending_output: Vec::new() }
+    fn new(stream: SessionStream) -> Result<Self, String> {
+        let input_reader = ActiveClientReader::new(&stream)?;
+        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new() })
+    }
+
+    fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>, timeout: Duration) -> Result<bool, std::io::Error> {
+        let mut first_poll = true;
+        loop {
+            let chunk = if first_poll {
+                first_poll = false;
+                self.input_reader.poll_timeout(&mut self.stream, timeout)?
+            } else {
+                self.input_reader.poll(&mut self.stream)?
+            };
+            match chunk {
+                Some(bytes) if bytes.is_empty() => return Ok(false),
+                Some(bytes) => self.input_buffer.extend_from_slice(&bytes),
+                None => break,
+            }
+        }
+
+        while let Some(frame) = Frame::read_from_buffer(&mut self.input_buffer)? {
+            pending.push_back(frame);
+        }
+        Ok(true)
     }
 
     fn enqueue_frame(&mut self, frame: &Frame) -> Result<(), String> {
@@ -1005,6 +1118,54 @@ impl ActiveClient {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(windows)]
+struct ActiveClientReader {
+    reader: crate::platform::ipc::OverlappedRead,
+}
+
+#[cfg(windows)]
+impl ActiveClientReader {
+    fn new(stream: &SessionStream) -> Result<Self, String> {
+        let reader = stream.overlapped_reader(64 * 1024).map_err(|err| format!("create foreground client reader: {err}"))?;
+        Ok(Self { reader })
+    }
+
+    fn poll(&mut self, _stream: &mut SessionStream) -> Result<Option<Vec<u8>>, std::io::Error> {
+        self.reader.poll()
+    }
+
+    fn poll_timeout(&mut self, _stream: &mut SessionStream, timeout: Duration) -> Result<Option<Vec<u8>>, std::io::Error> {
+        self.reader.poll_timeout(timeout)
+    }
+}
+
+#[cfg(not(windows))]
+struct ActiveClientReader;
+
+#[cfg(not(windows))]
+impl ActiveClientReader {
+    fn new(_stream: &SessionStream) -> Result<Self, String> {
+        Ok(Self)
+    }
+
+    fn poll(&mut self, stream: &mut SessionStream) -> Result<Option<Vec<u8>>, std::io::Error> {
+        self.poll_timeout(stream, Duration::ZERO)
+    }
+
+    fn poll_timeout(&mut self, stream: &mut SessionStream, _timeout: Duration) -> Result<Option<Vec<u8>>, std::io::Error> {
+        let mut buf = vec![0; 64 * 1024];
+        match stream.read(&mut buf) {
+            Ok(0) => Ok(Some(Vec::new())),
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some(buf))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -1037,7 +1198,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h"
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 
@@ -1051,7 +1212,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h"
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 
@@ -1076,7 +1237,8 @@ mod tests {
     #[test]
     fn active_client_rejects_unbounded_output_backlog() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
-        let mut client = super::ActiveClient { stream, pending_output: vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1] };
+        let mut client = super::ActiveClient::new(stream).expect("create active client");
+        client.pending_output = vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1];
 
         let err = client.enqueue_frame(&super::Frame::Output(vec![1])).expect_err("backlog should overflow");
 

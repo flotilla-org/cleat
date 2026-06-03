@@ -160,6 +160,21 @@ impl Frame {
         Self::decode(tag, payload)
     }
 
+    pub(crate) fn read_from_buffer(buffer: &mut Vec<u8>) -> std::io::Result<Option<Self>> {
+        if buffer.len() < 5 {
+            return Ok(None);
+        }
+        let tag = buffer[0];
+        let len = u32::from_le_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+        let frame_len = 5usize.checked_add(len).ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame length overflow"))?;
+        if buffer.len() < frame_len {
+            return Ok(None);
+        }
+        let payload = buffer[5..frame_len].to_vec();
+        buffer.drain(..frame_len);
+        Self::decode(tag, payload).map(Some)
+    }
+
     pub fn write(&self, writer: &mut impl Write) -> std::io::Result<()> {
         let (tag, payload) = self.encode();
         let mut header = [0u8; 5];

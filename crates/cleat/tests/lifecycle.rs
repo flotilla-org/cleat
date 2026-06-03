@@ -108,7 +108,7 @@ fn create_uses_requested_vt_engine() {
     assert_eq!(created.vt_engine, VtEngineKind::Passthrough);
 }
 
-#[cfg(not(feature = "ghostty-vt"))]
+#[cfg(all(not(feature = "ghostty-vt"), not(windows)))]
 #[test]
 fn create_rejects_unavailable_vt_engine() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -122,7 +122,7 @@ fn create_rejects_unavailable_vt_engine() {
     assert!(err.contains("ghostty-vt"));
 }
 
-#[cfg(not(feature = "ghostty-vt"))]
+#[cfg(all(not(feature = "ghostty-vt"), not(windows)))]
 #[test]
 fn create_rejects_default_nonfunctional_build() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -274,7 +274,7 @@ fn attach_creates_session_lazily_and_reuses_it_on_later_attach() {
     assert_eq!(second.vt_engine, vt::default_vt_engine_kind());
 }
 
-#[cfg(not(feature = "ghostty-vt"))]
+#[cfg(all(not(feature = "ghostty-vt"), not(windows)))]
 #[test]
 fn attach_rejects_lazy_create_in_nonfunctional_build() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());

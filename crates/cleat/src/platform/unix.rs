@@ -17,7 +17,11 @@ use nix::{
     unistd::{chdir, execvp, read as nix_read, tcgetpgrp, write as nix_write, Pid},
 };
 
-use crate::{protocol::SignalTarget, runtime::SessionMetadata};
+use crate::{
+    platform::ipc::{SessionListener, SessionStream},
+    protocol::SignalTarget,
+    runtime::SessionMetadata,
+};
 
 const STRIP_ENV_VARS: &[&str] = &["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"];
 
@@ -100,12 +104,15 @@ pub struct PollResult {
 }
 
 pub fn poll_session_ready(
-    listener_fd: RawFd,
-    client_fd: Option<RawFd>,
+    listener: &SessionListener,
+    client: Option<&SessionStream>,
     client_needs_write: bool,
-    pty_fd: RawFd,
+    pty_child: &PtyChild,
     timeout_ms: i32,
 ) -> Result<PollResult, String> {
+    let listener_fd = listener.as_raw_fd();
+    let client_fd = client.map(AsRawFd::as_raw_fd);
+    let pty_fd = pty_child.master_fd();
     let listener_borrowed = borrow_raw(listener_fd);
     let pty_borrowed = borrow_raw(pty_fd);
     let mut fds = vec![PollFd::new(listener_borrowed, PollFlags::POLLIN), PollFd::new(pty_borrowed, PollFlags::POLLIN)];

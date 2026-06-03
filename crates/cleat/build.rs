@@ -90,14 +90,13 @@ fn ghostty_install(repo_root: &Path) -> Result<GhosttyInstall, String> {
     }
 
     let static_lib = lib_dir.join(static_library_filename());
-    if static_lib.exists() {
-        return Ok(GhosttyInstall { prefix, lib_dir, link_mode: LinkMode::Static, shared_lib: None });
-    }
-
     if !shared_lib.exists() {
+        if static_lib.exists() {
+            return Ok(GhosttyInstall { prefix, lib_dir, link_mode: LinkMode::Static, shared_lib: None });
+        }
         return Err(missing_ghostty_install_message(
             &prefix,
-            format!("missing ghostty library; expected {} or {}", static_lib.display(), shared_lib.display()),
+            format!("missing ghostty library; expected {} or {}", shared_lib.display(), static_lib.display()),
         ));
     }
 

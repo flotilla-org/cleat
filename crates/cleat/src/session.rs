@@ -1034,11 +1034,23 @@ fn drain_pty_output_after_exit(
                     }
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || is_pty_eof_after_exit(&err) => break,
             Err(err) => return Err(format!("read pty output after exit: {err}")),
         }
     }
     Ok(())
+}
+
+fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 struct DrainExitContext<'a> {

@@ -6,7 +6,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Storage::FileSystem::{CreateFileW, ReadFile, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
     System::{
         Console::{
@@ -19,7 +19,7 @@ use windows_sys::Win32::{
     },
 };
 
-const GENERIC_READ_WRITE: u32 = 0x8000_0000 | 0x4000_0000;
+const GENERIC_READ_WRITE: u32 = GENERIC_READ | GENERIC_WRITE;
 const VK_BACK: u16 = 0x08;
 const VK_TAB: u16 = 0x09;
 const VK_RETURN: u16 = 0x0d;

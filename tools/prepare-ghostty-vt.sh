@@ -68,9 +68,13 @@ mkdir -p "$INSTALL_DIR"
 (cd "$SOURCE_DIR" && zig build $build_step --prefix "$INSTALL_DIR")
 
 test -f "$INSTALL_DIR/include/ghostty/vt.h"
-test -f "$INSTALL_DIR/lib/libghostty-vt.a"
 
 case "$(uname -s)" in
-  Darwin) test -f "$INSTALL_DIR/lib/libghostty-vt.dylib" ;;
-  *)      test -f "$INSTALL_DIR/lib/libghostty-vt.so" ;;
+  Darwin) shared_lib="$INSTALL_DIR/lib/libghostty-vt.dylib" ;;
+  *)      shared_lib="$INSTALL_DIR/lib/libghostty-vt.so" ;;
 esac
+static_lib="$INSTALL_DIR/lib/libghostty-vt.a"
+if [ ! -f "$static_lib" ] && [ ! -f "$shared_lib" ]; then
+  echo "missing Ghostty VT library: expected $static_lib or $shared_lib" >&2
+  exit 1
+fi

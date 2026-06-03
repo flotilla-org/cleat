@@ -34,10 +34,8 @@ pub struct PtyChild {
     process: HANDLE,
     thread: HANDLE,
     process_id: u32,
-    input_read: HANDLE,
     input_write: HANDLE,
     output_read: HANDLE,
-    output_write: HANDLE,
 }
 
 impl PtyChild {
@@ -45,16 +43,18 @@ impl PtyChild {
         let pipes = Pipes::new()?;
         let conpty = create_pseudo_console(80, 24, pipes.input_read, pipes.output_write)?;
         let process = spawn_with_conpty(&windows_shell_command(session), conpty, session.cwd.as_ref())?;
+        unsafe {
+            CloseHandle(pipes.input_read);
+            CloseHandle(pipes.output_write);
+        }
 
         Ok(Self {
             conpty,
             process: process.hProcess,
             thread: process.hThread,
             process_id: process.dwProcessId,
-            input_read: pipes.input_read,
             input_write: pipes.input_write,
             output_read: pipes.output_read,
-            output_write: pipes.output_write,
         })
     }
 
@@ -158,9 +158,7 @@ impl Drop for PtyChild {
     fn drop(&mut self) {
         unsafe {
             CloseHandle(self.input_write);
-            CloseHandle(self.input_read);
             CloseHandle(self.output_read);
-            CloseHandle(self.output_write);
             CloseHandle(self.thread);
             CloseHandle(self.process);
             ClosePseudoConsole(self.conpty);
@@ -186,7 +184,10 @@ pub fn poll_session_ready(
     pty_child: &PtyChild,
     timeout_ms: i32,
 ) -> Result<PollResult, String> {
-    let client_readable = client.map(SessionStream::has_available_bytes).transpose()?.unwrap_or(false);
+    // Named-pipe byte availability is not a reliable readiness boundary for
+    // the foreground client stream here. The session stream is nonblocking, so
+    // the daemon loop can cheaply attempt a read and let WouldBlock mean idle.
+    let client_readable = client.is_some();
     let pty_readable = pty_child.output_available()?;
     let listener_readable = true;
 

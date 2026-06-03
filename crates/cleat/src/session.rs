@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -22,10 +22,7 @@ use crate::{
             set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
         },
         pty::{exit_code_from_wait_status, poll_session_ready, PtyChild},
-        terminal::{
-            attach_signal_exit_requested, current_terminal_size, poll_stdin_readable, stdout_is_tty, AttachSignalHandlers,
-            TerminalModeGuard,
-        },
+        terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::Frame,
     runtime::{RuntimeLayout, SessionMetadata},
@@ -35,7 +32,8 @@ use crate::{
 const FOREGROUND_NAME: &str = "foreground";
 const DEFAULT_TERMINAL_COLS: u16 = 80;
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
-const DETACH_CLEANUP_SEQUENCE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h";
+const DETACH_CLEANUP_SEQUENCE: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -48,7 +46,7 @@ pub struct ForegroundAttach {
 impl ForegroundAttach {
     pub fn relay_stdio(self) -> Result<(), String> {
         let mut cleanup = AttachCleanupGuard::stdout();
-        let _tty_mode = TerminalModeGuard::activate()?;
+        let mut terminal = ForegroundTerminal::enter()?;
         let _signal_handlers = AttachSignalHandlers::install()?;
         let read_handle = {
             let stream = self.stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
@@ -93,21 +91,15 @@ impl ForegroundAttach {
             Ok(())
         });
 
-        let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 4096];
         let stdin_result = loop {
             if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
                 break Ok(());
             }
-            match poll_stdin_readable(Duration::from_millis(100)) {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(_err) if attach_signal_exit_requested() => break Ok(()),
-                Err(err) => break Err(err),
-            }
-            match stdin.read(&mut buf) {
-                Ok(0) => break Ok(()),
-                Ok(n) => {
+            match terminal.read_input(Duration::from_millis(100), &mut buf) {
+                Ok(None) => continue,
+                Ok(Some(0)) => break Ok(()),
+                Ok(Some(n)) => {
                     let mut stream = self.stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
                     if let Err(err) = Frame::Input(buf[..n].to_vec()).write(&mut *stream) {
                         if is_graceful_socket_shutdown(&err) {
@@ -115,6 +107,17 @@ impl ForegroundAttach {
                         }
                         break Err(format!("write input frame: {err}"));
                     }
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    break Ok(())
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => break Err(format!("read stdin: {err}")),
@@ -449,8 +452,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 pty_child.resize(cols, rows)?;
                                 let replay = apply_attach_state(vt_engine.as_mut(), cols, rows, &capabilities)?;
                                 Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
-                                set_stream_nonblocking(&stream, true).map_err(|err| format!("set client nonblocking: {err}"))?;
-                                let mut client = ActiveClient::new(stream);
+                                let mut client = ActiveClient::new(stream)?;
                                 if let Some(payload) = replay {
                                     if !payload.is_empty() {
                                         if had_foreground_client {
@@ -702,28 +704,14 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
         }
 
-        if poll_result.client_readable {
+        if active_client.is_some() {
             let mut client_disconnected = false;
             let mut pending = VecDeque::new();
-            if let Some(stream) = active_client.as_mut() {
-                loop {
-                    match Frame::read(&mut stream.stream) {
-                        Ok(frame) => pending.push_back(frame),
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(err)
-                            if matches!(
-                                err.kind(),
-                                std::io::ErrorKind::UnexpectedEof
-                                    | std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::ConnectionAborted
-                            ) =>
-                        {
-                            client_disconnected = true;
-                            break;
-                        }
-                        Err(err) => return Err(format!("read client frame: {err}")),
-                    }
+            if let Some(client) = active_client.as_mut() {
+                match client.drain_input_frames(&mut pending) {
+                    Ok(true) => {}
+                    Ok(false) => client_disconnected = true,
+                    Err(err) => return Err(format!("read client frame: {err}")),
                 }
             }
 
@@ -1058,11 +1046,29 @@ fn drain_pty_output_after_exit(
 struct ActiveClient {
     stream: SessionStream,
     pending_output: Vec<u8>,
+    input_reader: crate::platform::ipc::OverlappedRead,
+    input_buffer: Vec<u8>,
 }
 
 impl ActiveClient {
-    fn new(stream: SessionStream) -> Self {
-        Self { stream, pending_output: Vec::new() }
+    fn new(stream: SessionStream) -> Result<Self, String> {
+        let input_reader = stream.overlapped_reader(64 * 1024).map_err(|err| format!("create foreground client reader: {err}"))?;
+        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new() })
+    }
+
+    fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>) -> Result<bool, std::io::Error> {
+        loop {
+            match self.input_reader.poll()? {
+                Some(bytes) if bytes.is_empty() => return Ok(false),
+                Some(bytes) => self.input_buffer.extend_from_slice(&bytes),
+                None => break,
+            }
+        }
+
+        while let Some(frame) = Frame::read_from_buffer(&mut self.input_buffer)? {
+            pending.push_back(frame);
+        }
+        Ok(true)
     }
 
     fn enqueue_frame(&mut self, frame: &Frame) -> Result<(), String> {
@@ -1120,7 +1126,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h"
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 
@@ -1134,7 +1140,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h"
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 

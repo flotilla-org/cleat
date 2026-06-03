@@ -325,6 +325,8 @@ impl Drop for OverlappedRead {
         unsafe {
             if self.pending {
                 CancelIoEx(self.handle, &mut *self.overlapped);
+                let mut transferred = 0;
+                let _ = GetOverlappedResult(self.handle, &mut *self.overlapped, &mut transferred, 1);
             }
             CloseHandle(self.event);
         }

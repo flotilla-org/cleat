@@ -387,6 +387,8 @@ impl ExecResult {
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     match cli.command {
         Command::Attach { id, no_create, vt, cwd, cmd, record } => {
+            // Windows can provide basic sessions through ConPTY plus the
+            // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
             if !no_create && !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
@@ -406,6 +408,8 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             }
         }
         Command::Launch { id, json, vt, cwd, cmd, record } => {
+            // Windows can provide basic sessions through ConPTY plus the
+            // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
             if !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());

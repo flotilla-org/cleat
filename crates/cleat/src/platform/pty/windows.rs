@@ -29,6 +29,10 @@ use crate::{
     runtime::SessionMetadata,
 };
 
+const POSIX_SIGINT: i32 = 2;
+const POSIX_SIGKILL: i32 = 9;
+const POSIX_SIGTERM: i32 = 15;
+
 pub struct PtyChild {
     conpty: HPCON,
     process: HANDLE,
@@ -129,7 +133,7 @@ impl PtyChild {
 
     pub fn dispatch_signal(&self, signal: i32, _target: SignalTarget) -> Result<(), String> {
         match signal {
-            2 => {
+            POSIX_SIGINT => {
                 let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, self.process_id) };
                 if ok == 0 {
                     Err(last_error("GenerateConsoleCtrlEvent"))
@@ -137,7 +141,7 @@ impl PtyChild {
                     Ok(())
                 }
             }
-            9 | 15 => {
+            POSIX_SIGKILL | POSIX_SIGTERM => {
                 let ok = unsafe { TerminateProcess(self.process, signal as u32) };
                 if ok == 0 {
                     Err(last_error("TerminateProcess"))
@@ -186,7 +190,8 @@ pub fn poll_session_ready(
 ) -> Result<PollResult, String> {
     // Named-pipe byte availability is not a reliable readiness boundary for
     // the foreground client stream here. The session loop owns an overlapped
-    // read and applies the idle timeout when it drains client input.
+    // read and applies the idle timeout when it drains client input, so this
+    // flag means "client connected" on Windows rather than "bytes available".
     let client_readable = client.is_some();
     let pty_readable = pty_child.output_available()?;
     let listener_readable = true;

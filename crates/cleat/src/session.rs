@@ -707,8 +707,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         if active_client.is_some() {
             let mut client_disconnected = false;
             let mut pending = VecDeque::new();
+            let client_read_timeout =
+                if poll_result.pty_readable || poll_result.client_writable { Duration::ZERO } else { Duration::from_millis(100) };
             if let Some(client) = active_client.as_mut() {
-                match client.drain_input_frames(&mut pending) {
+                match client.drain_input_frames(&mut pending, client_read_timeout) {
                     Ok(true) => {}
                     Ok(false) => client_disconnected = true,
                     Err(err) => return Err(format!("read client frame: {err}")),
@@ -1056,9 +1058,16 @@ impl ActiveClient {
         Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new() })
     }
 
-    fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>) -> Result<bool, std::io::Error> {
+    fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>, timeout: Duration) -> Result<bool, std::io::Error> {
+        let mut first_poll = true;
         loop {
-            match self.input_reader.poll()? {
+            let chunk = if first_poll {
+                first_poll = false;
+                self.input_reader.poll_timeout(timeout)?
+            } else {
+                self.input_reader.poll()?
+            };
+            match chunk {
                 Some(bytes) if bytes.is_empty() => return Ok(false),
                 Some(bytes) => self.input_buffer.extend_from_slice(&bytes),
                 None => break,

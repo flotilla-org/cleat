@@ -148,17 +148,14 @@ fn list_reports_existing_sessions() {
     let output = cli::execute(cli, &service).expect("execute list").expect("list output");
     let lines: Vec<_> = output.lines().collect();
 
-    assert_eq!(
-        lines,
-        vec![
-            format!(
-                "alpha\tdetached\t{} ({})\t/repo",
-                vt::default_vt_engine_kind().as_str(),
-                vt::vt_engine_status(vt::default_vt_engine_kind())
-            ),
-            format!("beta\tdetached\tpassthrough ({})\tzsh", vt::vt_engine_status(VtEngineKind::Passthrough)),
-        ]
-    );
+    assert_eq!(lines, vec![
+        format!(
+            "alpha\tdetached\t{} ({})\t/repo",
+            vt::default_vt_engine_kind().as_str(),
+            vt::vt_engine_status(vt::default_vt_engine_kind())
+        ),
+        format!("beta\tdetached\tpassthrough ({})\tzsh", vt::vt_engine_status(VtEngineKind::Passthrough)),
+    ]);
 }
 
 #[test]

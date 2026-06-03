@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -53,7 +54,12 @@ impl ForegroundTerminal {
                     & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_MOUSE_INPUT);
                 set_console_mode(input_handle.handle, raw)?;
                 let vt_input = set_console_mode(input_handle.handle, raw | ENABLE_VIRTUAL_TERMINAL_INPUT).is_ok();
-                let input_reader = TerminalInput::Console { handle: input_handle.handle, vt_input, pending_high_surrogate: None };
+                let input_reader = TerminalInput::Console {
+                    handle: input_handle.handle,
+                    vt_input,
+                    pending_high_surrogate: None,
+                    pending_bytes: VecDeque::new(),
+                };
                 (input_reader, Some(ConsoleHandleMode { handle: input_handle, original }))
             }
             None => (TerminalInput::ByteStream { handle: input_handle.handle }, None),
@@ -136,15 +142,15 @@ pub fn stdout_is_tty() -> Result<bool, String> {
 }
 
 enum TerminalInput {
-    Console { handle: HANDLE, vt_input: bool, pending_high_surrogate: Option<u16> },
+    Console { handle: HANDLE, vt_input: bool, pending_high_surrogate: Option<u16>, pending_bytes: VecDeque<u8> },
     ByteStream { handle: HANDLE },
 }
 
 impl TerminalInput {
     fn read(&mut self, timeout: Duration, buf: &mut [u8]) -> io::Result<Option<usize>> {
         match self {
-            Self::Console { handle, vt_input, pending_high_surrogate } => {
-                read_console_input(*handle, *vt_input, pending_high_surrogate, timeout, buf)
+            Self::Console { handle, vt_input, pending_high_surrogate, pending_bytes } => {
+                read_console_input(*handle, *vt_input, pending_high_surrogate, pending_bytes, timeout, buf)
             }
             Self::ByteStream { handle } => read_byte_stream(*handle, buf).map(Some),
         }
@@ -165,9 +171,14 @@ fn read_console_input(
     handle: HANDLE,
     vt_input: bool,
     pending_high_surrogate: &mut Option<u16>,
+    pending_bytes: &mut VecDeque<u8>,
     timeout: Duration,
     buf: &mut [u8],
 ) -> io::Result<Option<usize>> {
+    if !pending_bytes.is_empty() {
+        return Ok(Some(drain_pending_bytes(pending_bytes, buf)));
+    }
+
     if !wait_for_handle(handle, timeout)? {
         return Ok(None);
     }
@@ -209,6 +220,7 @@ fn read_console_input(
         if !out.is_empty() {
             let n = out.len().min(buf.len());
             buf[..n].copy_from_slice(&out[..n]);
+            pending_bytes.extend(out[n..].iter().copied());
             return Ok(Some(n));
         }
 
@@ -216,6 +228,14 @@ fn read_console_input(
             return Ok(None);
         }
     }
+}
+
+fn drain_pending_bytes(pending: &mut VecDeque<u8>, buf: &mut [u8]) -> usize {
+    let n = pending.len().min(buf.len());
+    for slot in buf.iter_mut().take(n) {
+        *slot = pending.pop_front().expect("pending byte available");
+    }
+    n
 }
 
 fn append_key_event_bytes(virtual_key: u16, unicode: u16, pending_high_surrogate: &mut Option<u16>, out: &mut Vec<u8>) {

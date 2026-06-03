@@ -185,8 +185,8 @@ pub fn poll_session_ready(
     timeout_ms: i32,
 ) -> Result<PollResult, String> {
     // Named-pipe byte availability is not a reliable readiness boundary for
-    // the foreground client stream here. The session stream is nonblocking, so
-    // the daemon loop can cheaply attempt a read and let WouldBlock mean idle.
+    // the foreground client stream here. The session loop owns an overlapped
+    // read and applies the idle timeout when it drains client input.
     let client_readable = client.is_some();
     let pty_readable = pty_child.output_available()?;
     let listener_readable = true;
@@ -318,6 +318,8 @@ fn spawn_with_conpty(command_line: &str, conpty: HPCON, cwd: Option<&PathBuf>) -
 
 fn windows_shell_command(session: &SessionMetadata) -> String {
     match &session.cmd {
+        // Keep explicit commands in cmd.exe syntax for now. A PowerShell
+        // command path would need separate quoting and -Command semantics.
         Some(cmd) => format!("cmd.exe /D /C {}", quote_windows_arg(cmd)),
         None => "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass".to_string(),
     }
@@ -381,9 +383,8 @@ fn last_error(operation: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{runtime::SessionMetadata, vt::VtEngineKind};
-
     use super::{quote_windows_arg, windows_shell_command};
+    use crate::{runtime::SessionMetadata, vt::VtEngineKind};
 
     #[test]
     fn quotes_empty_argument() {

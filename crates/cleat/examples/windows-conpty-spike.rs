@@ -1,22 +1,28 @@
 #[cfg(windows)]
 mod spike {
-    use std::error::Error;
-    use std::ffi::c_void;
-    use std::fs::File;
-    use std::io::{Read, Write};
-    use std::mem::{size_of, zeroed};
-    use std::os::windows::io::FromRawHandle;
-    use std::ptr::{null, null_mut};
-    use std::thread;
+    use std::{
+        error::Error,
+        ffi::c_void,
+        fs::File,
+        io::{Read, Write},
+        mem::{size_of, zeroed},
+        os::windows::io::FromRawHandle,
+        ptr::{null, null_mut},
+        thread,
+    };
 
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::System::Console::{ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON};
-    use windows_sys::Win32::System::Pipes::CreatePipe;
-    use windows_sys::Win32::System::Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
-        WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Security::SECURITY_ATTRIBUTES,
+        System::{
+            Console::{ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON},
+            Pipes::CreatePipe,
+            Threading::{
+                CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, InitializeProcThreadAttributeList,
+                UpdateProcThreadAttribute, WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+                PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            },
+        },
     };
 
     const READY_MARKER: &str = "cleat-conpty-ready";

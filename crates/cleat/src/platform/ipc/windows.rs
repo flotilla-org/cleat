@@ -7,7 +7,7 @@ use std::{
     path::Path,
     ptr::{null, null_mut},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
@@ -111,7 +111,7 @@ pub fn connect_session_stream(socket_path: &Path) -> Result<SessionStream, Strin
 }
 
 pub fn try_connect_session_stream(socket_path: &Path) -> io::Result<SessionStream> {
-    let pipe_name = pipe_name_for_socket_path(socket_path);
+    let pipe_name = pipe_name_from_marker_file(socket_path)?;
     let handle = open_pipe(&pipe_name)?;
     Ok(SessionStream { handle })
 }
@@ -269,6 +269,10 @@ impl OverlappedRead {
     }
 
     pub(crate) fn poll(&mut self) -> io::Result<Option<Vec<u8>>> {
+        self.poll_timeout(Duration::ZERO)
+    }
+
+    pub(crate) fn poll_timeout(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
         if !self.pending {
             unsafe {
                 ResetEvent(self.event);
@@ -295,7 +299,7 @@ impl OverlappedRead {
             }
         }
 
-        match unsafe { WaitForSingleObject(self.event, 0) } {
+        match unsafe { WaitForSingleObject(self.event, wait_timeout_ms(timeout)) } {
             WAIT_TIMEOUT => Ok(None),
             WAIT_OBJECT_0 => {
                 let mut transferred = 0;
@@ -327,6 +331,8 @@ impl Drop for OverlappedRead {
     }
 }
 
+// windows-sys imports Win32 constants as static values, which cannot be used
+// directly in Rust match patterns.
 const ERROR_PIPE_LISTING_ALIAS: u32 = ERROR_PIPE_LISTENING;
 
 fn overlapped_read_blocking(handle: HANDLE, buf: &mut [u8]) -> io::Result<usize> {
@@ -405,6 +411,7 @@ fn create_pipe_instance(pipe_name: &[u16]) -> io::Result<HANDLE> {
 }
 
 fn open_pipe(pipe_name: &[u16]) -> io::Result<HANDLE> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let handle = unsafe {
             CreateFileW(pipe_name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, null_mut())
@@ -416,9 +423,17 @@ fn open_pipe(pipe_name: &[u16]) -> io::Result<HANDLE> {
         let error = unsafe { GetLastError() };
         match error {
             ERROR_PIPE_BUSY => {
-                let waited = unsafe { WaitNamedPipeW(pipe_name.as_ptr(), 5_000) };
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for named pipe"));
+                }
+                let remaining_ms = deadline.saturating_duration_since(now).as_millis().min(5_000) as u32;
+                let waited = unsafe { WaitNamedPipeW(pipe_name.as_ptr(), remaining_ms) };
                 if waited == 0 {
-                    return Err(io::Error::last_os_error());
+                    let err = io::Error::last_os_error();
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, format!("timed out waiting for named pipe: {err}")));
+                    }
                 }
             }
             ERROR_FILE_NOT_FOUND => return Err(io_error_from_code(error)),
@@ -447,8 +462,21 @@ fn pipe_name_for_socket_path(socket_path: &Path) -> Vec<u16> {
     format!(r"\\.\pipe\cleat-{:016x}", hasher.finish()).encode_utf16().chain(Some(0)).collect()
 }
 
+fn pipe_name_from_marker_file(socket_path: &Path) -> io::Result<Vec<u16>> {
+    let pipe_name = fs::read_to_string(socket_path)?;
+    let pipe_name = pipe_name.trim_end_matches(['\r', '\n']);
+    if pipe_name.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("empty named-pipe marker {}", socket_path.display())));
+    }
+    Ok(pipe_name.encode_utf16().chain(Some(0)).collect())
+}
+
 fn display_wide(value: &[u16]) -> String {
     String::from_utf16_lossy(value.strip_suffix(&[0]).unwrap_or(value))
+}
+
+fn wait_timeout_ms(timeout: Duration) -> u32 {
+    timeout.as_millis().min(u32::MAX as u128) as u32
 }
 
 fn io_error_from_code(code: u32) -> io::Error {

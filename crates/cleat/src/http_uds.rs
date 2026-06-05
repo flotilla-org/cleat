@@ -353,19 +353,24 @@ pub(crate) fn read_response(reader: &mut impl Read) -> std::io::Result<HttpRespo
 
 pub(crate) fn read_response_head(reader: &mut impl Read) -> std::io::Result<HttpResponse> {
     let mut bytes = Vec::new();
-    while !has_header_end(&bytes) {
+    let header_end = loop {
+        if let Some(header_end) = header_end_index(&bytes) {
+            break header_end;
+        }
         if bytes.len() >= MAX_HEADER_BYTES {
             return Err(Error::new(ErrorKind::InvalidData, "HTTP response headers exceeded maximum size"));
         }
+        // Used for the attach upgrade handshake. Do not stage larger reads
+        // here: bytes after the header already belong to the upgraded frame
+        // stream and must stay unread for the attach relay.
         let mut buf = [0; 1];
         let n = reader.read(&mut buf)?;
         if n == 0 {
             return Err(Error::new(ErrorKind::UnexpectedEof, "connection closed before HTTP response headers completed"));
         }
         bytes.extend_from_slice(&buf[..n]);
-    }
+    };
 
-    let header_end = header_end_index(&bytes).expect("header end checked");
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut headers);
     let status = parsed.parse(&bytes[..header_end + 4]).map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
@@ -495,10 +500,6 @@ fn content_length(headers: &[httparse::Header<'_>]) -> std::io::Result<usize> {
         }
     }
     Ok(0)
-}
-
-fn has_header_end(bytes: &[u8]) -> bool {
-    header_end_index(bytes).is_some()
 }
 
 fn header_end_index(bytes: &[u8]) -> Option<usize> {

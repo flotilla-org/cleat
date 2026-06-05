@@ -129,7 +129,6 @@ impl SessionRuntime {
         self.vt_engine.screen_text().map(|_| ())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn snapshot(&mut self, dirty: DirtyState) -> Result<TerminalSnapshot, String> {
         self.vt_engine.screen_grid().map(|grid| TerminalSnapshot::from_screen_grid(grid, dirty))
     }

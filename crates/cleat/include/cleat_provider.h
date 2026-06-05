@@ -10,6 +10,28 @@ extern "C" {
 #endif
 
 #define CLEAT_PROVIDER_ABI_VERSION 1u
+#define CLEAT_PROVIDER_BACKEND_MOCK 0u
+#define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
+#define CLEAT_PROVIDER_VT_DEFAULT 0u
+#define CLEAT_PROVIDER_VT_PASSTHROUGH 1u
+#define CLEAT_PROVIDER_VT_GHOSTTY 2u
+#define CLEAT_INPUT_KEY 1u
+#define CLEAT_INPUT_TEXT 2u
+#define CLEAT_INPUT_MOUSE 3u
+#define CLEAT_INPUT_FOCUS 4u
+#define CLEAT_INPUT_PASTE 5u
+#define CLEAT_INPUT_RESIZE 6u
+#define CLEAT_KEY_UNICODE_SCALAR 1u
+#define CLEAT_KEY_NAMED 2u
+#define CLEAT_KEY_ENTER 1u
+#define CLEAT_KEY_ESCAPE 2u
+#define CLEAT_KEY_BACKSPACE 3u
+#define CLEAT_KEY_TAB 4u
+#define CLEAT_KEY_DELETE 5u
+#define CLEAT_KEY_ARROW_UP 12u
+#define CLEAT_KEY_ARROW_DOWN 13u
+#define CLEAT_KEY_ARROW_LEFT 14u
+#define CLEAT_KEY_ARROW_RIGHT 15u
 
 typedef struct CleatProvider cleat_provider;
 typedef struct CleatSession cleat_session;
@@ -23,6 +45,9 @@ typedef enum cleat_dirty_state {
 typedef struct cleat_provider_desc {
     uint32_t abi_version;
     uint32_t requested_features;
+    uint32_t backend;
+    const uint8_t *runtime_root;
+    size_t runtime_root_len;
 } cleat_provider_desc;
 
 typedef struct cleat_session_desc {
@@ -30,6 +55,12 @@ typedef struct cleat_session_desc {
     uint16_t rows;
     float cell_width_px;
     float cell_height_px;
+    uint32_t vt_engine;
+    const uint8_t *command;
+    size_t command_len;
+    const uint8_t *cwd;
+    size_t cwd_len;
+    bool record;
 } cleat_session_desc;
 
 typedef struct cleat_rgb {

@@ -3,6 +3,7 @@ pub mod cast_reader;
 pub mod cli;
 pub mod da;
 pub mod duration_parser;
+mod http_uds;
 pub mod keys;
 pub mod platform;
 pub mod protocol;

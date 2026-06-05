@@ -3,6 +3,7 @@
 #[cfg(feature = "ghostty-vt")]
 use std::process::{Command, Stdio};
 use std::{
+    io::{Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -39,6 +40,19 @@ fn wait_for_socket(path: &std::path::Path) {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("timed out waiting for socket {}", path.display());
+}
+
+fn http_session_request(root: &std::path::Path, id: &str, request: &str) -> String {
+    let socket_path = session_socket_path(root, id);
+    let mut stream = UnixStream::connect(&socket_path).expect("connect session socket");
+    stream.write_all(request.as_bytes()).expect("write request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    response
+}
+
+fn http_body(response: &str) -> &str {
+    response.split_once("\r\n\r\n").map(|(_, body)| body).expect("HTTP response body")
 }
 
 struct EnvVarGuard {
@@ -190,6 +204,50 @@ fn capture_rejects_passthrough_sessions() {
     let err = cli::execute(cli, &service).expect_err("passthrough capture should fail");
 
     assert!(err.contains("placeholder"));
+}
+
+#[test]
+fn session_daemon_accepts_http_control_requests_on_session_socket() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+
+    let health = http_session_request(temp.path(), "alpha", "GET /healthz HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
+    assert!(http_body(&health).contains("\"service\":\"cleat-session\""));
+
+    let inspect = http_session_request(temp.path(), "alpha", "GET /sessions/alpha HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(inspect.starts_with("HTTP/1.1 200 OK\r\n"), "{inspect}");
+    let inspect_json: serde_json::Value = serde_json::from_str(http_body(&inspect)).expect("inspect json");
+    assert_eq!(inspect_json["session"]["id"], "alpha");
+
+    let keys_body = r#"{"bytes":[104,105,10]}"#;
+    let keys = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!("POST /sessions/alpha/keys HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}", keys_body.len(), keys_body),
+    );
+    assert!(keys.starts_with("HTTP/1.1 204 No Content\r\n"), "{keys}");
+
+    let resize_body = r#"{"cols":12,"rows":7}"#;
+    let resize = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!("POST /sessions/alpha/resize HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}", resize_body.len(), resize_body),
+    );
+    assert!(resize.starts_with("HTTP/1.1 204 No Content\r\n"), "{resize}");
+
+    let resized = http_session_request(temp.path(), "alpha", "GET /sessions/alpha HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    let resized_json: serde_json::Value = serde_json::from_str(http_body(&resized)).expect("resized inspect json");
+    assert_eq!(resized_json["terminal"]["cols"], 12);
+    assert_eq!(resized_json["terminal"]["rows"], 7);
+
+    let snapshot = http_session_request(temp.path(), "alpha", "GET /sessions/alpha/snapshot HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(snapshot.starts_with("HTTP/1.1 409 Conflict\r\n"), "{snapshot}");
+    assert!(http_body(&snapshot).contains("placeholder"));
+
+    service.kill("alpha").expect("kill alpha");
 }
 
 #[cfg(feature = "ghostty-vt")]

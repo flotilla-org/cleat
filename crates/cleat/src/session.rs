@@ -13,7 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use http::StatusCode;
+
 use crate::{
+    http_uds,
     platform::{
         daemon::spawn_daemon_process,
         ipc::{
@@ -419,7 +422,18 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     {
                         set_stream_nonblocking(&stream, true).map_err(|err| format!("set accepted stream nonblocking: {err}"))?;
                     }
-                    match Frame::read(&mut stream) {
+                    let mut prefix = [0; 5];
+                    if let Err(err) = stream.read_exact(&mut prefix) {
+                        let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
+                        continue;
+                    }
+                    if http_uds::looks_like_http_prefix(&prefix) {
+                        if let Err(err) = handle_http_request(root, id, &mut stream, &prefix, &mut runtime, &mut active_client) {
+                            let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
+                        }
+                        continue;
+                    }
+                    match Frame::read_after_header(prefix, &mut stream) {
                         Ok(Frame::AttachInit { cols, rows, capabilities }) => {
                             if active_client.is_none() {
                                 let replay = runtime.apply_attach_state(cols, rows, &capabilities)?;
@@ -771,6 +785,68 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 #[cfg(not(any(unix, windows)))]
 pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<(), String> {
     Err("session daemon is only supported on unix".into())
+}
+
+fn handle_http_request(
+    root: &Path,
+    daemon_id: &str,
+    stream: &mut SessionStream,
+    prefix: &[u8],
+    runtime: &mut SessionRuntime,
+    active_client: &mut Option<ActiveClient>,
+) -> Result<(), String> {
+    let request = http_uds::read_request_with_prefix(stream, prefix).map_err(|err| format!("read HTTP request: {err}"))?;
+    match http_uds::route(&request) {
+        http_uds::Route::Root | http_uds::Route::Health => http_uds::write_json(
+            stream,
+            StatusCode::OK,
+            &serde_json::json!({
+                "service": "cleat-session",
+                "session": daemon_id,
+                "ok": true,
+            }),
+        )
+        .map_err(|err| format!("write HTTP response: {err}")),
+        http_uds::Route::SessionInspect { id } if id == daemon_id => {
+            let result = runtime.inspect(active_client.is_some());
+            http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
+        }
+        http_uds::Route::SessionKeys { id } if id == daemon_id => {
+            let body: http_uds::KeysRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys request: {err}"))?;
+            runtime.write_input(&body.bytes)?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP keys response: {err}"))
+        }
+        http_uds::Route::SessionResize { id } if id == daemon_id => {
+            let body: http_uds::ResizeRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resize request: {err}"))?;
+            runtime.resize(body.cols, body.rows)?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP resize response: {err}"))
+        }
+        http_uds::Route::SessionSnapshot { id } if id == daemon_id => {
+            let output = runtime.read_available_output(active_client.is_some())?;
+            if let Some(client) = active_client.as_mut() {
+                for chunk in output.chunks {
+                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
+                        let _ = fs::remove_file(foreground_path(root, daemon_id));
+                        runtime.record_detach();
+                        *active_client = None;
+                        break;
+                    }
+                }
+            }
+            match runtime.snapshot(crate::provider::DirtyState::Full) {
+                Ok(snapshot) => http_uds::write_json(stream, StatusCode::OK, &http_uds::snapshot_response(snapshot))
+                    .map_err(|err| format!("write HTTP snapshot response: {err}")),
+                Err(err) => {
+                    http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP snapshot error: {err}"))
+                }
+            }
+        }
+        _ => {
+            http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
+        }
+    }
 }
 
 struct ActiveClient {

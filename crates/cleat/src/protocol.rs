@@ -153,6 +153,10 @@ impl Frame {
     pub fn read(reader: &mut impl Read) -> std::io::Result<Self> {
         let mut header = [0u8; 5];
         reader.read_exact(&mut header)?;
+        Self::read_after_header(header, reader)
+    }
+
+    pub(crate) fn read_after_header(header: [u8; 5], reader: &mut impl Read) -> std::io::Result<Self> {
         let tag = header[0];
         let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];

@@ -254,13 +254,19 @@ pub fn attach_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundA
     loop {
         let mut stream = connect_session_stream(&socket_path)?;
         let (cols, rows) = current_terminal_size();
-        Frame::AttachInit { cols, rows, capabilities: attach_init_capabilities() }
-            .write(&mut stream)
-            .map_err(|err| format!("write attach init: {err}"))?;
-        match Frame::read(&mut stream).map_err(|err| format!("read attach response: {err}"))? {
-            Frame::Ack => return Ok(ForegroundAttach { stream: Arc::new(Mutex::new(stream)) }),
-            Frame::Busy => {}
-            other => return Err(format!("unexpected attach response: {other:?}")),
+        let body = serde_json::to_vec(&http_uds::AttachRequest {
+            cols,
+            rows,
+            capabilities: attach_capabilities_to_http(attach_init_capabilities()),
+        })
+        .map_err(|err| format!("serialize attach request: {err}"))?;
+        http_uds::write_attach_upgrade_request(&mut stream, &format!("/sessions/{id}/attach"), &body)
+            .map_err(|err| format!("write attach upgrade request: {err}"))?;
+        let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read attach upgrade response: {err}"))?;
+        match response.status {
+            StatusCode::SWITCHING_PROTOCOLS => return Ok(ForegroundAttach { stream: Arc::new(Mutex::new(stream)) }),
+            StatusCode::CONFLICT => {}
+            other => return Err(format!("unexpected attach response: {other}")),
         }
         if Instant::now() >= deadline {
             return Err(format!("session {id} already has a foreground client"));
@@ -347,6 +353,26 @@ fn record_pty_output(engine: &mut dyn VtEngine, bytes: &[u8]) -> Result<(), Stri
 
 fn attach_init_capabilities() -> vt::ClientCapabilities {
     vt::ClientCapabilities::conservative_fallback()
+}
+
+fn attach_capabilities_to_http(capabilities: vt::ClientCapabilities) -> http_uds::AttachCapabilitiesRequest {
+    http_uds::AttachCapabilitiesRequest {
+        color_level: match capabilities.color_level {
+            vt::ColorLevel::Sixteen => http_uds::AttachColorLevelRequest::Sixteen,
+            vt::ColorLevel::Ansi256 => http_uds::AttachColorLevelRequest::Ansi256,
+            vt::ColorLevel::TrueColor => http_uds::AttachColorLevelRequest::TrueColor,
+        },
+        kitty_keyboard: capabilities.kitty_keyboard,
+    }
+}
+
+fn attach_capabilities_from_http(capabilities: http_uds::AttachCapabilitiesRequest) -> vt::ClientCapabilities {
+    let color_level = match capabilities.color_level {
+        http_uds::AttachColorLevelRequest::Sixteen => vt::ColorLevel::Sixteen,
+        http_uds::AttachColorLevelRequest::Ansi256 => vt::ColorLevel::Ansi256,
+        http_uds::AttachColorLevelRequest::TrueColor => vt::ColorLevel::TrueColor,
+    };
+    vt::ClientCapabilities::new(color_level, capabilities.kitty_keyboard)
 }
 
 #[cfg(test)]
@@ -458,6 +484,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         let mut http_state = HttpRequestState {
                             runtime: &mut runtime,
                             active_client: &mut active_client,
+                            had_foreground_client: &mut had_foreground_client,
                             pending_waits: &mut pending_waits,
                             pending_expects: &mut pending_expects,
                         };
@@ -827,6 +854,7 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
 struct HttpRequestState<'a> {
     runtime: &'a mut SessionRuntime,
     active_client: &'a mut Option<ActiveClient>,
+    had_foreground_client: &'a mut bool,
     pending_waits: &'a mut Vec<PendingWait>,
     pending_expects: &'a mut Vec<PendingExpect>,
 }
@@ -853,6 +881,36 @@ fn handle_http_request(
         http_uds::Route::SessionInspect { id } if id == daemon_id => {
             let result = state.runtime.inspect(state.active_client.is_some());
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
+        }
+        http_uds::Route::SessionAttach { id } if id == daemon_id => 'attach: {
+            let body: http_uds::AttachRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP attach request: {err}"))?;
+            if state.active_client.is_some() {
+                http_uds::write_error(stream, StatusCode::CONFLICT, "session already has a foreground client")
+                    .map_err(|err| format!("write HTTP attach busy response: {err}"))?;
+                break 'attach Ok(());
+            }
+
+            let capabilities = attach_capabilities_from_http(body.capabilities);
+            let replay = state.runtime.apply_attach_state(body.cols, body.rows, &capabilities)?;
+            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
+            let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
+            #[cfg(unix)]
+            set_stream_nonblocking(&attach_stream, true).map_err(|err| format!("set HTTP attach stream nonblocking: {err}"))?;
+            let mut client = ActiveClient::new(attach_stream)?;
+            if let Some(payload) = replay {
+                if !payload.is_empty() {
+                    if *state.had_foreground_client {
+                        client.enqueue_frame(&Frame::Output(REATTACH_CLEAR_SEQUENCE.to_vec()))?;
+                    }
+                    client.enqueue_frame(&Frame::Output(payload))?;
+                }
+            }
+            let _ = fs::write(foreground_path(root, daemon_id), b"1");
+            *state.active_client = Some(client);
+            *state.had_foreground_client = true;
+            state.runtime.record_attach();
+            Ok(())
         }
         http_uds::Route::SessionDetach { id } if id == daemon_id => {
             let _ = fs::remove_file(foreground_path(root, daemon_id));
@@ -1228,9 +1286,74 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        apply_attach_state, attach_init_capabilities, default_vt_engine, record_pty_output, AttachCleanupGuard, TestReplayProbeVtEngine,
+        apply_attach_state, attach_foreground, attach_init_capabilities, default_vt_engine, record_pty_output, session_socket_path,
+        AttachCleanupGuard, TestReplayProbeVtEngine,
     };
-    use crate::vt::{self, VtEngine};
+    use crate::{
+        runtime::RuntimeLayout,
+        vt::{self, VtEngine},
+    };
+
+    fn read_http_request(stream: &mut impl std::io::Read) -> String {
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0; 1024];
+            let n = stream.read(&mut buf).expect("read request");
+            assert_ne!(n, 0, "connection closed before request completed");
+            bytes.extend_from_slice(&buf[..n]);
+            if http_request_complete(&bytes) {
+                return String::from_utf8(bytes).expect("request utf8");
+            }
+        }
+    }
+
+    fn http_request_complete(bytes: &[u8]) -> bool {
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let header = String::from_utf8_lossy(&bytes[..header_end + 4]);
+        let content_length = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or(0);
+        bytes.len() >= header_end + 4 + content_length
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_foreground_uses_http_upgrade_request() {
+        use std::{fs, os::unix::net::UnixListener, sync::mpsc, thread, time::Duration};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("alpha")).expect("create session dir");
+        let socket_path = session_socket_path(temp.path(), "alpha");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_http_request(&mut stream);
+            tx.send(request).expect("send request");
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n")
+                .expect("write response");
+        });
+
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        let attach = attach_foreground(&layout, "alpha").expect("attach");
+        drop(attach);
+        let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
+
+        reader.join().expect("join reader");
+        assert!(request.starts_with("POST /sessions/alpha/attach HTTP/1.1\r\n"), "{request}");
+        assert!(request.contains("Connection: Upgrade\r\n"), "{request}");
+        assert!(request.contains("Upgrade: cleat-attach/1\r\n"), "{request}");
+        assert!(request.ends_with(r#""capabilities":{"color_level":"sixteen","kitty_keyboard":false}}"#), "{request}");
+    }
 
     #[test]
     fn cleanup_guard_writes_on_drop() {

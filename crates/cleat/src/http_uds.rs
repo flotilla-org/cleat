@@ -17,6 +17,7 @@ pub(crate) type HttpRequest = Request<Vec<u8>>;
 pub(crate) enum Route {
     Root,
     Health,
+    SessionAttach { id: String },
     SessionDetach { id: String },
     SessionExpect { id: String },
     SessionInspect { id: String },
@@ -64,6 +65,27 @@ pub(crate) enum NamedKey {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AttachRequest {
+    pub cols: u16,
+    pub rows: u16,
+    pub capabilities: AttachCapabilitiesRequest,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AttachCapabilitiesRequest {
+    pub color_level: AttachColorLevelRequest,
+    pub kitty_keyboard: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttachColorLevelRequest {
+    Sixteen,
+    Ansi256,
+    TrueColor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -289,6 +311,15 @@ pub(crate) fn write_request(writer: &mut impl Write, method: Method, path: &str,
     writer.write_all(body)
 }
 
+pub(crate) fn write_attach_upgrade_request(writer: &mut impl Write, path: &str, body: &[u8]) -> std::io::Result<()> {
+    write!(
+        writer,
+        "POST {path} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n",
+        body.len()
+    )?;
+    writer.write_all(body)
+}
+
 pub(crate) fn read_response(reader: &mut impl Read) -> std::io::Result<HttpResponse> {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
@@ -311,6 +342,31 @@ pub(crate) fn read_response(reader: &mut impl Read) -> std::io::Result<HttpRespo
     Ok(HttpResponse { status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?, body })
 }
 
+pub(crate) fn read_response_head(reader: &mut impl Read) -> std::io::Result<HttpResponse> {
+    let mut bytes = Vec::new();
+    while !has_header_end(&bytes) {
+        if bytes.len() >= MAX_HEADER_BYTES {
+            return Err(Error::new(ErrorKind::InvalidData, "HTTP response headers exceeded maximum size"));
+        }
+        let mut buf = [0; 1];
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "connection closed before HTTP response headers completed"));
+        }
+        bytes.extend_from_slice(&buf[..n]);
+    }
+
+    let header_end = header_end_index(&bytes).expect("header end checked");
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut headers);
+    let status = parsed.parse(&bytes[..header_end + 4]).map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+    if status.is_partial() {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "partial HTTP response headers"));
+    }
+    let code = parsed.code.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing HTTP response status"))?;
+    Ok(HttpResponse { status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?, body: Vec::new() })
+}
+
 pub(crate) fn route(request: &HttpRequest) -> Route {
     let path = request.uri().path();
     match (request.method(), path) {
@@ -326,6 +382,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
             };
             match (request.method(), segments.next(), segments.next()) {
                 (&Method::GET, None, None) => Route::SessionInspect { id: id.to_string() },
+                (&Method::POST, Some("attach"), None) => Route::SessionAttach { id: id.to_string() },
                 (&Method::POST, Some("detach"), None) => Route::SessionDetach { id: id.to_string() },
                 (&Method::POST, Some("expect"), None) => Route::SessionExpect { id: id.to_string() },
                 (&Method::POST, Some("input"), None) => Route::SessionInput { id: id.to_string() },
@@ -353,6 +410,10 @@ pub(crate) fn write_json<T: Serialize>(writer: &mut impl Write, status: StatusCo
 
 pub(crate) fn write_no_content(writer: &mut impl Write) -> std::io::Result<()> {
     write_response(writer, response(StatusCode::NO_CONTENT, "application/octet-stream", Vec::new())?)
+}
+
+pub(crate) fn write_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
+    write!(writer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n")
 }
 
 pub(crate) fn write_error(writer: &mut impl Write, status: StatusCode, message: &str) -> std::io::Result<()> {
@@ -473,6 +534,7 @@ mod tests {
         let cases = [
             ("GET", "/healthz", Route::Health),
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/attach", Route::SessionAttach { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/detach", Route::SessionDetach { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/expect", Route::SessionExpect { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/input", Route::SessionInput { id: "alpha".to_string() }),

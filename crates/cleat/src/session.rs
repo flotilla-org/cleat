@@ -811,6 +811,26 @@ fn handle_http_request(
             let result = runtime.inspect(active_client.is_some());
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
         }
+        http_uds::Route::SessionInput { id } if id == daemon_id => {
+            let body: http_uds::InputRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
+            match body {
+                http_uds::InputRequest::Text { text } | http_uds::InputRequest::Paste { text } => {
+                    runtime.write_input(text.as_bytes())?;
+                }
+                http_uds::InputRequest::Key { key } => {
+                    let bytes = http_input_key_bytes(key);
+                    runtime.write_input(&bytes)?;
+                }
+                http_uds::InputRequest::RawBytes { bytes } => {
+                    runtime.write_input(&bytes)?;
+                }
+                http_uds::InputRequest::Resize { cols, rows } => {
+                    runtime.resize(cols, rows)?;
+                }
+            }
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP input response: {err}"))
+        }
         http_uds::Route::SessionKeys { id } if id == daemon_id => {
             let body: http_uds::KeysRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys request: {err}"))?;
@@ -846,6 +866,30 @@ fn handle_http_request(
         _ => {
             http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
         }
+    }
+}
+
+fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
+    match key {
+        http_uds::KeyRequest::UnicodeScalar { codepoint } => {
+            let mut bytes = Vec::new();
+            if let Some(ch) = char::from_u32(codepoint) {
+                let mut buf = [0; 4];
+                bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            bytes
+        }
+        http_uds::KeyRequest::Named { key } => match key {
+            http_uds::NamedKey::Enter => b"\r".to_vec(),
+            http_uds::NamedKey::Escape => b"\x1b".to_vec(),
+            http_uds::NamedKey::Backspace => b"\x7f".to_vec(),
+            http_uds::NamedKey::Tab => b"\t".to_vec(),
+            http_uds::NamedKey::Delete => b"\x1b[3~".to_vec(),
+            http_uds::NamedKey::ArrowUp => b"\x1b[A".to_vec(),
+            http_uds::NamedKey::ArrowDown => b"\x1b[B".to_vec(),
+            http_uds::NamedKey::ArrowRight => b"\x1b[C".to_vec(),
+            http_uds::NamedKey::ArrowLeft => b"\x1b[D".to_vec(),
+        },
     }
 }
 

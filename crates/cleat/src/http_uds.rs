@@ -18,10 +18,42 @@ pub(crate) enum Route {
     Root,
     Health,
     SessionInspect { id: String },
+    SessionInput { id: String },
     SessionKeys { id: String },
     SessionResize { id: String },
     SessionSnapshot { id: String },
     NotFound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum InputRequest {
+    Text { text: String },
+    Paste { text: String },
+    Key { key: KeyRequest },
+    RawBytes { bytes: Vec<u8> },
+    Resize { cols: u16, rows: u16 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum KeyRequest {
+    UnicodeScalar { codepoint: u32 },
+    Named { key: NamedKey },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NamedKey {
+    Enter,
+    Escape,
+    Backspace,
+    Tab,
+    Delete,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -195,6 +227,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
             };
             match (request.method(), segments.next(), segments.next()) {
                 (&Method::GET, None, None) => Route::SessionInspect { id: id.to_string() },
+                (&Method::POST, Some("input"), None) => Route::SessionInput { id: id.to_string() },
                 (&Method::POST, Some("keys"), None) => Route::SessionKeys { id: id.to_string() },
                 (&Method::POST, Some("resize"), None) => Route::SessionResize { id: id.to_string() },
                 (&Method::GET, Some("snapshot"), None) => Route::SessionSnapshot { id: id.to_string() },
@@ -331,6 +364,7 @@ mod tests {
         let cases = [
             ("GET", "/healthz", Route::Health),
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/input", Route::SessionInput { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/keys", Route::SessionKeys { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/resize", Route::SessionResize { id: "alpha".to_string() }),
             ("GET", "/sessions/alpha/snapshot", Route::SessionSnapshot { id: "alpha".to_string() }),

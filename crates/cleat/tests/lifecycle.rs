@@ -235,6 +235,30 @@ fn session_daemon_accepts_http_control_requests_on_session_socket() {
     );
     assert!(keys.starts_with("HTTP/1.1 204 No Content\r\n"), "{keys}");
 
+    let input_text_body = r#"{"kind":"text","text":"structured input"}"#;
+    let input_text = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!(
+            "POST /sessions/alpha/input HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}",
+            input_text_body.len(),
+            input_text_body
+        ),
+    );
+    assert!(input_text.starts_with("HTTP/1.1 204 No Content\r\n"), "{input_text}");
+
+    let input_key_body = r#"{"kind":"key","key":{"kind":"named","key":"enter"}}"#;
+    let input_key = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!(
+            "POST /sessions/alpha/input HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}",
+            input_key_body.len(),
+            input_key_body
+        ),
+    );
+    assert!(input_key.starts_with("HTTP/1.1 204 No Content\r\n"), "{input_key}");
+
     let resize_body = r#"{"cols":12,"rows":7}"#;
     let resize = http_session_request(
         temp.path(),
@@ -247,6 +271,22 @@ fn session_daemon_accepts_http_control_requests_on_session_socket() {
     let resized_json: serde_json::Value = serde_json::from_str(http_body(&resized)).expect("resized inspect json");
     assert_eq!(resized_json["terminal"]["cols"], 12);
     assert_eq!(resized_json["terminal"]["rows"], 7);
+
+    let input_resize_body = r#"{"kind":"resize","cols":14,"rows":8}"#;
+    let input_resize = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!(
+            "POST /sessions/alpha/input HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}",
+            input_resize_body.len(),
+            input_resize_body
+        ),
+    );
+    assert!(input_resize.starts_with("HTTP/1.1 204 No Content\r\n"), "{input_resize}");
+    let input_resized = http_session_request(temp.path(), "alpha", "GET /sessions/alpha HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    let input_resized_json: serde_json::Value = serde_json::from_str(http_body(&input_resized)).expect("input resized inspect json");
+    assert_eq!(input_resized_json["terminal"]["cols"], 14);
+    assert_eq!(input_resized_json["terminal"]["rows"], 8);
 
     let snapshot = http_session_request(temp.path(), "alpha", "GET /sessions/alpha/snapshot HTTP/1.1\r\nHost: cleat\r\n\r\n");
     assert!(snapshot.starts_with("HTTP/1.1 409 Conflict\r\n"), "{snapshot}");

@@ -398,9 +398,9 @@ pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, ev
             Ok(None) => true,
             Err(_) => false,
         },
-        SessionBackend::Daemon(daemon) => match input_event_bytes(&event) {
-            Ok(Some(bytes)) => {
-                if daemon_write_bytes(daemon, &bytes).is_err() {
+        SessionBackend::Daemon(daemon) => match daemon_input_request(&event) {
+            Ok(Some(input)) => {
+                if daemon_send_input(daemon, input).is_err() {
                     return false;
                 }
                 daemon.dirty = DirtyState::Partial;
@@ -584,6 +584,12 @@ fn daemon_write_bytes(session: &mut DaemonSession, bytes: &[u8]) -> Result<(), S
     expect_status(response, StatusCode::NO_CONTENT, "keys")
 }
 
+fn daemon_send_input(session: &mut DaemonSession, input: http_uds::InputRequest) -> Result<(), String> {
+    let body = serde_json::to_vec(&input).map_err(|err| format!("serialize input request: {err}"))?;
+    let response = daemon_request(session, Method::POST, &format!("/sessions/{}/input", session.id), &body)?;
+    expect_status(response, StatusCode::NO_CONTENT, "input")
+}
+
 fn daemon_snapshot(session: &mut DaemonSession) -> Result<TerminalSnapshot, String> {
     let response = daemon_request(session, Method::GET, &format!("/sessions/{}/snapshot", session.id), &[])?;
     if response.status != StatusCode::OK {
@@ -666,6 +672,37 @@ fn cursor_style_from_name(name: &str) -> Result<TerminalCursorStyle, String> {
     }
 }
 
+fn daemon_input_request(event: &CleatInputEvent) -> Result<Option<http_uds::InputRequest>, Utf8Error> {
+    match event.kind {
+        CLEAT_INPUT_TEXT => read_event_text(event).map(|text| Some(http_uds::InputRequest::Text { text })),
+        CLEAT_INPUT_PASTE => read_event_text(event).map(|text| Some(http_uds::InputRequest::Paste { text })),
+        CLEAT_INPUT_KEY => Ok(key_input_request(event).map(|key| http_uds::InputRequest::Key { key })),
+        CLEAT_INPUT_RESIZE => Ok(Some(http_uds::InputRequest::Resize { cols: event.cell_col.max(1), rows: event.cell_row.max(1) })),
+        CLEAT_INPUT_MOUSE | CLEAT_INPUT_FOCUS => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+fn key_input_request(event: &CleatInputEvent) -> Option<http_uds::KeyRequest> {
+    if event.key_kind == CLEAT_KEY_UNICODE_SCALAR {
+        return Some(http_uds::KeyRequest::UnicodeScalar { codepoint: event.key_code });
+    }
+
+    let key = match event.key_code {
+        CLEAT_KEY_ENTER => http_uds::NamedKey::Enter,
+        CLEAT_KEY_ESCAPE => http_uds::NamedKey::Escape,
+        CLEAT_KEY_BACKSPACE => http_uds::NamedKey::Backspace,
+        CLEAT_KEY_TAB => http_uds::NamedKey::Tab,
+        CLEAT_KEY_DELETE => http_uds::NamedKey::Delete,
+        CLEAT_KEY_ARROW_UP => http_uds::NamedKey::ArrowUp,
+        CLEAT_KEY_ARROW_DOWN => http_uds::NamedKey::ArrowDown,
+        CLEAT_KEY_ARROW_RIGHT => http_uds::NamedKey::ArrowRight,
+        CLEAT_KEY_ARROW_LEFT => http_uds::NamedKey::ArrowLeft,
+        _ => return None,
+    };
+    Some(http_uds::KeyRequest::Named { key })
+}
+
 fn read_optional_utf8(ptr: *const u8, len: usize) -> Result<Option<String>, Utf8Error> {
     if ptr.is_null() || len == 0 {
         return Ok(None);
@@ -684,11 +721,15 @@ fn input_event_bytes(event: &CleatInputEvent) -> Result<Option<Vec<u8>>, Utf8Err
 }
 
 fn read_event_text_bytes(event: &CleatInputEvent) -> Result<Vec<u8>, Utf8Error> {
+    read_event_text(event).map(|text| text.into_bytes())
+}
+
+fn read_event_text(event: &CleatInputEvent) -> Result<String, Utf8Error> {
     if event.text.is_null() || event.text_len == 0 {
-        return Ok(Vec::new());
+        return Ok(String::new());
     }
     let bytes = unsafe { slice::from_raw_parts(event.text, event.text_len) };
-    std::str::from_utf8(bytes).map(|text| text.as_bytes().to_vec())
+    std::str::from_utf8(bytes).map(|text| text.to_string())
 }
 
 fn key_event_bytes(event: &CleatInputEvent) -> Result<Vec<u8>, Utf8Error> {
@@ -834,6 +875,24 @@ mod tests {
             cleat_session_destroy(session);
             cleat_provider_close(provider);
         }
+    }
+
+    #[test]
+    fn daemon_input_request_maps_ffi_text_and_named_key_events() {
+        let text = b"hello";
+        let text_event =
+            CleatInputEvent { kind: CLEAT_INPUT_TEXT, text: text.as_ptr(), text_len: text.len(), ..CleatInputEvent::default() };
+        assert_eq!(
+            daemon_input_request(&text_event).expect("text input"),
+            Some(http_uds::InputRequest::Text { text: "hello".to_string() })
+        );
+
+        let key_event =
+            CleatInputEvent { kind: CLEAT_INPUT_KEY, key_kind: CLEAT_KEY_NAMED, key_code: CLEAT_KEY_ENTER, ..CleatInputEvent::default() };
+        assert_eq!(
+            daemon_input_request(&key_event).expect("key input"),
+            Some(http_uds::InputRequest::Key { key: http_uds::KeyRequest::Named { key: http_uds::NamedKey::Enter } })
+        );
     }
 
     #[cfg(unix)]

@@ -531,6 +531,33 @@ fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_c
 }
 
 #[test]
+fn http_detach_records_only_real_foreground_transition() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).expect("create alpha");
+
+    let attach_stream = http_attach_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback());
+
+    let first_detach = http_session_request(temp.path(), "alpha", "POST /sessions/alpha/detach HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(first_detach.starts_with("HTTP/1.1 204 No Content\r\n"), "{first_detach}");
+
+    let second_detach = http_session_request(temp.path(), "alpha", "POST /sessions/alpha/detach HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(second_detach.starts_with("HTTP/1.1 204 No Content\r\n"), "{second_detach}");
+    drop(attach_stream);
+
+    let cast_path = temp.path().join("alpha").join(cleat::recording::CAST_FILE_NAME);
+    let events = cleat::cast_reader::read_all_events_since(&cast_path, 0).expect("read cast events");
+    let attach_count = events.iter().filter(|event| matches!(event.code, cleat::asciicast::EventCode::Custom('a'))).count();
+    let detach_count = events.iter().filter(|event| matches!(event.code, cleat::asciicast::EventCode::Custom('d'))).count();
+
+    assert_eq!(attach_count, 1, "expected one foreground attach event, got {events:?}");
+    assert_eq!(detach_count, 1, "expected one foreground detach event, got {events:?}");
+
+    service.kill("alpha").expect("kill session");
+}
+
+#[test]
 fn lifecycle_attach_init_capabilities_drive_replay_output_on_daemon_path() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _guard = EnvVarGuard::set("CLEAT_TEST_VT_ENGINE", "replay-probe");

@@ -46,16 +46,14 @@ impl SessionRuntime {
             vt::VtEngineKind::Passthrough => Some(DeviceAttributeTracker::new()),
             vt::VtEngineKind::Ghostty => None,
         };
-        let mut recorder = None;
-        if session.record {
-            match SessionRecorder::new(&session_dir, vt_engine.size().0, vt_engine.size().1, session.vt_engine.as_str()) {
-                Ok(mut r) => {
-                    write_replay_snapshot(&mut *vt_engine, &mut r, session.vt_engine.as_str(), Duration::ZERO);
-                    recorder = Some(r);
-                }
-                Err(err) => eprintln!("failed to start recording: {err}"),
-            }
-        }
+        let recorder = if session.record {
+            let mut recorder = SessionRecorder::new(&session_dir, vt_engine.size().0, vt_engine.size().1, session.vt_engine.as_str())
+                .map_err(|err| format!("failed to start recording: {err}"))?;
+            write_replay_snapshot(&mut *vt_engine, &mut recorder, session.vt_engine.as_str(), Duration::ZERO);
+            Some(recorder)
+        } else {
+            None
+        };
 
         Ok(Self {
             session: session.clone(),
@@ -355,7 +353,7 @@ fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vt::{CellFlags, CellWidth, CursorState, ResolvedCell, Rgb, ScreenGrid};
+    use crate::vt::{passthrough::PassthroughVtEngine, CellFlags, CellWidth, CursorState, ResolvedCell, Rgb, ScreenGrid, VtEngineKind};
 
     #[derive(Debug)]
     struct GridEngine {
@@ -416,5 +414,27 @@ mod tests {
 
         assert_eq!(engine.screen_grid().expect("screen grid"), grid);
         assert_eq!(engine.screen_text().expect("screen text"), "A");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_fails_when_requested_recording_cannot_start() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(temp.path().join(crate::recording::CAST_FILE_NAME)).expect("create cast path directory");
+        let session = SessionMetadata {
+            id: "alpha".to_string(),
+            vt_engine: VtEngineKind::Passthrough,
+            cwd: None,
+            cmd: Some("true".to_string()),
+            record: true,
+        };
+
+        let err = match SessionRuntime::spawn(temp.path().to_path_buf(), &session, Box::new(PassthroughVtEngine::new(80, 24))) {
+            Ok(_) => panic!("requested recording startup failure should fail session spawn"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("failed to start recording"), "{err}");
+        assert!(err.contains(crate::recording::CAST_FILE_NAME), "{err}");
     }
 }

@@ -14,18 +14,18 @@ use std::{
 };
 
 use crate::{
-    da::DeviceAttributeTracker,
     platform::{
         daemon::spawn_daemon_process,
         ipc::{
             bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
             set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
         },
-        pty::{exit_code_from_wait_status, poll_session_ready, PtyChild},
+        pty::poll_session_ready,
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::Frame,
     runtime::{RuntimeLayout, SessionMetadata},
+    session_runtime::SessionRuntime,
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
 
@@ -35,7 +35,6 @@ const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DETACH_CLEANUP_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
-const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -338,6 +337,7 @@ impl VtEngine for TestReplayProbeVtEngine {
     }
 }
 
+#[cfg(test)]
 fn record_pty_output(engine: &mut dyn VtEngine, bytes: &[u8]) -> Result<(), String> {
     engine.feed(bytes)
 }
@@ -346,6 +346,7 @@ fn attach_init_capabilities() -> vt::ClientCapabilities {
     vt::ClientCapabilities::conservative_fallback()
 }
 
+#[cfg(test)]
 fn apply_attach_state(
     engine: &mut dyn VtEngine,
     cols: u16,
@@ -390,45 +391,17 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     set_listener_nonblocking(&listener, true)?;
     fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let pty_child = PtyChild::spawn(session)?;
-    pty_child.set_nonblocking()?;
-    let mut vt_engine = default_vt_engine(session.vt_engine)?;
-    // The DA tracker is the only DA source for the passthrough engine.
-    // The ghostty engine answers DA itself via its DeviceAttributes callback,
-    // so we skip the tracker there to avoid double replies.
-    let mut detached_da = match session.vt_engine {
-        vt::VtEngineKind::Passthrough => Some(DeviceAttributeTracker::new()),
-        vt::VtEngineKind::Ghostty => None,
-    };
-
+    let mut runtime = SessionRuntime::spawn(session_dir.clone(), session, default_vt_engine(session.vt_engine)?)?;
     let mut active_client: Option<ActiveClient> = None;
-    let mut recorder: Option<crate::recording::SessionRecorder> = None;
-    let epoch = Instant::now();
-    let mut markers: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    if session.record {
-        let (cols, rows) = vt_engine.size();
-        match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
-            Ok(mut r) => {
-                // Bootstrap: emit initial snapshot if VT engine has state
-                if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
-                    let state = String::from_utf8_lossy(&payload);
-                    r.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, std::time::Duration::ZERO);
-                }
-                recorder = Some(r);
-            }
-            Err(err) => eprintln!("failed to start recording: {err}"),
-        }
-    }
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
     let mut pending_expects: Vec<PendingExpect> = Vec::new();
-    let mut last_pty_output_at: Option<Instant> = None;
     loop {
         let poll_result = poll_session_ready(
             &listener,
             active_client.as_ref().map(|client| &client.stream),
             active_client.as_ref().map(|client| !client.pending_output.is_empty()).unwrap_or(false),
-            &pty_child,
+            runtime.pty_child(),
             100,
         )?;
 
@@ -449,8 +422,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     match Frame::read(&mut stream) {
                         Ok(Frame::AttachInit { cols, rows, capabilities }) => {
                             if active_client.is_none() {
-                                pty_child.resize(cols, rows)?;
-                                let replay = apply_attach_state(vt_engine.as_mut(), cols, rows, &capabilities)?;
+                                let replay = runtime.apply_attach_state(cols, rows, &capabilities)?;
                                 Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
                                 #[cfg(unix)]
                                 set_stream_nonblocking(&stream, true).map_err(|err| format!("set client nonblocking: {err}"))?;
@@ -466,21 +438,17 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = fs::write(foreground_path(root, id), b"1");
                                 active_client = Some(client);
                                 had_foreground_client = true;
-                                if let Some(ref mut rec) = recorder {
-                                    rec.event(crate::asciicast::EventCode::Custom('a'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                                }
+                                runtime.record_attach();
                             } else {
                                 let _ = Frame::Busy.write(&mut stream);
                             }
                         }
                         Ok(Frame::Detach) => {
                             let _ = fs::remove_file(foreground_path(root, id));
-                            if let Some(ref mut rec) = recorder {
-                                rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                            }
+                            runtime.record_detach();
                             active_client = None;
                         }
-                        Ok(Frame::Capture) => match vt_engine.screen_text() {
+                        Ok(Frame::Capture) => match runtime.capture_text() {
                             Ok(text) => {
                                 let _ = Frame::Output(text.into_bytes()).write(&mut stream);
                             }
@@ -489,31 +457,20 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
                         },
                         Ok(Frame::SendKeys(bytes)) => {
-                            if let Some(ref mut rec) = recorder {
-                                rec.input(&bytes, epoch.elapsed());
-                            }
-                            if let Err(err) = pty_child.write_all(&bytes) {
+                            if let Err(err) = runtime.write_input(&bytes) {
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         }
-                        Ok(Frame::SendKeysWithMark { bytes, marker_name }) => {
-                            if let Some(ref mut rec) = recorder {
-                                rec.flush();
-                                rec.event(crate::asciicast::EventCode::Marker, &marker_name, epoch.elapsed());
-                                let offset = rec.bytes_written();
-                                markers.insert(marker_name, offset);
-                                rec.input(&bytes, epoch.elapsed());
-                                if let Err(err) = pty_child.write_all(&bytes) {
-                                    let _ = Frame::Error(err).write(&mut stream);
-                                } else {
-                                    let _ = Frame::MarkResult { offset }.write(&mut stream);
-                                }
-                            } else {
-                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
+                        Ok(Frame::SendKeysWithMark { bytes, marker_name }) => match runtime.write_input_with_mark(&bytes, marker_name) {
+                            Ok(offset) => {
+                                let _ = Frame::MarkResult { offset }.write(&mut stream);
                             }
-                        }
+                            Err(err) => {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        },
                         Ok(Frame::Inspect) => {
-                            let result = build_inspect_result(session, vt_engine.as_ref(), &active_client, &pty_child, &recorder, &markers);
+                            let result = runtime.inspect(active_client.is_some());
                             match serde_json::to_vec(&result) {
                                 Ok(json) => {
                                     let _ = Frame::InspectResult(json).write(&mut stream);
@@ -523,105 +480,45 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 }
                             }
                         }
-                        Ok(Frame::Signal { signal, target }) => match pty_child.dispatch_signal(signal, target) {
+                        Ok(Frame::Signal { signal, target }) => match runtime.dispatch_signal(signal, target) {
                             Ok(()) => {
-                                if let Some(ref mut rec) = recorder {
-                                    let target_str = match target {
-                                        crate::protocol::SignalTarget::Foreground => "foreground",
-                                        crate::protocol::SignalTarget::Leader => "leader",
-                                        crate::protocol::SignalTarget::Tree => "tree",
-                                    };
-                                    rec.event(
-                                        crate::asciicast::EventCode::Custom('s'),
-                                        &serde_json::json!({"signal": signal, "target": target_str}).to_string(),
-                                        epoch.elapsed(),
-                                    );
-                                }
                                 let _ = Frame::Ack.write(&mut stream);
                             }
                             Err(err) => {
                                 let _ = Frame::Error(err).write(&mut stream);
                             }
                         },
-                        Ok(Frame::Mark { name }) => {
-                            if let Some(ref mut rec) = recorder {
-                                rec.flush();
-                                if let Some(ref marker_name) = name {
-                                    // Emit standard asciicast "m" event
-                                    rec.event(crate::asciicast::EventCode::Marker, marker_name, epoch.elapsed());
-                                    // Store the offset *after* the marker event so that
-                                    // read_events_since starts at the first event following
-                                    // the marker rather than at the marker line itself.
-                                    markers.insert(marker_name.clone(), rec.bytes_written());
-                                }
-                                let _ = Frame::MarkResult { offset: rec.bytes_written() }.write(&mut stream);
-                            } else {
-                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
+                        Ok(Frame::Mark { name }) => match runtime.mark(name) {
+                            Ok(offset) => {
+                                let _ = Frame::MarkResult { offset }.write(&mut stream);
                             }
-                        }
+                            Err(err) => {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        },
                         Ok(Frame::ResolveMarker { name }) => {
-                            if let Some(offset) = markers.get(&name) {
-                                let _ = Frame::MarkResult { offset: *offset }.write(&mut stream);
+                            if let Some(offset) = runtime.resolve_marker(&name) {
+                                let _ = Frame::MarkResult { offset }.write(&mut stream);
                             } else {
                                 let _ = Frame::Error(format!("marker not found: {name}")).write(&mut stream);
                             }
                         }
                         Ok(Frame::ResolveNextMarker { after }) => {
-                            // Markers are appended at the current recording offset, so byte-offset
-                            // order matches creation order. min(offset > after) picks the
-                            // chronologically-next marker. Back-filling markers would break this.
-                            let next = markers.iter().filter(|(_, &offset)| offset > after).map(|(_, &offset)| offset).min();
+                            let next = runtime.resolve_next_marker_after(after);
                             let reply = match next {
                                 Some(offset) => Frame::MarkResult { offset },
                                 None => Frame::MarkNotFound,
                             };
                             let _ = reply.write(&mut stream);
                         }
-                        Ok(Frame::RecordControl { enable }) => {
-                            if enable && recorder.is_none() {
-                                // First-time activation: create new recorder
-                                let (cols, rows) = vt_engine.size();
-                                match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
-                                    Ok(mut r) => {
-                                        if let Ok(Some(payload)) =
-                                            vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback())
-                                        {
-                                            let state = String::from_utf8_lossy(&payload);
-                                            r.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, epoch.elapsed());
-                                        }
-                                        recorder = Some(r);
-                                        let _ = Frame::Ack.write(&mut stream);
-                                    }
-                                    Err(err) => {
-                                        let _ = Frame::Error(err).write(&mut stream);
-                                    }
-                                }
-                            } else if enable {
-                                // Resume from pause
-                                if let Some(ref mut rec) = recorder {
-                                    if rec.is_paused() {
-                                        rec.resume(epoch.elapsed());
-                                        // Emit a VT snapshot so the resumed portion has screen context
-                                        if let Ok(Some(payload)) =
-                                            vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback())
-                                        {
-                                            let (cols, rows) = vt_engine.size();
-                                            let state = String::from_utf8_lossy(&payload);
-                                            rec.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, epoch.elapsed());
-                                        }
-                                    }
-                                }
-                                let _ = Frame::Ack.write(&mut stream);
-                            } else if !enable && recorder.as_ref().is_some_and(|r| !r.is_paused()) {
-                                // Pause recording (keep recorder alive for gap tracking)
-                                if let Some(ref mut rec) = recorder {
-                                    rec.pause(epoch.elapsed());
-                                }
-                                let _ = Frame::Ack.write(&mut stream);
-                            } else {
+                        Ok(Frame::RecordControl { enable }) => match runtime.set_recording(enable) {
+                            Ok(()) => {
                                 let _ = Frame::Ack.write(&mut stream);
                             }
-                        }
+                            Err(err) => {
+                                let _ = Frame::Error(err).write(&mut stream);
+                            }
+                        },
                         Ok(Frame::Wait { conditions, timeout_ms }) => 'wait: {
                             if conditions.is_empty() {
                                 let _ = Frame::Error("at least one wait condition is required".to_string()).write(&mut stream);
@@ -631,7 +528,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             // Validate: TextMatch requires screen_text support
                             let has_text_match = conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::TextMatch { .. }));
                             if has_text_match {
-                                if let Err(err) = vt_engine.screen_text() {
+                                if let Err(err) = runtime.validate_text_matching() {
                                     let _ = Frame::Error(format!("text matching not supported: {err}")).write(&mut stream);
                                     break 'wait;
                                 }
@@ -639,14 +536,12 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
                             // Check --text immediately at registration
                             if has_text_match {
-                                if let Ok(screen) = vt_engine.screen_text() {
-                                    for condition in &conditions {
-                                        if let crate::protocol::WaitCondition::TextMatch { text } = condition {
-                                            if screen.contains(text.as_str()) {
-                                                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
-                                                    .write(&mut stream);
-                                                break 'wait;
-                                            }
+                                for condition in &conditions {
+                                    if let crate::protocol::WaitCondition::TextMatch { text } = condition {
+                                        if runtime.screen_contains(text.as_str()) {
+                                            let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
+                                                .write(&mut stream);
+                                            break 'wait;
                                         }
                                     }
                                 }
@@ -660,15 +555,13 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             pending_waits.push(PendingWait { stream, conditions, timeout_ms, registered_at: Instant::now() });
                         }
                         Ok(Frame::Expect { text, since_offset, timeout_ms }) => 'expect: {
-                            if recorder.is_none() {
+                            if !runtime.recording_active() {
                                 let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
                                 break 'expect;
                             }
                             // Check immediately — text may already be in the recording
                             let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
-                            if let Some(ref mut rec) = recorder {
-                                rec.flush();
-                            }
+                            runtime.flush_recording();
                             if cast_path.exists() {
                                 if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, since_offset) {
                                     let output: String = events.iter().map(|e| e.data.as_str()).collect();
@@ -722,17 +615,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             while let Some(frame) = pending.pop_front() {
                 match frame {
                     Frame::Input(bytes) => {
-                        if let Some(ref mut rec) = recorder {
-                            rec.input(&bytes, epoch.elapsed());
-                        }
-                        pty_child.write_all(&bytes)?;
+                        runtime.write_input(&bytes)?;
                     }
                     Frame::Resize { cols, rows } => {
-                        if let Some(ref mut rec) = recorder {
-                            rec.event(crate::asciicast::EventCode::Resize, &format!("{}x{}", cols, rows), epoch.elapsed());
-                        }
-                        pty_child.resize(cols, rows)?;
-                        vt_engine.resize(cols, rows)?;
+                        runtime.resize(cols, rows)?;
                     }
                     _ => {}
                 }
@@ -740,9 +626,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
             if client_disconnected && active_client.is_some() {
                 let _ = fs::remove_file(foreground_path(root, id));
-                if let Some(ref mut rec) = recorder {
-                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                }
+                runtime.record_detach();
                 active_client = None;
             }
         }
@@ -754,69 +638,26 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             };
             if !client_writable {
                 let _ = fs::remove_file(foreground_path(root, id));
-                if let Some(ref mut rec) = recorder {
-                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                }
+                runtime.record_detach();
                 active_client = None;
             }
         }
 
         if poll_result.pty_readable {
-            loop {
-                let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
-                match pty_child.read_output(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        last_pty_output_at = Some(Instant::now());
-                        record_pty_output(vt_engine.as_mut(), &buf[..n])?;
-                        if let Some(ref mut rec) = recorder {
-                            let elapsed = epoch.elapsed();
-                            rec.output(&buf[..n], elapsed);
-                            if rec.output_bytes_since_snapshot() >= 256 * 1024 {
-                                if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
-                                    let (cols, rows) = vt_engine.size();
-                                    let state = String::from_utf8_lossy(&payload);
-                                    rec.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, elapsed);
-                                } else {
-                                    rec.reset_output_bytes_since_snapshot();
-                                }
-                            }
-                        }
-                        // Drain engine replies every iteration so the buffer never accumulates
-                        // stale replies across an attach→detach transition. When attached, the
-                        // host terminal is authoritative for query responses, so we discard.
-                        let engine_reply = vt_engine.drain_replies();
-                        if active_client.is_none() {
-                            if let Some(ref mut tracker) = detached_da {
-                                for reply in tracker.push(&buf[..n]) {
-                                    pty_child.write_all(&reply)?;
-                                }
-                            }
-                            if !engine_reply.is_empty() {
-                                pty_child.write_all(&engine_reply)?;
-                            }
-                        }
-                        if let Some(client) = active_client.as_mut() {
-                            if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
-                                let _ = fs::remove_file(foreground_path(root, id));
-                                if let Some(ref mut rec) = recorder {
-                                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                                }
-                                active_client = None;
-                            }
-                        }
+            let output = runtime.read_available_output(active_client.is_some())?;
+            for chunk in output.chunks {
+                if let Some(client) = active_client.as_mut() {
+                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
+                        let _ = fs::remove_file(foreground_path(root, id));
+                        runtime.record_detach();
+                        active_client = None;
+                        break;
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(err) => return Err(format!("read pty output: {err}")),
                 }
             }
         }
 
-        if let Some(ref mut rec) = recorder {
-            if !poll_result.pty_readable && !poll_result.client_readable {
-                rec.flush();
-            }
-        }
+        runtime.flush_recording_if_idle(poll_result.pty_readable, poll_result.client_readable);
 
         // Evaluate pending waits on each loop tick.
         // Write errors are intentionally discarded — the client may have disconnected.
@@ -835,7 +676,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 match condition {
                     crate::protocol::WaitCondition::OutputIdle { quiet_ms } => {
                         // Silence measured from max(registration_time, last_output_time)
-                        let silence_since = match last_pty_output_at {
+                        let silence_since = match runtime.last_pty_output_at() {
                             Some(t) if t > wait.registered_at => t,
                             _ => wait.registered_at,
                         };
@@ -846,12 +687,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         }
                     }
                     crate::protocol::WaitCondition::TextMatch { text } => {
-                        if let Ok(screen) = vt_engine.screen_text() {
-                            if screen.contains(text.as_str()) {
-                                let _ =
-                                    Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut wait.stream);
-                                return false;
-                            }
+                        if runtime.screen_contains(text.as_str()) {
+                            let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut wait.stream);
+                            return false;
                         }
                     }
                 }
@@ -862,9 +700,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
         // Evaluate pending expects by scanning the cast file for text matches.
         if !pending_expects.is_empty() {
-            if let Some(ref mut rec) = recorder {
-                rec.flush();
-            }
+            runtime.flush_recording();
             let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
             pending_expects.retain_mut(|expect| {
                 let elapsed = expect.registered_at.elapsed();
@@ -894,16 +730,18 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             });
         }
 
-        if let Some(status) = pty_child.exited()? {
-            drain_pty_output_after_exit(
-                &pty_child,
-                vt_engine.as_mut(),
-                &mut recorder,
-                &mut active_client,
-                &mut detached_da,
-                DrainExitContext { root, id, vt_engine_kind: session.vt_engine, epoch },
-                &mut last_pty_output_at,
-            )?;
+        if let Some(exit_code) = runtime.exit_code_if_exited()? {
+            let output = runtime.drain_output_after_exit(active_client.is_some())?;
+            for chunk in output.chunks {
+                if let Some(client) = active_client.as_mut() {
+                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
+                        let _ = fs::remove_file(foreground_path(root, id));
+                        runtime.record_detach();
+                        active_client = None;
+                        break;
+                    }
+                }
+            }
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
                 let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut wait.stream);
@@ -912,13 +750,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 let elapsed_ms = expect.registered_at.elapsed().as_millis() as u64;
                 let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut expect.stream);
             }
-            if let Some(ref mut rec) = recorder {
-                // Flush any held-back incomplete UTF-8 bytes before the exit
-                // event so they appear in the correct order in the cast file.
-                rec.flush_final();
-                let code = exit_code_from_wait_status(&status);
-                rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());
-            }
+            runtime.record_exit_code(exit_code);
             if let Some(client) = active_client.as_mut() {
                 let _ = client.flush_pending_output();
             }
@@ -930,7 +762,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(daemon_pid_path(root, id));
     let _ = fs::remove_file(foreground_path(root, id));
-    if recorder.is_none() {
+    if !runtime.should_keep_session_dir() {
         let _ = fs::remove_dir_all(&session_dir);
     }
     Ok(())
@@ -939,125 +771,6 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 #[cfg(not(any(unix, windows)))]
 pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<(), String> {
     Err("session daemon is only supported on unix".into())
-}
-
-#[cfg(any(unix, windows))]
-fn build_inspect_result(
-    session: &SessionMetadata,
-    vt_engine: &dyn VtEngine,
-    active_client: &Option<ActiveClient>,
-    pty_child: &PtyChild,
-    recorder: &Option<crate::recording::SessionRecorder>,
-    markers: &std::collections::HashMap<String, u64>,
-) -> crate::protocol::InspectResult {
-    let (cols, rows) = vt_engine.size();
-    let foreground_pgid = pty_child.foreground_pgid();
-
-    crate::protocol::InspectResult {
-        session: crate::protocol::SessionInspect {
-            id: session.id.clone(),
-            state: "running".to_string(),
-            vt_engine: session.vt_engine.as_str().to_string(),
-            vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
-            functional_vt_available: crate::vt::functional_vt_available(),
-            cwd: session.cwd.clone(),
-            cmd: session.cmd.clone(),
-        },
-        terminal: crate::protocol::TerminalInspect { rows, cols },
-        process: crate::protocol::ProcessInspect {
-            leader_pid: pty_child.leader_pid(),
-            foreground_pgid,
-            leader_cwd: pty_child.leader_cwd(),
-            foreground_cwd: pty_child.foreground_cwd(),
-        },
-        attachments: if active_client.is_some() {
-            vec![crate::protocol::AttachmentInspect { role: "controller".to_string() }]
-        } else {
-            vec![]
-        },
-        recording: crate::protocol::RecordingInspect {
-            active: recorder.as_ref().is_some_and(|r| !r.is_paused()),
-            bytes_written: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
-            markers: markers.clone(),
-        },
-    }
-}
-
-fn drain_pty_output_after_exit(
-    pty_child: &PtyChild,
-    vt_engine: &mut dyn VtEngine,
-    recorder: &mut Option<crate::recording::SessionRecorder>,
-    active_client: &mut Option<ActiveClient>,
-    detached_da: &mut Option<DeviceAttributeTracker>,
-    context: DrainExitContext<'_>,
-    last_pty_output_at: &mut Option<Instant>,
-) -> Result<(), String> {
-    loop {
-        let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
-        match pty_child.read_output(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                *last_pty_output_at = Some(Instant::now());
-                record_pty_output(vt_engine, &buf[..n])?;
-                if let Some(ref mut rec) = recorder {
-                    let elapsed = context.epoch.elapsed();
-                    rec.output(&buf[..n], elapsed);
-                    if rec.output_bytes_since_snapshot() >= 256 * 1024 {
-                        if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
-                            let (cols, rows) = vt_engine.size();
-                            let state = String::from_utf8_lossy(&payload);
-                            rec.write_snapshot(&state, context.vt_engine_kind.as_str(), cols, rows, elapsed);
-                        } else {
-                            rec.reset_output_bytes_since_snapshot();
-                        }
-                    }
-                }
-
-                let engine_reply = vt_engine.drain_replies();
-                if active_client.is_none() {
-                    if let Some(ref mut tracker) = detached_da {
-                        for reply in tracker.push(&buf[..n]) {
-                            pty_child.write_all(&reply)?;
-                        }
-                    }
-                    if !engine_reply.is_empty() {
-                        pty_child.write_all(&engine_reply)?;
-                    }
-                }
-                if let Some(client) = active_client.as_mut() {
-                    if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
-                        let _ = fs::remove_file(foreground_path(context.root, context.id));
-                        if let Some(ref mut rec) = recorder {
-                            rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, context.epoch.elapsed());
-                        }
-                        *active_client = None;
-                    }
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || is_pty_eof_after_exit(&err) => break,
-            Err(err) => return Err(format!("read pty output after exit: {err}")),
-        }
-    }
-    Ok(())
-}
-
-fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        err.raw_os_error() == Some(libc::EIO)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = err;
-        false
-    }
-}
-
-struct DrainExitContext<'a> {
-    root: &'a Path,
-    id: &'a str,
-    vt_engine_kind: VtEngineKind,
-    epoch: Instant,
 }
 
 struct ActiveClient {

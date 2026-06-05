@@ -837,11 +837,35 @@ fn handle_http_request(
             runtime.write_input(&body.bytes)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP keys response: {err}"))
         }
+        http_uds::Route::SessionRecord { id } if id == daemon_id => {
+            let body: http_uds::RecordRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;
+            runtime.set_recording(body.enable)?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP record response: {err}"))
+        }
+        http_uds::Route::SessionMark { id } if id == daemon_id => {
+            let body: http_uds::MarkRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP mark request: {err}"))?;
+            let offset = runtime.mark(body.name)?;
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
+                .map_err(|err| format!("write HTTP mark response: {err}"))
+        }
         http_uds::Route::SessionResize { id } if id == daemon_id => {
             let body: http_uds::ResizeRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resize request: {err}"))?;
             runtime.resize(body.cols, body.rows)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP resize response: {err}"))
+        }
+        http_uds::Route::SessionScreen { id } if id == daemon_id => match runtime.capture_text() {
+            Ok(text) => http_uds::write_json(stream, StatusCode::OK, &http_uds::ScreenResponse { text })
+                .map_err(|err| format!("write HTTP screen response: {err}")),
+            Err(err) => http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP screen error: {err}")),
+        },
+        http_uds::Route::SessionSignal { id } if id == daemon_id => {
+            let body: http_uds::SignalRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP signal request: {err}"))?;
+            runtime.dispatch_signal(body.signal, signal_target_from_http(body.target))?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP signal response: {err}"))
         }
         http_uds::Route::SessionSnapshot { id } if id == daemon_id => {
             let output = runtime.read_available_output(active_client.is_some())?;
@@ -866,6 +890,14 @@ fn handle_http_request(
         _ => {
             http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
         }
+    }
+}
+
+fn signal_target_from_http(target: http_uds::SignalTargetRequest) -> crate::protocol::SignalTarget {
+    match target {
+        http_uds::SignalTargetRequest::Foreground => crate::protocol::SignalTarget::Foreground,
+        http_uds::SignalTargetRequest::Leader => crate::protocol::SignalTarget::Leader,
+        http_uds::SignalTargetRequest::Tree => crate::protocol::SignalTarget::Tree,
     }
 }
 

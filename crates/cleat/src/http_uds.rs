@@ -20,7 +20,11 @@ pub(crate) enum Route {
     SessionInspect { id: String },
     SessionInput { id: String },
     SessionKeys { id: String },
+    SessionMark { id: String },
+    SessionRecord { id: String },
     SessionResize { id: String },
+    SessionScreen { id: String },
+    SessionSignal { id: String },
     SessionSnapshot { id: String },
     NotFound,
 }
@@ -65,6 +69,40 @@ pub(crate) struct KeysRequest {
 pub(crate) struct ResizeRequest {
     pub cols: u16,
     pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RecordRequest {
+    pub enable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MarkRequest {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MarkResponse {
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ScreenResponse {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SignalRequest {
+    pub signal: i32,
+    pub target: SignalTargetRequest,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SignalTargetRequest {
+    Foreground,
+    Leader,
+    Tree,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
@@ -229,7 +267,11 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::GET, None, None) => Route::SessionInspect { id: id.to_string() },
                 (&Method::POST, Some("input"), None) => Route::SessionInput { id: id.to_string() },
                 (&Method::POST, Some("keys"), None) => Route::SessionKeys { id: id.to_string() },
+                (&Method::POST, Some("mark"), None) => Route::SessionMark { id: id.to_string() },
+                (&Method::POST, Some("record"), None) => Route::SessionRecord { id: id.to_string() },
                 (&Method::POST, Some("resize"), None) => Route::SessionResize { id: id.to_string() },
+                (&Method::GET, Some("screen"), None) => Route::SessionScreen { id: id.to_string() },
+                (&Method::POST, Some("signal"), None) => Route::SessionSignal { id: id.to_string() },
                 (&Method::GET, Some("snapshot"), None) => Route::SessionSnapshot { id: id.to_string() },
                 _ => Route::NotFound,
             }
@@ -366,7 +408,11 @@ mod tests {
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/input", Route::SessionInput { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/keys", Route::SessionKeys { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/mark", Route::SessionMark { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/record", Route::SessionRecord { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/resize", Route::SessionResize { id: "alpha".to_string() }),
+            ("GET", "/sessions/alpha/screen", Route::SessionScreen { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/signal", Route::SessionSignal { id: "alpha".to_string() }),
             ("GET", "/sessions/alpha/snapshot", Route::SessionSnapshot { id: "alpha".to_string() }),
         ];
 

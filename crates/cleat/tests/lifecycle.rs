@@ -235,6 +235,24 @@ fn session_daemon_accepts_http_control_requests_on_session_socket() {
     );
     assert!(keys.starts_with("HTTP/1.1 204 No Content\r\n"), "{keys}");
 
+    let record_body = r#"{"enable":true}"#;
+    let record = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!("POST /sessions/alpha/record HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}", record_body.len(), record_body),
+    );
+    assert!(record.starts_with("HTTP/1.1 204 No Content\r\n"), "{record}");
+
+    let mark_body = r#"{"name":"m1"}"#;
+    let mark = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!("POST /sessions/alpha/mark HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}", mark_body.len(), mark_body),
+    );
+    assert!(mark.starts_with("HTTP/1.1 200 OK\r\n"), "{mark}");
+    let mark_json: serde_json::Value = serde_json::from_str(http_body(&mark)).expect("mark json");
+    assert!(mark_json["offset"].is_u64());
+
     let input_text_body = r#"{"kind":"text","text":"structured input"}"#;
     let input_text = http_session_request(
         temp.path(),
@@ -287,6 +305,10 @@ fn session_daemon_accepts_http_control_requests_on_session_socket() {
     let input_resized_json: serde_json::Value = serde_json::from_str(http_body(&input_resized)).expect("input resized inspect json");
     assert_eq!(input_resized_json["terminal"]["cols"], 14);
     assert_eq!(input_resized_json["terminal"]["rows"], 8);
+
+    let screen = http_session_request(temp.path(), "alpha", "GET /sessions/alpha/screen HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(screen.starts_with("HTTP/1.1 409 Conflict\r\n"), "{screen}");
+    assert!(http_body(&screen).contains("placeholder"));
 
     let snapshot = http_session_request(temp.path(), "alpha", "GET /sessions/alpha/snapshot HTTP/1.1\r\nHost: cleat\r\n\r\n");
     assert!(snapshot.starts_with("HTTP/1.1 409 Conflict\r\n"), "{snapshot}");

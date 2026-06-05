@@ -1100,37 +1100,10 @@ mod tests {
         AttachCleanupGuard, TestReplayProbeVtEngine,
     };
     use crate::{
+        http_uds::read_http_request_for_test,
         runtime::RuntimeLayout,
         vt::{self, VtEngine},
     };
-
-    fn read_http_request(stream: &mut impl std::io::Read) -> String {
-        let mut bytes = Vec::new();
-        loop {
-            let mut buf = [0; 1024];
-            let n = stream.read(&mut buf).expect("read request");
-            assert_ne!(n, 0, "connection closed before request completed");
-            bytes.extend_from_slice(&buf[..n]);
-            if http_request_complete(&bytes) {
-                return String::from_utf8(bytes).expect("request utf8");
-            }
-        }
-    }
-
-    fn http_request_complete(bytes: &[u8]) -> bool {
-        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
-            return false;
-        };
-        let header = String::from_utf8_lossy(&bytes[..header_end + 4]);
-        let content_length = header
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("content length"))
-            })
-            .unwrap_or(0);
-        bytes.len() >= header_end + 4 + content_length
-    }
 
     #[cfg(unix)]
     #[test]
@@ -1146,7 +1119,7 @@ mod tests {
             use std::io::Write;
 
             let (mut stream, _) = listener.accept().expect("accept connection");
-            let request = read_http_request(&mut stream);
+            let request = read_http_request_for_test(&mut stream);
             tx.send(request).expect("send request");
             stream
                 .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n")

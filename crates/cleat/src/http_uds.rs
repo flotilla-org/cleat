@@ -252,7 +252,10 @@ pub(crate) fn looks_like_http_prefix(prefix: &[u8]) -> bool {
 
 pub(crate) fn read_request_with_prefix(reader: &mut impl Read, prefix: &[u8]) -> std::io::Result<HttpRequest> {
     let mut bytes = prefix.to_vec();
-    while !has_header_end(&bytes) {
+    let header_end = loop {
+        if let Some(header_end) = header_end_index(&bytes) {
+            break header_end;
+        }
         if bytes.len() >= MAX_HEADER_BYTES {
             return Err(Error::new(ErrorKind::InvalidData, "HTTP request headers exceeded maximum size"));
         }
@@ -262,9 +265,8 @@ pub(crate) fn read_request_with_prefix(reader: &mut impl Read, prefix: &[u8]) ->
             return Err(Error::new(ErrorKind::UnexpectedEof, "connection closed before HTTP headers completed"));
         }
         bytes.extend_from_slice(&buf[..n]);
-    }
+    };
 
-    let header_end = header_end_index(&bytes).expect("header end checked");
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Request::new(&mut headers);
     let status = parsed.parse(&bytes[..header_end + 4]).map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
@@ -501,6 +503,36 @@ fn has_header_end(bytes: &[u8]) -> bool {
 
 fn header_end_index(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+#[cfg(test)]
+pub(crate) fn read_http_request_for_test(stream: &mut impl Read) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        let mut buf = [0; 1024];
+        let n = stream.read(&mut buf).expect("read request");
+        assert_ne!(n, 0, "connection closed before request completed");
+        bytes.extend_from_slice(&buf[..n]);
+        if http_request_complete_for_test(&bytes) {
+            return String::from_utf8(bytes).expect("request utf8");
+        }
+    }
+}
+
+#[cfg(test)]
+fn http_request_complete_for_test(bytes: &[u8]) -> bool {
+    let Some(header_end) = header_end_index(bytes) else {
+        return false;
+    };
+    let header = String::from_utf8_lossy(&bytes[..header_end + 4]);
+    let content_length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("content length"))
+        })
+        .unwrap_or(0);
+    bytes.len() >= header_end + 4 + content_length
 }
 
 fn dirty_name(dirty: DirtyState) -> &'static str {

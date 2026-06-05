@@ -391,14 +391,14 @@ fn apply_attach_state(
 }
 
 struct PendingWait {
-    response: PendingResponse,
+    stream: SessionStream,
     conditions: Vec<crate::protocol::WaitCondition>,
     timeout_ms: u64,
     registered_at: Instant,
 }
 
 struct PendingExpect {
-    response: PendingResponse,
+    stream: SessionStream,
     text: String,
     since_offset: u64,
     last_checked_file_size: u64,
@@ -406,31 +406,8 @@ struct PendingExpect {
     registered_at: Instant,
 }
 
-enum PendingResponse {
-    Frame(SessionStream),
-    Http(SessionStream),
-}
-
-impl PendingResponse {
-    fn write_wait_result(&mut self, status: crate::protocol::WaitStatus, elapsed_ms: u64) -> std::io::Result<()> {
-        match self {
-            PendingResponse::Frame(stream) => Frame::WaitResult { status, elapsed_ms }.write(stream),
-            PendingResponse::Http(stream) => http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
-                status: wait_status_to_http(status),
-                elapsed_ms,
-            }),
-        }
-    }
-
-    fn write_expect_result(&mut self, status: crate::protocol::WaitStatus, elapsed_ms: u64) -> std::io::Result<()> {
-        match self {
-            PendingResponse::Frame(stream) => Frame::ExpectResult { status, elapsed_ms }.write(stream),
-            PendingResponse::Http(stream) => http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
-                status: wait_status_to_http(status),
-                elapsed_ms,
-            }),
-        }
-    }
+fn write_http_wait_result(stream: &mut SessionStream, status: crate::protocol::WaitStatus, elapsed_ms: u64) -> std::io::Result<()> {
+    http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse { status: wait_status_to_http(status), elapsed_ms })
 }
 
 #[cfg(any(unix, windows))]
@@ -480,197 +457,20 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
                         continue;
                     }
-                    if http_uds::looks_like_http_prefix(&prefix) {
-                        let mut http_state = HttpRequestState {
-                            runtime: &mut runtime,
-                            active_client: &mut active_client,
-                            had_foreground_client: &mut had_foreground_client,
-                            pending_waits: &mut pending_waits,
-                            pending_expects: &mut pending_expects,
-                        };
-                        if let Err(err) = handle_http_request(root, id, &mut stream, &prefix, &mut http_state) {
-                            let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
-                        }
+                    if !http_uds::looks_like_http_prefix(&prefix) {
+                        let _ = Frame::Error("session daemon requires HTTP requests".to_string()).write(&mut stream);
                         continue;
                     }
-                    match Frame::read_after_header(prefix, &mut stream) {
-                        Ok(Frame::AttachInit { cols, rows, capabilities }) => {
-                            if active_client.is_none() {
-                                let replay = runtime.apply_attach_state(cols, rows, &capabilities)?;
-                                Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
-                                #[cfg(unix)]
-                                set_stream_nonblocking(&stream, true).map_err(|err| format!("set client nonblocking: {err}"))?;
-                                let mut client = ActiveClient::new(stream)?;
-                                if let Some(payload) = replay {
-                                    if !payload.is_empty() {
-                                        if had_foreground_client {
-                                            client.enqueue_frame(&Frame::Output(REATTACH_CLEAR_SEQUENCE.to_vec()))?;
-                                        }
-                                        client.enqueue_frame(&Frame::Output(payload))?;
-                                    }
-                                }
-                                let _ = fs::write(foreground_path(root, id), b"1");
-                                active_client = Some(client);
-                                had_foreground_client = true;
-                                runtime.record_attach();
-                            } else {
-                                let _ = Frame::Busy.write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::Detach) => {
-                            let _ = fs::remove_file(foreground_path(root, id));
-                            runtime.record_detach();
-                            active_client = None;
-                        }
-                        Ok(Frame::Capture) => match runtime.capture_text() {
-                            Ok(text) => {
-                                let _ = Frame::Output(text.into_bytes()).write(&mut stream);
-                            }
-                            Err(err) => {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        },
-                        Ok(Frame::SendKeys(bytes)) => {
-                            if let Err(err) = runtime.write_input(&bytes) {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::SendKeysWithMark { bytes, marker_name }) => match runtime.write_input_with_mark(&bytes, marker_name) {
-                            Ok(offset) => {
-                                let _ = Frame::MarkResult { offset }.write(&mut stream);
-                            }
-                            Err(err) => {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        },
-                        Ok(Frame::Inspect) => {
-                            let result = runtime.inspect(active_client.is_some());
-                            match serde_json::to_vec(&result) {
-                                Ok(json) => {
-                                    let _ = Frame::InspectResult(json).write(&mut stream);
-                                }
-                                Err(err) => {
-                                    let _ = Frame::Error(format!("serialize inspect: {err}")).write(&mut stream);
-                                }
-                            }
-                        }
-                        Ok(Frame::Signal { signal, target }) => match runtime.dispatch_signal(signal, target) {
-                            Ok(()) => {
-                                let _ = Frame::Ack.write(&mut stream);
-                            }
-                            Err(err) => {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        },
-                        Ok(Frame::Mark { name }) => match runtime.mark(name) {
-                            Ok(offset) => {
-                                let _ = Frame::MarkResult { offset }.write(&mut stream);
-                            }
-                            Err(err) => {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        },
-                        Ok(Frame::ResolveMarker { name }) => {
-                            if let Some(offset) = runtime.resolve_marker(&name) {
-                                let _ = Frame::MarkResult { offset }.write(&mut stream);
-                            } else {
-                                let _ = Frame::Error(format!("marker not found: {name}")).write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::ResolveNextMarker { after }) => {
-                            let next = runtime.resolve_next_marker_after(after);
-                            let reply = match next {
-                                Some(offset) => Frame::MarkResult { offset },
-                                None => Frame::MarkNotFound,
-                            };
-                            let _ = reply.write(&mut stream);
-                        }
-                        Ok(Frame::RecordControl { enable }) => match runtime.set_recording(enable) {
-                            Ok(()) => {
-                                let _ = Frame::Ack.write(&mut stream);
-                            }
-                            Err(err) => {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        },
-                        Ok(Frame::Wait { conditions, timeout_ms }) => 'wait: {
-                            if conditions.is_empty() {
-                                let _ = Frame::Error("at least one wait condition is required".to_string()).write(&mut stream);
-                                break 'wait;
-                            }
 
-                            // Validate: TextMatch requires screen_text support
-                            let has_text_match = conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::TextMatch { .. }));
-                            if has_text_match {
-                                if let Err(err) = runtime.validate_text_matching() {
-                                    let _ = Frame::Error(format!("text matching not supported: {err}")).write(&mut stream);
-                                    break 'wait;
-                                }
-                            }
-
-                            // Check --text immediately at registration
-                            if has_text_match {
-                                for condition in &conditions {
-                                    if let crate::protocol::WaitCondition::TextMatch { text } = condition {
-                                        if runtime.screen_contains(text.as_str()) {
-                                            let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
-                                                .write(&mut stream);
-                                            break 'wait;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Register for async evaluation
-                            if let Err(err) = set_stream_nonblocking(&stream, true) {
-                                let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
-                                break 'wait;
-                            }
-                            pending_waits.push(PendingWait {
-                                response: PendingResponse::Frame(stream),
-                                conditions,
-                                timeout_ms,
-                                registered_at: Instant::now(),
-                            });
-                        }
-                        Ok(Frame::Expect { text, since_offset, timeout_ms }) => 'expect: {
-                            if !runtime.recording_active() {
-                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
-                                break 'expect;
-                            }
-                            // Check immediately — text may already be in the recording
-                            let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
-                            runtime.flush_recording();
-                            if cast_path.exists() {
-                                if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, since_offset) {
-                                    let output: String = events.iter().map(|e| e.data.as_str()).collect();
-                                    if output.contains(&text) {
-                                        let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
-                                            .write(&mut stream);
-                                        break 'expect;
-                                    }
-                                }
-                            }
-                            if let Err(err) = set_stream_nonblocking(&stream, true) {
-                                let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
-                                break 'expect;
-                            }
-                            let initial_file_size = std::fs::metadata(&cast_path).map(|m| m.len()).unwrap_or(0);
-                            pending_expects.push(PendingExpect {
-                                response: PendingResponse::Frame(stream),
-                                text,
-                                since_offset,
-                                last_checked_file_size: initial_file_size,
-                                timeout_ms,
-                                registered_at: Instant::now(),
-                            });
-                        }
-                        Ok(other) => {
-                            let _ = Frame::Error(format!("unrecognized request: {other:?}")).write(&mut stream);
-                        }
-                        Err(err) => {
-                            let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
-                        }
+                    let mut http_state = HttpRequestState {
+                        runtime: &mut runtime,
+                        active_client: &mut active_client,
+                        had_foreground_client: &mut had_foreground_client,
+                        pending_waits: &mut pending_waits,
+                        pending_expects: &mut pending_expects,
+                    };
+                    if let Err(err) = handle_http_request(root, id, &mut stream, &prefix, &mut http_state) {
+                        let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -746,7 +546,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
             // Check timeout first
             if elapsed_ms >= wait.timeout_ms {
-                let _ = wait.response.write_wait_result(crate::protocol::WaitStatus::Timeout, elapsed_ms);
+                let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
                 return false;
             }
 
@@ -761,13 +561,13 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         };
                         let quiet_duration = silence_since.elapsed().as_millis() as u64;
                         if quiet_duration >= *quiet_ms {
-                            let _ = wait.response.write_wait_result(crate::protocol::WaitStatus::Ready, elapsed_ms);
+                            let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
                             return false;
                         }
                     }
                     crate::protocol::WaitCondition::TextMatch { text } => {
                         if runtime.screen_contains(text.as_str()) {
-                            let _ = wait.response.write_wait_result(crate::protocol::WaitStatus::Ready, elapsed_ms);
+                            let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
                             return false;
                         }
                     }
@@ -786,7 +586,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 let elapsed_ms = elapsed.as_millis() as u64;
 
                 if elapsed_ms >= expect.timeout_ms {
-                    let _ = expect.response.write_expect_result(crate::protocol::WaitStatus::Timeout, elapsed_ms);
+                    let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
                     return false;
                 }
 
@@ -797,7 +597,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, expect.since_offset) {
                             let output: String = events.iter().map(|e| e.data.as_str()).collect();
                             if output.contains(&expect.text) {
-                                let _ = expect.response.write_expect_result(crate::protocol::WaitStatus::Ready, elapsed_ms);
+                                let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
                                 return false;
                             }
                         }
@@ -822,11 +622,11 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
-                let _ = wait.response.write_wait_result(crate::protocol::WaitStatus::SessionGone, elapsed_ms);
+                let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
             }
             for mut expect in pending_expects.drain(..) {
                 let elapsed_ms = expect.registered_at.elapsed().as_millis() as u64;
-                let _ = expect.response.write_expect_result(crate::protocol::WaitStatus::SessionGone, elapsed_ms);
+                let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
             }
             runtime.record_exit_code(exit_code);
             if let Some(client) = active_client.as_mut() {
@@ -951,7 +751,7 @@ fn handle_http_request(
             }
             let initial_file_size = std::fs::metadata(&cast_path).map(|metadata| metadata.len()).unwrap_or(0);
             state.pending_expects.push(PendingExpect {
-                response: PendingResponse::Http(pending_stream),
+                stream: pending_stream,
                 text: body.text,
                 since_offset: body.since_offset,
                 last_checked_file_size: initial_file_size,
@@ -1101,7 +901,7 @@ fn handle_http_request(
                 break 'wait Ok(());
             }
             state.pending_waits.push(PendingWait {
-                response: PendingResponse::Http(pending_stream),
+                stream: pending_stream,
                 conditions,
                 timeout_ms: body.timeout_ms,
                 registered_at: Instant::now(),

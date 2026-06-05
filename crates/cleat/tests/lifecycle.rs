@@ -60,6 +60,41 @@ fn http_body(response: &str) -> &str {
     response.split_once("\r\n\r\n").map(|(_, body)| body).expect("HTTP response body")
 }
 
+fn http_attach_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, capabilities: ClientCapabilities) -> UnixStream {
+    let socket_path = session_socket_path(root, id);
+    let mut stream = UnixStream::connect(&socket_path).expect("connect session socket");
+    let color_level = match capabilities.color_level {
+        ColorLevel::Sixteen => "sixteen",
+        ColorLevel::Ansi256 => "ansi256",
+        ColorLevel::TrueColor => "true_color",
+    };
+    let body = format!(
+        r#"{{"cols":{cols},"rows":{rows},"capabilities":{{"color_level":"{color_level}","kitty_keyboard":{}}}}}"#,
+        capabilities.kitty_keyboard
+    );
+    write!(
+        stream,
+        "POST /sessions/{id}/attach HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write attach request");
+
+    let response = read_http_response_head(&mut stream);
+    assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
+    stream
+}
+
+fn read_http_response_head(stream: &mut UnixStream) -> String {
+    let mut bytes = Vec::new();
+    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).expect("read response head");
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).expect("response utf8")
+}
+
 struct EnvVarGuard {
     key: &'static str,
     original: Option<std::ffi::OsString>,
@@ -489,13 +524,7 @@ fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_c
 
     service.create(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("create alpha");
 
-    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
-    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
-        .write(&mut stream)
-        .expect("write attach init");
-
-    let response = Frame::read(&mut stream).expect("read attach response");
-    assert_eq!(response, Frame::Ack);
+    let _stream = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::new(ColorLevel::Ansi256, true));
 
     let err = service.attach(Some("alpha".into()), None, None, None, false).expect_err("second attach should fail");
     assert!(err.contains("foreground client"));
@@ -510,13 +539,7 @@ fn lifecycle_attach_init_capabilities_drive_replay_output_on_daemon_path() {
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("create alpha");
 
-    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
-    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
-        .write(&mut stream)
-        .expect("write attach init");
-
-    let response = Frame::read(&mut stream).expect("read attach response");
-    assert_eq!(response, Frame::Ack);
+    let mut stream = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::new(ColorLevel::Ansi256, true));
 
     let replay = Frame::read(&mut stream).expect("read replay output");
     assert_eq!(replay, Frame::Output(b"Ansi256:true".to_vec()));
@@ -529,11 +552,7 @@ fn send_keys_injects_input_into_running_session_pty() {
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("cat".into()), false).expect("create alpha");
 
-    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
-    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
-        .write(&mut stream)
-        .expect("write attach init");
-    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
+    let mut stream = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::conservative_fallback());
 
     service.send_keys("alpha", b"hello\n").expect("send keys");
 
@@ -565,11 +584,7 @@ fn send_keys_cli_executes_end_to_end() {
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("cat".into()), false).expect("create alpha");
 
-    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
-    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::conservative_fallback() }
-        .write(&mut stream)
-        .expect("write attach init");
-    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
+    let mut stream = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::conservative_fallback());
 
     let cli = Cli::try_parse_from(["cleat", "send-keys", "alpha", "h", "i", "Enter"]).expect("parse send-keys");
     assert_eq!(cli::execute(cli, &service).expect("execute send-keys"), None);
@@ -643,12 +658,8 @@ fn attached_session_does_not_get_synthetic_da_reply() {
     std::thread::sleep(Duration::from_secs(1));
 
     // Attach BEFORE sending the DA query
-    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect");
+    let mut stream = http_attach_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback());
     stream.set_read_timeout(Some(Duration::from_millis(100))).ok();
-    Frame::AttachInit { cols: 80, rows: 24, capabilities: ClientCapabilities::conservative_fallback() }
-        .write(&mut stream)
-        .expect("write attach init");
-    assert_eq!(Frame::read(&mut stream).expect("read ack"), Frame::Ack);
 
     // Send DA1 query while attached — cat echoes it, daemon forwards but should NOT inject response
     service.send_keys("alpha", b"\x1b[c").expect("send DA query");
@@ -708,11 +719,7 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
         .create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 1; printf 'after'; sleep 5".into()), false)
         .expect("create alpha");
 
-    let mut first = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect first socket");
-    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
-        .write(&mut first)
-        .expect("write first attach init");
-    assert_eq!(Frame::read(&mut first).expect("read first attach response"), Frame::Ack);
+    let mut first = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::new(ColorLevel::Ansi256, true));
 
     let first_live = Frame::read(&mut first).expect("read first live output");
     let first_live_bytes = match first_live {
@@ -728,11 +735,7 @@ fn replay_reattach_delivers_restore_before_new_live_output() {
     }
     assert!(!foreground_path(temp.path(), "alpha").exists(), "foreground marker should clear before reattach");
 
-    let mut second = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect second socket");
-    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
-        .write(&mut second)
-        .expect("write second attach init");
-    assert_eq!(Frame::read(&mut second).expect("read second attach response"), Frame::Ack);
+    let mut second = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::new(ColorLevel::Ansi256, true));
 
     let clear = Frame::read(&mut second).expect("read clear output");
     assert_eq!(clear, Frame::Output(b"\x1b[2J\x1b[H".to_vec()));
@@ -764,11 +767,7 @@ fn first_attach_replay_does_not_clear_before_output() {
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("printf 'before'; sleep 5".into()), false).expect("create alpha");
 
-    let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).expect("connect socket");
-    Frame::AttachInit { cols: 100, rows: 30, capabilities: ClientCapabilities::new(ColorLevel::Ansi256, true) }
-        .write(&mut stream)
-        .expect("write attach init");
-    assert_eq!(Frame::read(&mut stream).expect("read attach response"), Frame::Ack);
+    let mut stream = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::new(ColorLevel::Ansi256, true));
 
     let first = Frame::read(&mut stream).expect("read first output");
     let bytes = match first {

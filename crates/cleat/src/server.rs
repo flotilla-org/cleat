@@ -12,7 +12,7 @@ use crate::{
         daemon::{is_session_daemon_alive, terminate_session_daemon_if_expected},
         ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
-    protocol::{Frame, SessionInfo, SessionStatus},
+    protocol::{SessionInfo, SessionStatus},
     runtime::RuntimeLayout,
     session::{attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, ForegroundAttach},
     vt::VtEngineKind,
@@ -169,10 +169,7 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
 
-        let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream = connect_session_socket(&socket_path)?;
-        Frame::Detach.write(&mut stream).map_err(|err| format!("write detach request: {err}"))?;
-        Ok(())
+        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/detach"), &())
     }
 
     pub fn capture(&self, id: &str) -> Result<String, String> {
@@ -598,6 +595,34 @@ mod tests {
         session::{daemon_pid_path, session_socket_path},
     };
 
+    fn read_http_request(stream: &mut impl std::io::Read) -> String {
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0; 1024];
+            let n = stream.read(&mut buf).expect("read request");
+            assert_ne!(n, 0, "connection closed before request completed");
+            bytes.extend_from_slice(&buf[..n]);
+            if http_request_complete(&bytes) {
+                return String::from_utf8(bytes).expect("request utf8");
+            }
+        }
+    }
+
+    fn http_request_complete(bytes: &[u8]) -> bool {
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let header = String::from_utf8_lossy(&bytes[..header_end + 4]);
+        let content_length = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or(0);
+        bytes.len() >= header_end + 4 + content_length
+    }
+
     #[test]
     fn kill_does_not_signal_unrelated_process_from_stale_pid_file() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -638,12 +663,10 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
         let (tx, rx) = mpsc::channel();
         let reader = thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
 
             let (mut stream, _) = listener.accept().expect("accept connection");
-            let mut buf = [0; 1024];
-            let n = stream.read(&mut buf).expect("read request");
-            let request = String::from_utf8(buf[..n].to_vec()).expect("request utf8");
+            let request = read_http_request(&mut stream);
             tx.send(request).expect("send request");
             stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("write response");
         });
@@ -657,6 +680,32 @@ mod tests {
     }
 
     #[test]
+    fn detach_posts_http_request_to_session_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = temp.path().join("alpha");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let socket_path = session_socket_path(temp.path(), "alpha");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_http_request(&mut stream);
+            tx.send(request).expect("send request");
+            stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("write response");
+        });
+
+        service.detach("alpha").expect("detach");
+        let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
+
+        reader.join().expect("join reader");
+        assert!(request.starts_with("POST /sessions/alpha/detach HTTP/1.1\r\n"), "{request}");
+    }
+
+    #[test]
     fn wait_posts_http_request_to_session_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
@@ -667,12 +716,10 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
         let (tx, rx) = mpsc::channel();
         let reader = thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
 
             let (mut stream, _) = listener.accept().expect("accept connection");
-            let mut buf = [0; 2048];
-            let n = stream.read(&mut buf).expect("read request");
-            let request = String::from_utf8(buf[..n].to_vec()).expect("request utf8");
+            let request = read_http_request(&mut stream);
             tx.send(request).expect("send request");
             stream
                 .write_all(
@@ -701,12 +748,10 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
         let (tx, rx) = mpsc::channel();
         let reader = thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
 
             let (mut stream, _) = listener.accept().expect("accept connection");
-            let mut buf = [0; 2048];
-            let n = stream.read(&mut buf).expect("read request");
-            let request = String::from_utf8(buf[..n].to_vec()).expect("request utf8");
+            let request = read_http_request(&mut stream);
             tx.send(request).expect("send request");
             stream
                 .write_all(

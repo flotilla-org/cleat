@@ -17,6 +17,7 @@ pub(crate) type HttpRequest = Request<Vec<u8>>;
 pub(crate) enum Route {
     Root,
     Health,
+    SessionDetach { id: String },
     SessionExpect { id: String },
     SessionInspect { id: String },
     SessionInput { id: String },
@@ -325,6 +326,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
             };
             match (request.method(), segments.next(), segments.next()) {
                 (&Method::GET, None, None) => Route::SessionInspect { id: id.to_string() },
+                (&Method::POST, Some("detach"), None) => Route::SessionDetach { id: id.to_string() },
                 (&Method::POST, Some("expect"), None) => Route::SessionExpect { id: id.to_string() },
                 (&Method::POST, Some("input"), None) => Route::SessionInput { id: id.to_string() },
                 (&Method::POST, Some("keys"), None) => Route::SessionKeys { id: id.to_string() },
@@ -471,6 +473,7 @@ mod tests {
         let cases = [
             ("GET", "/healthz", Route::Health),
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/detach", Route::SessionDetach { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/expect", Route::SessionExpect { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/input", Route::SessionInput { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/keys", Route::SessionKeys { id: "alpha".to_string() }),

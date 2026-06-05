@@ -854,6 +854,12 @@ fn handle_http_request(
             let result = state.runtime.inspect(state.active_client.is_some());
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
         }
+        http_uds::Route::SessionDetach { id } if id == daemon_id => {
+            let _ = fs::remove_file(foreground_path(root, daemon_id));
+            state.runtime.record_detach();
+            *state.active_client = None;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP detach response: {err}"))
+        }
         http_uds::Route::SessionExpect { id } if id == daemon_id => 'expect: {
             let body: http_uds::ExpectRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP expect request: {err}"))?;

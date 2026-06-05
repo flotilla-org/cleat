@@ -17,6 +17,8 @@ pub(crate) type HttpRequest = Request<Vec<u8>>;
 pub(crate) enum Route {
     Root,
     Health,
+    Sessions,
+    SessionDelete { id: String },
     SessionAttach { id: String },
     SessionDetach { id: String },
     SessionExpect { id: String },
@@ -178,6 +180,11 @@ pub(crate) struct ScreenResponse {
 pub(crate) struct SignalRequest {
     pub signal: i32,
     pub target: SignalTargetRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SessionListResponse {
+    pub sessions: Vec<crate::protocol::InspectResult>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +379,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
     match (request.method(), path) {
         (&Method::GET, "/") => Route::Root,
         (&Method::GET, "/healthz") => Route::Health,
+        (&Method::GET, "/sessions") => Route::Sessions,
         _ => {
             let Some(rest) = path.strip_prefix("/sessions/") else {
                 return Route::NotFound;
@@ -382,6 +390,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
             };
             match (request.method(), segments.next(), segments.next()) {
                 (&Method::GET, None, None) => Route::SessionInspect { id: id.to_string() },
+                (&Method::DELETE, None, None) => Route::SessionDelete { id: id.to_string() },
                 (&Method::POST, Some("attach"), None) => Route::SessionAttach { id: id.to_string() },
                 (&Method::POST, Some("detach"), None) => Route::SessionDetach { id: id.to_string() },
                 (&Method::POST, Some("expect"), None) => Route::SessionExpect { id: id.to_string() },
@@ -547,7 +556,9 @@ mod tests {
     fn routes_provider_critical_session_endpoints() {
         let cases = [
             ("GET", "/healthz", Route::Health),
+            ("GET", "/sessions", Route::Sessions),
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
+            ("DELETE", "/sessions/alpha", Route::SessionDelete { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/attach", Route::SessionAttach { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/detach", Route::SessionDetach { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/expect", Route::SessionExpect { id: "alpha".to_string() }),

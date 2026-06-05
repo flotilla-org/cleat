@@ -39,6 +39,7 @@ const DETACH_CLEANUP_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const TERMINATE_SIGNAL: i32 = 15;
 
 #[derive(Debug)]
 pub struct ForegroundAttach {
@@ -678,9 +679,18 @@ fn handle_http_request(
             }),
         )
         .map_err(|err| format!("write HTTP response: {err}")),
+        http_uds::Route::Sessions => {
+            let result = state.runtime.inspect(state.active_client.is_some());
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions: vec![result] })
+                .map_err(|err| format!("write HTTP sessions response: {err}"))
+        }
         http_uds::Route::SessionInspect { id } if id == daemon_id => {
             let result = state.runtime.inspect(state.active_client.is_some());
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
+        }
+        http_uds::Route::SessionDelete { id } if id == daemon_id => {
+            state.runtime.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader)?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
         }
         http_uds::Route::SessionAttach { id } if id == daemon_id => 'attach: {
             let body: http_uds::AttachRequest =

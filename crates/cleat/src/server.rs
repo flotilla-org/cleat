@@ -1,5 +1,6 @@
 use std::{
     path::Path,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -9,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::{
     http_uds,
     platform::{
-        daemon::{is_session_daemon_alive, terminate_session_daemon_if_expected},
+        daemon::{daemon_pid_path, is_session_daemon_alive, terminate_session_daemon_if_expected},
         ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
     protocol::{SessionInfo, SessionStatus},
@@ -159,6 +160,20 @@ impl SessionService {
     pub fn kill(&self, id: &str) -> Result<(), String> {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
+        }
+        let pid_path = daemon_pid_path(self.layout.root(), id);
+        if self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &()).is_ok() {
+            if pid_path.exists() {
+                for _ in 0..50 {
+                    if !self.layout.root().join(id).exists() || !pid_path.exists() || !is_session_daemon_alive(self.layout.root(), id) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+            if !self.layout.root().join(id).exists() {
+                return Ok(());
+            }
         }
         terminate_session_daemon_if_expected(self.layout.root(), id);
         self.layout.remove_session(id)
@@ -468,7 +483,7 @@ impl SessionService {
         if let Some(timeout) = read_timeout {
             set_stream_read_timeout(&stream, Some(timeout))?;
         }
-        let body = if method == Method::GET {
+        let body = if method == Method::GET || method == Method::DELETE {
             Vec::new()
         } else {
             serde_json::to_vec(body).map_err(|err| format!("serialize HTTP request: {err}"))?
@@ -677,6 +692,33 @@ mod tests {
         reader.join().expect("join reader");
         assert!(request.starts_with("POST /sessions/alpha/keys HTTP/1.1\r\n"), "{request}");
         assert!(request.ends_with(r#"{"bytes":[104,101,108,108,111,13]}"#), "{request}");
+    }
+
+    #[test]
+    fn kill_deletes_session_over_http_when_socket_is_available() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = temp.path().join("alpha");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let socket_path = session_socket_path(temp.path(), "alpha");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_http_request(&mut stream);
+            tx.send(request).expect("send request");
+            stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("write response");
+        });
+
+        service.kill("alpha").expect("kill session");
+        let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
+
+        reader.join().expect("join reader");
+        assert!(request.starts_with("DELETE /sessions/alpha HTTP/1.1\r\n"), "{request}");
+        assert!(!session_dir.exists(), "kill should remove the local session directory");
     }
 
     #[test]

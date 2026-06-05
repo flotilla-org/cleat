@@ -13,19 +13,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+use http::StatusCode;
+
 use crate::{
-    da::DeviceAttributeTracker,
+    http_uds,
     platform::{
         daemon::spawn_daemon_process,
         ipc::{
             bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
             set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
         },
-        pty::{exit_code_from_wait_status, poll_session_ready, PtyChild},
+        pty::poll_session_ready,
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::Frame,
     runtime::{RuntimeLayout, SessionMetadata},
+    session_runtime::SessionRuntime,
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
 
@@ -35,8 +38,8 @@ const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DETACH_CLEANUP_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
-const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const TERMINATE_SIGNAL: i32 = 15;
 
 #[derive(Debug)]
 pub struct ForegroundAttach {
@@ -252,13 +255,19 @@ pub fn attach_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundA
     loop {
         let mut stream = connect_session_stream(&socket_path)?;
         let (cols, rows) = current_terminal_size();
-        Frame::AttachInit { cols, rows, capabilities: attach_init_capabilities() }
-            .write(&mut stream)
-            .map_err(|err| format!("write attach init: {err}"))?;
-        match Frame::read(&mut stream).map_err(|err| format!("read attach response: {err}"))? {
-            Frame::Ack => return Ok(ForegroundAttach { stream: Arc::new(Mutex::new(stream)) }),
-            Frame::Busy => {}
-            other => return Err(format!("unexpected attach response: {other:?}")),
+        let body = serde_json::to_vec(&http_uds::AttachRequest {
+            cols,
+            rows,
+            capabilities: attach_capabilities_to_http(attach_init_capabilities()),
+        })
+        .map_err(|err| format!("serialize attach request: {err}"))?;
+        http_uds::write_attach_upgrade_request(&mut stream, &format!("/sessions/{id}/attach"), &body)
+            .map_err(|err| format!("write attach upgrade request: {err}"))?;
+        let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read attach upgrade response: {err}"))?;
+        match response.status {
+            StatusCode::SWITCHING_PROTOCOLS => return Ok(ForegroundAttach { stream: Arc::new(Mutex::new(stream)) }),
+            StatusCode::CONFLICT => {}
+            other => return Err(format!("unexpected attach response: {other}")),
         }
         if Instant::now() >= deadline {
             return Err(format!("session {id} already has a foreground client"));
@@ -338,6 +347,7 @@ impl VtEngine for TestReplayProbeVtEngine {
     }
 }
 
+#[cfg(test)]
 fn record_pty_output(engine: &mut dyn VtEngine, bytes: &[u8]) -> Result<(), String> {
     engine.feed(bytes)
 }
@@ -346,6 +356,27 @@ fn attach_init_capabilities() -> vt::ClientCapabilities {
     vt::ClientCapabilities::conservative_fallback()
 }
 
+fn attach_capabilities_to_http(capabilities: vt::ClientCapabilities) -> http_uds::AttachCapabilitiesRequest {
+    http_uds::AttachCapabilitiesRequest {
+        color_level: match capabilities.color_level {
+            vt::ColorLevel::Sixteen => http_uds::AttachColorLevelRequest::Sixteen,
+            vt::ColorLevel::Ansi256 => http_uds::AttachColorLevelRequest::Ansi256,
+            vt::ColorLevel::TrueColor => http_uds::AttachColorLevelRequest::TrueColor,
+        },
+        kitty_keyboard: capabilities.kitty_keyboard,
+    }
+}
+
+fn attach_capabilities_from_http(capabilities: http_uds::AttachCapabilitiesRequest) -> vt::ClientCapabilities {
+    let color_level = match capabilities.color_level {
+        http_uds::AttachColorLevelRequest::Sixteen => vt::ColorLevel::Sixteen,
+        http_uds::AttachColorLevelRequest::Ansi256 => vt::ColorLevel::Ansi256,
+        http_uds::AttachColorLevelRequest::TrueColor => vt::ColorLevel::TrueColor,
+    };
+    vt::ClientCapabilities::new(color_level, capabilities.kitty_keyboard)
+}
+
+#[cfg(test)]
 fn apply_attach_state(
     engine: &mut dyn VtEngine,
     cols: u16,
@@ -376,6 +407,10 @@ struct PendingExpect {
     registered_at: Instant,
 }
 
+fn write_http_wait_result(stream: &mut SessionStream, status: crate::protocol::WaitStatus, elapsed_ms: u64) -> std::io::Result<()> {
+    http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse { status: wait_status_to_http(status), elapsed_ms })
+}
+
 #[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
     let id = &session.id;
@@ -390,45 +425,17 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     set_listener_nonblocking(&listener, true)?;
     fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let pty_child = PtyChild::spawn(session)?;
-    pty_child.set_nonblocking()?;
-    let mut vt_engine = default_vt_engine(session.vt_engine)?;
-    // The DA tracker is the only DA source for the passthrough engine.
-    // The ghostty engine answers DA itself via its DeviceAttributes callback,
-    // so we skip the tracker there to avoid double replies.
-    let mut detached_da = match session.vt_engine {
-        vt::VtEngineKind::Passthrough => Some(DeviceAttributeTracker::new()),
-        vt::VtEngineKind::Ghostty => None,
-    };
-
+    let mut runtime = SessionRuntime::spawn(session_dir.clone(), session, default_vt_engine(session.vt_engine)?)?;
     let mut active_client: Option<ActiveClient> = None;
-    let mut recorder: Option<crate::recording::SessionRecorder> = None;
-    let epoch = Instant::now();
-    let mut markers: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    if session.record {
-        let (cols, rows) = vt_engine.size();
-        match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
-            Ok(mut r) => {
-                // Bootstrap: emit initial snapshot if VT engine has state
-                if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
-                    let state = String::from_utf8_lossy(&payload);
-                    r.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, std::time::Duration::ZERO);
-                }
-                recorder = Some(r);
-            }
-            Err(err) => eprintln!("failed to start recording: {err}"),
-        }
-    }
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
     let mut pending_expects: Vec<PendingExpect> = Vec::new();
-    let mut last_pty_output_at: Option<Instant> = None;
     loop {
         let poll_result = poll_session_ready(
             &listener,
             active_client.as_ref().map(|client| &client.stream),
             active_client.as_ref().map(|client| !client.pending_output.is_empty()).unwrap_or(false),
-            &pty_child,
+            runtime.pty_child(),
             100,
         )?;
 
@@ -446,259 +453,25 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     {
                         set_stream_nonblocking(&stream, true).map_err(|err| format!("set accepted stream nonblocking: {err}"))?;
                     }
-                    match Frame::read(&mut stream) {
-                        Ok(Frame::AttachInit { cols, rows, capabilities }) => {
-                            if active_client.is_none() {
-                                pty_child.resize(cols, rows)?;
-                                let replay = apply_attach_state(vt_engine.as_mut(), cols, rows, &capabilities)?;
-                                Frame::Ack.write(&mut stream).map_err(|err| format!("write attach ack: {err}"))?;
-                                #[cfg(unix)]
-                                set_stream_nonblocking(&stream, true).map_err(|err| format!("set client nonblocking: {err}"))?;
-                                let mut client = ActiveClient::new(stream)?;
-                                if let Some(payload) = replay {
-                                    if !payload.is_empty() {
-                                        if had_foreground_client {
-                                            client.enqueue_frame(&Frame::Output(REATTACH_CLEAR_SEQUENCE.to_vec()))?;
-                                        }
-                                        client.enqueue_frame(&Frame::Output(payload))?;
-                                    }
-                                }
-                                let _ = fs::write(foreground_path(root, id), b"1");
-                                active_client = Some(client);
-                                had_foreground_client = true;
-                                if let Some(ref mut rec) = recorder {
-                                    rec.event(crate::asciicast::EventCode::Custom('a'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                                }
-                            } else {
-                                let _ = Frame::Busy.write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::Detach) => {
-                            let _ = fs::remove_file(foreground_path(root, id));
-                            if let Some(ref mut rec) = recorder {
-                                rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                            }
-                            active_client = None;
-                        }
-                        Ok(Frame::Capture) => match vt_engine.screen_text() {
-                            Ok(text) => {
-                                let _ = Frame::Output(text.into_bytes()).write(&mut stream);
-                            }
-                            Err(err) => {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        },
-                        Ok(Frame::SendKeys(bytes)) => {
-                            if let Some(ref mut rec) = recorder {
-                                rec.input(&bytes, epoch.elapsed());
-                            }
-                            if let Err(err) = pty_child.write_all(&bytes) {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::SendKeysWithMark { bytes, marker_name }) => {
-                            if let Some(ref mut rec) = recorder {
-                                rec.flush();
-                                rec.event(crate::asciicast::EventCode::Marker, &marker_name, epoch.elapsed());
-                                let offset = rec.bytes_written();
-                                markers.insert(marker_name, offset);
-                                rec.input(&bytes, epoch.elapsed());
-                                if let Err(err) = pty_child.write_all(&bytes) {
-                                    let _ = Frame::Error(err).write(&mut stream);
-                                } else {
-                                    let _ = Frame::MarkResult { offset }.write(&mut stream);
-                                }
-                            } else {
-                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::Inspect) => {
-                            let result = build_inspect_result(session, vt_engine.as_ref(), &active_client, &pty_child, &recorder, &markers);
-                            match serde_json::to_vec(&result) {
-                                Ok(json) => {
-                                    let _ = Frame::InspectResult(json).write(&mut stream);
-                                }
-                                Err(err) => {
-                                    let _ = Frame::Error(format!("serialize inspect: {err}")).write(&mut stream);
-                                }
-                            }
-                        }
-                        Ok(Frame::Signal { signal, target }) => match pty_child.dispatch_signal(signal, target) {
-                            Ok(()) => {
-                                if let Some(ref mut rec) = recorder {
-                                    let target_str = match target {
-                                        crate::protocol::SignalTarget::Foreground => "foreground",
-                                        crate::protocol::SignalTarget::Leader => "leader",
-                                        crate::protocol::SignalTarget::Tree => "tree",
-                                    };
-                                    rec.event(
-                                        crate::asciicast::EventCode::Custom('s'),
-                                        &serde_json::json!({"signal": signal, "target": target_str}).to_string(),
-                                        epoch.elapsed(),
-                                    );
-                                }
-                                let _ = Frame::Ack.write(&mut stream);
-                            }
-                            Err(err) => {
-                                let _ = Frame::Error(err).write(&mut stream);
-                            }
-                        },
-                        Ok(Frame::Mark { name }) => {
-                            if let Some(ref mut rec) = recorder {
-                                rec.flush();
-                                if let Some(ref marker_name) = name {
-                                    // Emit standard asciicast "m" event
-                                    rec.event(crate::asciicast::EventCode::Marker, marker_name, epoch.elapsed());
-                                    // Store the offset *after* the marker event so that
-                                    // read_events_since starts at the first event following
-                                    // the marker rather than at the marker line itself.
-                                    markers.insert(marker_name.clone(), rec.bytes_written());
-                                }
-                                let _ = Frame::MarkResult { offset: rec.bytes_written() }.write(&mut stream);
-                            } else {
-                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::ResolveMarker { name }) => {
-                            if let Some(offset) = markers.get(&name) {
-                                let _ = Frame::MarkResult { offset: *offset }.write(&mut stream);
-                            } else {
-                                let _ = Frame::Error(format!("marker not found: {name}")).write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::ResolveNextMarker { after }) => {
-                            // Markers are appended at the current recording offset, so byte-offset
-                            // order matches creation order. min(offset > after) picks the
-                            // chronologically-next marker. Back-filling markers would break this.
-                            let next = markers.iter().filter(|(_, &offset)| offset > after).map(|(_, &offset)| offset).min();
-                            let reply = match next {
-                                Some(offset) => Frame::MarkResult { offset },
-                                None => Frame::MarkNotFound,
-                            };
-                            let _ = reply.write(&mut stream);
-                        }
-                        Ok(Frame::RecordControl { enable }) => {
-                            if enable && recorder.is_none() {
-                                // First-time activation: create new recorder
-                                let (cols, rows) = vt_engine.size();
-                                match crate::recording::SessionRecorder::new(&root.join(id), cols, rows, session.vt_engine.as_str()) {
-                                    Ok(mut r) => {
-                                        if let Ok(Some(payload)) =
-                                            vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback())
-                                        {
-                                            let state = String::from_utf8_lossy(&payload);
-                                            r.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, epoch.elapsed());
-                                        }
-                                        recorder = Some(r);
-                                        let _ = Frame::Ack.write(&mut stream);
-                                    }
-                                    Err(err) => {
-                                        let _ = Frame::Error(err).write(&mut stream);
-                                    }
-                                }
-                            } else if enable {
-                                // Resume from pause
-                                if let Some(ref mut rec) = recorder {
-                                    if rec.is_paused() {
-                                        rec.resume(epoch.elapsed());
-                                        // Emit a VT snapshot so the resumed portion has screen context
-                                        if let Ok(Some(payload)) =
-                                            vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback())
-                                        {
-                                            let (cols, rows) = vt_engine.size();
-                                            let state = String::from_utf8_lossy(&payload);
-                                            rec.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, epoch.elapsed());
-                                        }
-                                    }
-                                }
-                                let _ = Frame::Ack.write(&mut stream);
-                            } else if !enable && recorder.as_ref().is_some_and(|r| !r.is_paused()) {
-                                // Pause recording (keep recorder alive for gap tracking)
-                                if let Some(ref mut rec) = recorder {
-                                    rec.pause(epoch.elapsed());
-                                }
-                                let _ = Frame::Ack.write(&mut stream);
-                            } else {
-                                let _ = Frame::Ack.write(&mut stream);
-                            }
-                        }
-                        Ok(Frame::Wait { conditions, timeout_ms }) => 'wait: {
-                            if conditions.is_empty() {
-                                let _ = Frame::Error("at least one wait condition is required".to_string()).write(&mut stream);
-                                break 'wait;
-                            }
+                    let mut prefix = [0; 5];
+                    if let Err(err) = stream.read_exact(&mut prefix) {
+                        let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
+                        continue;
+                    }
+                    if !http_uds::looks_like_http_prefix(&prefix) {
+                        let _ = Frame::Error("session daemon requires HTTP requests".to_string()).write(&mut stream);
+                        continue;
+                    }
 
-                            // Validate: TextMatch requires screen_text support
-                            let has_text_match = conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::TextMatch { .. }));
-                            if has_text_match {
-                                if let Err(err) = vt_engine.screen_text() {
-                                    let _ = Frame::Error(format!("text matching not supported: {err}")).write(&mut stream);
-                                    break 'wait;
-                                }
-                            }
-
-                            // Check --text immediately at registration
-                            if has_text_match {
-                                if let Ok(screen) = vt_engine.screen_text() {
-                                    for condition in &conditions {
-                                        if let crate::protocol::WaitCondition::TextMatch { text } = condition {
-                                            if screen.contains(text.as_str()) {
-                                                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
-                                                    .write(&mut stream);
-                                                break 'wait;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Register for async evaluation
-                            if let Err(err) = set_stream_nonblocking(&stream, true) {
-                                let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
-                                break 'wait;
-                            }
-                            pending_waits.push(PendingWait { stream, conditions, timeout_ms, registered_at: Instant::now() });
-                        }
-                        Ok(Frame::Expect { text, since_offset, timeout_ms }) => 'expect: {
-                            if recorder.is_none() {
-                                let _ = Frame::Error("recording not active".to_string()).write(&mut stream);
-                                break 'expect;
-                            }
-                            // Check immediately — text may already be in the recording
-                            let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
-                            if let Some(ref mut rec) = recorder {
-                                rec.flush();
-                            }
-                            if cast_path.exists() {
-                                if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, since_offset) {
-                                    let output: String = events.iter().map(|e| e.data.as_str()).collect();
-                                    if output.contains(&text) {
-                                        let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms: 0 }
-                                            .write(&mut stream);
-                                        break 'expect;
-                                    }
-                                }
-                            }
-                            if let Err(err) = set_stream_nonblocking(&stream, true) {
-                                let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
-                                break 'expect;
-                            }
-                            let initial_file_size = std::fs::metadata(&cast_path).map(|m| m.len()).unwrap_or(0);
-                            pending_expects.push(PendingExpect {
-                                stream,
-                                text,
-                                since_offset,
-                                last_checked_file_size: initial_file_size,
-                                timeout_ms,
-                                registered_at: Instant::now(),
-                            });
-                        }
-                        Ok(other) => {
-                            let _ = Frame::Error(format!("unrecognized request: {other:?}")).write(&mut stream);
-                        }
-                        Err(err) => {
-                            let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
-                        }
+                    let mut http_state = HttpRequestState {
+                        runtime: &mut runtime,
+                        active_client: &mut active_client,
+                        had_foreground_client: &mut had_foreground_client,
+                        pending_waits: &mut pending_waits,
+                        pending_expects: &mut pending_expects,
+                    };
+                    if let Err(err) = handle_http_request(root, id, &mut stream, &prefix, &mut http_state) {
+                        let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -722,17 +495,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             while let Some(frame) = pending.pop_front() {
                 match frame {
                     Frame::Input(bytes) => {
-                        if let Some(ref mut rec) = recorder {
-                            rec.input(&bytes, epoch.elapsed());
-                        }
-                        pty_child.write_all(&bytes)?;
+                        runtime.write_input(&bytes)?;
                     }
                     Frame::Resize { cols, rows } => {
-                        if let Some(ref mut rec) = recorder {
-                            rec.event(crate::asciicast::EventCode::Resize, &format!("{}x{}", cols, rows), epoch.elapsed());
-                        }
-                        pty_child.resize(cols, rows)?;
-                        vt_engine.resize(cols, rows)?;
+                        runtime.resize(cols, rows)?;
                     }
                     _ => {}
                 }
@@ -740,9 +506,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
             if client_disconnected && active_client.is_some() {
                 let _ = fs::remove_file(foreground_path(root, id));
-                if let Some(ref mut rec) = recorder {
-                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                }
+                runtime.record_detach();
                 active_client = None;
             }
         }
@@ -754,69 +518,26 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             };
             if !client_writable {
                 let _ = fs::remove_file(foreground_path(root, id));
-                if let Some(ref mut rec) = recorder {
-                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                }
+                runtime.record_detach();
                 active_client = None;
             }
         }
 
         if poll_result.pty_readable {
-            loop {
-                let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
-                match pty_child.read_output(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        last_pty_output_at = Some(Instant::now());
-                        record_pty_output(vt_engine.as_mut(), &buf[..n])?;
-                        if let Some(ref mut rec) = recorder {
-                            let elapsed = epoch.elapsed();
-                            rec.output(&buf[..n], elapsed);
-                            if rec.output_bytes_since_snapshot() >= 256 * 1024 {
-                                if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
-                                    let (cols, rows) = vt_engine.size();
-                                    let state = String::from_utf8_lossy(&payload);
-                                    rec.write_snapshot(&state, session.vt_engine.as_str(), cols, rows, elapsed);
-                                } else {
-                                    rec.reset_output_bytes_since_snapshot();
-                                }
-                            }
-                        }
-                        // Drain engine replies every iteration so the buffer never accumulates
-                        // stale replies across an attach→detach transition. When attached, the
-                        // host terminal is authoritative for query responses, so we discard.
-                        let engine_reply = vt_engine.drain_replies();
-                        if active_client.is_none() {
-                            if let Some(ref mut tracker) = detached_da {
-                                for reply in tracker.push(&buf[..n]) {
-                                    pty_child.write_all(&reply)?;
-                                }
-                            }
-                            if !engine_reply.is_empty() {
-                                pty_child.write_all(&engine_reply)?;
-                            }
-                        }
-                        if let Some(client) = active_client.as_mut() {
-                            if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
-                                let _ = fs::remove_file(foreground_path(root, id));
-                                if let Some(ref mut rec) = recorder {
-                                    rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, epoch.elapsed());
-                                }
-                                active_client = None;
-                            }
-                        }
+            let output = runtime.read_available_output(active_client.is_some())?;
+            for chunk in output.chunks {
+                if let Some(client) = active_client.as_mut() {
+                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
+                        let _ = fs::remove_file(foreground_path(root, id));
+                        runtime.record_detach();
+                        active_client = None;
+                        break;
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(err) => return Err(format!("read pty output: {err}")),
                 }
             }
         }
 
-        if let Some(ref mut rec) = recorder {
-            if !poll_result.pty_readable && !poll_result.client_readable {
-                rec.flush();
-            }
-        }
+        runtime.flush_recording_if_idle(poll_result.pty_readable, poll_result.client_readable);
 
         // Evaluate pending waits on each loop tick.
         // Write errors are intentionally discarded — the client may have disconnected.
@@ -826,7 +547,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
             // Check timeout first
             if elapsed_ms >= wait.timeout_ms {
-                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Timeout, elapsed_ms }.write(&mut wait.stream);
+                let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
                 return false;
             }
 
@@ -835,23 +556,20 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 match condition {
                     crate::protocol::WaitCondition::OutputIdle { quiet_ms } => {
                         // Silence measured from max(registration_time, last_output_time)
-                        let silence_since = match last_pty_output_at {
+                        let silence_since = match runtime.last_pty_output_at() {
                             Some(t) if t > wait.registered_at => t,
                             _ => wait.registered_at,
                         };
                         let quiet_duration = silence_since.elapsed().as_millis() as u64;
                         if quiet_duration >= *quiet_ms {
-                            let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut wait.stream);
+                            let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
                             return false;
                         }
                     }
                     crate::protocol::WaitCondition::TextMatch { text } => {
-                        if let Ok(screen) = vt_engine.screen_text() {
-                            if screen.contains(text.as_str()) {
-                                let _ =
-                                    Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut wait.stream);
-                                return false;
-                            }
+                        if runtime.screen_contains(text.as_str()) {
+                            let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
+                            return false;
                         }
                     }
                 }
@@ -862,16 +580,14 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
         // Evaluate pending expects by scanning the cast file for text matches.
         if !pending_expects.is_empty() {
-            if let Some(ref mut rec) = recorder {
-                rec.flush();
-            }
+            runtime.flush_recording();
             let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
             pending_expects.retain_mut(|expect| {
                 let elapsed = expect.registered_at.elapsed();
                 let elapsed_ms = elapsed.as_millis() as u64;
 
                 if elapsed_ms >= expect.timeout_ms {
-                    let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Timeout, elapsed_ms }.write(&mut expect.stream);
+                    let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
                     return false;
                 }
 
@@ -882,8 +598,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, expect.since_offset) {
                             let output: String = events.iter().map(|e| e.data.as_str()).collect();
                             if output.contains(&expect.text) {
-                                let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }
-                                    .write(&mut expect.stream);
+                                let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
                                 return false;
                             }
                         }
@@ -894,31 +609,27 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             });
         }
 
-        if let Some(status) = pty_child.exited()? {
-            drain_pty_output_after_exit(
-                &pty_child,
-                vt_engine.as_mut(),
-                &mut recorder,
-                &mut active_client,
-                &mut detached_da,
-                DrainExitContext { root, id, vt_engine_kind: session.vt_engine, epoch },
-                &mut last_pty_output_at,
-            )?;
+        if let Some(exit_code) = runtime.exit_code_if_exited()? {
+            let output = runtime.drain_output_after_exit(active_client.is_some())?;
+            for chunk in output.chunks {
+                if let Some(client) = active_client.as_mut() {
+                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
+                        let _ = fs::remove_file(foreground_path(root, id));
+                        runtime.record_detach();
+                        active_client = None;
+                        break;
+                    }
+                }
+            }
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
-                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut wait.stream);
+                let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
             }
             for mut expect in pending_expects.drain(..) {
                 let elapsed_ms = expect.registered_at.elapsed().as_millis() as u64;
-                let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut expect.stream);
+                let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
             }
-            if let Some(ref mut rec) = recorder {
-                // Flush any held-back incomplete UTF-8 bytes before the exit
-                // event so they appear in the correct order in the cast file.
-                rec.flush_final();
-                let code = exit_code_from_wait_status(&status);
-                rec.event(crate::asciicast::EventCode::Exit, &code.to_string(), epoch.elapsed());
-            }
+            runtime.record_exit_code(exit_code);
             if let Some(client) = active_client.as_mut() {
                 let _ = client.flush_pending_output();
             }
@@ -930,7 +641,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(daemon_pid_path(root, id));
     let _ = fs::remove_file(foreground_path(root, id));
-    if recorder.is_none() {
+    if !runtime.should_keep_session_dir() {
         let _ = fs::remove_dir_all(&session_dir);
     }
     Ok(())
@@ -941,123 +652,323 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
     Err("session daemon is only supported on unix".into())
 }
 
-#[cfg(any(unix, windows))]
-fn build_inspect_result(
-    session: &SessionMetadata,
-    vt_engine: &dyn VtEngine,
-    active_client: &Option<ActiveClient>,
-    pty_child: &PtyChild,
-    recorder: &Option<crate::recording::SessionRecorder>,
-    markers: &std::collections::HashMap<String, u64>,
-) -> crate::protocol::InspectResult {
-    let (cols, rows) = vt_engine.size();
-    let foreground_pgid = pty_child.foreground_pgid();
-
-    crate::protocol::InspectResult {
-        session: crate::protocol::SessionInspect {
-            id: session.id.clone(),
-            state: "running".to_string(),
-            vt_engine: session.vt_engine.as_str().to_string(),
-            vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
-            functional_vt_available: crate::vt::functional_vt_available(),
-            cwd: session.cwd.clone(),
-            cmd: session.cmd.clone(),
-        },
-        terminal: crate::protocol::TerminalInspect { rows, cols },
-        process: crate::protocol::ProcessInspect {
-            leader_pid: pty_child.leader_pid(),
-            foreground_pgid,
-            leader_cwd: pty_child.leader_cwd(),
-            foreground_cwd: pty_child.foreground_cwd(),
-        },
-        attachments: if active_client.is_some() {
-            vec![crate::protocol::AttachmentInspect { role: "controller".to_string() }]
-        } else {
-            vec![]
-        },
-        recording: crate::protocol::RecordingInspect {
-            active: recorder.as_ref().is_some_and(|r| !r.is_paused()),
-            bytes_written: recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
-            markers: markers.clone(),
-        },
-    }
+struct HttpRequestState<'a> {
+    runtime: &'a mut SessionRuntime,
+    active_client: &'a mut Option<ActiveClient>,
+    had_foreground_client: &'a mut bool,
+    pending_waits: &'a mut Vec<PendingWait>,
+    pending_expects: &'a mut Vec<PendingExpect>,
 }
 
-fn drain_pty_output_after_exit(
-    pty_child: &PtyChild,
-    vt_engine: &mut dyn VtEngine,
-    recorder: &mut Option<crate::recording::SessionRecorder>,
-    active_client: &mut Option<ActiveClient>,
-    detached_da: &mut Option<DeviceAttributeTracker>,
-    context: DrainExitContext<'_>,
-    last_pty_output_at: &mut Option<Instant>,
+fn handle_http_request(
+    root: &Path,
+    daemon_id: &str,
+    stream: &mut SessionStream,
+    prefix: &[u8],
+    state: &mut HttpRequestState<'_>,
 ) -> Result<(), String> {
-    loop {
-        let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
-        match pty_child.read_output(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                *last_pty_output_at = Some(Instant::now());
-                record_pty_output(vt_engine, &buf[..n])?;
-                if let Some(ref mut rec) = recorder {
-                    let elapsed = context.epoch.elapsed();
-                    rec.output(&buf[..n], elapsed);
-                    if rec.output_bytes_since_snapshot() >= 256 * 1024 {
-                        if let Ok(Some(payload)) = vt_engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()) {
-                            let (cols, rows) = vt_engine.size();
-                            let state = String::from_utf8_lossy(&payload);
-                            rec.write_snapshot(&state, context.vt_engine_kind.as_str(), cols, rows, elapsed);
-                        } else {
-                            rec.reset_output_bytes_since_snapshot();
-                        }
-                    }
-                }
+    let request = http_uds::read_request_with_prefix(stream, prefix).map_err(|err| format!("read HTTP request: {err}"))?;
+    match http_uds::route(&request) {
+        http_uds::Route::Root | http_uds::Route::Health => http_uds::write_json(
+            stream,
+            StatusCode::OK,
+            &serde_json::json!({
+                "service": "cleat-session",
+                "session": daemon_id,
+                "ok": true,
+            }),
+        )
+        .map_err(|err| format!("write HTTP response: {err}")),
+        http_uds::Route::Sessions => {
+            let result = state.runtime.inspect(state.active_client.is_some());
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions: vec![result] })
+                .map_err(|err| format!("write HTTP sessions response: {err}"))
+        }
+        http_uds::Route::SessionInspect { id } if id == daemon_id => {
+            let result = state.runtime.inspect(state.active_client.is_some());
+            http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
+        }
+        http_uds::Route::SessionDelete { id } if id == daemon_id => {
+            state.runtime.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader)?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
+        }
+        http_uds::Route::SessionAttach { id } if id == daemon_id => 'attach: {
+            let body: http_uds::AttachRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP attach request: {err}"))?;
+            if state.active_client.is_some() {
+                http_uds::write_error(stream, StatusCode::CONFLICT, "session already has a foreground client")
+                    .map_err(|err| format!("write HTTP attach busy response: {err}"))?;
+                break 'attach Ok(());
+            }
 
-                let engine_reply = vt_engine.drain_replies();
-                if active_client.is_none() {
-                    if let Some(ref mut tracker) = detached_da {
-                        for reply in tracker.push(&buf[..n]) {
-                            pty_child.write_all(&reply)?;
-                        }
+            let capabilities = attach_capabilities_from_http(body.capabilities);
+            let replay = state.runtime.apply_attach_state(body.cols, body.rows, &capabilities)?;
+            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
+            let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
+            #[cfg(unix)]
+            set_stream_nonblocking(&attach_stream, true).map_err(|err| format!("set HTTP attach stream nonblocking: {err}"))?;
+            let mut client = ActiveClient::new(attach_stream)?;
+            if let Some(payload) = replay {
+                if !payload.is_empty() {
+                    if *state.had_foreground_client {
+                        client.enqueue_frame(&Frame::Output(REATTACH_CLEAR_SEQUENCE.to_vec()))?;
                     }
-                    if !engine_reply.is_empty() {
-                        pty_child.write_all(&engine_reply)?;
-                    }
+                    client.enqueue_frame(&Frame::Output(payload))?;
                 }
-                if let Some(client) = active_client.as_mut() {
-                    if client.enqueue_frame(&Frame::Output(buf[..n].to_vec())).is_err() {
-                        let _ = fs::remove_file(foreground_path(context.root, context.id));
-                        if let Some(ref mut rec) = recorder {
-                            rec.event(crate::asciicast::EventCode::Custom('d'), r#"{"client":"foreground"}"#, context.epoch.elapsed());
-                        }
-                        *active_client = None;
+            }
+            let _ = fs::write(foreground_path(root, daemon_id), b"1");
+            *state.active_client = Some(client);
+            *state.had_foreground_client = true;
+            state.runtime.record_attach();
+            Ok(())
+        }
+        http_uds::Route::SessionDetach { id } if id == daemon_id => {
+            let _ = fs::remove_file(foreground_path(root, daemon_id));
+            state.runtime.record_detach();
+            *state.active_client = None;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP detach response: {err}"))
+        }
+        http_uds::Route::SessionExpect { id } if id == daemon_id => 'expect: {
+            let body: http_uds::ExpectRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP expect request: {err}"))?;
+            if !state.runtime.recording_active() {
+                http_uds::write_error(stream, StatusCode::CONFLICT, "recording not active")
+                    .map_err(|err| format!("write HTTP expect error: {err}"))?;
+                break 'expect Ok(());
+            }
+
+            let cast_path = root.join(daemon_id).join(crate::recording::CAST_FILE_NAME);
+            state.runtime.flush_recording();
+            if cast_path.exists() {
+                if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, body.since_offset) {
+                    let output: String = events.iter().map(|event| event.data.as_str()).collect();
+                    if output.contains(&body.text) {
+                        http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
+                            status: http_uds::WaitStatusResponse::Ready,
+                            elapsed_ms: 0,
+                        })
+                        .map_err(|err| format!("write HTTP expect response: {err}"))?;
+                        break 'expect Ok(());
                     }
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || is_pty_eof_after_exit(&err) => break,
-            Err(err) => return Err(format!("read pty output after exit: {err}")),
+
+            let pending_stream = stream.try_clone().map_err(|err| format!("clone HTTP expect stream: {err}"))?;
+            if let Err(err) = set_stream_nonblocking(&pending_stream, true) {
+                http_uds::write_error(stream, StatusCode::INTERNAL_SERVER_ERROR, &format!("set nonblocking: {err}"))
+                    .map_err(|err| format!("write HTTP expect error: {err}"))?;
+                break 'expect Ok(());
+            }
+            let initial_file_size = std::fs::metadata(&cast_path).map(|metadata| metadata.len()).unwrap_or(0);
+            state.pending_expects.push(PendingExpect {
+                stream: pending_stream,
+                text: body.text,
+                since_offset: body.since_offset,
+                last_checked_file_size: initial_file_size,
+                timeout_ms: body.timeout_ms,
+                registered_at: Instant::now(),
+            });
+            Ok(())
+        }
+        http_uds::Route::SessionInput { id } if id == daemon_id => {
+            let body: http_uds::InputRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
+            match body {
+                http_uds::InputRequest::Text { text } | http_uds::InputRequest::Paste { text } => {
+                    state.runtime.write_input(text.as_bytes())?;
+                }
+                http_uds::InputRequest::Key { key } => {
+                    let bytes = http_input_key_bytes(key);
+                    state.runtime.write_input(&bytes)?;
+                }
+                http_uds::InputRequest::RawBytes { bytes } => {
+                    state.runtime.write_input(&bytes)?;
+                }
+                http_uds::InputRequest::Resize { cols, rows } => {
+                    state.runtime.resize(cols, rows)?;
+                }
+            }
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP input response: {err}"))
+        }
+        http_uds::Route::SessionKeys { id } if id == daemon_id => {
+            let body: http_uds::KeysRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys request: {err}"))?;
+            state.runtime.write_input(&body.bytes)?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP keys response: {err}"))
+        }
+        http_uds::Route::SessionKeysWithMark { id } if id == daemon_id => {
+            let body: http_uds::KeysWithMarkRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys-with-mark request: {err}"))?;
+            let offset = state.runtime.write_input_with_mark(&body.bytes, body.marker_name)?;
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
+                .map_err(|err| format!("write HTTP keys-with-mark response: {err}"))
+        }
+        http_uds::Route::SessionRecord { id } if id == daemon_id => {
+            let body: http_uds::RecordRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;
+            state.runtime.set_recording(body.enable)?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP record response: {err}"))
+        }
+        http_uds::Route::SessionMark { id } if id == daemon_id => {
+            let body: http_uds::MarkRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP mark request: {err}"))?;
+            let offset = state.runtime.mark(body.name)?;
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
+                .map_err(|err| format!("write HTTP mark response: {err}"))
+        }
+        http_uds::Route::SessionResolveMarker { id } if id == daemon_id => {
+            let body: http_uds::ResolveMarkerRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-marker request: {err}"))?;
+            match state.runtime.resolve_marker(&body.name) {
+                Some(offset) => http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
+                    .map_err(|err| format!("write HTTP resolve-marker response: {err}")),
+                None => http_uds::write_error(stream, StatusCode::NOT_FOUND, &format!("marker not found: {}", body.name))
+                    .map_err(|err| format!("write HTTP resolve-marker error: {err}")),
+            }
+        }
+        http_uds::Route::SessionResolveNextMarker { id } if id == daemon_id => {
+            let body: http_uds::ResolveNextMarkerRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-next-marker request: {err}"))?;
+            let offset = state.runtime.resolve_next_marker_after(body.after);
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::ResolveNextMarkerResponse { offset })
+                .map_err(|err| format!("write HTTP resolve-next-marker response: {err}"))
+        }
+        http_uds::Route::SessionResize { id } if id == daemon_id => {
+            let body: http_uds::ResizeRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resize request: {err}"))?;
+            state.runtime.resize(body.cols, body.rows)?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP resize response: {err}"))
+        }
+        http_uds::Route::SessionScreen { id } if id == daemon_id => match state.runtime.capture_text() {
+            Ok(text) => http_uds::write_json(stream, StatusCode::OK, &http_uds::ScreenResponse { text })
+                .map_err(|err| format!("write HTTP screen response: {err}")),
+            Err(err) => http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP screen error: {err}")),
+        },
+        http_uds::Route::SessionSignal { id } if id == daemon_id => {
+            let body: http_uds::SignalRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP signal request: {err}"))?;
+            state.runtime.dispatch_signal(body.signal, signal_target_from_http(body.target))?;
+            http_uds::write_no_content(stream).map_err(|err| format!("write HTTP signal response: {err}"))
+        }
+        http_uds::Route::SessionSnapshot { id } if id == daemon_id => {
+            let output = state.runtime.read_available_output(state.active_client.is_some())?;
+            if let Some(client) = state.active_client.as_mut() {
+                for chunk in output.chunks {
+                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
+                        let _ = fs::remove_file(foreground_path(root, daemon_id));
+                        state.runtime.record_detach();
+                        *state.active_client = None;
+                        break;
+                    }
+                }
+            }
+            match state.runtime.snapshot(crate::provider::DirtyState::Full) {
+                Ok(snapshot) => http_uds::write_json(stream, StatusCode::OK, &http_uds::snapshot_response(snapshot))
+                    .map_err(|err| format!("write HTTP snapshot response: {err}")),
+                Err(err) => {
+                    http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP snapshot error: {err}"))
+                }
+            }
+        }
+        http_uds::Route::SessionWait { id } if id == daemon_id => 'wait: {
+            let body: http_uds::WaitRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP wait request: {err}"))?;
+            let conditions: Vec<_> = body.conditions.into_iter().map(wait_condition_from_http).collect();
+            if conditions.is_empty() {
+                http_uds::write_error(stream, StatusCode::BAD_REQUEST, "at least one wait condition is required")
+                    .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                break 'wait Ok(());
+            }
+
+            let has_text_match = conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::TextMatch { .. }));
+            if has_text_match {
+                if let Err(err) = state.runtime.validate_text_matching() {
+                    http_uds::write_error(stream, StatusCode::CONFLICT, &format!("text matching not supported: {err}"))
+                        .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                    break 'wait Ok(());
+                }
+            }
+
+            if has_text_match {
+                for condition in &conditions {
+                    if let crate::protocol::WaitCondition::TextMatch { text } = condition {
+                        if state.runtime.screen_contains(text.as_str()) {
+                            http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
+                                status: http_uds::WaitStatusResponse::Ready,
+                                elapsed_ms: 0,
+                            })
+                            .map_err(|err| format!("write HTTP wait response: {err}"))?;
+                            break 'wait Ok(());
+                        }
+                    }
+                }
+            }
+
+            let pending_stream = stream.try_clone().map_err(|err| format!("clone HTTP wait stream: {err}"))?;
+            if let Err(err) = set_stream_nonblocking(&pending_stream, true) {
+                http_uds::write_error(stream, StatusCode::INTERNAL_SERVER_ERROR, &format!("set nonblocking: {err}"))
+                    .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                break 'wait Ok(());
+            }
+            state.pending_waits.push(PendingWait {
+                stream: pending_stream,
+                conditions,
+                timeout_ms: body.timeout_ms,
+                registered_at: Instant::now(),
+            });
+            Ok(())
+        }
+        _ => {
+            http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
         }
     }
-    Ok(())
 }
 
-fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        err.raw_os_error() == Some(libc::EIO)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = err;
-        false
+fn signal_target_from_http(target: http_uds::SignalTargetRequest) -> crate::protocol::SignalTarget {
+    match target {
+        http_uds::SignalTargetRequest::Foreground => crate::protocol::SignalTarget::Foreground,
+        http_uds::SignalTargetRequest::Leader => crate::protocol::SignalTarget::Leader,
+        http_uds::SignalTargetRequest::Tree => crate::protocol::SignalTarget::Tree,
     }
 }
 
-struct DrainExitContext<'a> {
-    root: &'a Path,
-    id: &'a str,
-    vt_engine_kind: VtEngineKind,
-    epoch: Instant,
+fn wait_condition_from_http(condition: http_uds::WaitConditionRequest) -> crate::protocol::WaitCondition {
+    match condition {
+        http_uds::WaitConditionRequest::OutputIdle { quiet_ms } => crate::protocol::WaitCondition::OutputIdle { quiet_ms },
+        http_uds::WaitConditionRequest::TextMatch { text } => crate::protocol::WaitCondition::TextMatch { text },
+    }
+}
+
+fn wait_status_to_http(status: crate::protocol::WaitStatus) -> http_uds::WaitStatusResponse {
+    match status {
+        crate::protocol::WaitStatus::Ready => http_uds::WaitStatusResponse::Ready,
+        crate::protocol::WaitStatus::Timeout => http_uds::WaitStatusResponse::Timeout,
+        crate::protocol::WaitStatus::SessionGone => http_uds::WaitStatusResponse::SessionGone,
+    }
+}
+
+fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
+    match key {
+        http_uds::KeyRequest::UnicodeScalar { codepoint } => {
+            let mut bytes = Vec::new();
+            if let Some(ch) = char::from_u32(codepoint) {
+                let mut buf = [0; 4];
+                bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            bytes
+        }
+        http_uds::KeyRequest::Named { key } => match key {
+            http_uds::NamedKey::Enter => b"\r".to_vec(),
+            http_uds::NamedKey::Escape => b"\x1b".to_vec(),
+            http_uds::NamedKey::Backspace => b"\x7f".to_vec(),
+            http_uds::NamedKey::Tab => b"\t".to_vec(),
+            http_uds::NamedKey::Delete => b"\x1b[3~".to_vec(),
+            http_uds::NamedKey::ArrowUp => b"\x1b[A".to_vec(),
+            http_uds::NamedKey::ArrowDown => b"\x1b[B".to_vec(),
+            http_uds::NamedKey::ArrowRight => b"\x1b[C".to_vec(),
+            http_uds::NamedKey::ArrowLeft => b"\x1b[D".to_vec(),
+        },
+    }
 }
 
 struct ActiveClient {
@@ -1185,9 +1096,47 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        apply_attach_state, attach_init_capabilities, default_vt_engine, record_pty_output, AttachCleanupGuard, TestReplayProbeVtEngine,
+        apply_attach_state, attach_foreground, attach_init_capabilities, default_vt_engine, record_pty_output, session_socket_path,
+        AttachCleanupGuard, TestReplayProbeVtEngine,
     };
-    use crate::vt::{self, VtEngine};
+    use crate::{
+        http_uds::read_http_request_for_test,
+        runtime::RuntimeLayout,
+        vt::{self, VtEngine},
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_foreground_uses_http_upgrade_request() {
+        use std::{fs, os::unix::net::UnixListener, sync::mpsc, thread, time::Duration};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("alpha")).expect("create session dir");
+        let socket_path = session_socket_path(temp.path(), "alpha");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_http_request_for_test(&mut stream);
+            tx.send(request).expect("send request");
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n")
+                .expect("write response");
+        });
+
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        let attach = attach_foreground(&layout, "alpha").expect("attach");
+        drop(attach);
+        let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
+
+        reader.join().expect("join reader");
+        assert!(request.starts_with("POST /sessions/alpha/attach HTTP/1.1\r\n"), "{request}");
+        assert!(request.contains("Connection: Upgrade\r\n"), "{request}");
+        assert!(request.contains("Upgrade: cleat-attach/1\r\n"), "{request}");
+        assert!(request.ends_with(r#""capabilities":{"color_level":"sixteen","kitty_keyboard":false}}"#), "{request}");
+    }
 
     #[test]
     fn cleanup_guard_writes_on_drop() {

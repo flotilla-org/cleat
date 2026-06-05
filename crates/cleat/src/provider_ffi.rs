@@ -1,12 +1,17 @@
 use std::{path::PathBuf, ptr, slice, str::Utf8Error};
 
+use http::{Method, StatusCode};
+
 use crate::{
+    http_uds,
+    platform::ipc::connect_session_stream,
     protocol::SignalTarget,
     provider::{
-        DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
+        DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle, TerminalRgb,
         TerminalSnapshot,
     },
     runtime::RuntimeLayout,
+    session::{ensure_session_started, session_socket_path},
     session_runtime::SessionRuntime,
     vt::{self, VtEngineKind},
 };
@@ -14,6 +19,7 @@ use crate::{
 pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
+pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
 pub const CLEAT_PROVIDER_VT_DEFAULT: u32 = 0;
 pub const CLEAT_PROVIDER_VT_PASSTHROUGH: u32 = 1;
 pub const CLEAT_PROVIDER_VT_GHOSTTY: u32 = 2;
@@ -153,11 +159,13 @@ pub struct CleatSession {
 enum ProviderBackend {
     Mock,
     InProcess,
+    Daemon,
 }
 
 enum SessionBackend {
     Mock(MockSession),
     InProcess(Box<InProcessSession>),
+    Daemon(DaemonSession),
 }
 
 struct MockSession {
@@ -171,6 +179,12 @@ struct InProcessSession {
     runtime: SessionRuntime,
     dirty: DirtyState,
     exited: bool,
+}
+
+struct DaemonSession {
+    id: String,
+    runtime_root: PathBuf,
+    dirty: DirtyState,
 }
 
 impl Drop for InProcessSession {
@@ -243,6 +257,7 @@ pub unsafe extern "C" fn cleat_provider_open(desc: *const CleatProviderDesc) -> 
     let backend = match requested.backend {
         CLEAT_PROVIDER_BACKEND_MOCK => ProviderBackend::Mock,
         CLEAT_PROVIDER_BACKEND_IN_PROCESS => ProviderBackend::InProcess,
+        CLEAT_PROVIDER_BACKEND_DAEMON => ProviderBackend::Daemon,
         _ => return ptr::null_mut(),
     };
     let runtime_root = match read_optional_utf8(requested.runtime_root, requested.runtime_root_len) {
@@ -300,6 +315,10 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
             Ok(session) => SessionBackend::InProcess(Box::new(session)),
             Err(_) => return ptr::null_mut(),
         },
+        ProviderBackend::Daemon => match create_daemon_session(provider, desc) {
+            Ok(session) => SessionBackend::Daemon(session),
+            Err(_) => return ptr::null_mut(),
+        },
     };
     Box::into_raw(Box::new(CleatSession { backend, last_snapshot: None }))
 }
@@ -338,6 +357,13 @@ pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: 
             in_process.dirty = DirtyState::Full;
             true
         }
+        SessionBackend::Daemon(daemon) => {
+            if daemon_resize(daemon, cols.max(1), rows.max(1)).is_err() {
+                return false;
+            }
+            daemon.dirty = DirtyState::Full;
+            true
+        }
     }
 }
 
@@ -367,6 +393,17 @@ pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, ev
                     return false;
                 }
                 in_process.dirty = DirtyState::Partial;
+                true
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        },
+        SessionBackend::Daemon(daemon) => match input_event_bytes(&event) {
+            Ok(Some(bytes)) => {
+                if daemon_write_bytes(daemon, &bytes).is_err() {
+                    return false;
+                }
+                daemon.dirty = DirtyState::Partial;
                 true
             }
             Ok(None) => true,
@@ -402,6 +439,13 @@ pub unsafe extern "C" fn cleat_session_write_bytes(session: *mut CleatSession, b
             in_process.dirty = DirtyState::Partial;
             true
         }
+        SessionBackend::Daemon(daemon) => {
+            if daemon_write_bytes(daemon, bytes).is_err() {
+                return false;
+            }
+            daemon.dirty = DirtyState::Partial;
+            true
+        }
     }
 }
 
@@ -414,6 +458,7 @@ pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> Cl
         .map(|session| match &session.backend {
             SessionBackend::Mock(mock) => mock.dirty.into(),
             SessionBackend::InProcess(in_process) => in_process.dirty.into(),
+            SessionBackend::Daemon(daemon) => daemon.dirty.into(),
         })
         .unwrap_or(CleatDirtyState::Full)
 }
@@ -461,6 +506,13 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
             in_process.dirty = DirtyState::Clean;
             snapshot
         }
+        SessionBackend::Daemon(daemon) => match daemon_snapshot(daemon) {
+            Ok(snapshot) => {
+                daemon.dirty = DirtyState::Clean;
+                snapshot
+            }
+            Err(_) => return false,
+        },
     };
     let owned = OwnedSnapshot::from_snapshot(snapshot);
     *out = owned.snapshot;
@@ -485,12 +537,7 @@ pub unsafe extern "C" fn cleat_session_release_snapshot(session: *mut CleatSessi
 
 fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<InProcessSession, String> {
     let layout = RuntimeLayout::new(provider.runtime_root.clone());
-    let vt_engine = match desc.vt_engine {
-        CLEAT_PROVIDER_VT_DEFAULT => vt::default_vt_engine_kind(),
-        CLEAT_PROVIDER_VT_PASSTHROUGH => VtEngineKind::Passthrough,
-        CLEAT_PROVIDER_VT_GHOSTTY => VtEngineKind::Ghostty,
-        other => return Err(format!("unsupported vt engine tag {other}")),
-    };
+    let vt_engine = vt_engine_from_tag(desc.vt_engine)?;
     vt_engine.ensure_available()?;
 
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
@@ -502,6 +549,121 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     runtime.resize(desc.cols.max(1), desc.rows.max(1))?;
 
     Ok(InProcessSession { runtime, dirty: DirtyState::Full, exited: false })
+}
+
+fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
+    let layout = RuntimeLayout::new(provider.runtime_root.clone());
+    let vt_engine = vt_engine_from_tag(desc.vt_engine)?;
+    let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
+    let cwd = read_optional_utf8(desc.cwd, desc.cwd_len).map_err(|err| format!("cwd is not valid UTF-8: {err}"))?.map(PathBuf::from);
+    let metadata = ensure_session_started(&layout, None, Some(vt_engine), cwd, cmd, desc.record)?;
+    let mut session = DaemonSession { id: metadata.id, runtime_root: provider.runtime_root.clone(), dirty: DirtyState::Full };
+    daemon_resize(&mut session, desc.cols.max(1), desc.rows.max(1))?;
+    Ok(session)
+}
+
+fn vt_engine_from_tag(tag: u32) -> Result<VtEngineKind, String> {
+    match tag {
+        CLEAT_PROVIDER_VT_DEFAULT => Ok(vt::default_vt_engine_kind()),
+        CLEAT_PROVIDER_VT_PASSTHROUGH => Ok(VtEngineKind::Passthrough),
+        CLEAT_PROVIDER_VT_GHOSTTY => Ok(VtEngineKind::Ghostty),
+        other => Err(format!("unsupported vt engine tag {other}")),
+    }
+}
+
+fn daemon_resize(session: &mut DaemonSession, cols: u16, rows: u16) -> Result<(), String> {
+    let body =
+        serde_json::to_vec(&serde_json::json!({ "cols": cols, "rows": rows })).map_err(|err| format!("serialize resize request: {err}"))?;
+    let response = daemon_request(session, Method::POST, &format!("/sessions/{}/resize", session.id), &body)?;
+    expect_status(response, StatusCode::NO_CONTENT, "resize")
+}
+
+fn daemon_write_bytes(session: &mut DaemonSession, bytes: &[u8]) -> Result<(), String> {
+    let body = serde_json::to_vec(&serde_json::json!({ "bytes": bytes })).map_err(|err| format!("serialize keys request: {err}"))?;
+    let response = daemon_request(session, Method::POST, &format!("/sessions/{}/keys", session.id), &body)?;
+    expect_status(response, StatusCode::NO_CONTENT, "keys")
+}
+
+fn daemon_snapshot(session: &mut DaemonSession) -> Result<TerminalSnapshot, String> {
+    let response = daemon_request(session, Method::GET, &format!("/sessions/{}/snapshot", session.id), &[])?;
+    if response.status != StatusCode::OK {
+        return Err(format!("snapshot returned {}", response.status));
+    }
+    let snapshot: http_uds::SnapshotResponse =
+        serde_json::from_slice(&response.body).map_err(|err| format!("parse snapshot response: {err}"))?;
+    terminal_snapshot_from_http(snapshot)
+}
+
+fn daemon_request(session: &DaemonSession, method: Method, path: &str, body: &[u8]) -> Result<http_uds::HttpResponse, String> {
+    let socket_path = session_socket_path(&session.runtime_root, &session.id);
+    let mut stream = connect_session_stream(&socket_path)?;
+    http_uds::write_request(&mut stream, method, path, body).map_err(|err| format!("write HTTP request: {err}"))?;
+    http_uds::read_response(&mut stream).map_err(|err| format!("read HTTP response: {err}"))
+}
+
+fn expect_status(response: http_uds::HttpResponse, expected: StatusCode, operation: &str) -> Result<(), String> {
+    if response.status == expected {
+        Ok(())
+    } else {
+        Err(format!("{operation} returned {}", response.status))
+    }
+}
+
+fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<TerminalSnapshot, String> {
+    Ok(TerminalSnapshot {
+        cols: snapshot.cols,
+        rows: snapshot.rows,
+        cells: snapshot
+            .cells
+            .into_iter()
+            .map(|cell| {
+                Ok(TerminalCell {
+                    graphemes: cell.graphemes,
+                    fg: TerminalRgb { r: cell.fg.r, g: cell.fg.g, b: cell.fg.b },
+                    bg: TerminalRgb { r: cell.bg.r, g: cell.bg.g, b: cell.bg.b },
+                    flags: TerminalCellFlags::from_bits_truncate(cell.flags),
+                    width: cell_width_from_name(&cell.width)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        cursor: TerminalCursor {
+            col: snapshot.cursor.col,
+            row: snapshot.cursor.row,
+            visible: snapshot.cursor.visible,
+            style: cursor_style_from_name(&snapshot.cursor.style)?,
+            wide_tail: snapshot.cursor.wide_tail,
+        },
+        dirty: dirty_from_name(&snapshot.dirty)?,
+    })
+}
+
+fn dirty_from_name(name: &str) -> Result<DirtyState, String> {
+    match name {
+        "clean" => Ok(DirtyState::Clean),
+        "partial" => Ok(DirtyState::Partial),
+        "full" => Ok(DirtyState::Full),
+        other => Err(format!("unknown dirty state {other}")),
+    }
+}
+
+fn cell_width_from_name(name: &str) -> Result<TerminalCellWidth, String> {
+    match name {
+        "narrow" => Ok(TerminalCellWidth::Narrow),
+        "wide" => Ok(TerminalCellWidth::Wide),
+        "spacer_tail" => Ok(TerminalCellWidth::SpacerTail),
+        "spacer_head" => Ok(TerminalCellWidth::SpacerHead),
+        other => Err(format!("unknown cell width {other}")),
+    }
+}
+
+fn cursor_style_from_name(name: &str) -> Result<TerminalCursorStyle, String> {
+    match name {
+        "bar" => Ok(TerminalCursorStyle::Bar),
+        "block" => Ok(TerminalCursorStyle::Block),
+        "underline" => Ok(TerminalCursorStyle::Underline),
+        "block_hollow" => Ok(TerminalCursorStyle::BlockHollow),
+        other => Err(format!("unknown cursor style {other}")),
+    }
 }
 
 fn read_optional_utf8(ptr: *const u8, len: usize) -> Result<Option<String>, Utf8Error> {

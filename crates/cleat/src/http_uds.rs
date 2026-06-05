@@ -35,43 +35,49 @@ pub(crate) struct ResizeRequest {
     pub rows: u16,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
 pub(crate) struct SnapshotResponse {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<CellResponse>,
     pub cursor: CursorResponse,
-    pub dirty: &'static str,
+    pub dirty: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
 pub(crate) struct CellResponse {
     pub graphemes: Vec<u32>,
     pub fg: RgbResponse,
     pub bg: RgbResponse,
     pub flags: u32,
-    pub width: &'static str,
+    pub width: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RgbResponse {
     pub r: u8,
     pub g: u8,
     pub b: u8,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CursorResponse {
     pub col: u16,
     pub row: u16,
     pub visible: bool,
-    pub style: &'static str,
+    pub style: String,
     pub wide_tail: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub(crate) struct ErrorResponse<'a> {
     pub error: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HttpResponse {
+    pub status: StatusCode,
+    pub body: Vec<u8>,
 }
 
 pub(crate) fn looks_like_http_prefix(prefix: &[u8]) -> bool {
@@ -143,6 +149,37 @@ pub(crate) fn read_request_with_prefix(reader: &mut impl Read, prefix: &[u8]) ->
     builder.body(body).map_err(Error::other)
 }
 
+pub(crate) fn write_request(writer: &mut impl Write, method: Method, path: &str, body: &[u8]) -> std::io::Result<()> {
+    write!(
+        writer,
+        "{method} {path} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    writer.write_all(body)
+}
+
+pub(crate) fn read_response(reader: &mut impl Read) -> std::io::Result<HttpResponse> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    let header_end =
+        header_end_index(&bytes).ok_or_else(|| Error::new(ErrorKind::InvalidData, "HTTP response missing header terminator"))?;
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut headers);
+    let status = parsed.parse(&bytes[..header_end + 4]).map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+    if status.is_partial() {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "partial HTTP response headers"));
+    }
+    let code = parsed.code.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing HTTP response status"))?;
+    let content_length = content_length(parsed.headers)?;
+    let body_start = header_end + 4;
+    if bytes.len().saturating_sub(body_start) < content_length {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "HTTP response body shorter than content-length"));
+    }
+    let mut body = bytes[body_start..].to_vec();
+    body.truncate(content_length);
+    Ok(HttpResponse { status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?, body })
+}
+
 pub(crate) fn route(request: &HttpRequest) -> Route {
     let path = request.uri().path();
     match (request.method(), path) {
@@ -192,17 +229,17 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
                 fg: RgbResponse { r: cell.fg.r, g: cell.fg.g, b: cell.fg.b },
                 bg: RgbResponse { r: cell.bg.r, g: cell.bg.g, b: cell.bg.b },
                 flags: cell.flags.bits(),
-                width: cell_width_name(cell.width),
+                width: cell_width_name(cell.width).to_string(),
             })
             .collect(),
         cursor: CursorResponse {
             col: snapshot.cursor.col,
             row: snapshot.cursor.row,
             visible: snapshot.cursor.visible,
-            style: cursor_style_name(snapshot.cursor.style),
+            style: cursor_style_name(snapshot.cursor.style).to_string(),
             wide_tail: snapshot.cursor.wide_tail,
         },
-        dirty: dirty_name(snapshot.dirty),
+        dirty: dirty_name(snapshot.dirty).to_string(),
     }
 }
 

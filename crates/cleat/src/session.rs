@@ -837,6 +837,13 @@ fn handle_http_request(
             runtime.write_input(&body.bytes)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP keys response: {err}"))
         }
+        http_uds::Route::SessionKeysWithMark { id } if id == daemon_id => {
+            let body: http_uds::KeysWithMarkRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys-with-mark request: {err}"))?;
+            let offset = runtime.write_input_with_mark(&body.bytes, body.marker_name)?;
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
+                .map_err(|err| format!("write HTTP keys-with-mark response: {err}"))
+        }
         http_uds::Route::SessionRecord { id } if id == daemon_id => {
             let body: http_uds::RecordRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;
@@ -849,6 +856,23 @@ fn handle_http_request(
             let offset = runtime.mark(body.name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP mark response: {err}"))
+        }
+        http_uds::Route::SessionResolveMarker { id } if id == daemon_id => {
+            let body: http_uds::ResolveMarkerRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-marker request: {err}"))?;
+            match runtime.resolve_marker(&body.name) {
+                Some(offset) => http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
+                    .map_err(|err| format!("write HTTP resolve-marker response: {err}")),
+                None => http_uds::write_error(stream, StatusCode::NOT_FOUND, &format!("marker not found: {}", body.name))
+                    .map_err(|err| format!("write HTTP resolve-marker error: {err}")),
+            }
+        }
+        http_uds::Route::SessionResolveNextMarker { id } if id == daemon_id => {
+            let body: http_uds::ResolveNextMarkerRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-next-marker request: {err}"))?;
+            let offset = runtime.resolve_next_marker_after(body.after);
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::ResolveNextMarkerResponse { offset })
+                .map_err(|err| format!("write HTTP resolve-next-marker response: {err}"))
         }
         http_uds::Route::SessionResize { id } if id == daemon_id => {
             let body: http_uds::ResizeRequest =

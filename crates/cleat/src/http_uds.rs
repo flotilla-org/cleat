@@ -20,8 +20,11 @@ pub(crate) enum Route {
     SessionInspect { id: String },
     SessionInput { id: String },
     SessionKeys { id: String },
+    SessionKeysWithMark { id: String },
     SessionMark { id: String },
     SessionRecord { id: String },
+    SessionResolveMarker { id: String },
+    SessionResolveNextMarker { id: String },
     SessionResize { id: String },
     SessionScreen { id: String },
     SessionSignal { id: String },
@@ -66,6 +69,12 @@ pub(crate) struct KeysRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct KeysWithMarkRequest {
+    pub bytes: Vec<u8>,
+    pub marker_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ResizeRequest {
     pub cols: u16,
     pub rows: u16,
@@ -84,6 +93,21 @@ pub(crate) struct MarkRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MarkResponse {
     pub offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ResolveMarkerRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ResolveNextMarkerRequest {
+    pub after: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ResolveNextMarkerResponse {
+    pub offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,8 +291,11 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::GET, None, None) => Route::SessionInspect { id: id.to_string() },
                 (&Method::POST, Some("input"), None) => Route::SessionInput { id: id.to_string() },
                 (&Method::POST, Some("keys"), None) => Route::SessionKeys { id: id.to_string() },
+                (&Method::POST, Some("keys-with-mark"), None) => Route::SessionKeysWithMark { id: id.to_string() },
                 (&Method::POST, Some("mark"), None) => Route::SessionMark { id: id.to_string() },
                 (&Method::POST, Some("record"), None) => Route::SessionRecord { id: id.to_string() },
+                (&Method::POST, Some("resolve-marker"), None) => Route::SessionResolveMarker { id: id.to_string() },
+                (&Method::POST, Some("resolve-next-marker"), None) => Route::SessionResolveNextMarker { id: id.to_string() },
                 (&Method::POST, Some("resize"), None) => Route::SessionResize { id: id.to_string() },
                 (&Method::GET, Some("screen"), None) => Route::SessionScreen { id: id.to_string() },
                 (&Method::POST, Some("signal"), None) => Route::SessionSignal { id: id.to_string() },
@@ -408,8 +435,11 @@ mod tests {
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/input", Route::SessionInput { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/keys", Route::SessionKeys { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/keys-with-mark", Route::SessionKeysWithMark { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/mark", Route::SessionMark { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/record", Route::SessionRecord { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/resolve-marker", Route::SessionResolveMarker { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/resolve-next-marker", Route::SessionResolveNextMarker { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/resize", Route::SessionResize { id: "alpha".to_string() }),
             ("GET", "/sessions/alpha/screen", Route::SessionScreen { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/signal", Route::SessionSignal { id: "alpha".to_string() }),

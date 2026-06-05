@@ -271,16 +271,12 @@ impl SessionService {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream = connect_session_socket(&socket_path)?;
-        Frame::SendKeysWithMark { bytes: bytes.to_vec(), marker_name: marker_name.to_string() }
-            .write(&mut stream)
-            .map_err(|err| format!("write send-keys-with-mark request: {err}"))?;
-        match Frame::read(&mut stream).map_err(|err| format!("read send-keys-with-mark response: {err}"))? {
-            Frame::MarkResult { offset } => Ok(offset),
-            Frame::Error(message) => Err(message),
-            other => Err(format!("unexpected send-keys-with-mark response: {other:?}")),
-        }
+        let response: http_uds::MarkResponse =
+            self.http_json(id, Method::POST, &format!("/sessions/{id}/keys-with-mark"), &http_uds::KeysWithMarkRequest {
+                bytes: bytes.to_vec(),
+                marker_name: marker_name.to_string(),
+            })?;
+        Ok(response.offset)
     }
 
     pub fn attach(
@@ -363,29 +359,22 @@ impl SessionService {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream = connect_session_socket(&socket_path)?;
-        Frame::ResolveMarker { name: name.to_string() }.write(&mut stream).map_err(|e| format!("write resolve: {e}"))?;
-        match Frame::read(&mut stream).map_err(|e| format!("read resolve response: {e}"))? {
-            Frame::MarkResult { offset } => Ok(offset),
-            Frame::Error(msg) => Err(msg),
-            other => Err(format!("unexpected resolve response: {other:?}")),
-        }
+        let response: http_uds::MarkResponse =
+            self.http_json(id, Method::POST, &format!("/sessions/{id}/resolve-marker"), &http_uds::ResolveMarkerRequest {
+                name: name.to_string(),
+            })?;
+        Ok(response.offset)
     }
 
     pub fn resolve_next_marker_after(&self, id: &str, after: u64) -> Result<Option<u64>, String> {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream = connect_session_socket(&socket_path)?;
-        Frame::ResolveNextMarker { after }.write(&mut stream).map_err(|e| format!("write resolve-next: {e}"))?;
-        match Frame::read(&mut stream).map_err(|e| format!("read resolve-next response: {e}"))? {
-            Frame::MarkResult { offset } => Ok(Some(offset)),
-            Frame::MarkNotFound => Ok(None),
-            Frame::Error(msg) => Err(msg),
-            other => Err(format!("unexpected resolve-next response: {other:?}")),
-        }
+        let response: http_uds::ResolveNextMarkerResponse =
+            self.http_json(id, Method::POST, &format!("/sessions/{id}/resolve-next-marker"), &http_uds::ResolveNextMarkerRequest {
+                after,
+            })?;
+        Ok(response.offset)
     }
 
     pub fn record(&self, id: &str, enable: bool) -> Result<(), String> {

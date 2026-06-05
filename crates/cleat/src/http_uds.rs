@@ -17,6 +17,7 @@ pub(crate) type HttpRequest = Request<Vec<u8>>;
 pub(crate) enum Route {
     Root,
     Health,
+    SessionExpect { id: String },
     SessionInspect { id: String },
     SessionInput { id: String },
     SessionKeys { id: String },
@@ -29,6 +30,7 @@ pub(crate) enum Route {
     SessionScreen { id: String },
     SessionSignal { id: String },
     SessionSnapshot { id: String },
+    SessionWait { id: String },
     NotFound,
 }
 
@@ -108,6 +110,40 @@ pub(crate) struct ResolveNextMarkerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ResolveNextMarkerResponse {
     pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct WaitRequest {
+    pub conditions: Vec<WaitConditionRequest>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum WaitConditionRequest {
+    OutputIdle { quiet_ms: u64 },
+    TextMatch { text: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ExpectRequest {
+    pub text: String,
+    pub since_offset: u64,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct WaitResultResponse {
+    pub status: WaitStatusResponse,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WaitStatusResponse {
+    Ready,
+    Timeout,
+    SessionGone,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -289,6 +325,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
             };
             match (request.method(), segments.next(), segments.next()) {
                 (&Method::GET, None, None) => Route::SessionInspect { id: id.to_string() },
+                (&Method::POST, Some("expect"), None) => Route::SessionExpect { id: id.to_string() },
                 (&Method::POST, Some("input"), None) => Route::SessionInput { id: id.to_string() },
                 (&Method::POST, Some("keys"), None) => Route::SessionKeys { id: id.to_string() },
                 (&Method::POST, Some("keys-with-mark"), None) => Route::SessionKeysWithMark { id: id.to_string() },
@@ -300,6 +337,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::GET, Some("screen"), None) => Route::SessionScreen { id: id.to_string() },
                 (&Method::POST, Some("signal"), None) => Route::SessionSignal { id: id.to_string() },
                 (&Method::GET, Some("snapshot"), None) => Route::SessionSnapshot { id: id.to_string() },
+                (&Method::POST, Some("wait"), None) => Route::SessionWait { id: id.to_string() },
                 _ => Route::NotFound,
             }
         }
@@ -433,6 +471,7 @@ mod tests {
         let cases = [
             ("GET", "/healthz", Route::Health),
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/expect", Route::SessionExpect { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/input", Route::SessionInput { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/keys", Route::SessionKeys { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/keys-with-mark", Route::SessionKeysWithMark { id: "alpha".to_string() }),
@@ -444,6 +483,7 @@ mod tests {
             ("GET", "/sessions/alpha/screen", Route::SessionScreen { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/signal", Route::SessionSignal { id: "alpha".to_string() }),
             ("GET", "/sessions/alpha/snapshot", Route::SessionSnapshot { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/wait", Route::SessionWait { id: "alpha".to_string() }),
         ];
 
         for (method, path, expected) in cases {

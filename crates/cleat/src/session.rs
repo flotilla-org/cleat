@@ -365,19 +365,46 @@ fn apply_attach_state(
 }
 
 struct PendingWait {
-    stream: SessionStream,
+    response: PendingResponse,
     conditions: Vec<crate::protocol::WaitCondition>,
     timeout_ms: u64,
     registered_at: Instant,
 }
 
 struct PendingExpect {
-    stream: SessionStream,
+    response: PendingResponse,
     text: String,
     since_offset: u64,
     last_checked_file_size: u64,
     timeout_ms: u64,
     registered_at: Instant,
+}
+
+enum PendingResponse {
+    Frame(SessionStream),
+    Http(SessionStream),
+}
+
+impl PendingResponse {
+    fn write_wait_result(&mut self, status: crate::protocol::WaitStatus, elapsed_ms: u64) -> std::io::Result<()> {
+        match self {
+            PendingResponse::Frame(stream) => Frame::WaitResult { status, elapsed_ms }.write(stream),
+            PendingResponse::Http(stream) => http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
+                status: wait_status_to_http(status),
+                elapsed_ms,
+            }),
+        }
+    }
+
+    fn write_expect_result(&mut self, status: crate::protocol::WaitStatus, elapsed_ms: u64) -> std::io::Result<()> {
+        match self {
+            PendingResponse::Frame(stream) => Frame::ExpectResult { status, elapsed_ms }.write(stream),
+            PendingResponse::Http(stream) => http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
+                status: wait_status_to_http(status),
+                elapsed_ms,
+            }),
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -428,7 +455,13 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         continue;
                     }
                     if http_uds::looks_like_http_prefix(&prefix) {
-                        if let Err(err) = handle_http_request(root, id, &mut stream, &prefix, &mut runtime, &mut active_client) {
+                        let mut http_state = HttpRequestState {
+                            runtime: &mut runtime,
+                            active_client: &mut active_client,
+                            pending_waits: &mut pending_waits,
+                            pending_expects: &mut pending_expects,
+                        };
+                        if let Err(err) = handle_http_request(root, id, &mut stream, &prefix, &mut http_state) {
                             let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                         }
                         continue;
@@ -566,7 +599,12 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                                 let _ = Frame::Error(format!("set nonblocking: {err}")).write(&mut stream);
                                 break 'wait;
                             }
-                            pending_waits.push(PendingWait { stream, conditions, timeout_ms, registered_at: Instant::now() });
+                            pending_waits.push(PendingWait {
+                                response: PendingResponse::Frame(stream),
+                                conditions,
+                                timeout_ms,
+                                registered_at: Instant::now(),
+                            });
                         }
                         Ok(Frame::Expect { text, since_offset, timeout_ms }) => 'expect: {
                             if !runtime.recording_active() {
@@ -592,7 +630,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                             }
                             let initial_file_size = std::fs::metadata(&cast_path).map(|m| m.len()).unwrap_or(0);
                             pending_expects.push(PendingExpect {
-                                stream,
+                                response: PendingResponse::Frame(stream),
                                 text,
                                 since_offset,
                                 last_checked_file_size: initial_file_size,
@@ -681,7 +719,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
             // Check timeout first
             if elapsed_ms >= wait.timeout_ms {
-                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Timeout, elapsed_ms }.write(&mut wait.stream);
+                let _ = wait.response.write_wait_result(crate::protocol::WaitStatus::Timeout, elapsed_ms);
                 return false;
             }
 
@@ -696,13 +734,13 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         };
                         let quiet_duration = silence_since.elapsed().as_millis() as u64;
                         if quiet_duration >= *quiet_ms {
-                            let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut wait.stream);
+                            let _ = wait.response.write_wait_result(crate::protocol::WaitStatus::Ready, elapsed_ms);
                             return false;
                         }
                     }
                     crate::protocol::WaitCondition::TextMatch { text } => {
                         if runtime.screen_contains(text.as_str()) {
-                            let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }.write(&mut wait.stream);
+                            let _ = wait.response.write_wait_result(crate::protocol::WaitStatus::Ready, elapsed_ms);
                             return false;
                         }
                     }
@@ -721,7 +759,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 let elapsed_ms = elapsed.as_millis() as u64;
 
                 if elapsed_ms >= expect.timeout_ms {
-                    let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Timeout, elapsed_ms }.write(&mut expect.stream);
+                    let _ = expect.response.write_expect_result(crate::protocol::WaitStatus::Timeout, elapsed_ms);
                     return false;
                 }
 
@@ -732,8 +770,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, expect.since_offset) {
                             let output: String = events.iter().map(|e| e.data.as_str()).collect();
                             if output.contains(&expect.text) {
-                                let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::Ready, elapsed_ms }
-                                    .write(&mut expect.stream);
+                                let _ = expect.response.write_expect_result(crate::protocol::WaitStatus::Ready, elapsed_ms);
                                 return false;
                             }
                         }
@@ -758,11 +795,11 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
-                let _ = Frame::WaitResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut wait.stream);
+                let _ = wait.response.write_wait_result(crate::protocol::WaitStatus::SessionGone, elapsed_ms);
             }
             for mut expect in pending_expects.drain(..) {
                 let elapsed_ms = expect.registered_at.elapsed().as_millis() as u64;
-                let _ = Frame::ExpectResult { status: crate::protocol::WaitStatus::SessionGone, elapsed_ms }.write(&mut expect.stream);
+                let _ = expect.response.write_expect_result(crate::protocol::WaitStatus::SessionGone, elapsed_ms);
             }
             runtime.record_exit_code(exit_code);
             if let Some(client) = active_client.as_mut() {
@@ -787,13 +824,19 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
     Err("session daemon is only supported on unix".into())
 }
 
+struct HttpRequestState<'a> {
+    runtime: &'a mut SessionRuntime,
+    active_client: &'a mut Option<ActiveClient>,
+    pending_waits: &'a mut Vec<PendingWait>,
+    pending_expects: &'a mut Vec<PendingExpect>,
+}
+
 fn handle_http_request(
     root: &Path,
     daemon_id: &str,
     stream: &mut SessionStream,
     prefix: &[u8],
-    runtime: &mut SessionRuntime,
-    active_client: &mut Option<ActiveClient>,
+    state: &mut HttpRequestState<'_>,
 ) -> Result<(), String> {
     let request = http_uds::read_request_with_prefix(stream, prefix).map_err(|err| format!("read HTTP request: {err}"))?;
     match http_uds::route(&request) {
@@ -808,25 +851,67 @@ fn handle_http_request(
         )
         .map_err(|err| format!("write HTTP response: {err}")),
         http_uds::Route::SessionInspect { id } if id == daemon_id => {
-            let result = runtime.inspect(active_client.is_some());
+            let result = state.runtime.inspect(state.active_client.is_some());
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
+        }
+        http_uds::Route::SessionExpect { id } if id == daemon_id => 'expect: {
+            let body: http_uds::ExpectRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP expect request: {err}"))?;
+            if !state.runtime.recording_active() {
+                http_uds::write_error(stream, StatusCode::CONFLICT, "recording not active")
+                    .map_err(|err| format!("write HTTP expect error: {err}"))?;
+                break 'expect Ok(());
+            }
+
+            let cast_path = root.join(daemon_id).join(crate::recording::CAST_FILE_NAME);
+            state.runtime.flush_recording();
+            if cast_path.exists() {
+                if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, body.since_offset) {
+                    let output: String = events.iter().map(|event| event.data.as_str()).collect();
+                    if output.contains(&body.text) {
+                        http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
+                            status: http_uds::WaitStatusResponse::Ready,
+                            elapsed_ms: 0,
+                        })
+                        .map_err(|err| format!("write HTTP expect response: {err}"))?;
+                        break 'expect Ok(());
+                    }
+                }
+            }
+
+            let pending_stream = stream.try_clone().map_err(|err| format!("clone HTTP expect stream: {err}"))?;
+            if let Err(err) = set_stream_nonblocking(&pending_stream, true) {
+                http_uds::write_error(stream, StatusCode::INTERNAL_SERVER_ERROR, &format!("set nonblocking: {err}"))
+                    .map_err(|err| format!("write HTTP expect error: {err}"))?;
+                break 'expect Ok(());
+            }
+            let initial_file_size = std::fs::metadata(&cast_path).map(|metadata| metadata.len()).unwrap_or(0);
+            state.pending_expects.push(PendingExpect {
+                response: PendingResponse::Http(pending_stream),
+                text: body.text,
+                since_offset: body.since_offset,
+                last_checked_file_size: initial_file_size,
+                timeout_ms: body.timeout_ms,
+                registered_at: Instant::now(),
+            });
+            Ok(())
         }
         http_uds::Route::SessionInput { id } if id == daemon_id => {
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
                 http_uds::InputRequest::Text { text } | http_uds::InputRequest::Paste { text } => {
-                    runtime.write_input(text.as_bytes())?;
+                    state.runtime.write_input(text.as_bytes())?;
                 }
                 http_uds::InputRequest::Key { key } => {
                     let bytes = http_input_key_bytes(key);
-                    runtime.write_input(&bytes)?;
+                    state.runtime.write_input(&bytes)?;
                 }
                 http_uds::InputRequest::RawBytes { bytes } => {
-                    runtime.write_input(&bytes)?;
+                    state.runtime.write_input(&bytes)?;
                 }
                 http_uds::InputRequest::Resize { cols, rows } => {
-                    runtime.resize(cols, rows)?;
+                    state.runtime.resize(cols, rows)?;
                 }
             }
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP input response: {err}"))
@@ -834,33 +919,33 @@ fn handle_http_request(
         http_uds::Route::SessionKeys { id } if id == daemon_id => {
             let body: http_uds::KeysRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys request: {err}"))?;
-            runtime.write_input(&body.bytes)?;
+            state.runtime.write_input(&body.bytes)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP keys response: {err}"))
         }
         http_uds::Route::SessionKeysWithMark { id } if id == daemon_id => {
             let body: http_uds::KeysWithMarkRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys-with-mark request: {err}"))?;
-            let offset = runtime.write_input_with_mark(&body.bytes, body.marker_name)?;
+            let offset = state.runtime.write_input_with_mark(&body.bytes, body.marker_name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP keys-with-mark response: {err}"))
         }
         http_uds::Route::SessionRecord { id } if id == daemon_id => {
             let body: http_uds::RecordRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;
-            runtime.set_recording(body.enable)?;
+            state.runtime.set_recording(body.enable)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP record response: {err}"))
         }
         http_uds::Route::SessionMark { id } if id == daemon_id => {
             let body: http_uds::MarkRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP mark request: {err}"))?;
-            let offset = runtime.mark(body.name)?;
+            let offset = state.runtime.mark(body.name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP mark response: {err}"))
         }
         http_uds::Route::SessionResolveMarker { id } if id == daemon_id => {
             let body: http_uds::ResolveMarkerRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-marker request: {err}"))?;
-            match runtime.resolve_marker(&body.name) {
+            match state.runtime.resolve_marker(&body.name) {
                 Some(offset) => http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                     .map_err(|err| format!("write HTTP resolve-marker response: {err}")),
                 None => http_uds::write_error(stream, StatusCode::NOT_FOUND, &format!("marker not found: {}", body.name))
@@ -870,17 +955,17 @@ fn handle_http_request(
         http_uds::Route::SessionResolveNextMarker { id } if id == daemon_id => {
             let body: http_uds::ResolveNextMarkerRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-next-marker request: {err}"))?;
-            let offset = runtime.resolve_next_marker_after(body.after);
+            let offset = state.runtime.resolve_next_marker_after(body.after);
             http_uds::write_json(stream, StatusCode::OK, &http_uds::ResolveNextMarkerResponse { offset })
                 .map_err(|err| format!("write HTTP resolve-next-marker response: {err}"))
         }
         http_uds::Route::SessionResize { id } if id == daemon_id => {
             let body: http_uds::ResizeRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resize request: {err}"))?;
-            runtime.resize(body.cols, body.rows)?;
+            state.runtime.resize(body.cols, body.rows)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP resize response: {err}"))
         }
-        http_uds::Route::SessionScreen { id } if id == daemon_id => match runtime.capture_text() {
+        http_uds::Route::SessionScreen { id } if id == daemon_id => match state.runtime.capture_text() {
             Ok(text) => http_uds::write_json(stream, StatusCode::OK, &http_uds::ScreenResponse { text })
                 .map_err(|err| format!("write HTTP screen response: {err}")),
             Err(err) => http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP screen error: {err}")),
@@ -888,28 +973,76 @@ fn handle_http_request(
         http_uds::Route::SessionSignal { id } if id == daemon_id => {
             let body: http_uds::SignalRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP signal request: {err}"))?;
-            runtime.dispatch_signal(body.signal, signal_target_from_http(body.target))?;
+            state.runtime.dispatch_signal(body.signal, signal_target_from_http(body.target))?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP signal response: {err}"))
         }
         http_uds::Route::SessionSnapshot { id } if id == daemon_id => {
-            let output = runtime.read_available_output(active_client.is_some())?;
-            if let Some(client) = active_client.as_mut() {
+            let output = state.runtime.read_available_output(state.active_client.is_some())?;
+            if let Some(client) = state.active_client.as_mut() {
                 for chunk in output.chunks {
                     if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
                         let _ = fs::remove_file(foreground_path(root, daemon_id));
-                        runtime.record_detach();
-                        *active_client = None;
+                        state.runtime.record_detach();
+                        *state.active_client = None;
                         break;
                     }
                 }
             }
-            match runtime.snapshot(crate::provider::DirtyState::Full) {
+            match state.runtime.snapshot(crate::provider::DirtyState::Full) {
                 Ok(snapshot) => http_uds::write_json(stream, StatusCode::OK, &http_uds::snapshot_response(snapshot))
                     .map_err(|err| format!("write HTTP snapshot response: {err}")),
                 Err(err) => {
                     http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP snapshot error: {err}"))
                 }
             }
+        }
+        http_uds::Route::SessionWait { id } if id == daemon_id => 'wait: {
+            let body: http_uds::WaitRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP wait request: {err}"))?;
+            let conditions: Vec<_> = body.conditions.into_iter().map(wait_condition_from_http).collect();
+            if conditions.is_empty() {
+                http_uds::write_error(stream, StatusCode::BAD_REQUEST, "at least one wait condition is required")
+                    .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                break 'wait Ok(());
+            }
+
+            let has_text_match = conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::TextMatch { .. }));
+            if has_text_match {
+                if let Err(err) = state.runtime.validate_text_matching() {
+                    http_uds::write_error(stream, StatusCode::CONFLICT, &format!("text matching not supported: {err}"))
+                        .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                    break 'wait Ok(());
+                }
+            }
+
+            if has_text_match {
+                for condition in &conditions {
+                    if let crate::protocol::WaitCondition::TextMatch { text } = condition {
+                        if state.runtime.screen_contains(text.as_str()) {
+                            http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
+                                status: http_uds::WaitStatusResponse::Ready,
+                                elapsed_ms: 0,
+                            })
+                            .map_err(|err| format!("write HTTP wait response: {err}"))?;
+                            break 'wait Ok(());
+                        }
+                    }
+                }
+            }
+
+            let pending_stream = stream.try_clone().map_err(|err| format!("clone HTTP wait stream: {err}"))?;
+            if let Err(err) = set_stream_nonblocking(&pending_stream, true) {
+                http_uds::write_error(stream, StatusCode::INTERNAL_SERVER_ERROR, &format!("set nonblocking: {err}"))
+                    .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                break 'wait Ok(());
+            }
+            state.pending_waits.push(PendingWait {
+                response: PendingResponse::Http(pending_stream),
+                conditions,
+                timeout_ms: body.timeout_ms,
+                registered_at: Instant::now(),
+            });
+            Ok(())
         }
         _ => {
             http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
@@ -922,6 +1055,21 @@ fn signal_target_from_http(target: http_uds::SignalTargetRequest) -> crate::prot
         http_uds::SignalTargetRequest::Foreground => crate::protocol::SignalTarget::Foreground,
         http_uds::SignalTargetRequest::Leader => crate::protocol::SignalTarget::Leader,
         http_uds::SignalTargetRequest::Tree => crate::protocol::SignalTarget::Tree,
+    }
+}
+
+fn wait_condition_from_http(condition: http_uds::WaitConditionRequest) -> crate::protocol::WaitCondition {
+    match condition {
+        http_uds::WaitConditionRequest::OutputIdle { quiet_ms } => crate::protocol::WaitCondition::OutputIdle { quiet_ms },
+        http_uds::WaitConditionRequest::TextMatch { text } => crate::protocol::WaitCondition::TextMatch { text },
+    }
+}
+
+fn wait_status_to_http(status: crate::protocol::WaitStatus) -> http_uds::WaitStatusResponse {
+    match status {
+        crate::protocol::WaitStatus::Ready => http_uds::WaitStatusResponse::Ready,
+        crate::protocol::WaitStatus::Timeout => http_uds::WaitStatusResponse::Timeout,
+        crate::protocol::WaitStatus::SessionGone => http_uds::WaitStatusResponse::SessionGone,
     }
 }
 

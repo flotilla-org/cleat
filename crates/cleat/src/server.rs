@@ -393,34 +393,29 @@ impl SessionService {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream = connect_session_socket(&socket_path)?;
-        // The wait response can take up to timeout_ms plus some overhead.
-        // Remove any default read timeout so the blocking read succeeds.
-        set_stream_read_timeout(&stream, Some(Duration::from_millis(timeout_ms + 5000)))?;
-        Frame::Wait { conditions, timeout_ms }.write(&mut stream).map_err(|err| format!("write wait request: {err}"))?;
-        match Frame::read(&mut stream).map_err(|err| format!("read wait response: {err}"))? {
-            Frame::WaitResult { status, elapsed_ms } => Ok((status, elapsed_ms)),
-            Frame::Error(message) => Err(message),
-            other => Err(format!("unexpected wait response: {other:?}")),
-        }
+        let conditions = conditions.into_iter().map(wait_condition_to_http).collect();
+        let response: http_uds::WaitResultResponse = self.http_json_with_read_timeout(
+            id,
+            Method::POST,
+            &format!("/sessions/{id}/wait"),
+            &http_uds::WaitRequest { conditions, timeout_ms },
+            Duration::from_millis(timeout_ms.saturating_add(5000)),
+        )?;
+        Ok((wait_status_from_http(response.status), response.elapsed_ms))
     }
 
     pub fn expect(&self, id: &str, text: &str, since_offset: u64, timeout_ms: u64) -> Result<(crate::protocol::WaitStatus, u64), String> {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let socket_path = session_socket_path(self.layout.root(), id);
-        let mut stream = connect_session_socket(&socket_path)?;
-        set_stream_read_timeout(&stream, Some(Duration::from_millis(timeout_ms + 5000)))?;
-        Frame::Expect { text: text.to_string(), since_offset, timeout_ms }
-            .write(&mut stream)
-            .map_err(|err| format!("write expect request: {err}"))?;
-        match Frame::read(&mut stream).map_err(|err| format!("read expect response: {err}"))? {
-            Frame::ExpectResult { status, elapsed_ms } => Ok((status, elapsed_ms)),
-            Frame::Error(message) => Err(message),
-            other => Err(format!("unexpected expect response: {other:?}")),
-        }
+        let response: http_uds::WaitResultResponse = self.http_json_with_read_timeout(
+            id,
+            Method::POST,
+            &format!("/sessions/{id}/expect"),
+            &http_uds::ExpectRequest { text: text.to_string(), since_offset, timeout_ms },
+            Duration::from_millis(timeout_ms.saturating_add(5000)),
+        )?;
+        Ok((wait_status_from_http(response.status), response.elapsed_ms))
     }
 
     pub fn serve(&self, session: &crate::runtime::SessionMetadata) -> Result<(), String> {
@@ -429,6 +424,21 @@ impl SessionService {
 
     fn http_json<T: serde::Serialize, R: DeserializeOwned>(&self, id: &str, method: Method, path: &str, body: &T) -> Result<R, String> {
         let response = self.http_request(id, method.clone(), path, body)?;
+        if response.status != StatusCode::OK {
+            return Err(http_error_message(response));
+        }
+        serde_json::from_slice(&response.body).map_err(|err| format!("parse HTTP response: {err}"))
+    }
+
+    fn http_json_with_read_timeout<T: serde::Serialize, R: DeserializeOwned>(
+        &self,
+        id: &str,
+        method: Method,
+        path: &str,
+        body: &T,
+        read_timeout: Duration,
+    ) -> Result<R, String> {
+        let response = self.http_request_with_read_timeout(id, method, path, body, Some(read_timeout))?;
         if response.status != StatusCode::OK {
             return Err(http_error_message(response));
         }
@@ -445,8 +455,22 @@ impl SessionService {
     }
 
     fn http_request<T: serde::Serialize>(&self, id: &str, method: Method, path: &str, body: &T) -> Result<http_uds::HttpResponse, String> {
+        self.http_request_with_read_timeout(id, method, path, body, None)
+    }
+
+    fn http_request_with_read_timeout<T: serde::Serialize>(
+        &self,
+        id: &str,
+        method: Method,
+        path: &str,
+        body: &T,
+        read_timeout: Option<Duration>,
+    ) -> Result<http_uds::HttpResponse, String> {
         let socket_path = session_socket_path(self.layout.root(), id);
         let mut stream = connect_session_socket(&socket_path)?;
+        if let Some(timeout) = read_timeout {
+            set_stream_read_timeout(&stream, Some(timeout))?;
+        }
         let body = if method == Method::GET {
             Vec::new()
         } else {
@@ -525,6 +549,21 @@ fn signal_target_to_http(target: crate::protocol::SignalTarget) -> http_uds::Sig
     }
 }
 
+fn wait_condition_to_http(condition: crate::protocol::WaitCondition) -> http_uds::WaitConditionRequest {
+    match condition {
+        crate::protocol::WaitCondition::OutputIdle { quiet_ms } => http_uds::WaitConditionRequest::OutputIdle { quiet_ms },
+        crate::protocol::WaitCondition::TextMatch { text } => http_uds::WaitConditionRequest::TextMatch { text },
+    }
+}
+
+fn wait_status_from_http(status: http_uds::WaitStatusResponse) -> crate::protocol::WaitStatus {
+    match status {
+        http_uds::WaitStatusResponse::Ready => crate::protocol::WaitStatus::Ready,
+        http_uds::WaitStatusResponse::Timeout => crate::protocol::WaitStatus::Timeout,
+        http_uds::WaitStatusResponse::SessionGone => crate::protocol::WaitStatus::SessionGone,
+    }
+}
+
 fn http_error_message(response: http_uds::HttpResponse) -> String {
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body) {
         if let Some(message) = value.get("error").and_then(|value| value.as_str()) {
@@ -554,6 +593,7 @@ mod tests {
 
     use super::SessionService;
     use crate::{
+        protocol::{WaitCondition, WaitStatus},
         runtime::RuntimeLayout,
         session::{daemon_pid_path, session_socket_path},
     };
@@ -614,6 +654,74 @@ mod tests {
         reader.join().expect("join reader");
         assert!(request.starts_with("POST /sessions/alpha/keys HTTP/1.1\r\n"), "{request}");
         assert!(request.ends_with(r#"{"bytes":[104,101,108,108,111,13]}"#), "{request}");
+    }
+
+    #[test]
+    fn wait_posts_http_request_to_session_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = temp.path().join("alpha");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let socket_path = session_socket_path(temp.path(), "alpha");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0; 2048];
+            let n = stream.read(&mut buf).expect("read request");
+            let request = String::from_utf8(buf[..n].to_vec()).expect("request utf8");
+            tx.send(request).expect("send request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 34\r\nConnection: close\r\n\r\n{\"status\":\"ready\",\"elapsed_ms\":42}",
+                )
+                .expect("write response");
+        });
+
+        let result = service.wait("alpha", vec![WaitCondition::OutputIdle { quiet_ms: 250 }], 5000).expect("wait");
+        let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
+
+        reader.join().expect("join reader");
+        assert_eq!(result, (WaitStatus::Ready, 42));
+        assert!(request.starts_with("POST /sessions/alpha/wait HTTP/1.1\r\n"), "{request}");
+        assert!(request.ends_with(r#"{"conditions":[{"kind":"output_idle","quiet_ms":250}],"timeout_ms":5000}"#), "{request}");
+    }
+
+    #[test]
+    fn expect_posts_http_request_to_session_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = temp.path().join("alpha");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let socket_path = session_socket_path(temp.path(), "alpha");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0; 2048];
+            let n = stream.read(&mut buf).expect("read request");
+            let request = String::from_utf8(buf[..n].to_vec()).expect("request utf8");
+            tx.send(request).expect("send request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 37\r\nConnection: close\r\n\r\n{\"status\":\"timeout\",\"elapsed_ms\":500}",
+                )
+                .expect("write response");
+        });
+
+        let result = service.expect("alpha", "DONE", 123, 500).expect("expect");
+        let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
+
+        reader.join().expect("join reader");
+        assert_eq!(result, (WaitStatus::Timeout, 500));
+        assert!(request.starts_with("POST /sessions/alpha/expect HTTP/1.1\r\n"), "{request}");
+        assert!(request.ends_with(r#"{"text":"DONE","since_offset":123,"timeout_ms":500}"#), "{request}");
     }
 
     #[test]

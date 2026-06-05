@@ -60,12 +60,12 @@ pub(crate) enum NamedKey {
     ArrowRight,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct KeysRequest {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ResizeRequest {
     pub cols: u16,
     pub rows: u16,

@@ -5,6 +5,9 @@ edition = "2021"
 license.workspace = true
 build = "build.rs"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 default = []
 ghostty-vt = []

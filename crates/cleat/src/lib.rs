@@ -7,6 +7,7 @@ pub mod keys;
 pub mod platform;
 pub mod protocol;
 pub mod provider;
+pub mod provider_ffi;
 pub mod recording;
 pub mod replay;
 pub mod runtime;

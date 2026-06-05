@@ -6,6 +6,7 @@ pub mod duration_parser;
 pub mod keys;
 pub mod platform;
 pub mod protocol;
+pub mod provider;
 pub mod recording;
 pub mod replay;
 pub mod runtime;

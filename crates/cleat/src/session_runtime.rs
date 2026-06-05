@@ -10,9 +10,10 @@ use crate::{
     da::DeviceAttributeTracker,
     platform::pty::{exit_code_from_wait_status, PtyChild},
     protocol::{InspectResult, SignalTarget},
+    provider::{DirtyState, TerminalSnapshot},
     recording::SessionRecorder,
     runtime::SessionMetadata,
-    vt::{self, ScreenGrid, VtEngine},
+    vt::{self, VtEngine},
 };
 
 const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
@@ -129,8 +130,8 @@ impl SessionRuntime {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
-        self.vt_engine.screen_grid()
+    pub(crate) fn snapshot(&mut self, dirty: DirtyState) -> Result<TerminalSnapshot, String> {
+        self.vt_engine.screen_grid().map(|grid| TerminalSnapshot::from_screen_grid(grid, dirty))
     }
 
     pub(crate) fn write_input(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -355,7 +356,7 @@ fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vt::{CellFlags, CellWidth, CursorState, ResolvedCell, Rgb};
+    use crate::vt::{CellFlags, CellWidth, CursorState, ResolvedCell, Rgb, ScreenGrid};
 
     #[derive(Debug)]
     struct GridEngine {

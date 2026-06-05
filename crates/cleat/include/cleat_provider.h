@@ -33,6 +33,14 @@ extern "C" {
 #define CLEAT_KEY_ARROW_DOWN 13u
 #define CLEAT_KEY_ARROW_LEFT 14u
 #define CLEAT_KEY_ARROW_RIGHT 15u
+#define CLEAT_CELL_WIDTH_NARROW 0u
+#define CLEAT_CELL_WIDTH_WIDE 1u
+#define CLEAT_CELL_WIDTH_SPACER_TAIL 2u
+#define CLEAT_CELL_WIDTH_SPACER_HEAD 3u
+#define CLEAT_CURSOR_STYLE_BAR 0u
+#define CLEAT_CURSOR_STYLE_BLOCK 1u
+#define CLEAT_CURSOR_STYLE_UNDERLINE 2u
+#define CLEAT_CURSOR_STYLE_BLOCK_HOLLOW 3u
 
 typedef struct CleatProvider cleat_provider;
 typedef struct CleatSession cleat_session;
@@ -124,6 +132,12 @@ bool cleat_session_send_input(cleat_session *session, const cleat_input_event *e
 bool cleat_session_write_bytes(cleat_session *session, const uint8_t *bytes, size_t size);
 
 cleat_dirty_state cleat_session_dirty(const cleat_session *session);
+
+/*
+ * Only one snapshot may be live per session. Call
+ * cleat_session_release_snapshot before requesting another snapshot for the
+ * same session.
+ */
 bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
 void cleat_session_release_snapshot(cleat_session *session, cleat_snapshot *snapshot);
 

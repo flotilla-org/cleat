@@ -237,7 +237,7 @@ pub(crate) fn looks_like_http_prefix(prefix: &[u8]) -> bool {
     prefix.starts_with(b"GET ")
         || prefix.starts_with(b"POST ")
         || prefix.starts_with(b"PUT ")
-        || prefix.starts_with(b"DELETE")
+        || prefix.starts_with(b"DELET")
         || prefix.starts_with(b"PATCH")
         || prefix.starts_with(b"HEAD ")
         || prefix.starts_with(b"OPTIO")
@@ -409,7 +409,13 @@ pub(crate) fn write_json<T: Serialize>(writer: &mut impl Write, status: StatusCo
 }
 
 pub(crate) fn write_no_content(writer: &mut impl Write) -> std::io::Result<()> {
-    write_response(writer, response(StatusCode::NO_CONTENT, "application/octet-stream", Vec::new())?)
+    let response = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(CONTENT_LENGTH, 0)
+        .header(CONNECTION, "close")
+        .body(Vec::new())
+        .map_err(Error::other)?;
+    write_response(writer, response)
 }
 
 pub(crate) fn write_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
@@ -530,6 +536,14 @@ mod tests {
     }
 
     #[test]
+    fn detects_http_methods_from_five_byte_prefix() {
+        for prefix in [b"GET /".as_slice(), b"POST ", b"PUT /", b"DELET", b"PATCH", b"HEAD ", b"OPTIO"] {
+            assert!(looks_like_http_prefix(prefix));
+        }
+        assert!(!looks_like_http_prefix(b"\0\0\0\0\0"));
+    }
+
+    #[test]
     fn routes_provider_critical_session_endpoints() {
         let cases = [
             ("GET", "/healthz", Route::Health),
@@ -567,5 +581,17 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("content-type: application/json\r\n"));
         assert!(response.ends_with("{\"error\":\"nope\"}"));
+    }
+
+    #[test]
+    fn no_content_response_omits_content_type() {
+        let mut response = Vec::new();
+
+        write_no_content(&mut response).expect("write");
+        let response = String::from_utf8(response).expect("utf8");
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("content-length: 0\r\n"));
+        assert!(!response.contains("content-type:"));
     }
 }

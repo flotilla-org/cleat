@@ -40,6 +40,14 @@ pub const CLEAT_KEY_ARROW_UP: u32 = 12;
 pub const CLEAT_KEY_ARROW_DOWN: u32 = 13;
 pub const CLEAT_KEY_ARROW_LEFT: u32 = 14;
 pub const CLEAT_KEY_ARROW_RIGHT: u32 = 15;
+pub const CLEAT_CELL_WIDTH_NARROW: u32 = 0;
+pub const CLEAT_CELL_WIDTH_WIDE: u32 = 1;
+pub const CLEAT_CELL_WIDTH_SPACER_TAIL: u32 = 2;
+pub const CLEAT_CELL_WIDTH_SPACER_HEAD: u32 = 3;
+pub const CLEAT_CURSOR_STYLE_BAR: u32 = 0;
+pub const CLEAT_CURSOR_STYLE_BLOCK: u32 = 1;
+pub const CLEAT_CURSOR_STYLE_UNDERLINE: u32 = 2;
+pub const CLEAT_CURSOR_STYLE_BLOCK_HOLLOW: u32 = 3;
 
 const POSIX_SIGTERM: i32 = 15;
 
@@ -466,13 +474,17 @@ pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> Cl
 /// # Safety
 ///
 /// `session` must be a valid session pointer. `out` must point to writable
-/// storage for a `CleatSnapshot`.
+/// storage for a `CleatSnapshot`. Only one snapshot may be live per session;
+/// callers must release the previous snapshot before requesting another one.
 #[no_mangle]
 pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out: *mut CleatSnapshot) -> bool {
     let session = match unsafe { session.as_mut() } {
         Some(session) => session,
         None => return false,
     };
+    if session.last_snapshot.is_some() {
+        return false;
+    }
     let out = match unsafe { out.as_mut() } {
         Some(out) => out,
         None => return false,
@@ -798,10 +810,10 @@ fn cursor_to_ffi(cursor: TerminalCursor) -> CleatCursor {
         row: cursor.row,
         visible: cursor.visible,
         style: match cursor.style {
-            TerminalCursorStyle::Bar => 0,
-            TerminalCursorStyle::Block => 1,
-            TerminalCursorStyle::Underline => 2,
-            TerminalCursorStyle::BlockHollow => 3,
+            TerminalCursorStyle::Bar => CLEAT_CURSOR_STYLE_BAR,
+            TerminalCursorStyle::Block => CLEAT_CURSOR_STYLE_BLOCK,
+            TerminalCursorStyle::Underline => CLEAT_CURSOR_STYLE_UNDERLINE,
+            TerminalCursorStyle::BlockHollow => CLEAT_CURSOR_STYLE_BLOCK_HOLLOW,
         },
         wide_tail: cursor.wide_tail,
     }
@@ -809,10 +821,10 @@ fn cursor_to_ffi(cursor: TerminalCursor) -> CleatCursor {
 
 fn cell_width_tag(width: TerminalCellWidth) -> u32 {
     match width {
-        TerminalCellWidth::Narrow => 0,
-        TerminalCellWidth::Wide => 1,
-        TerminalCellWidth::SpacerTail => 2,
-        TerminalCellWidth::SpacerHead => 3,
+        TerminalCellWidth::Narrow => CLEAT_CELL_WIDTH_NARROW,
+        TerminalCellWidth::Wide => CLEAT_CELL_WIDTH_WIDE,
+        TerminalCellWidth::SpacerTail => CLEAT_CELL_WIDTH_SPACER_TAIL,
+        TerminalCellWidth::SpacerHead => CLEAT_CELL_WIDTH_SPACER_HEAD,
     }
 }
 
@@ -850,6 +862,28 @@ mod tests {
             cleat_session_release_snapshot(session, &mut snapshot);
             assert!(snapshot.cells.is_null());
             assert_eq!(snapshot.cell_count, 0);
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn snapshot_requires_release_before_next_snapshot() {
+        unsafe {
+            let provider = cleat_provider_open(ptr::null());
+            let session = cleat_session_create(provider, ptr::null());
+
+            let mut first = CleatSnapshot::default();
+            let mut second = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut first));
+            assert!(!first.cells.is_null());
+            assert!(!cleat_session_snapshot(session, &mut second));
+            assert!(second.cells.is_null());
+
+            cleat_session_release_snapshot(session, &mut first);
+            assert!(cleat_session_snapshot(session, &mut second));
+
+            cleat_session_release_snapshot(session, &mut second);
             cleat_session_destroy(session);
             cleat_provider_close(provider);
         }

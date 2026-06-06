@@ -71,6 +71,21 @@ pub const CLEAT_MOD_SHIFT: u16 = 1;
 pub const CLEAT_MOD_CTRL: u16 = 2;
 pub const CLEAT_MOD_ALT: u16 = 4;
 pub const CLEAT_MOD_SUPER: u16 = 8;
+pub const CLEAT_MOUSE_PRESS: u32 = 1;
+pub const CLEAT_MOUSE_RELEASE: u32 = 2;
+pub const CLEAT_MOUSE_MOVE: u32 = 3;
+pub const CLEAT_MOUSE_WHEEL: u32 = 4;
+pub const CLEAT_MOUSE_BUTTON_NONE: u32 = 0;
+pub const CLEAT_MOUSE_BUTTON_LEFT: u32 = 1;
+pub const CLEAT_MOUSE_BUTTON_MIDDLE: u32 = 2;
+pub const CLEAT_MOUSE_BUTTON_RIGHT: u32 = 3;
+pub const CLEAT_MOUSE_BUTTON_BACK: u32 = 4;
+pub const CLEAT_MOUSE_BUTTON_FORWARD: u32 = 5;
+pub const CLEAT_MOUSE_BUTTON_FLAG_LEFT: u16 = 1;
+pub const CLEAT_MOUSE_BUTTON_FLAG_MIDDLE: u16 = 2;
+pub const CLEAT_MOUSE_BUTTON_FLAG_RIGHT: u16 = 4;
+pub const CLEAT_MOUSE_BUTTON_FLAG_BACK: u16 = 8;
+pub const CLEAT_MOUSE_BUTTON_FLAG_FORWARD: u16 = 16;
 pub const CLEAT_CELL_WIDTH_NARROW: u32 = 0;
 pub const CLEAT_CELL_WIDTH_WIDE: u32 = 1;
 pub const CLEAT_CELL_WIDTH_SPACER_TAIL: u32 = 2;
@@ -222,6 +237,9 @@ pub struct CleatInputEvent {
     pub generated_text: *const u8,
     pub generated_text_len: usize,
     pub platform_keycode: u32,
+    pub mouse_kind: u32,
+    pub mouse_button: u32,
+    pub mouse_buttons: u16,
     pub cell_col: u16,
     pub cell_row: u16,
     pub x_px: f32,
@@ -1551,6 +1569,35 @@ mod tests {
             assert!(cleat_session_send_input_batch(session, ptr::null(), 0, &mut empty));
             assert_eq!(empty, CleatInputResult { first_sequence: 5, count: 0 });
 
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn mouse_events_are_semantic_and_do_not_emit_bytes_without_mouse_mode() {
+        let event = CleatInputEvent {
+            kind: CLEAT_INPUT_MOUSE,
+            modifiers: CLEAT_MOD_SHIFT,
+            mouse_kind: CLEAT_MOUSE_WHEEL,
+            mouse_button: CLEAT_MOUSE_BUTTON_NONE,
+            mouse_buttons: CLEAT_MOUSE_BUTTON_FLAG_LEFT,
+            cell_col: 7,
+            cell_row: 3,
+            x_px: 70.5,
+            y_px: 31.25,
+            wheel_delta_y: -1.0,
+            ..CleatInputEvent::default()
+        };
+        assert_eq!(input_event_bytes(&event).expect("mouse input"), None);
+        assert_eq!(daemon_input_request(&event).expect("mouse daemon input"), None);
+
+        unsafe {
+            let provider = cleat_provider_open(ptr::null());
+            let session = cleat_session_create(provider, ptr::null());
+            let mut result = CleatInputResult::default();
+            assert!(cleat_session_send_input_ex(session, &event, &mut result));
+            assert_eq!(result, CleatInputResult { first_sequence: 1, count: 1 });
             cleat_session_destroy(session);
             cleat_provider_close(provider);
         }

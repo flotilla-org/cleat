@@ -58,6 +58,21 @@ extern "C" {
 #define CLEAT_MOD_CTRL 2u
 #define CLEAT_MOD_ALT 4u
 #define CLEAT_MOD_SUPER 8u
+#define CLEAT_MOUSE_PRESS 1u
+#define CLEAT_MOUSE_RELEASE 2u
+#define CLEAT_MOUSE_MOVE 3u
+#define CLEAT_MOUSE_WHEEL 4u
+#define CLEAT_MOUSE_BUTTON_NONE 0u
+#define CLEAT_MOUSE_BUTTON_LEFT 1u
+#define CLEAT_MOUSE_BUTTON_MIDDLE 2u
+#define CLEAT_MOUSE_BUTTON_RIGHT 3u
+#define CLEAT_MOUSE_BUTTON_BACK 4u
+#define CLEAT_MOUSE_BUTTON_FORWARD 5u
+#define CLEAT_MOUSE_BUTTON_FLAG_LEFT 1u
+#define CLEAT_MOUSE_BUTTON_FLAG_MIDDLE 2u
+#define CLEAT_MOUSE_BUTTON_FLAG_RIGHT 4u
+#define CLEAT_MOUSE_BUTTON_FLAG_BACK 8u
+#define CLEAT_MOUSE_BUTTON_FLAG_FORWARD 16u
 #define CLEAT_CELL_WIDTH_NARROW 0u
 #define CLEAT_CELL_WIDTH_WIDE 1u
 #define CLEAT_CELL_WIDTH_SPACER_TAIL 2u
@@ -143,6 +158,11 @@ typedef struct cleat_snapshot {
     cleat_dirty_state dirty;
 } cleat_snapshot;
 
+/*
+ * For mouse events, cell_col/cell_row are the authoritative terminal-cell
+ * coordinates. x_px/y_px are terminal pixel coordinates relative to the
+ * terminal content area.
+ */
 typedef struct cleat_input_event {
     uint32_t kind;
     uint16_t modifiers;
@@ -155,6 +175,9 @@ typedef struct cleat_input_event {
     const uint8_t *generated_text;
     size_t generated_text_len;
     uint32_t platform_keycode;
+    uint32_t mouse_kind;
+    uint32_t mouse_button;
+    uint16_t mouse_buttons;
     uint16_t cell_col;
     uint16_t cell_row;
     float x_px;

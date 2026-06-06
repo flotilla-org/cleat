@@ -14,7 +14,7 @@ use crate::{
     protocol::SignalTarget,
     provider::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
-        TerminalGeometry, TerminalRgb, TerminalSnapshot,
+        TerminalGeometry, TerminalRgb, TerminalScrollbackExtent, TerminalSnapshot, TerminalViewportKind,
     },
     runtime::RuntimeLayout,
     session::{ensure_session_started, session_socket_path},
@@ -94,6 +94,9 @@ pub const CLEAT_CURSOR_STYLE_BAR: u32 = 0;
 pub const CLEAT_CURSOR_STYLE_BLOCK: u32 = 1;
 pub const CLEAT_CURSOR_STYLE_UNDERLINE: u32 = 2;
 pub const CLEAT_CURSOR_STYLE_BLOCK_HOLLOW: u32 = 3;
+pub const CLEAT_VIEWPORT_LIVE_NORMAL: u32 = 1;
+pub const CLEAT_VIEWPORT_LIVE_ALTERNATE: u32 = 2;
+pub const CLEAT_VIEWPORT_NORMAL_SCROLLBACK: u32 = 3;
 
 const POSIX_SIGTERM: i32 = 15;
 
@@ -214,6 +217,8 @@ pub struct CleatSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub geometry: CleatTerminalGeometry,
+    pub viewport_kind: u32,
+    pub scrollback_offset_rows: u64,
     pub render_generation: u64,
     pub cells: *const CleatCell,
     pub cell_count: usize,
@@ -253,6 +258,21 @@ pub struct CleatInputEvent {
 pub struct CleatInputResult {
     pub first_sequence: u64,
     pub count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleatScrollbackExtent {
+    pub normal_scrollback_rows: u64,
+    pub live_rows: u16,
+    pub alternate_screen: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleatViewportRequest {
+    pub kind: u32,
+    pub scrollback_offset_rows: u64,
 }
 
 pub struct CleatProvider {
@@ -299,6 +319,7 @@ struct InProcessSession {
 struct DaemonSession {
     id: String,
     runtime_root: PathBuf,
+    rows: u16,
     observation: ObservationState,
 }
 
@@ -422,6 +443,8 @@ impl OwnedSnapshot {
                 cols: snapshot.cols,
                 rows: snapshot.rows,
                 geometry: snapshot.geometry.into(),
+                viewport_kind: viewport_kind_to_ffi(snapshot.viewport_kind),
+                scrollback_offset_rows: snapshot.scrollback_offset_rows,
                 render_generation: snapshot.render_generation,
                 cells: ptr::null(),
                 cell_count: cells.len(),
@@ -437,6 +460,23 @@ impl OwnedSnapshot {
         owned.snapshot.cells = owned.cells.as_ptr();
         owned.snapshot.dirty_rows = if owned.dirty_rows.is_empty() { ptr::null() } else { owned.dirty_rows.as_ptr() };
         owned
+    }
+}
+
+fn viewport_kind_to_ffi(kind: TerminalViewportKind) -> u32 {
+    match kind {
+        TerminalViewportKind::LiveNormal => CLEAT_VIEWPORT_LIVE_NORMAL,
+        TerminalViewportKind::LiveAlternate => CLEAT_VIEWPORT_LIVE_ALTERNATE,
+        TerminalViewportKind::NormalScrollback => CLEAT_VIEWPORT_NORMAL_SCROLLBACK,
+    }
+}
+
+fn viewport_kind_from_ffi(kind: u32) -> Option<TerminalViewportKind> {
+    match kind {
+        0 | CLEAT_VIEWPORT_LIVE_NORMAL => Some(TerminalViewportKind::LiveNormal),
+        CLEAT_VIEWPORT_LIVE_ALTERNATE => Some(TerminalViewportKind::LiveAlternate),
+        CLEAT_VIEWPORT_NORMAL_SCROLLBACK => Some(TerminalViewportKind::NormalScrollback),
+        _ => None,
     }
 }
 
@@ -584,6 +624,7 @@ pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: 
             if daemon_resize(daemon, cols.max(1), rows.max(1)).is_err() {
                 return false;
             }
+            daemon.rows = rows.max(1);
             mark_full_and_wake(&mut daemon.observation, rows.max(1), &session.wake);
             true
         }
@@ -818,6 +859,29 @@ pub unsafe extern "C" fn cleat_session_mark_observed(session: *mut CleatSession,
 /// # Safety
 ///
 /// `session` must be a valid session pointer. `out` must point to writable
+/// `CleatScrollbackExtent` storage.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_scrollback_extent(session: *mut CleatSession, out: *mut CleatScrollbackExtent) -> bool {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    let out = match unsafe { out.as_mut() } {
+        Some(out) => out,
+        None => return false,
+    };
+    let extent = session_scrollback_extent(session);
+    *out = CleatScrollbackExtent {
+        normal_scrollback_rows: extent.normal_scrollback_rows,
+        live_rows: extent.live_rows,
+        alternate_screen: extent.alternate_screen,
+    };
+    true
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer. `out` must point to writable
 /// storage for a `CleatSnapshot`. Only one snapshot may be live per session;
 /// callers must release the previous snapshot before requesting another one.
 #[no_mangle]
@@ -861,6 +925,38 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
     *out = owned.snapshot;
     session.last_snapshot = Some(owned);
     true
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer. `request`, when non-null, must
+/// point to a valid `CleatViewportRequest`. `out` must point to writable
+/// storage for a `CleatSnapshot`.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_viewport_snapshot(
+    session: *mut CleatSession,
+    request: *const CleatViewportRequest,
+    out: *mut CleatSnapshot,
+) -> bool {
+    let request = unsafe { request.as_ref() }
+        .copied()
+        .unwrap_or(CleatViewportRequest { kind: CLEAT_VIEWPORT_LIVE_NORMAL, scrollback_offset_rows: 0 });
+    let Some(kind) = viewport_kind_from_ffi(request.kind) else {
+        return false;
+    };
+    if kind != TerminalViewportKind::LiveNormal || request.scrollback_offset_rows != 0 {
+        return false;
+    }
+    unsafe { cleat_session_snapshot(session, out) }
+}
+
+fn session_scrollback_extent(session: &mut CleatSession) -> TerminalScrollbackExtent {
+    let live_rows = match &mut session.backend {
+        SessionBackend::Mock(mock) => mock.rows,
+        SessionBackend::InProcess(in_process) => in_process.runtime.inspect(false).terminal.rows,
+        SessionBackend::Daemon(daemon) => daemon.rows,
+    };
+    TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows, alternate_screen: false }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -963,6 +1059,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let mut session = DaemonSession {
         id: metadata.id,
         runtime_root: provider.runtime_root.clone(),
+        rows: desc.rows.max(1),
         observation: ObservationState::new(desc.rows.max(1)),
     };
     daemon_resize(&mut session, desc.cols.max(1), desc.rows.max(1))?;
@@ -982,7 +1079,9 @@ fn daemon_resize(session: &mut DaemonSession, cols: u16, rows: u16) -> Result<()
     let body =
         serde_json::to_vec(&serde_json::json!({ "cols": cols, "rows": rows })).map_err(|err| format!("serialize resize request: {err}"))?;
     let response = daemon_request(session, Method::POST, &format!("/sessions/{}/resize", session.id), &body)?;
-    expect_status(response, StatusCode::NO_CONTENT, "resize")
+    expect_status(response, StatusCode::NO_CONTENT, "resize")?;
+    session.rows = rows;
+    Ok(())
 }
 
 fn daemon_write_bytes(session: &mut DaemonSession, bytes: &[u8]) -> Result<(), String> {
@@ -1027,6 +1126,8 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
         cols: snapshot.cols,
         rows: snapshot.rows,
         geometry: geometry_from_http(snapshot.geometry),
+        viewport_kind: viewport_kind_from_name(&snapshot.viewport_kind)?,
+        scrollback_offset_rows: snapshot.scrollback_offset_rows,
         render_generation: 0,
         cells: snapshot
             .cells
@@ -1091,6 +1192,15 @@ fn cursor_style_from_name(name: &str) -> Result<TerminalCursorStyle, String> {
         "underline" => Ok(TerminalCursorStyle::Underline),
         "block_hollow" => Ok(TerminalCursorStyle::BlockHollow),
         other => Err(format!("unknown cursor style {other}")),
+    }
+}
+
+fn viewport_kind_from_name(name: &str) -> Result<TerminalViewportKind, String> {
+    match name {
+        "live_normal" => Ok(TerminalViewportKind::LiveNormal),
+        "live_alternate" => Ok(TerminalViewportKind::LiveAlternate),
+        "normal_scrollback" => Ok(TerminalViewportKind::NormalScrollback),
+        other => Err(format!("unknown viewport kind {other}")),
     }
 }
 
@@ -1214,6 +1324,8 @@ fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> T
         cols,
         rows,
         geometry: TerminalGeometry::default(),
+        viewport_kind: TerminalViewportKind::LiveNormal,
+        scrollback_offset_rows: 0,
         render_generation: 0,
         cells,
         cursor: TerminalCursor {
@@ -1339,6 +1451,32 @@ mod tests {
             assert!(cleat_session_snapshot(session, &mut second));
 
             cleat_session_release_snapshot(session, &mut second);
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn live_viewport_snapshot_and_zero_scrollback_extent_are_exposed() {
+        unsafe {
+            let provider = cleat_provider_open(ptr::null());
+            let session = cleat_session_create(provider, &CleatSessionDesc { cols: 12, rows: 5, ..CleatSessionDesc::default() });
+
+            let mut extent = CleatScrollbackExtent::default();
+            assert!(cleat_session_scrollback_extent(session, &mut extent));
+            assert_eq!(extent, CleatScrollbackExtent { normal_scrollback_rows: 0, live_rows: 5, alternate_screen: false });
+
+            let mut snapshot = CleatSnapshot::default();
+            assert!(cleat_session_viewport_snapshot(session, ptr::null(), &mut snapshot));
+            assert_eq!(snapshot.cols, 12);
+            assert_eq!(snapshot.rows, 5);
+            assert_eq!(snapshot.viewport_kind, CLEAT_VIEWPORT_LIVE_NORMAL);
+            assert_eq!(snapshot.scrollback_offset_rows, 0);
+            cleat_session_release_snapshot(session, &mut snapshot);
+
+            let request = CleatViewportRequest { kind: CLEAT_VIEWPORT_NORMAL_SCROLLBACK, scrollback_offset_rows: 1 };
+            assert!(!cleat_session_viewport_snapshot(session, &request, &mut snapshot));
+
             cleat_session_destroy(session);
             cleat_provider_close(provider);
         }

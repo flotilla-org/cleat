@@ -24,6 +24,8 @@ pub struct TerminalSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub geometry: TerminalGeometry,
+    pub viewport_kind: TerminalViewportKind,
+    pub scrollback_offset_rows: u64,
     pub render_generation: u64,
     pub cells: Vec<TerminalCell>,
     pub cursor: TerminalCursor,
@@ -37,6 +39,8 @@ impl TerminalSnapshot {
             cols: grid.cols,
             rows: grid.rows,
             geometry: TerminalGeometry::default(),
+            viewport_kind: TerminalViewportKind::LiveNormal,
+            scrollback_offset_rows: 0,
             render_generation: 0,
             cells: grid.cells.into_iter().map(TerminalCell::from_resolved_cell).collect(),
             cursor: TerminalCursor::from_cursor_state(grid.cursor),
@@ -44,6 +48,21 @@ impl TerminalSnapshot {
             dirty_rows: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalViewportKind {
+    #[default]
+    LiveNormal,
+    LiveAlternate,
+    NormalScrollback,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalScrollbackExtent {
+    pub normal_scrollback_rows: u64,
+    pub live_rows: u16,
+    pub alternate_screen: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -399,6 +418,8 @@ mod tests {
         assert_eq!(snapshot.cols, 2);
         assert_eq!(snapshot.rows, 1);
         assert_eq!(snapshot.geometry, TerminalGeometry::default());
+        assert_eq!(snapshot.viewport_kind, TerminalViewportKind::LiveNormal);
+        assert_eq!(snapshot.scrollback_offset_rows, 0);
         assert_eq!(snapshot.render_generation, 0);
         assert_eq!(snapshot.dirty, DirtyState::Full);
         assert!(snapshot.dirty_rows.is_empty());

@@ -81,6 +81,9 @@ extern "C" {
 #define CLEAT_CURSOR_STYLE_BLOCK 1u
 #define CLEAT_CURSOR_STYLE_UNDERLINE 2u
 #define CLEAT_CURSOR_STYLE_BLOCK_HOLLOW 3u
+#define CLEAT_VIEWPORT_LIVE_NORMAL 1u
+#define CLEAT_VIEWPORT_LIVE_ALTERNATE 2u
+#define CLEAT_VIEWPORT_NORMAL_SCROLLBACK 3u
 
 typedef struct CleatProvider cleat_provider;
 typedef struct CleatSession cleat_session;
@@ -149,6 +152,8 @@ typedef struct cleat_snapshot {
     uint16_t cols;
     uint16_t rows;
     cleat_terminal_geometry geometry;
+    uint32_t viewport_kind;
+    uint64_t scrollback_offset_rows;
     uint64_t render_generation;
     const cleat_cell *cells;
     size_t cell_count;
@@ -191,6 +196,17 @@ typedef struct cleat_input_result {
     size_t count;
 } cleat_input_result;
 
+typedef struct cleat_scrollback_extent {
+    uint64_t normal_scrollback_rows;
+    uint16_t live_rows;
+    bool alternate_screen;
+} cleat_scrollback_extent;
+
+typedef struct cleat_viewport_request {
+    uint32_t kind;
+    uint64_t scrollback_offset_rows;
+} cleat_viewport_request;
+
 uint32_t cleat_provider_abi_version(void);
 
 cleat_provider *cleat_provider_open(const cleat_provider_desc *desc);
@@ -225,6 +241,12 @@ cleat_dirty_state cleat_session_dirty(const cleat_session *session);
  * Snapshots do not clear dirty state by themselves.
  */
 bool cleat_session_mark_observed(cleat_session *session, uint64_t generation);
+/*
+ * Reports VT-owned live scrollback state. This is not derived from session
+ * recordings. Providers may report zero normal scrollback rows until the VT
+ * backend exposes scrollback rows.
+ */
+bool cleat_session_scrollback_extent(cleat_session *session, cleat_scrollback_extent *out);
 
 /*
  * Only one snapshot may be live per session. Call
@@ -234,6 +256,11 @@ bool cleat_session_mark_observed(cleat_session *session, uint64_t generation);
  * provider knows exact dirty rows; otherwise dirty_row_count is zero.
  */
 bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
+/*
+ * Returns a snapshot for a requested terminal viewport. Unsupported viewport
+ * kinds or offsets return false.
+ */
+bool cleat_session_viewport_snapshot(cleat_session *session, const cleat_viewport_request *request, cleat_snapshot *out);
 void cleat_session_release_snapshot(cleat_session *session, cleat_snapshot *snapshot);
 
 #ifdef __cplusplus

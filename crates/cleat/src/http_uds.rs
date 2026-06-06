@@ -6,7 +6,7 @@ use http::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalGeometry, TerminalSnapshot};
+use crate::provider::{DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalGeometry, TerminalSnapshot, TerminalViewportKind};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -200,6 +200,8 @@ pub(crate) struct SnapshotResponse {
     pub cols: u16,
     pub rows: u16,
     pub geometry: GeometryResponse,
+    pub viewport_kind: String,
+    pub scrollback_offset_rows: u64,
     pub cells: Vec<CellResponse>,
     pub cursor: CursorResponse,
     pub dirty: String,
@@ -471,6 +473,8 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
         cols: snapshot.cols,
         rows: snapshot.rows,
         geometry: snapshot.geometry.into(),
+        viewport_kind: viewport_kind_name(snapshot.viewport_kind).to_string(),
+        scrollback_offset_rows: snapshot.scrollback_offset_rows,
         cells: snapshot
             .cells
             .into_iter()
@@ -584,6 +588,14 @@ fn cursor_style_name(style: TerminalCursorStyle) -> &'static str {
         TerminalCursorStyle::Block => "block",
         TerminalCursorStyle::Underline => "underline",
         TerminalCursorStyle::BlockHollow => "block_hollow",
+    }
+}
+
+fn viewport_kind_name(kind: TerminalViewportKind) -> &'static str {
+    match kind {
+        TerminalViewportKind::LiveNormal => "live_normal",
+        TerminalViewportKind::LiveAlternate => "live_alternate",
+        TerminalViewportKind::NormalScrollback => "normal_scrollback",
     }
 }
 

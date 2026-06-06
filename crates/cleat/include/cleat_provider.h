@@ -44,6 +44,7 @@ extern "C" {
 
 typedef struct CleatProvider cleat_provider;
 typedef struct CleatSession cleat_session;
+typedef void cleat_wake_fn(void *user_data);
 
 typedef enum cleat_dirty_state {
     CLEAT_DIRTY_CLEAN = 0,
@@ -98,8 +99,11 @@ typedef struct cleat_cursor {
 typedef struct cleat_snapshot {
     uint16_t cols;
     uint16_t rows;
+    uint64_t render_generation;
     const cleat_cell *cells;
     size_t cell_count;
+    const uint16_t *dirty_rows;
+    size_t dirty_row_count;
     cleat_cursor cursor;
     cleat_dirty_state dirty;
 } cleat_snapshot;
@@ -122,6 +126,12 @@ typedef struct cleat_input_event {
 uint32_t cleat_provider_abi_version(void);
 
 cleat_provider *cleat_provider_open(const cleat_provider_desc *desc);
+/*
+ * Registers an edge-triggered wake callback. The provider calls it when a
+ * session transitions from observed/clean to dirty; callers should poll
+ * sessions to find the one that needs attention.
+ */
+void cleat_provider_set_wake_callback(cleat_provider *provider, cleat_wake_fn *wake, void *user_data);
 void cleat_provider_close(cleat_provider *provider);
 
 cleat_session *cleat_session_create(cleat_provider *provider, const cleat_session_desc *desc);
@@ -133,11 +143,18 @@ bool cleat_session_write_bytes(cleat_session *session, const uint8_t *bytes, siz
 
 cleat_dirty_state cleat_session_poll(cleat_session *session);
 cleat_dirty_state cleat_session_dirty(const cleat_session *session);
+/*
+ * Marks a render_generation returned by cleat_session_snapshot as observed.
+ * Snapshots do not clear dirty state by themselves.
+ */
+bool cleat_session_mark_observed(cleat_session *session, uint64_t generation);
 
 /*
  * Only one snapshot may be live per session. Call
  * cleat_session_release_snapshot before requesting another snapshot for the
  * same session.
+ * dirty_rows is populated only when dirty is CLEAT_DIRTY_PARTIAL and the
+ * provider knows exact dirty rows; otherwise dirty_row_count is zero.
  */
 bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
 void cleat_session_release_snapshot(cleat_session *session, cleat_snapshot *snapshot);

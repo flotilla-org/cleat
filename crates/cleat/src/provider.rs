@@ -23,9 +23,11 @@ pub enum DirtyState {
 pub struct TerminalSnapshot {
     pub cols: u16,
     pub rows: u16,
+    pub render_generation: u64,
     pub cells: Vec<TerminalCell>,
     pub cursor: TerminalCursor,
     pub dirty: DirtyState,
+    pub dirty_rows: Vec<u16>,
 }
 
 impl TerminalSnapshot {
@@ -33,9 +35,11 @@ impl TerminalSnapshot {
         Self {
             cols: grid.cols,
             rows: grid.rows,
+            render_generation: 0,
             cells: grid.cells.into_iter().map(TerminalCell::from_resolved_cell).collect(),
             cursor: TerminalCursor::from_cursor_state(grid.cursor),
             dirty,
+            dirty_rows: Vec::new(),
         }
     }
 }
@@ -329,7 +333,9 @@ mod tests {
 
         assert_eq!(snapshot.cols, 2);
         assert_eq!(snapshot.rows, 1);
+        assert_eq!(snapshot.render_generation, 0);
         assert_eq!(snapshot.dirty, DirtyState::Full);
+        assert!(snapshot.dirty_rows.is_empty());
         assert_eq!(snapshot.cursor.style, TerminalCursorStyle::Bar);
         assert!(snapshot.cursor.visible);
         assert!(snapshot.cursor.wide_tail);

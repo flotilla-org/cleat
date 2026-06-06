@@ -1,4 +1,10 @@
-use std::{path::PathBuf, ptr, slice, str::Utf8Error};
+use std::{
+    ffi::c_void,
+    path::PathBuf,
+    ptr, slice,
+    str::Utf8Error,
+    sync::{Arc, Mutex},
+};
 
 use http::{Method, StatusCode};
 
@@ -129,8 +135,11 @@ pub struct CleatCursor {
 pub struct CleatSnapshot {
     pub cols: u16,
     pub rows: u16,
+    pub render_generation: u64,
     pub cells: *const CleatCell,
     pub cell_count: usize,
+    pub dirty_rows: *const u16,
+    pub dirty_row_count: usize,
     pub cursor: CleatCursor,
     pub dirty: CleatDirtyState,
 }
@@ -156,10 +165,12 @@ pub struct CleatProvider {
     features: ProviderFeatures,
     backend: ProviderBackend,
     runtime_root: PathBuf,
+    wake: Arc<Mutex<WakeCallback>>,
 }
 
 pub struct CleatSession {
     backend: SessionBackend,
+    wake: Arc<Mutex<WakeCallback>>,
     last_snapshot: Option<Box<OwnedSnapshot>>,
 }
 
@@ -179,20 +190,104 @@ enum SessionBackend {
 struct MockSession {
     cols: u16,
     rows: u16,
-    dirty: DirtyState,
+    observation: ObservationState,
     input_count: u64,
 }
 
 struct InProcessSession {
     runtime: SessionRuntime,
-    dirty: DirtyState,
+    observation: ObservationState,
     exited: bool,
 }
 
 struct DaemonSession {
     id: String,
     runtime_root: PathBuf,
+    observation: ObservationState,
+}
+
+pub type CleatWakeFn = Option<unsafe extern "C" fn(*mut c_void)>;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct WakeCallback {
+    wake: CleatWakeFn,
+    user_data: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ObservationState {
+    render_generation: u64,
+    observed_generation: u64,
     dirty: DirtyState,
+    dirty_rows: Vec<u16>,
+}
+
+impl ObservationState {
+    fn new(rows: u16) -> Self {
+        let mut state = Self { render_generation: 0, observed_generation: 0, dirty: DirtyState::Clean, dirty_rows: Vec::new() };
+        state.mark_full(rows);
+        state
+    }
+
+    fn dirty(&self) -> DirtyState {
+        if self.render_generation > self.observed_generation {
+            self.dirty
+        } else {
+            DirtyState::Clean
+        }
+    }
+
+    fn mark_full(&mut self, _rows: u16) -> bool {
+        let was_clean = self.dirty() == DirtyState::Clean;
+        self.render_generation = self.render_generation.saturating_add(1);
+        self.dirty = DirtyState::Full;
+        self.dirty_rows.clear();
+        was_clean
+    }
+
+    fn mark_partial_rows(&mut self, rows: impl IntoIterator<Item = u16>) -> bool {
+        let was_clean = self.dirty() == DirtyState::Clean;
+        self.render_generation = self.render_generation.saturating_add(1);
+        if self.dirty != DirtyState::Full {
+            self.dirty = DirtyState::Partial;
+            for row in rows {
+                if !self.dirty_rows.contains(&row) {
+                    self.dirty_rows.push(row);
+                }
+            }
+            self.dirty_rows.sort_unstable();
+        }
+        was_clean
+    }
+
+    fn mark_partial_unknown(&mut self) -> bool {
+        let was_clean = self.dirty() == DirtyState::Clean;
+        self.render_generation = self.render_generation.saturating_add(1);
+        if self.dirty != DirtyState::Full {
+            self.dirty = DirtyState::Partial;
+            self.dirty_rows.clear();
+        }
+        was_clean
+    }
+
+    fn mark_observed(&mut self, generation: u64) -> bool {
+        if generation > self.render_generation {
+            return false;
+        }
+        self.observed_generation = self.observed_generation.max(generation);
+        if self.observed_generation >= self.render_generation {
+            self.dirty = DirtyState::Clean;
+            self.dirty_rows.clear();
+        }
+        true
+    }
+
+    fn annotate_snapshot(&self, snapshot: &mut TerminalSnapshot) {
+        snapshot.render_generation = self.render_generation;
+        snapshot.dirty = self.dirty();
+        snapshot.dirty_rows = if snapshot.dirty == DirtyState::Partial { self.dirty_rows.clone() } else { Vec::new() };
+    }
 }
 
 impl Drop for InProcessSession {
@@ -206,6 +301,7 @@ impl Drop for InProcessSession {
 struct OwnedSnapshot {
     snapshot: CleatSnapshot,
     cells: Vec<CleatCell>,
+    dirty_rows: Vec<u16>,
     _graphemes: Vec<Vec<u32>>,
 }
 
@@ -229,15 +325,20 @@ impl OwnedSnapshot {
             snapshot: CleatSnapshot {
                 cols: snapshot.cols,
                 rows: snapshot.rows,
+                render_generation: snapshot.render_generation,
                 cells: ptr::null(),
                 cell_count: cells.len(),
+                dirty_rows: ptr::null(),
+                dirty_row_count: snapshot.dirty_rows.len(),
                 cursor: cursor_to_ffi(snapshot.cursor),
                 dirty: snapshot.dirty.into(),
             },
             cells,
+            dirty_rows: snapshot.dirty_rows,
             _graphemes: graphemes,
         });
         owned.snapshot.cells = owned.cells.as_ptr();
+        owned.snapshot.dirty_rows = if owned.dirty_rows.is_empty() { ptr::null() } else { owned.dirty_rows.as_ptr() };
         owned
     }
 }
@@ -276,7 +377,22 @@ pub unsafe extern "C" fn cleat_provider_open(desc: *const CleatProviderDesc) -> 
     let features = ProviderFeatures::from_bits_truncate(requested.requested_features)
         | ProviderFeatures::CELL_SNAPSHOTS
         | ProviderFeatures::STRUCTURED_MOUSE_INPUT;
-    Box::into_raw(Box::new(CleatProvider { features, backend, runtime_root }))
+    Box::into_raw(Box::new(CleatProvider { features, backend, runtime_root, wake: Arc::new(Mutex::new(WakeCallback::default())) }))
+}
+
+/// # Safety
+///
+/// `provider` must be a valid provider pointer. `user_data` is stored
+/// opaquely and passed back to `wake` when provider state transitions from
+/// clean to dirty.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_provider_set_wake_callback(provider: *mut CleatProvider, wake: CleatWakeFn, user_data: *mut c_void) {
+    if let Some(provider) = unsafe { provider.as_mut() } {
+        if let Ok(mut callback) = provider.wake.lock() {
+            callback.wake = wake;
+            callback.user_data = user_data as usize;
+        }
+    }
 }
 
 /// # Safety
@@ -317,7 +433,8 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
     });
     let backend = match provider.backend {
         ProviderBackend::Mock => {
-            SessionBackend::Mock(MockSession { cols: desc.cols.max(1), rows: desc.rows.max(1), dirty: DirtyState::Full, input_count: 0 })
+            let rows = desc.rows.max(1);
+            SessionBackend::Mock(MockSession { cols: desc.cols.max(1), rows, observation: ObservationState::new(rows), input_count: 0 })
         }
         ProviderBackend::InProcess => match create_in_process_session(provider, desc) {
             Ok(session) => SessionBackend::InProcess(Box::new(session)),
@@ -328,7 +445,7 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
             Err(_) => return ptr::null_mut(),
         },
     };
-    Box::into_raw(Box::new(CleatSession { backend, last_snapshot: None }))
+    Box::into_raw(Box::new(CleatSession { backend, wake: provider.wake.clone(), last_snapshot: None }))
 }
 
 /// # Safety
@@ -355,21 +472,21 @@ pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: 
         SessionBackend::Mock(mock) => {
             mock.cols = cols.max(1);
             mock.rows = rows.max(1);
-            mock.dirty = DirtyState::Full;
+            mark_full_and_wake(&mut mock.observation, mock.rows, &session.wake);
             true
         }
         SessionBackend::InProcess(in_process) => {
             if in_process.runtime.resize(cols.max(1), rows.max(1)).is_err() {
                 return false;
             }
-            in_process.dirty = DirtyState::Full;
+            mark_full_and_wake(&mut in_process.observation, rows.max(1), &session.wake);
             true
         }
         SessionBackend::Daemon(daemon) => {
             if daemon_resize(daemon, cols.max(1), rows.max(1)).is_err() {
                 return false;
             }
-            daemon.dirty = DirtyState::Full;
+            mark_full_and_wake(&mut daemon.observation, rows.max(1), &session.wake);
             true
         }
     }
@@ -392,7 +509,7 @@ pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, ev
     match &mut session.backend {
         SessionBackend::Mock(mock) => {
             mock.input_count = mock.input_count.saturating_add(1);
-            mock.dirty = DirtyState::Partial;
+            mark_partial_rows_and_wake(&mut mock.observation, [0], &session.wake);
             true
         }
         SessionBackend::InProcess(in_process) => match input_event_bytes(&event) {
@@ -400,7 +517,6 @@ pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, ev
                 if in_process.runtime.write_input(&bytes).is_err() {
                     return false;
                 }
-                in_process.dirty = DirtyState::Partial;
                 true
             }
             Ok(None) => true,
@@ -411,7 +527,6 @@ pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, ev
                 if daemon_send_input(daemon, input).is_err() {
                     return false;
                 }
-                daemon.dirty = DirtyState::Partial;
                 true
             }
             Ok(None) => true,
@@ -437,21 +552,19 @@ pub unsafe extern "C" fn cleat_session_write_bytes(session: *mut CleatSession, b
     match &mut session.backend {
         SessionBackend::Mock(mock) => {
             mock.input_count = mock.input_count.saturating_add(1);
-            mock.dirty = DirtyState::Partial;
+            mark_partial_rows_and_wake(&mut mock.observation, [0], &session.wake);
             true
         }
         SessionBackend::InProcess(in_process) => {
             if in_process.runtime.write_input(bytes).is_err() {
                 return false;
             }
-            in_process.dirty = DirtyState::Partial;
             true
         }
         SessionBackend::Daemon(daemon) => {
             if daemon_write_bytes(daemon, bytes).is_err() {
                 return false;
             }
-            daemon.dirty = DirtyState::Partial;
             true
         }
     }
@@ -467,14 +580,19 @@ pub unsafe extern "C" fn cleat_session_poll(session: *mut CleatSession) -> Cleat
         None => return CleatDirtyState::Full,
     };
     match &mut session.backend {
-        SessionBackend::Mock(mock) => mock.dirty.into(),
+        SessionBackend::Mock(mock) => mock.observation.dirty().into(),
         SessionBackend::InProcess(in_process) => {
-            if pump_in_process_session(in_process).is_err() {
-                in_process.dirty = DirtyState::Full;
+            match pump_in_process_session(in_process) {
+                Ok(PumpOutcome::Clean) => {}
+                Ok(PumpOutcome::PartialUnknown) => mark_partial_unknown_and_wake(&mut in_process.observation, &session.wake),
+                Ok(PumpOutcome::Full) | Err(_) => {
+                    let rows = in_process.runtime.inspect(false).terminal.rows;
+                    mark_full_and_wake(&mut in_process.observation, rows, &session.wake);
+                }
             }
-            in_process.dirty.into()
+            in_process.observation.dirty().into()
         }
-        SessionBackend::Daemon(daemon) => daemon.dirty.into(),
+        SessionBackend::Daemon(daemon) => daemon.observation.dirty().into(),
     }
 }
 
@@ -485,11 +603,28 @@ pub unsafe extern "C" fn cleat_session_poll(session: *mut CleatSession) -> Cleat
 pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> CleatDirtyState {
     unsafe { session.as_ref() }
         .map(|session| match &session.backend {
-            SessionBackend::Mock(mock) => mock.dirty.into(),
-            SessionBackend::InProcess(in_process) => in_process.dirty.into(),
-            SessionBackend::Daemon(daemon) => daemon.dirty.into(),
+            SessionBackend::Mock(mock) => mock.observation.dirty().into(),
+            SessionBackend::InProcess(in_process) => in_process.observation.dirty().into(),
+            SessionBackend::Daemon(daemon) => daemon.observation.dirty().into(),
         })
         .unwrap_or(CleatDirtyState::Full)
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer. `generation` should be a render
+/// generation returned by `cleat_session_snapshot`.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_mark_observed(session: *mut CleatSession, generation: u64) -> bool {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    match &mut session.backend {
+        SessionBackend::Mock(mock) => mock.observation.mark_observed(generation),
+        SessionBackend::InProcess(in_process) => in_process.observation.mark_observed(generation),
+        SessionBackend::Daemon(daemon) => daemon.observation.mark_observed(generation),
+    }
 }
 
 /// # Safety
@@ -512,25 +647,22 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
     };
     let snapshot = match &mut session.backend {
         SessionBackend::Mock(mock) => {
-            let snapshot = mock_snapshot(mock.cols, mock.rows, mock.dirty, mock.input_count);
-            mock.dirty = DirtyState::Clean;
+            let mut snapshot = mock_snapshot(mock.cols, mock.rows, mock.observation.dirty(), mock.input_count);
+            mock.observation.annotate_snapshot(&mut snapshot);
             snapshot
         }
         SessionBackend::InProcess(in_process) => {
-            if pump_in_process_session(in_process).is_err() {
-                return false;
-            }
-            let dirty = in_process.dirty;
-            let snapshot = match in_process.runtime.snapshot(dirty) {
+            let dirty = in_process.observation.dirty();
+            let mut snapshot = match in_process.runtime.snapshot(dirty) {
                 Ok(snapshot) => snapshot,
                 Err(_) => return false,
             };
-            in_process.dirty = DirtyState::Clean;
+            in_process.observation.annotate_snapshot(&mut snapshot);
             snapshot
         }
         SessionBackend::Daemon(daemon) => match daemon_snapshot(daemon) {
-            Ok(snapshot) => {
-                daemon.dirty = DirtyState::Clean;
+            Ok(mut snapshot) => {
+                daemon.observation.annotate_snapshot(&mut snapshot);
                 snapshot
             }
             Err(_) => return false,
@@ -542,7 +674,14 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
     true
 }
 
-fn pump_in_process_session(in_process: &mut InProcessSession) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PumpOutcome {
+    Clean,
+    PartialUnknown,
+    Full,
+}
+
+fn pump_in_process_session(in_process: &mut InProcessSession) -> Result<PumpOutcome, String> {
     let mut exited_now = false;
     if !in_process.exited {
         if let Some(exit_code) = in_process.runtime.exit_code_if_exited()? {
@@ -559,11 +698,40 @@ fn pump_in_process_session(in_process: &mut InProcessSession) -> Result<(), Stri
         in_process.runtime.read_available_output(false)?
     };
     if exited_now {
-        in_process.dirty = DirtyState::Full;
-    } else if !output.chunks.is_empty() && in_process.dirty == DirtyState::Clean {
-        in_process.dirty = DirtyState::Partial;
+        Ok(PumpOutcome::Full)
+    } else if !output.chunks.is_empty() {
+        Ok(PumpOutcome::PartialUnknown)
+    } else {
+        Ok(PumpOutcome::Clean)
     }
-    Ok(())
+}
+
+fn mark_full_and_wake(observation: &mut ObservationState, rows: u16, wake: &Arc<Mutex<WakeCallback>>) {
+    if observation.mark_full(rows) {
+        notify_wake(wake);
+    }
+}
+
+fn mark_partial_rows_and_wake(observation: &mut ObservationState, rows: impl IntoIterator<Item = u16>, wake: &Arc<Mutex<WakeCallback>>) {
+    if observation.mark_partial_rows(rows) {
+        notify_wake(wake);
+    }
+}
+
+fn mark_partial_unknown_and_wake(observation: &mut ObservationState, wake: &Arc<Mutex<WakeCallback>>) {
+    if observation.mark_partial_unknown() {
+        notify_wake(wake);
+    }
+}
+
+fn notify_wake(wake: &Arc<Mutex<WakeCallback>>) {
+    let callback = match wake.lock() {
+        Ok(callback) => *callback,
+        Err(_) => return,
+    };
+    if let Some(wake) = callback.wake {
+        unsafe { wake(callback.user_data as *mut c_void) };
+    }
 }
 
 /// # Safety
@@ -594,7 +762,7 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let mut runtime = SessionRuntime::spawn(session_dir, &metadata, vt::make_vt_engine(vt_engine, desc.cols.max(1), desc.rows.max(1))?)?;
     runtime.resize(desc.cols.max(1), desc.rows.max(1))?;
 
-    Ok(InProcessSession { runtime, dirty: DirtyState::Full, exited: false })
+    Ok(InProcessSession { runtime, observation: ObservationState::new(desc.rows.max(1)), exited: false })
 }
 
 fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
@@ -603,7 +771,11 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
     let cwd = read_optional_utf8(desc.cwd, desc.cwd_len).map_err(|err| format!("cwd is not valid UTF-8: {err}"))?.map(PathBuf::from);
     let metadata = ensure_session_started(&layout, None, Some(vt_engine), cwd, cmd, desc.record)?;
-    let mut session = DaemonSession { id: metadata.id, runtime_root: provider.runtime_root.clone(), dirty: DirtyState::Full };
+    let mut session = DaemonSession {
+        id: metadata.id,
+        runtime_root: provider.runtime_root.clone(),
+        observation: ObservationState::new(desc.rows.max(1)),
+    };
     daemon_resize(&mut session, desc.cols.max(1), desc.rows.max(1))?;
     Ok(session)
 }
@@ -665,6 +837,7 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
     Ok(TerminalSnapshot {
         cols: snapshot.cols,
         rows: snapshot.rows,
+        render_generation: 0,
         cells: snapshot
             .cells
             .into_iter()
@@ -686,6 +859,7 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
             wide_tail: snapshot.cursor.wide_tail,
         },
         dirty: dirty_from_name(&snapshot.dirty)?,
+        dirty_rows: Vec::new(),
     })
 }
 
@@ -826,6 +1000,7 @@ fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> T
     TerminalSnapshot {
         cols,
         rows,
+        render_generation: 0,
         cells,
         cursor: TerminalCursor {
             col: (input_count as u16) % cols,
@@ -835,6 +1010,7 @@ fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> T
             wide_tail: false,
         },
         dirty,
+        dirty_rows: Vec::new(),
     }
 }
 
@@ -864,7 +1040,38 @@ fn cell_width_tag(width: TerminalCellWidth) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    unsafe extern "C" fn count_wake(user_data: *mut c_void) {
+        let counter = unsafe { &*(user_data as *const AtomicUsize) };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn observation_generation_advances_until_latest_generation_is_observed() {
+        let mut observation = ObservationState::new(24);
+        assert_eq!(observation.render_generation, 1);
+        assert_eq!(observation.dirty(), DirtyState::Full);
+
+        assert!(observation.mark_observed(1));
+        assert_eq!(observation.dirty(), DirtyState::Clean);
+
+        assert!(observation.mark_partial_unknown());
+        assert_eq!(observation.render_generation, 2);
+        assert_eq!(observation.dirty(), DirtyState::Partial);
+
+        assert!(!observation.mark_partial_unknown());
+        assert_eq!(observation.render_generation, 3);
+        assert_eq!(observation.dirty(), DirtyState::Partial);
+
+        assert!(observation.mark_observed(2));
+        assert_eq!(observation.dirty(), DirtyState::Partial);
+        assert!(observation.mark_observed(3));
+        assert_eq!(observation.dirty(), DirtyState::Clean);
+        assert!(!observation.mark_observed(4));
+    }
 
     #[test]
     fn mock_provider_lifecycle_returns_and_releases_snapshot() {
@@ -926,20 +1133,48 @@ mod tests {
     #[test]
     fn mock_provider_dirty_tracks_input_and_snapshot() {
         unsafe {
+            let wake_count = AtomicUsize::new(0);
             let provider = cleat_provider_open(ptr::null());
+            cleat_provider_set_wake_callback(provider, Some(count_wake), &wake_count as *const AtomicUsize as *mut c_void);
             let session = cleat_session_create(provider, ptr::null());
             assert_eq!(cleat_session_dirty(session), CleatDirtyState::Full);
+
+            let mut initial = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut initial));
+            assert_eq!(initial.dirty, CleatDirtyState::Full);
+            assert_eq!(initial.render_generation, 1);
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Full);
+            assert!(cleat_session_mark_observed(session, initial.render_generation));
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
+            cleat_session_release_snapshot(session, &mut initial);
 
             let event = CleatInputEvent { kind: 1, ..CleatInputEvent::default() };
             assert!(cleat_session_send_input(session, &event));
             assert_eq!(cleat_session_dirty(session), CleatDirtyState::Partial);
+            assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
             let mut snapshot = CleatSnapshot::default();
             assert!(cleat_session_snapshot(session, &mut snapshot));
             assert_eq!(snapshot.dirty, CleatDirtyState::Partial);
-            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
+            assert_eq!(snapshot.render_generation, 2);
+            assert_eq!(snapshot.dirty_row_count, 1);
+            assert_eq!(slice::from_raw_parts(snapshot.dirty_rows, snapshot.dirty_row_count), &[0]);
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Partial);
 
             cleat_session_release_snapshot(session, &mut snapshot);
+            assert!(cleat_session_send_input(session, &event));
+            assert_eq!(wake_count.load(Ordering::SeqCst), 1, "dirty-to-dirty input should coalesce wakeups");
+            assert!(cleat_session_mark_observed(session, 2));
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Partial, "stale observation must not clear newer dirty state");
+
+            let mut later = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut later));
+            assert_eq!(later.render_generation, 3);
+            cleat_session_release_snapshot(session, &mut later);
+            assert!(cleat_session_mark_observed(session, 3));
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
+            assert!(!cleat_session_mark_observed(session, 4), "future observations should be rejected");
+
             cleat_session_destroy(session);
             cleat_provider_close(provider);
         }
@@ -989,7 +1224,16 @@ mod tests {
                 ..CleatSessionDesc::default()
             });
             assert!(!session.is_null());
+            assert!(cleat_session_mark_observed(session, 1));
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
             assert!(cleat_session_write_bytes(session, b"hello\n".as_ptr(), b"hello\n".len()));
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean, "accepted input should not imply completed output");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while cleat_session_poll(session) == CleatDirtyState::Clean && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Partial);
 
             cleat_session_destroy(session);
             cleat_provider_close(provider);

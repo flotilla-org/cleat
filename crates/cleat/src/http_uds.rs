@@ -6,7 +6,7 @@ use http::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalSnapshot};
+use crate::provider::{DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalGeometry, TerminalSnapshot};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -199,9 +199,33 @@ pub(crate) enum SignalTargetRequest {
 pub(crate) struct SnapshotResponse {
     pub cols: u16,
     pub rows: u16,
+    pub geometry: GeometryResponse,
     pub cells: Vec<CellResponse>,
     pub cursor: CursorResponse,
     pub dirty: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Deserialize)]
+pub(crate) struct GeometryResponse {
+    pub cell_width_px: f32,
+    pub cell_height_px: f32,
+    pub content_x_px: f32,
+    pub content_y_px: f32,
+    pub content_width_px: f32,
+    pub content_height_px: f32,
+}
+
+impl From<TerminalGeometry> for GeometryResponse {
+    fn from(value: TerminalGeometry) -> Self {
+        Self {
+            cell_width_px: value.cell_width_px,
+            cell_height_px: value.cell_height_px,
+            content_x_px: value.content_x_px,
+            content_y_px: value.content_y_px,
+            content_width_px: value.content_width_px,
+            content_height_px: value.content_height_px,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
@@ -446,6 +470,7 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
     SnapshotResponse {
         cols: snapshot.cols,
         rows: snapshot.rows,
+        geometry: snapshot.geometry.into(),
         cells: snapshot
             .cells
             .into_iter()

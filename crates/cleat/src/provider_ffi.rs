@@ -13,8 +13,8 @@ use crate::{
     platform::ipc::connect_session_stream,
     protocol::SignalTarget,
     provider::{
-        DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle, TerminalRgb,
-        TerminalSnapshot,
+        DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
+        TerminalGeometry, TerminalRgb, TerminalSnapshot,
     },
     runtime::RuntimeLayout,
     session::{ensure_session_started, session_socket_path},
@@ -132,9 +132,48 @@ pub struct CleatCursor {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CleatTerminalGeometry {
+    pub cell_width_px: f32,
+    pub cell_height_px: f32,
+    pub content_x_px: f32,
+    pub content_y_px: f32,
+    pub content_width_px: f32,
+    pub content_height_px: f32,
+}
+
+impl From<CleatTerminalGeometry> for TerminalGeometry {
+    fn from(value: CleatTerminalGeometry) -> Self {
+        TerminalGeometry {
+            cell_width_px: value.cell_width_px,
+            cell_height_px: value.cell_height_px,
+            content_x_px: value.content_x_px,
+            content_y_px: value.content_y_px,
+            content_width_px: value.content_width_px,
+            content_height_px: value.content_height_px,
+        }
+        .sanitized()
+    }
+}
+
+impl From<TerminalGeometry> for CleatTerminalGeometry {
+    fn from(value: TerminalGeometry) -> Self {
+        Self {
+            cell_width_px: value.cell_width_px,
+            cell_height_px: value.cell_height_px,
+            content_x_px: value.content_x_px,
+            content_y_px: value.content_y_px,
+            content_width_px: value.content_width_px,
+            content_height_px: value.content_height_px,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CleatSnapshot {
     pub cols: u16,
     pub rows: u16,
+    pub geometry: CleatTerminalGeometry,
     pub render_generation: u64,
     pub cells: *const CleatCell,
     pub cell_count: usize,
@@ -170,6 +209,7 @@ pub struct CleatProvider {
 
 pub struct CleatSession {
     backend: SessionBackend,
+    geometry: TerminalGeometry,
     wake: Arc<Mutex<WakeCallback>>,
     last_snapshot: Option<Box<OwnedSnapshot>>,
 }
@@ -325,6 +365,7 @@ impl OwnedSnapshot {
             snapshot: CleatSnapshot {
                 cols: snapshot.cols,
                 rows: snapshot.rows,
+                geometry: snapshot.geometry.into(),
                 render_generation: snapshot.render_generation,
                 cells: ptr::null(),
                 cell_count: cells.len(),
@@ -431,6 +472,7 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         cwd_len: 0,
         record: false,
     });
+    let geometry = TerminalGeometry::from_cell_size(desc.cols.max(1), desc.rows.max(1), desc.cell_width_px, desc.cell_height_px);
     let backend = match provider.backend {
         ProviderBackend::Mock => {
             let rows = desc.rows.max(1);
@@ -445,7 +487,7 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
             Err(_) => return ptr::null_mut(),
         },
     };
-    Box::into_raw(Box::new(CleatSession { backend, wake: provider.wake.clone(), last_snapshot: None }))
+    Box::into_raw(Box::new(CleatSession { backend, geometry, wake: provider.wake.clone(), last_snapshot: None }))
 }
 
 /// # Safety
@@ -463,7 +505,7 @@ pub unsafe extern "C" fn cleat_session_destroy(session: *mut CleatSession) {
 ///
 /// `session` must be a valid session pointer.
 #[no_mangle]
-pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: u16, rows: u16, _cell_w_px: f32, _cell_h_px: f32) -> bool {
+pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: u16, rows: u16) -> bool {
     let session = match unsafe { session.as_mut() } {
         Some(session) => session,
         None => return false,
@@ -490,6 +532,35 @@ pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: 
             true
         }
     }
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer. `geometry`, when non-null, must
+/// point to a valid `CleatTerminalGeometry` for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_update_geometry(session: *mut CleatSession, geometry: *const CleatTerminalGeometry) -> bool {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    let geometry = match unsafe { geometry.as_ref() } {
+        Some(geometry) => TerminalGeometry::from(*geometry),
+        None => return false,
+    };
+    if session.geometry == geometry {
+        return true;
+    }
+    session.geometry = geometry;
+    match &mut session.backend {
+        SessionBackend::Mock(mock) => mark_full_and_wake(&mut mock.observation, mock.rows, &session.wake),
+        SessionBackend::InProcess(in_process) => {
+            let rows = in_process.runtime.inspect(false).terminal.rows;
+            mark_full_and_wake(&mut in_process.observation, rows, &session.wake);
+        }
+        SessionBackend::Daemon(daemon) => mark_full_and_wake(&mut daemon.observation, 1, &session.wake),
+    }
+    true
 }
 
 /// # Safety
@@ -645,7 +716,7 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
         Some(out) => out,
         None => return false,
     };
-    let snapshot = match &mut session.backend {
+    let mut snapshot = match &mut session.backend {
         SessionBackend::Mock(mock) => {
             let mut snapshot = mock_snapshot(mock.cols, mock.rows, mock.observation.dirty(), mock.input_count);
             mock.observation.annotate_snapshot(&mut snapshot);
@@ -668,6 +739,7 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
             Err(_) => return false,
         },
     };
+    snapshot.geometry = session.geometry;
     let owned = OwnedSnapshot::from_snapshot(snapshot);
     *out = owned.snapshot;
     session.last_snapshot = Some(owned);
@@ -837,6 +909,7 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
     Ok(TerminalSnapshot {
         cols: snapshot.cols,
         rows: snapshot.rows,
+        geometry: geometry_from_http(snapshot.geometry),
         render_generation: 0,
         cells: snapshot
             .cells
@@ -861,6 +934,18 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
         dirty: dirty_from_name(&snapshot.dirty)?,
         dirty_rows: Vec::new(),
     })
+}
+
+fn geometry_from_http(geometry: http_uds::GeometryResponse) -> TerminalGeometry {
+    TerminalGeometry {
+        cell_width_px: geometry.cell_width_px,
+        cell_height_px: geometry.cell_height_px,
+        content_x_px: geometry.content_x_px,
+        content_y_px: geometry.content_y_px,
+        content_width_px: geometry.content_width_px,
+        content_height_px: geometry.content_height_px,
+    }
+    .sanitized()
 }
 
 fn dirty_from_name(name: &str) -> Result<DirtyState, String> {
@@ -1000,6 +1085,7 @@ fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> T
     TerminalSnapshot {
         cols,
         rows,
+        geometry: TerminalGeometry::default(),
         render_generation: 0,
         cells,
         cursor: TerminalCursor {
@@ -1174,6 +1260,63 @@ mod tests {
             assert!(cleat_session_mark_observed(session, 3));
             assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
             assert!(!cleat_session_mark_observed(session, 4), "future observations should be rejected");
+
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn mock_provider_updates_geometry_without_cell_resize() {
+        unsafe {
+            let wake_count = AtomicUsize::new(0);
+            let provider = cleat_provider_open(ptr::null());
+            cleat_provider_set_wake_callback(provider, Some(count_wake), &wake_count as *const AtomicUsize as *mut c_void);
+            let session = cleat_session_create(provider, &CleatSessionDesc {
+                cols: 8,
+                rows: 3,
+                cell_width_px: 10.0,
+                cell_height_px: 20.0,
+                ..CleatSessionDesc::default()
+            });
+
+            let mut initial = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut initial));
+            assert_eq!(initial.cols, 8);
+            assert_eq!(initial.rows, 3);
+            assert_eq!(initial.geometry.cell_width_px, 10.0);
+            assert_eq!(initial.geometry.cell_height_px, 20.0);
+            assert_eq!(initial.geometry.content_width_px, 80.0);
+            assert_eq!(initial.geometry.content_height_px, 60.0);
+            let initial_generation = initial.render_generation;
+            cleat_session_release_snapshot(session, &mut initial);
+            assert!(cleat_session_mark_observed(session, initial_generation));
+
+            let geometry = CleatTerminalGeometry {
+                cell_width_px: 12.0,
+                cell_height_px: 24.0,
+                content_x_px: 5.0,
+                content_y_px: 7.0,
+                content_width_px: 96.0,
+                content_height_px: 72.0,
+            };
+            assert!(cleat_session_update_geometry(session, &geometry));
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Full);
+            assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+            let mut snapshot = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut snapshot));
+            assert_eq!(snapshot.cols, 8);
+            assert_eq!(snapshot.rows, 3);
+            assert_eq!(snapshot.render_generation, initial_generation + 1);
+            assert_eq!(snapshot.geometry, geometry);
+
+            cleat_session_release_snapshot(session, &mut snapshot);
+            assert!(cleat_session_mark_observed(session, initial_generation + 1));
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
+            assert!(cleat_session_update_geometry(session, &geometry));
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
+            assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
             cleat_session_destroy(session);
             cleat_provider_close(provider);

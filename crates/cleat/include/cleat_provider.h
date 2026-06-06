@@ -96,9 +96,19 @@ typedef struct cleat_cursor {
     bool wide_tail;
 } cleat_cursor;
 
+typedef struct cleat_terminal_geometry {
+    float cell_width_px;
+    float cell_height_px;
+    float content_x_px;
+    float content_y_px;
+    float content_width_px;
+    float content_height_px;
+} cleat_terminal_geometry;
+
 typedef struct cleat_snapshot {
     uint16_t cols;
     uint16_t rows;
+    cleat_terminal_geometry geometry;
     uint64_t render_generation;
     const cleat_cell *cells;
     size_t cell_count;
@@ -137,7 +147,14 @@ void cleat_provider_close(cleat_provider *provider);
 cleat_session *cleat_session_create(cleat_provider *provider, const cleat_session_desc *desc);
 void cleat_session_destroy(cleat_session *session);
 
-bool cleat_session_resize(cleat_session *session, uint16_t cols, uint16_t rows, float cell_w_px, float cell_h_px);
+/* Updates row/column terminal size. Pixel geometry is updated separately. */
+bool cleat_session_resize(cleat_session *session, uint16_t cols, uint16_t rows);
+/*
+ * Updates terminal-visible pixel geometry without changing row/column size.
+ * content_* describes the terminal content rect; input pixel coordinates are
+ * relative to that content area.
+ */
+bool cleat_session_update_geometry(cleat_session *session, const cleat_terminal_geometry *geometry);
 bool cleat_session_send_input(cleat_session *session, const cleat_input_event *event);
 bool cleat_session_write_bytes(cleat_session *session, const uint8_t *bytes, size_t size);
 

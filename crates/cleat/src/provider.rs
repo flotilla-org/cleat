@@ -23,6 +23,7 @@ pub enum DirtyState {
 pub struct TerminalSnapshot {
     pub cols: u16,
     pub rows: u16,
+    pub geometry: TerminalGeometry,
     pub render_generation: u64,
     pub cells: Vec<TerminalCell>,
     pub cursor: TerminalCursor,
@@ -35,12 +36,65 @@ impl TerminalSnapshot {
         Self {
             cols: grid.cols,
             rows: grid.rows,
+            geometry: TerminalGeometry::default(),
             render_generation: 0,
             cells: grid.cells.into_iter().map(TerminalCell::from_resolved_cell).collect(),
             cursor: TerminalCursor::from_cursor_state(grid.cursor),
             dirty,
             dirty_rows: Vec::new(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TerminalGeometry {
+    pub cell_width_px: f32,
+    pub cell_height_px: f32,
+    pub content_x_px: f32,
+    pub content_y_px: f32,
+    pub content_width_px: f32,
+    pub content_height_px: f32,
+}
+
+impl TerminalGeometry {
+    pub fn from_cell_size(cols: u16, rows: u16, cell_width_px: f32, cell_height_px: f32) -> Self {
+        let cell_width_px = positive_finite_or_zero(cell_width_px);
+        let cell_height_px = positive_finite_or_zero(cell_height_px);
+        Self {
+            cell_width_px,
+            cell_height_px,
+            content_x_px: 0.0,
+            content_y_px: 0.0,
+            content_width_px: cols as f32 * cell_width_px,
+            content_height_px: rows as f32 * cell_height_px,
+        }
+    }
+
+    pub fn sanitized(self) -> Self {
+        Self {
+            cell_width_px: positive_finite_or_zero(self.cell_width_px),
+            cell_height_px: positive_finite_or_zero(self.cell_height_px),
+            content_x_px: finite_or_zero(self.content_x_px),
+            content_y_px: finite_or_zero(self.content_y_px),
+            content_width_px: positive_finite_or_zero(self.content_width_px),
+            content_height_px: positive_finite_or_zero(self.content_height_px),
+        }
+    }
+}
+
+fn positive_finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
     }
 }
 
@@ -333,6 +387,7 @@ mod tests {
 
         assert_eq!(snapshot.cols, 2);
         assert_eq!(snapshot.rows, 1);
+        assert_eq!(snapshot.geometry, TerminalGeometry::default());
         assert_eq!(snapshot.render_generation, 0);
         assert_eq!(snapshot.dirty, DirtyState::Full);
         assert!(snapshot.dirty_rows.is_empty());

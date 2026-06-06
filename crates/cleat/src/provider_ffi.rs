@@ -9,7 +9,7 @@ use std::{
 use http::{Method, StatusCode};
 
 use crate::{
-    http_uds,
+    http_uds, keys,
     platform::ipc::connect_session_stream,
     protocol::SignalTarget,
     provider::{
@@ -42,10 +42,35 @@ pub const CLEAT_KEY_ESCAPE: u32 = 2;
 pub const CLEAT_KEY_BACKSPACE: u32 = 3;
 pub const CLEAT_KEY_TAB: u32 = 4;
 pub const CLEAT_KEY_DELETE: u32 = 5;
+pub const CLEAT_KEY_INSERT: u32 = 6;
+pub const CLEAT_KEY_HOME: u32 = 7;
+pub const CLEAT_KEY_END: u32 = 8;
+pub const CLEAT_KEY_PAGE_UP: u32 = 9;
+pub const CLEAT_KEY_PAGE_DOWN: u32 = 10;
 pub const CLEAT_KEY_ARROW_UP: u32 = 12;
 pub const CLEAT_KEY_ARROW_DOWN: u32 = 13;
 pub const CLEAT_KEY_ARROW_LEFT: u32 = 14;
 pub const CLEAT_KEY_ARROW_RIGHT: u32 = 15;
+pub const CLEAT_KEY_FUNCTION_BASE: u32 = 100;
+pub const CLEAT_KEY_F1: u32 = 101;
+pub const CLEAT_KEY_F2: u32 = 102;
+pub const CLEAT_KEY_F3: u32 = 103;
+pub const CLEAT_KEY_F4: u32 = 104;
+pub const CLEAT_KEY_F5: u32 = 105;
+pub const CLEAT_KEY_F6: u32 = 106;
+pub const CLEAT_KEY_F7: u32 = 107;
+pub const CLEAT_KEY_F8: u32 = 108;
+pub const CLEAT_KEY_F9: u32 = 109;
+pub const CLEAT_KEY_F10: u32 = 110;
+pub const CLEAT_KEY_F11: u32 = 111;
+pub const CLEAT_KEY_F12: u32 = 112;
+pub const CLEAT_KEY_ACTION_PRESS: u32 = 1;
+pub const CLEAT_KEY_ACTION_REPEAT: u32 = 2;
+pub const CLEAT_KEY_ACTION_RELEASE: u32 = 3;
+pub const CLEAT_MOD_SHIFT: u16 = 1;
+pub const CLEAT_MOD_CTRL: u16 = 2;
+pub const CLEAT_MOD_ALT: u16 = 4;
+pub const CLEAT_MOD_SUPER: u16 = 8;
 pub const CLEAT_CELL_WIDTH_NARROW: u32 = 0;
 pub const CLEAT_CELL_WIDTH_WIDE: u32 = 1;
 pub const CLEAT_CELL_WIDTH_SPACER_TAIL: u32 = 2;
@@ -188,16 +213,28 @@ pub struct CleatSnapshot {
 pub struct CleatInputEvent {
     pub kind: u32,
     pub modifiers: u16,
+    pub consumed_modifiers: u16,
+    pub key_action: u32,
     pub key_kind: u32,
     pub key_code: u32,
     pub text: *const u8,
     pub text_len: usize,
+    pub generated_text: *const u8,
+    pub generated_text_len: usize,
+    pub platform_keycode: u32,
     pub cell_col: u16,
     pub cell_row: u16,
     pub x_px: f32,
     pub y_px: f32,
     pub wheel_delta_x: f32,
     pub wheel_delta_y: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleatInputResult {
+    pub first_sequence: u64,
+    pub count: usize,
 }
 
 pub struct CleatProvider {
@@ -210,6 +247,7 @@ pub struct CleatProvider {
 pub struct CleatSession {
     backend: SessionBackend,
     geometry: TerminalGeometry,
+    next_input_sequence: u64,
     wake: Arc<Mutex<WakeCallback>>,
     last_snapshot: Option<Box<OwnedSnapshot>>,
 }
@@ -487,7 +525,7 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
             Err(_) => return ptr::null_mut(),
         },
     };
-    Box::into_raw(Box::new(CleatSession { backend, geometry, wake: provider.wake.clone(), last_snapshot: None }))
+    Box::into_raw(Box::new(CleatSession { backend, geometry, next_input_sequence: 1, wake: provider.wake.clone(), last_snapshot: None }))
 }
 
 /// # Safety
@@ -569,6 +607,20 @@ pub unsafe extern "C" fn cleat_session_update_geometry(session: *mut CleatSessio
 /// point to a valid `CleatInputEvent` for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, event: *const CleatInputEvent) -> bool {
+    unsafe { cleat_session_send_input_ex(session, event, ptr::null_mut()) }
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer. `event`, when non-null, must
+/// point to a valid `CleatInputEvent` for the duration of the call. `out`, when
+/// non-null, must point to writable `CleatInputResult` storage.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_send_input_ex(
+    session: *mut CleatSession,
+    event: *const CleatInputEvent,
+    out: *mut CleatInputResult,
+) -> bool {
     let session = match unsafe { session.as_mut() } {
         Some(session) => session,
         None => return false,
@@ -577,13 +629,51 @@ pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, ev
         Some(event) => *event,
         None => return false,
     };
+    if !send_input_event(session, &event) {
+        return false;
+    }
+    record_input_acceptance(session, 1, out);
+    true
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer. `events` must either be null with
+/// `event_count == 0` or point to `event_count` readable `CleatInputEvent`
+/// values. `out`, when non-null, must point to writable `CleatInputResult`
+/// storage.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_send_input_batch(
+    session: *mut CleatSession,
+    events: *const CleatInputEvent,
+    event_count: usize,
+    out: *mut CleatInputResult,
+) -> bool {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    if event_count > 0 && events.is_null() {
+        return false;
+    }
+    let events = if event_count > 0 { unsafe { slice::from_raw_parts(events, event_count) } } else { &[] };
+    for event in events {
+        if !send_input_event(session, event) {
+            return false;
+        }
+    }
+    record_input_acceptance(session, event_count, out);
+    true
+}
+
+fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> bool {
     match &mut session.backend {
         SessionBackend::Mock(mock) => {
             mock.input_count = mock.input_count.saturating_add(1);
             mark_partial_rows_and_wake(&mut mock.observation, [0], &session.wake);
             true
         }
-        SessionBackend::InProcess(in_process) => match input_event_bytes(&event) {
+        SessionBackend::InProcess(in_process) => match input_event_bytes(event) {
             Ok(Some(bytes)) => {
                 if in_process.runtime.write_input(&bytes).is_err() {
                     return false;
@@ -593,7 +683,7 @@ pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, ev
             Ok(None) => true,
             Err(_) => false,
         },
-        SessionBackend::Daemon(daemon) => match daemon_input_request(&event) {
+        SessionBackend::Daemon(daemon) => match daemon_input_request(event) {
             Ok(Some(input)) => {
                 if daemon_send_input(daemon, input).is_err() {
                     return false;
@@ -603,6 +693,15 @@ pub unsafe extern "C" fn cleat_session_send_input(session: *mut CleatSession, ev
             Ok(None) => true,
             Err(_) => false,
         },
+    }
+}
+
+fn record_input_acceptance(session: &mut CleatSession, count: usize, out: *mut CleatInputResult) {
+    let first_sequence = session.next_input_sequence;
+    let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
+    session.next_input_sequence = session.next_input_sequence.saturating_add(count_u64);
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = CleatInputResult { first_sequence, count };
     }
 }
 
@@ -981,31 +1080,11 @@ fn daemon_input_request(event: &CleatInputEvent) -> Result<Option<http_uds::Inpu
     match event.kind {
         CLEAT_INPUT_TEXT => read_event_text(event).map(|text| Some(http_uds::InputRequest::Text { text })),
         CLEAT_INPUT_PASTE => read_event_text(event).map(|text| Some(http_uds::InputRequest::Paste { text })),
-        CLEAT_INPUT_KEY => Ok(key_input_request(event).map(|key| http_uds::InputRequest::Key { key })),
+        CLEAT_INPUT_KEY => key_event_bytes(event).map(|bytes| bytes.map(|bytes| http_uds::InputRequest::RawBytes { bytes })),
         CLEAT_INPUT_RESIZE => Ok(Some(http_uds::InputRequest::Resize { cols: event.cell_col.max(1), rows: event.cell_row.max(1) })),
         CLEAT_INPUT_MOUSE | CLEAT_INPUT_FOCUS => Ok(None),
         _ => Ok(None),
     }
-}
-
-fn key_input_request(event: &CleatInputEvent) -> Option<http_uds::KeyRequest> {
-    if event.key_kind == CLEAT_KEY_UNICODE_SCALAR {
-        return Some(http_uds::KeyRequest::UnicodeScalar { codepoint: event.key_code });
-    }
-
-    let key = match event.key_code {
-        CLEAT_KEY_ENTER => http_uds::NamedKey::Enter,
-        CLEAT_KEY_ESCAPE => http_uds::NamedKey::Escape,
-        CLEAT_KEY_BACKSPACE => http_uds::NamedKey::Backspace,
-        CLEAT_KEY_TAB => http_uds::NamedKey::Tab,
-        CLEAT_KEY_DELETE => http_uds::NamedKey::Delete,
-        CLEAT_KEY_ARROW_UP => http_uds::NamedKey::ArrowUp,
-        CLEAT_KEY_ARROW_DOWN => http_uds::NamedKey::ArrowDown,
-        CLEAT_KEY_ARROW_RIGHT => http_uds::NamedKey::ArrowRight,
-        CLEAT_KEY_ARROW_LEFT => http_uds::NamedKey::ArrowLeft,
-        _ => return None,
-    };
-    Some(http_uds::KeyRequest::Named { key })
 }
 
 fn read_optional_utf8(ptr: *const u8, len: usize) -> Result<Option<String>, Utf8Error> {
@@ -1019,7 +1098,7 @@ fn read_optional_utf8(ptr: *const u8, len: usize) -> Result<Option<String>, Utf8
 fn input_event_bytes(event: &CleatInputEvent) -> Result<Option<Vec<u8>>, Utf8Error> {
     match event.kind {
         CLEAT_INPUT_TEXT | CLEAT_INPUT_PASTE => read_event_text_bytes(event).map(Some),
-        CLEAT_INPUT_KEY => key_event_bytes(event).map(Some),
+        CLEAT_INPUT_KEY => key_event_bytes(event),
         CLEAT_INPUT_RESIZE | CLEAT_INPUT_MOUSE | CLEAT_INPUT_FOCUS => Ok(None),
         _ => Ok(None),
     }
@@ -1037,29 +1116,60 @@ fn read_event_text(event: &CleatInputEvent) -> Result<String, Utf8Error> {
     std::str::from_utf8(bytes).map(|text| text.to_string())
 }
 
-fn key_event_bytes(event: &CleatInputEvent) -> Result<Vec<u8>, Utf8Error> {
-    if event.key_kind == CLEAT_KEY_UNICODE_SCALAR {
-        let mut bytes = Vec::new();
-        if let Some(ch) = char::from_u32(event.key_code) {
-            let mut buf = [0; 4];
-            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        }
-        return Ok(bytes);
+fn read_generated_text_bytes(event: &CleatInputEvent) -> Result<Option<Vec<u8>>, Utf8Error> {
+    if event.generated_text.is_null() || event.generated_text_len == 0 {
+        return Ok(None);
+    }
+    let bytes = unsafe { slice::from_raw_parts(event.generated_text, event.generated_text_len) };
+    std::str::from_utf8(bytes).map(|_| Some(bytes.to_vec()))
+}
+
+fn key_event_bytes(event: &CleatInputEvent) -> Result<Option<Vec<u8>>, Utf8Error> {
+    if event.key_action == CLEAT_KEY_ACTION_RELEASE {
+        return Ok(None);
+    }
+    if let Some(bytes) = read_generated_text_bytes(event)? {
+        return Ok(Some(bytes));
     }
 
-    let bytes = match event.key_code {
-        CLEAT_KEY_ENTER => b"\r".as_slice(),
-        CLEAT_KEY_ESCAPE => b"\x1b".as_slice(),
-        CLEAT_KEY_BACKSPACE => b"\x7f".as_slice(),
-        CLEAT_KEY_TAB => b"\t".as_slice(),
-        CLEAT_KEY_DELETE => b"\x1b[3~".as_slice(),
-        CLEAT_KEY_ARROW_UP => b"\x1b[A".as_slice(),
-        CLEAT_KEY_ARROW_DOWN => b"\x1b[B".as_slice(),
-        CLEAT_KEY_ARROW_RIGHT => b"\x1b[C".as_slice(),
-        CLEAT_KEY_ARROW_LEFT => b"\x1b[D".as_slice(),
-        _ => b"".as_slice(),
-    };
-    Ok(bytes.to_vec())
+    let modifiers = key_modifiers(event.modifiers);
+    if event.key_kind == CLEAT_KEY_UNICODE_SCALAR {
+        return Ok(keys::encode_unicode_scalar(event.key_code, modifiers));
+    }
+
+    Ok(named_key(event.key_code).and_then(|key| keys::encode_named_key(key, modifiers)))
+}
+
+fn key_modifiers(modifiers: u16) -> keys::Modifiers {
+    keys::Modifiers {
+        control: modifiers & CLEAT_MOD_CTRL != 0,
+        meta: modifiers & CLEAT_MOD_ALT != 0,
+        shift: modifiers & CLEAT_MOD_SHIFT != 0,
+    }
+}
+
+fn named_key(key_code: u32) -> Option<keys::NamedKey> {
+    Some(match key_code {
+        CLEAT_KEY_ENTER => keys::NamedKey::Char(b'\r'),
+        CLEAT_KEY_ESCAPE => keys::NamedKey::Esc,
+        CLEAT_KEY_BACKSPACE => keys::NamedKey::Backspace,
+        CLEAT_KEY_TAB => keys::NamedKey::Tab,
+        CLEAT_KEY_DELETE => keys::NamedKey::Delete,
+        CLEAT_KEY_INSERT => keys::NamedKey::Insert,
+        CLEAT_KEY_HOME => keys::NamedKey::Home,
+        CLEAT_KEY_END => keys::NamedKey::End,
+        CLEAT_KEY_PAGE_UP => keys::NamedKey::PageUp,
+        CLEAT_KEY_PAGE_DOWN => keys::NamedKey::PageDown,
+        CLEAT_KEY_ARROW_UP => keys::NamedKey::Cursor { final_byte: b'A' },
+        CLEAT_KEY_ARROW_DOWN => keys::NamedKey::Cursor { final_byte: b'B' },
+        CLEAT_KEY_ARROW_RIGHT => keys::NamedKey::Cursor { final_byte: b'C' },
+        CLEAT_KEY_ARROW_LEFT => keys::NamedKey::Cursor { final_byte: b'D' },
+        CLEAT_KEY_FUNCTION_BASE..=u32::MAX => {
+            let function = u8::try_from(key_code - CLEAT_KEY_FUNCTION_BASE).ok()?;
+            keys::NamedKey::Function(function)
+        }
+        _ => return None,
+    })
 }
 
 fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> TerminalSnapshot {
@@ -1335,10 +1445,115 @@ mod tests {
 
         let key_event =
             CleatInputEvent { kind: CLEAT_INPUT_KEY, key_kind: CLEAT_KEY_NAMED, key_code: CLEAT_KEY_ENTER, ..CleatInputEvent::default() };
-        assert_eq!(
-            daemon_input_request(&key_event).expect("key input"),
-            Some(http_uds::InputRequest::Key { key: http_uds::KeyRequest::Named { key: http_uds::NamedKey::Enter } })
-        );
+        assert_eq!(daemon_input_request(&key_event).expect("key input"), Some(http_uds::InputRequest::RawBytes { bytes: b"\r".to_vec() }));
+    }
+
+    #[test]
+    fn key_event_bytes_use_generated_text_actions_and_shared_encoder() {
+        let generated = "é";
+        let generated_event = CleatInputEvent {
+            kind: CLEAT_INPUT_KEY,
+            key_kind: CLEAT_KEY_NAMED,
+            key_code: CLEAT_KEY_F1,
+            generated_text: generated.as_ptr(),
+            generated_text_len: generated.len(),
+            ..CleatInputEvent::default()
+        };
+        assert_eq!(key_event_bytes(&generated_event).expect("generated text"), Some(generated.as_bytes().to_vec()));
+
+        let release_event = CleatInputEvent {
+            kind: CLEAT_INPUT_KEY,
+            key_action: CLEAT_KEY_ACTION_RELEASE,
+            key_kind: CLEAT_KEY_NAMED,
+            key_code: CLEAT_KEY_F1,
+            ..CleatInputEvent::default()
+        };
+        assert_eq!(key_event_bytes(&release_event).expect("release"), None);
+
+        let modified_function = CleatInputEvent {
+            kind: CLEAT_INPUT_KEY,
+            key_action: CLEAT_KEY_ACTION_REPEAT,
+            key_kind: CLEAT_KEY_NAMED,
+            key_code: CLEAT_KEY_F2,
+            modifiers: CLEAT_MOD_SHIFT,
+            ..CleatInputEvent::default()
+        };
+        assert_eq!(key_event_bytes(&modified_function).expect("modified function"), Some(b"\x1b[1;2Q".to_vec()));
+    }
+
+    #[test]
+    fn provider_key_events_match_cli_encoder_for_equivalent_keys() {
+        let cases = [
+            (
+                CleatInputEvent {
+                    kind: CLEAT_INPUT_KEY,
+                    key_kind: CLEAT_KEY_NAMED,
+                    key_code: CLEAT_KEY_HOME,
+                    ..CleatInputEvent::default()
+                },
+                vec!["Home".to_string()],
+            ),
+            (
+                CleatInputEvent {
+                    kind: CLEAT_INPUT_KEY,
+                    key_kind: CLEAT_KEY_NAMED,
+                    key_code: CLEAT_KEY_ARROW_LEFT,
+                    modifiers: CLEAT_MOD_CTRL,
+                    ..CleatInputEvent::default()
+                },
+                vec!["C-Left".to_string()],
+            ),
+            (
+                CleatInputEvent {
+                    kind: CLEAT_INPUT_KEY,
+                    key_kind: CLEAT_KEY_NAMED,
+                    key_code: CLEAT_KEY_PAGE_UP,
+                    modifiers: CLEAT_MOD_ALT,
+                    ..CleatInputEvent::default()
+                },
+                vec!["M-PageUp".to_string()],
+            ),
+            (
+                CleatInputEvent { kind: CLEAT_INPUT_KEY, key_kind: CLEAT_KEY_NAMED, key_code: CLEAT_KEY_F12, ..CleatInputEvent::default() },
+                vec!["F12".to_string()],
+            ),
+        ];
+
+        for (event, tokens) in cases {
+            let provider_bytes = key_event_bytes(&event).expect("provider key").expect("encoded provider key");
+            let cli_bytes = keys::encode_send_keys(&tokens, false, false, 1).expect("cli key");
+            assert_eq!(provider_bytes, cli_bytes);
+        }
+    }
+
+    #[test]
+    fn send_input_reports_single_and_batch_sequence_ranges() {
+        unsafe {
+            let provider = cleat_provider_open(ptr::null());
+            let session = cleat_session_create(provider, ptr::null());
+            let event = CleatInputEvent {
+                kind: CLEAT_INPUT_KEY,
+                key_kind: CLEAT_KEY_NAMED,
+                key_code: CLEAT_KEY_ENTER,
+                ..CleatInputEvent::default()
+            };
+
+            let mut single = CleatInputResult::default();
+            assert!(cleat_session_send_input_ex(session, &event, &mut single));
+            assert_eq!(single, CleatInputResult { first_sequence: 1, count: 1 });
+
+            let events = [event, event, CleatInputEvent { key_action: CLEAT_KEY_ACTION_RELEASE, ..event }];
+            let mut batch = CleatInputResult::default();
+            assert!(cleat_session_send_input_batch(session, events.as_ptr(), events.len(), &mut batch));
+            assert_eq!(batch, CleatInputResult { first_sequence: 2, count: 3 });
+
+            let mut empty = CleatInputResult::default();
+            assert!(cleat_session_send_input_batch(session, ptr::null(), 0, &mut empty));
+            assert_eq!(empty, CleatInputResult { first_sequence: 5, count: 0 });
+
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
     }
 
     #[cfg(unix)]

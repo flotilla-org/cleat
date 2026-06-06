@@ -1,12 +1,12 @@
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Modifiers {
-    control: bool,
-    meta: bool,
-    shift: bool,
+pub struct Modifiers {
+    pub control: bool,
+    pub meta: bool,
+    pub shift: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NamedKey {
+pub enum NamedKey {
     Char(u8),
     Esc,
     Tab,
@@ -106,7 +106,7 @@ fn parse_special_key(token: &str) -> Option<Vec<u8>> {
     let (mut modifiers, base) = parse_tmux_modifiers(rest)?;
     modifiers.control |= control_prefix;
 
-    encode_named_key(base, modifiers).or_else(|| parse_single_byte_key(base, modifiers))
+    encode_named_token(base, modifiers).or_else(|| parse_single_byte_key(base, modifiers))
 }
 
 fn parse_tmux_modifiers(token: &str) -> Option<(Modifiers, &str)> {
@@ -137,8 +137,12 @@ fn parse_tmux_modifiers(token: &str) -> Option<(Modifiers, &str)> {
     Some((modifiers, base))
 }
 
-fn encode_named_key(token: &str, modifiers: Modifiers) -> Option<Vec<u8>> {
+fn encode_named_token(token: &str, modifiers: Modifiers) -> Option<Vec<u8>> {
     let named = parse_named_key(token)?;
+    encode_named_key(named, modifiers)
+}
+
+pub fn encode_named_key(named: NamedKey, modifiers: Modifiers) -> Option<Vec<u8>> {
     match named {
         NamedKey::Char(byte) => encode_modified_char(byte, modifiers),
         NamedKey::Esc => encode_escape(modifiers),
@@ -154,6 +158,18 @@ fn encode_named_key(token: &str, modifiers: Modifiers) -> Option<Vec<u8>> {
         NamedKey::PageDown => encode_tilde_key(b"6", modifier_value(modifiers)),
         NamedKey::Function(function) => encode_function_key(function, modifier_value(modifiers)),
     }
+}
+
+pub fn encode_unicode_scalar(codepoint: u32, modifiers: Modifiers) -> Option<Vec<u8>> {
+    let ch = char::from_u32(codepoint)?;
+    if ch.is_ascii() {
+        return encode_modified_char(ch as u8, modifiers);
+    }
+    if modifiers != Modifiers::default() {
+        return None;
+    }
+    let mut buf = [0; 4];
+    Some(ch.encode_utf8(&mut buf).as_bytes().to_vec())
 }
 
 fn parse_named_key(token: &str) -> Option<NamedKey> {

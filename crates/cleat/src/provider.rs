@@ -257,7 +257,18 @@ pub enum TerminalInputEvent {
 pub struct TerminalKeyEvent {
     pub key: TerminalKey,
     pub modifiers: TerminalModifiers,
-    pub pressed: bool,
+    pub consumed_modifiers: TerminalModifiers,
+    pub action: TerminalKeyAction,
+    pub generated_text: Option<String>,
+    pub platform_keycode: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalKeyAction {
+    #[default]
+    Press,
+    Repeat,
+    Release,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -407,7 +418,10 @@ mod tests {
         let key = TerminalInputEvent::Key(TerminalKeyEvent {
             key: TerminalKey::Named(TerminalNamedKey::Enter),
             modifiers: TerminalModifiers::CTRL | TerminalModifiers::ALT,
-            pressed: true,
+            consumed_modifiers: TerminalModifiers::CTRL,
+            action: TerminalKeyAction::Press,
+            generated_text: None,
+            platform_keycode: 36,
         });
         let mouse = TerminalInputEvent::Mouse(TerminalMouseEvent {
             kind: TerminalMouseEventKind::Press,

@@ -29,10 +29,35 @@ extern "C" {
 #define CLEAT_KEY_BACKSPACE 3u
 #define CLEAT_KEY_TAB 4u
 #define CLEAT_KEY_DELETE 5u
+#define CLEAT_KEY_INSERT 6u
+#define CLEAT_KEY_HOME 7u
+#define CLEAT_KEY_END 8u
+#define CLEAT_KEY_PAGE_UP 9u
+#define CLEAT_KEY_PAGE_DOWN 10u
 #define CLEAT_KEY_ARROW_UP 12u
 #define CLEAT_KEY_ARROW_DOWN 13u
 #define CLEAT_KEY_ARROW_LEFT 14u
 #define CLEAT_KEY_ARROW_RIGHT 15u
+#define CLEAT_KEY_FUNCTION_BASE 100u
+#define CLEAT_KEY_F1 101u
+#define CLEAT_KEY_F2 102u
+#define CLEAT_KEY_F3 103u
+#define CLEAT_KEY_F4 104u
+#define CLEAT_KEY_F5 105u
+#define CLEAT_KEY_F6 106u
+#define CLEAT_KEY_F7 107u
+#define CLEAT_KEY_F8 108u
+#define CLEAT_KEY_F9 109u
+#define CLEAT_KEY_F10 110u
+#define CLEAT_KEY_F11 111u
+#define CLEAT_KEY_F12 112u
+#define CLEAT_KEY_ACTION_PRESS 1u
+#define CLEAT_KEY_ACTION_REPEAT 2u
+#define CLEAT_KEY_ACTION_RELEASE 3u
+#define CLEAT_MOD_SHIFT 1u
+#define CLEAT_MOD_CTRL 2u
+#define CLEAT_MOD_ALT 4u
+#define CLEAT_MOD_SUPER 8u
 #define CLEAT_CELL_WIDTH_NARROW 0u
 #define CLEAT_CELL_WIDTH_WIDE 1u
 #define CLEAT_CELL_WIDTH_SPACER_TAIL 2u
@@ -121,10 +146,15 @@ typedef struct cleat_snapshot {
 typedef struct cleat_input_event {
     uint32_t kind;
     uint16_t modifiers;
+    uint16_t consumed_modifiers;
+    uint32_t key_action;
     uint32_t key_kind;
     uint32_t key_code;
     const uint8_t *text;
     size_t text_len;
+    const uint8_t *generated_text;
+    size_t generated_text_len;
+    uint32_t platform_keycode;
     uint16_t cell_col;
     uint16_t cell_row;
     float x_px;
@@ -132,6 +162,11 @@ typedef struct cleat_input_event {
     float wheel_delta_x;
     float wheel_delta_y;
 } cleat_input_event;
+
+typedef struct cleat_input_result {
+    uint64_t first_sequence;
+    size_t count;
+} cleat_input_result;
 
 uint32_t cleat_provider_abi_version(void);
 
@@ -156,6 +191,8 @@ bool cleat_session_resize(cleat_session *session, uint16_t cols, uint16_t rows);
  */
 bool cleat_session_update_geometry(cleat_session *session, const cleat_terminal_geometry *geometry);
 bool cleat_session_send_input(cleat_session *session, const cleat_input_event *event);
+bool cleat_session_send_input_ex(cleat_session *session, const cleat_input_event *event, cleat_input_result *out);
+bool cleat_session_send_input_batch(cleat_session *session, const cleat_input_event *events, size_t event_count, cleat_input_result *out);
 bool cleat_session_write_bytes(cleat_session *session, const uint8_t *bytes, size_t size);
 
 cleat_dirty_state cleat_session_poll(cleat_session *session);

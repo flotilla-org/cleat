@@ -6,7 +6,9 @@ use http::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalGeometry, TerminalSnapshot, TerminalViewportKind};
+use crate::provider::{
+    DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalGeometry, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
+};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -202,9 +204,31 @@ pub(crate) struct SnapshotResponse {
     pub geometry: GeometryResponse,
     pub viewport_kind: String,
     pub scrollback_offset_rows: u64,
+    pub scrollbar: ScrollbarResponse,
     pub cells: Vec<CellResponse>,
     pub cursor: CursorResponse,
     pub dirty: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
+pub(crate) struct ScrollbarResponse {
+    pub viewport_kind: String,
+    pub total_rows: u64,
+    pub viewport_rows: u16,
+    pub viewport_top_row: u64,
+    pub at_bottom: bool,
+}
+
+impl From<TerminalScrollbarState> for ScrollbarResponse {
+    fn from(value: TerminalScrollbarState) -> Self {
+        Self {
+            viewport_kind: viewport_kind_name(value.viewport_kind).to_string(),
+            total_rows: value.total_rows,
+            viewport_rows: value.viewport_rows,
+            viewport_top_row: value.viewport_top_row,
+            at_bottom: value.at_bottom,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Deserialize)]
@@ -475,6 +499,7 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
         geometry: snapshot.geometry.into(),
         viewport_kind: viewport_kind_name(snapshot.viewport_kind).to_string(),
         scrollback_offset_rows: snapshot.scrollback_offset_rows,
+        scrollbar: snapshot.scrollbar.into(),
         cells: snapshot
             .cells
             .into_iter()

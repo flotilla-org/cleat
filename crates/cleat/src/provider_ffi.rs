@@ -14,7 +14,8 @@ use crate::{
     protocol::SignalTarget,
     provider::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
-        TerminalGeometry, TerminalRgb, TerminalScrollbackExtent, TerminalSnapshot, TerminalViewportKind,
+        TerminalGeometry, TerminalRgb, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
+        ViewportCommand, ViewportCommandOutcome,
     },
     runtime::RuntimeLayout,
     session::{ensure_session_started, session_socket_path},
@@ -97,6 +98,12 @@ pub const CLEAT_CURSOR_STYLE_BLOCK_HOLLOW: u32 = 3;
 pub const CLEAT_VIEWPORT_LIVE_NORMAL: u32 = 1;
 pub const CLEAT_VIEWPORT_LIVE_ALTERNATE: u32 = 2;
 pub const CLEAT_VIEWPORT_NORMAL_SCROLLBACK: u32 = 3;
+pub const CLEAT_VIEWPORT_COMMAND_TOP: u32 = 1;
+pub const CLEAT_VIEWPORT_COMMAND_BOTTOM: u32 = 2;
+pub const CLEAT_VIEWPORT_COMMAND_DELTA_ROWS: u32 = 3;
+pub const CLEAT_VIEWPORT_OUTCOME_MOVED: u32 = 1;
+pub const CLEAT_VIEWPORT_OUTCOME_NO_OP: u32 = 2;
+pub const CLEAT_VIEWPORT_OUTCOME_UNSUPPORTED: u32 = 3;
 
 const POSIX_SIGTERM: i32 = 15;
 
@@ -219,6 +226,7 @@ pub struct CleatSnapshot {
     pub geometry: CleatTerminalGeometry,
     pub viewport_kind: u32,
     pub scrollback_offset_rows: u64,
+    pub scrollbar: CleatTerminalScrollbarState,
     pub render_generation: u64,
     pub cells: *const CleatCell,
     pub cell_count: usize,
@@ -234,6 +242,7 @@ pub struct CleatInputEvent {
     pub kind: u32,
     pub modifiers: u16,
     pub consumed_modifiers: u16,
+    pub focused: bool,
     pub key_action: u32,
     pub key_kind: u32,
     pub key_code: u32,
@@ -270,9 +279,32 @@ pub struct CleatScrollbackExtent {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleatTerminalScrollbarState {
+    pub viewport_kind: u32,
+    pub total_rows: u64,
+    pub viewport_rows: u16,
+    pub viewport_top_row: u64,
+    pub at_bottom: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CleatViewportRequest {
     pub kind: u32,
     pub scrollback_offset_rows: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleatViewportCommand {
+    pub kind: u32,
+    pub delta_rows: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleatViewportCommandResult {
+    pub outcome: u32,
 }
 
 pub struct CleatProvider {
@@ -445,6 +477,7 @@ impl OwnedSnapshot {
                 geometry: snapshot.geometry.into(),
                 viewport_kind: viewport_kind_to_ffi(snapshot.viewport_kind),
                 scrollback_offset_rows: snapshot.scrollback_offset_rows,
+                scrollbar: scrollbar_to_ffi(snapshot.scrollbar),
                 render_generation: snapshot.render_generation,
                 cells: ptr::null(),
                 cell_count: cells.len(),
@@ -471,12 +504,39 @@ fn viewport_kind_to_ffi(kind: TerminalViewportKind) -> u32 {
     }
 }
 
+fn scrollbar_to_ffi(scrollbar: TerminalScrollbarState) -> CleatTerminalScrollbarState {
+    CleatTerminalScrollbarState {
+        viewport_kind: viewport_kind_to_ffi(scrollbar.viewport_kind),
+        total_rows: scrollbar.total_rows,
+        viewport_rows: scrollbar.viewport_rows,
+        viewport_top_row: scrollbar.viewport_top_row,
+        at_bottom: scrollbar.at_bottom,
+    }
+}
+
 fn viewport_kind_from_ffi(kind: u32) -> Option<TerminalViewportKind> {
     match kind {
         0 | CLEAT_VIEWPORT_LIVE_NORMAL => Some(TerminalViewportKind::LiveNormal),
         CLEAT_VIEWPORT_LIVE_ALTERNATE => Some(TerminalViewportKind::LiveAlternate),
         CLEAT_VIEWPORT_NORMAL_SCROLLBACK => Some(TerminalViewportKind::NormalScrollback),
         _ => None,
+    }
+}
+
+fn viewport_command_from_ffi(command: CleatViewportCommand) -> Option<ViewportCommand> {
+    match command.kind {
+        CLEAT_VIEWPORT_COMMAND_TOP => Some(ViewportCommand::Top),
+        CLEAT_VIEWPORT_COMMAND_BOTTOM => Some(ViewportCommand::Bottom),
+        CLEAT_VIEWPORT_COMMAND_DELTA_ROWS => Some(ViewportCommand::DeltaRows(command.delta_rows)),
+        _ => None,
+    }
+}
+
+fn viewport_command_outcome_to_ffi(outcome: ViewportCommandOutcome) -> u32 {
+    match outcome {
+        ViewportCommandOutcome::Moved => CLEAT_VIEWPORT_OUTCOME_MOVED,
+        ViewportCommandOutcome::NoOp => CLEAT_VIEWPORT_OUTCOME_NO_OP,
+        ViewportCommandOutcome::Unsupported => CLEAT_VIEWPORT_OUTCOME_UNSUPPORTED,
     }
 }
 
@@ -688,10 +748,11 @@ pub unsafe extern "C" fn cleat_session_send_input_ex(
         Some(event) => *event,
         None => return false,
     };
-    if !send_input_event(session, &event) {
-        return false;
-    }
-    record_input_acceptance(session, 1, out);
+    let accepted_count = match send_input_event(session, &event) {
+        Some(count) => count,
+        None => return false,
+    };
+    record_input_acceptance(session, accepted_count, out);
     true
 }
 
@@ -716,43 +777,223 @@ pub unsafe extern "C" fn cleat_session_send_input_batch(
         return false;
     }
     let events = if event_count > 0 { unsafe { slice::from_raw_parts(events, event_count) } } else { &[] };
+    let mut accepted_count = 0usize;
     for event in events {
-        if !send_input_event(session, event) {
+        let Some(count) = send_input_event(session, event) else {
             return false;
-        }
+        };
+        accepted_count = accepted_count.saturating_add(count);
     }
-    record_input_acceptance(session, event_count, out);
+    record_input_acceptance(session, accepted_count, out);
     true
 }
 
-fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> bool {
+fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> Option<usize> {
     match &mut session.backend {
-        SessionBackend::Mock(mock) => {
-            mock.input_count = mock.input_count.saturating_add(1);
-            mark_partial_rows_and_wake(&mut mock.observation, [0], &session.wake);
-            true
-        }
+        SessionBackend::Mock(mock) => match input_event_bytes(event) {
+            Ok(Some(_)) => {
+                mock.input_count = mock.input_count.saturating_add(1);
+                mark_partial_rows_and_wake(&mut mock.observation, [0], &session.wake);
+                Some(1)
+            }
+            Ok(None) => Some(0),
+            Err(_) => None,
+        },
         SessionBackend::InProcess(in_process) => match input_event_bytes(event) {
             Ok(Some(bytes)) => {
                 if in_process.runtime.write_input(&bytes).is_err() {
-                    return false;
+                    return None;
                 }
-                true
+                Some(1)
             }
-            Ok(None) => true,
-            Err(_) => false,
+            Ok(None) if is_wheel_event(event) => route_in_process_wheel_event(&session.wake, in_process, event),
+            Ok(None) => Some(0),
+            Err(_) => None,
         },
         SessionBackend::Daemon(daemon) => match daemon_input_request(event) {
             Ok(Some(input)) => {
                 if daemon_send_input(daemon, input).is_err() {
-                    return false;
+                    return None;
                 }
-                true
+                Some(1)
             }
-            Ok(None) => true,
-            Err(_) => false,
+            Ok(None) => Some(0),
+            Err(_) => None,
         },
     }
+}
+
+fn is_wheel_event(event: &CleatInputEvent) -> bool {
+    event.kind == CLEAT_INPUT_MOUSE && event.mouse_kind == CLEAT_MOUSE_WHEEL
+}
+
+fn route_in_process_wheel_event(
+    wake: &Arc<Mutex<WakeCallback>>,
+    in_process: &mut InProcessSession,
+    event: &CleatInputEvent,
+) -> Option<usize> {
+    let modes = in_process.runtime.terminal_mode_state().ok()?;
+    if modes.mouse_tracking {
+        let bytes = mouse_report_bytes(event, modes)?;
+        if bytes.is_empty() {
+            return Some(0);
+        }
+        if in_process.runtime.write_input(&bytes).is_err() {
+            return None;
+        }
+        return Some(1);
+    }
+
+    if modes.active_alternate_screen && modes.alternate_scroll {
+        let bytes = alternate_scroll_cursor_bytes(event, modes);
+        if bytes.is_empty() {
+            return Some(0);
+        }
+        if in_process.runtime.write_input(&bytes).is_err() {
+            return None;
+        }
+        return Some(1);
+    }
+
+    let delta_rows = viewport_delta_rows_from_wheel(event);
+    if delta_rows == 0 {
+        return Some(0);
+    }
+    match in_process.runtime.scroll_viewport(ViewportCommand::DeltaRows(delta_rows)) {
+        Ok(ViewportCommandOutcome::Moved) => {
+            let rows = in_process.runtime.inspect(false).terminal.rows;
+            mark_full_and_wake(&mut in_process.observation, rows, wake);
+            Some(0)
+        }
+        Ok(ViewportCommandOutcome::NoOp | ViewportCommandOutcome::Unsupported) => Some(0),
+        Err(_) => None,
+    }
+}
+
+fn wheel_tick_count(delta: f32) -> usize {
+    if !delta.is_finite() {
+        return 0;
+    }
+    let rounded = delta.round().abs();
+    if rounded == 0.0 {
+        0
+    } else if rounded > usize::MAX as f32 {
+        usize::MAX
+    } else {
+        rounded as usize
+    }
+}
+
+fn viewport_delta_rows_from_wheel(event: &CleatInputEvent) -> i64 {
+    if !event.wheel_delta_y.is_finite() {
+        return 0;
+    }
+    let rounded = event.wheel_delta_y.round();
+    if rounded == 0.0 {
+        return 0;
+    }
+    let rows = if rounded > i64::MAX as f32 {
+        i64::MAX
+    } else if rounded < i64::MIN as f32 {
+        i64::MIN
+    } else {
+        rounded as i64
+    };
+    rows.saturating_neg()
+}
+
+fn alternate_scroll_cursor_bytes(event: &CleatInputEvent, modes: vt::TerminalModeState) -> Vec<u8> {
+    let count = wheel_tick_count(event.wheel_delta_y);
+    if count == 0 {
+        return Vec::new();
+    }
+    let seq = if event.wheel_delta_y.is_sign_positive() {
+        if modes.application_cursor_keys {
+            b"\x1bOA".as_slice()
+        } else {
+            b"\x1b[A".as_slice()
+        }
+    } else if modes.application_cursor_keys {
+        b"\x1bOB".as_slice()
+    } else {
+        b"\x1b[B".as_slice()
+    };
+    seq.repeat(count)
+}
+
+fn mouse_report_bytes(event: &CleatInputEvent, modes: vt::TerminalModeState) -> Option<Vec<u8>> {
+    let y_count = wheel_tick_count(event.wheel_delta_y);
+    let x_count = wheel_tick_count(event.wheel_delta_x);
+    if y_count == 0 && x_count == 0 {
+        return Some(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let modifiers = mouse_report_modifier_code(event.modifiers);
+    if y_count > 0 {
+        let button = if event.wheel_delta_y.is_sign_positive() { 64 } else { 65 } + modifiers;
+        append_mouse_report(&mut out, button, y_count, event, modes)?;
+    }
+    if x_count > 0 {
+        let button = if event.wheel_delta_x.is_sign_positive() { 66 } else { 67 } + modifiers;
+        append_mouse_report(&mut out, button, x_count, event, modes)?;
+    }
+    Some(out)
+}
+
+fn append_mouse_report(
+    out: &mut Vec<u8>,
+    button_code: u16,
+    count: usize,
+    event: &CleatInputEvent,
+    modes: vt::TerminalModeState,
+) -> Option<()> {
+    let (x, y) = if modes.mouse_sgr_pixels {
+        (one_based_coordinate(event.x_px), one_based_coordinate(event.y_px))
+    } else {
+        (u32::from(event.cell_col) + 1, u32::from(event.cell_row) + 1)
+    };
+
+    for _ in 0..count {
+        if modes.mouse_sgr || modes.mouse_sgr_pixels {
+            out.extend_from_slice(format!("\x1b[<{button_code};{x};{y}M").as_bytes());
+        } else {
+            let b = legacy_mouse_byte(button_code)?;
+            let x = legacy_mouse_byte(u16::try_from(x).ok()?)?;
+            let y = legacy_mouse_byte(u16::try_from(y).ok()?)?;
+            out.extend_from_slice(&[b'\x1b', b'[', b'M', b, x, y]);
+        }
+    }
+    Some(())
+}
+
+fn mouse_report_modifier_code(modifiers: u16) -> u16 {
+    let mut code = 0;
+    if modifiers & CLEAT_MOD_SHIFT != 0 {
+        code += 4;
+    }
+    if modifiers & CLEAT_MOD_ALT != 0 {
+        code += 8;
+    }
+    if modifiers & CLEAT_MOD_CTRL != 0 {
+        code += 16;
+    }
+    code
+}
+
+fn one_based_coordinate(value: f32) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        1
+    } else if value >= u32::MAX as f32 {
+        u32::MAX
+    } else {
+        value.round() as u32 + 1
+    }
+}
+
+fn legacy_mouse_byte(value: u16) -> Option<u8> {
+    let encoded = value.checked_add(32)?;
+    u8::try_from(encoded).ok()
 }
 
 fn record_input_acceptance(session: &mut CleatSession, count: usize, out: *mut CleatInputResult) {
@@ -882,6 +1123,50 @@ pub unsafe extern "C" fn cleat_session_scrollback_extent(session: *mut CleatSess
 /// # Safety
 ///
 /// `session` must be a valid session pointer. `out` must point to writable
+/// `CleatTerminalScrollbarState` storage.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_scrollbar_state(session: *mut CleatSession, out: *mut CleatTerminalScrollbarState) -> bool {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    let out = match unsafe { out.as_mut() } {
+        Some(out) => out,
+        None => return false,
+    };
+    *out = scrollbar_to_ffi(session_scrollbar_state(session));
+    true
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer. `command` must point to a valid
+/// `CleatViewportCommand`. `out`, when non-null, must point to writable
+/// `CleatViewportCommandResult` storage.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_scroll_viewport(
+    session: *mut CleatSession,
+    command: *const CleatViewportCommand,
+    out: *mut CleatViewportCommandResult,
+) -> bool {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    let command = match unsafe { command.as_ref() }.copied() {
+        Some(command) => viewport_command_from_ffi(command),
+        None => return false,
+    };
+    let outcome = session_scroll_viewport(session, command);
+    if let Some(out) = unsafe { out.as_mut() } {
+        out.outcome = viewport_command_outcome_to_ffi(outcome);
+    }
+    true
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer. `out` must point to writable
 /// storage for a `CleatSnapshot`. Only one snapshot may be live per session;
 /// callers must release the previous snapshot before requesting another one.
 #[no_mangle]
@@ -921,6 +1206,7 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
         },
     };
     snapshot.geometry = session.geometry;
+    snapshot.scrollbar = session_scrollbar_state(session);
     let owned = OwnedSnapshot::from_snapshot(snapshot);
     *out = owned.snapshot;
     session.last_snapshot = Some(owned);
@@ -951,12 +1237,47 @@ pub unsafe extern "C" fn cleat_session_viewport_snapshot(
 }
 
 fn session_scrollback_extent(session: &mut CleatSession) -> TerminalScrollbackExtent {
-    let live_rows = match &mut session.backend {
-        SessionBackend::Mock(mock) => mock.rows,
-        SessionBackend::InProcess(in_process) => in_process.runtime.inspect(false).terminal.rows,
-        SessionBackend::Daemon(daemon) => daemon.rows,
+    match &mut session.backend {
+        SessionBackend::Mock(mock) => TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: mock.rows, alternate_screen: false },
+        SessionBackend::InProcess(in_process) => in_process.runtime.scrollback_extent().unwrap_or_else(|_| TerminalScrollbackExtent {
+            normal_scrollback_rows: 0,
+            live_rows: in_process.runtime.inspect(false).terminal.rows,
+            alternate_screen: false,
+        }),
+        SessionBackend::Daemon(daemon) => {
+            TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: daemon.rows, alternate_screen: false }
+        }
+    }
+}
+
+fn session_scrollbar_state(session: &mut CleatSession) -> TerminalScrollbarState {
+    match &mut session.backend {
+        SessionBackend::Mock(mock) => TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, mock.rows),
+        SessionBackend::InProcess(in_process) => in_process.runtime.scrollbar_state().unwrap_or_else(|_| {
+            TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, in_process.runtime.inspect(false).terminal.rows)
+        }),
+        SessionBackend::Daemon(daemon) => TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, daemon.rows),
+    }
+}
+
+fn session_scroll_viewport(session: &mut CleatSession, command: Option<ViewportCommand>) -> ViewportCommandOutcome {
+    let Some(command) = command else {
+        return ViewportCommandOutcome::Unsupported;
     };
-    TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows, alternate_screen: false }
+    match &mut session.backend {
+        SessionBackend::Mock(_) | SessionBackend::Daemon(_) => match command {
+            ViewportCommand::Top | ViewportCommand::Bottom | ViewportCommand::DeltaRows(_) => ViewportCommandOutcome::NoOp,
+        },
+        SessionBackend::InProcess(in_process) => match in_process.runtime.scroll_viewport(command) {
+            Ok(ViewportCommandOutcome::Moved) => {
+                let rows = in_process.runtime.inspect(false).terminal.rows;
+                mark_full_and_wake(&mut in_process.observation, rows, &session.wake);
+                ViewportCommandOutcome::Moved
+            }
+            Ok(outcome) => outcome,
+            Err(_) => ViewportCommandOutcome::Unsupported,
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1128,6 +1449,7 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
         geometry: geometry_from_http(snapshot.geometry),
         viewport_kind: viewport_kind_from_name(&snapshot.viewport_kind)?,
         scrollback_offset_rows: snapshot.scrollback_offset_rows,
+        scrollbar: scrollbar_from_http(snapshot.scrollbar)?,
         render_generation: 0,
         cells: snapshot
             .cells
@@ -1152,6 +1474,15 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
         dirty: dirty_from_name(&snapshot.dirty)?,
         dirty_rows: Vec::new(),
     })
+}
+
+fn scrollbar_from_http(scrollbar: http_uds::ScrollbarResponse) -> Result<TerminalScrollbarState, String> {
+    Ok(TerminalScrollbarState::new(
+        viewport_kind_from_name(&scrollbar.viewport_kind)?,
+        scrollbar.total_rows,
+        scrollbar.viewport_rows,
+        scrollbar.viewport_top_row,
+    ))
 }
 
 fn geometry_from_http(geometry: http_uds::GeometryResponse) -> TerminalGeometry {
@@ -1326,6 +1657,7 @@ fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> T
         geometry: TerminalGeometry::default(),
         viewport_kind: TerminalViewportKind::LiveNormal,
         scrollback_offset_rows: 0,
+        scrollbar: TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, rows),
         render_generation: 0,
         cells,
         cursor: TerminalCursor {
@@ -1472,10 +1804,57 @@ mod tests {
             assert_eq!(snapshot.rows, 5);
             assert_eq!(snapshot.viewport_kind, CLEAT_VIEWPORT_LIVE_NORMAL);
             assert_eq!(snapshot.scrollback_offset_rows, 0);
+            assert_eq!(snapshot.scrollbar, CleatTerminalScrollbarState {
+                viewport_kind: CLEAT_VIEWPORT_LIVE_NORMAL,
+                total_rows: 5,
+                viewport_rows: 5,
+                viewport_top_row: 0,
+                at_bottom: true,
+            });
             cleat_session_release_snapshot(session, &mut snapshot);
 
             let request = CleatViewportRequest { kind: CLEAT_VIEWPORT_NORMAL_SCROLLBACK, scrollback_offset_rows: 1 };
             assert!(!cleat_session_viewport_snapshot(session, &request, &mut snapshot));
+
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn scrollbar_state_query_and_viewport_command_outcome_are_exposed() {
+        unsafe {
+            let provider = cleat_provider_open(ptr::null());
+            let session = cleat_session_create(provider, &CleatSessionDesc { cols: 12, rows: 5, ..CleatSessionDesc::default() });
+
+            let mut scrollbar = CleatTerminalScrollbarState::default();
+            assert!(cleat_session_scrollbar_state(session, &mut scrollbar));
+            assert_eq!(scrollbar, CleatTerminalScrollbarState {
+                viewport_kind: CLEAT_VIEWPORT_LIVE_NORMAL,
+                total_rows: 5,
+                viewport_rows: 5,
+                viewport_top_row: 0,
+                at_bottom: true,
+            });
+
+            let mut before = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut before));
+            let before_generation = before.render_generation;
+            cleat_session_release_snapshot(session, &mut before);
+
+            let command = CleatViewportCommand { kind: CLEAT_VIEWPORT_COMMAND_DELTA_ROWS, delta_rows: 0 };
+            let mut result = CleatViewportCommandResult::default();
+            assert!(cleat_session_scroll_viewport(session, &command, &mut result));
+            assert_eq!(result.outcome, CLEAT_VIEWPORT_OUTCOME_NO_OP);
+
+            let mut after = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut after));
+            assert_eq!(after.render_generation, before_generation);
+            cleat_session_release_snapshot(session, &mut after);
+
+            let bad_command = CleatViewportCommand { kind: u32::MAX, delta_rows: 0 };
+            assert!(cleat_session_scroll_viewport(session, &bad_command, &mut result));
+            assert_eq!(result.outcome, CLEAT_VIEWPORT_OUTCOME_UNSUPPORTED);
 
             cleat_session_destroy(session);
             cleat_provider_close(provider);
@@ -1500,7 +1879,12 @@ mod tests {
             assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
             cleat_session_release_snapshot(session, &mut initial);
 
-            let event = CleatInputEvent { kind: 1, ..CleatInputEvent::default() };
+            let event = CleatInputEvent {
+                kind: CLEAT_INPUT_KEY,
+                key_kind: CLEAT_KEY_NAMED,
+                key_code: CLEAT_KEY_ENTER,
+                ..CleatInputEvent::default()
+            };
             assert!(cleat_session_send_input(session, &event));
             assert_eq!(cleat_session_dirty(session), CleatDirtyState::Partial);
             assert_eq!(wake_count.load(Ordering::SeqCst), 1);
@@ -1701,11 +2085,11 @@ mod tests {
             let events = [event, event, CleatInputEvent { key_action: CLEAT_KEY_ACTION_RELEASE, ..event }];
             let mut batch = CleatInputResult::default();
             assert!(cleat_session_send_input_batch(session, events.as_ptr(), events.len(), &mut batch));
-            assert_eq!(batch, CleatInputResult { first_sequence: 2, count: 3 });
+            assert_eq!(batch, CleatInputResult { first_sequence: 2, count: 2 });
 
             let mut empty = CleatInputResult::default();
             assert!(cleat_session_send_input_batch(session, ptr::null(), 0, &mut empty));
-            assert_eq!(empty, CleatInputResult { first_sequence: 5, count: 0 });
+            assert_eq!(empty, CleatInputResult { first_sequence: 4, count: 0 });
 
             cleat_session_destroy(session);
             cleat_provider_close(provider);
@@ -1735,7 +2119,166 @@ mod tests {
             let session = cleat_session_create(provider, ptr::null());
             let mut result = CleatInputResult::default();
             assert!(cleat_session_send_input_ex(session, &event, &mut result));
-            assert_eq!(result, CleatInputResult { first_sequence: 1, count: 1 });
+            assert_eq!(result, CleatInputResult { first_sequence: 1, count: 0 });
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn no_byte_input_events_do_not_consume_sequence_numbers() {
+        unsafe {
+            let provider = cleat_provider_open(ptr::null());
+            let session = cleat_session_create(provider, ptr::null());
+
+            let release = CleatInputEvent {
+                kind: CLEAT_INPUT_KEY,
+                key_kind: CLEAT_KEY_NAMED,
+                key_code: CLEAT_KEY_ENTER,
+                key_action: CLEAT_KEY_ACTION_RELEASE,
+                ..CleatInputEvent::default()
+            };
+            let mut release_result = CleatInputResult::default();
+            assert!(cleat_session_send_input_ex(session, &release, &mut release_result));
+            assert_eq!(release_result, CleatInputResult { first_sequence: 1, count: 0 });
+
+            let press = CleatInputEvent {
+                kind: CLEAT_INPUT_KEY,
+                key_kind: CLEAT_KEY_NAMED,
+                key_code: CLEAT_KEY_ENTER,
+                ..CleatInputEvent::default()
+            };
+            let mut press_result = CleatInputResult::default();
+            assert!(cleat_session_send_input_ex(session, &press, &mut press_result));
+            assert_eq!(press_result, CleatInputResult { first_sequence: 1, count: 1 });
+
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn wheel_mouse_report_encoding_uses_sgr_coordinates_and_modifiers() {
+        let event = CleatInputEvent {
+            kind: CLEAT_INPUT_MOUSE,
+            mouse_kind: CLEAT_MOUSE_WHEEL,
+            modifiers: CLEAT_MOD_SHIFT | CLEAT_MOD_CTRL,
+            cell_col: 7,
+            cell_row: 3,
+            wheel_delta_y: 1.0,
+            ..CleatInputEvent::default()
+        };
+        let bytes =
+            mouse_report_bytes(&event, vt::TerminalModeState { mouse_tracking: true, mouse_sgr: true, ..vt::TerminalModeState::default() })
+                .expect("mouse report bytes");
+        assert_eq!(bytes, b"\x1b[<84;8;4M");
+    }
+
+    #[test]
+    fn alternate_scroll_wheel_encoding_uses_cursor_key_mode() {
+        let event =
+            CleatInputEvent { kind: CLEAT_INPUT_MOUSE, mouse_kind: CLEAT_MOUSE_WHEEL, wheel_delta_y: -2.0, ..CleatInputEvent::default() };
+        let bytes = alternate_scroll_cursor_bytes(&event, vt::TerminalModeState {
+            application_cursor_keys: true,
+            ..vt::TerminalModeState::default()
+        });
+        assert_eq!(bytes, b"\x1bOB\x1bOB");
+    }
+
+    #[cfg(all(unix, feature = "ghostty-vt"))]
+    #[test]
+    fn in_process_viewport_move_advances_generation_and_reports_scrollback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_string_lossy();
+        let command = b"cat";
+
+        unsafe {
+            let wake_count = AtomicUsize::new(0);
+            let provider = cleat_provider_open(&CleatProviderDesc {
+                abi_version: CLEAT_PROVIDER_ABI_VERSION,
+                requested_features: ProviderFeatures::CELL_SNAPSHOTS.bits(),
+                backend: CLEAT_PROVIDER_BACKEND_IN_PROCESS,
+                runtime_root: root.as_ptr(),
+                runtime_root_len: root.len(),
+            });
+            assert!(!provider.is_null());
+            cleat_provider_set_wake_callback(provider, Some(count_wake), &wake_count as *const AtomicUsize as *mut c_void);
+
+            let session = cleat_session_create(provider, &CleatSessionDesc {
+                cols: 20,
+                rows: 3,
+                vt_engine: CLEAT_PROVIDER_VT_GHOSTTY,
+                command: command.as_ptr(),
+                command_len: command.len(),
+                ..CleatSessionDesc::default()
+            });
+            assert!(!session.is_null());
+
+            let mut initial = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut initial));
+            assert!(cleat_session_mark_observed(session, initial.render_generation));
+            cleat_session_release_snapshot(session, &mut initial);
+
+            let input = b"line 0\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\n";
+            assert!(cleat_session_write_bytes(session, input.as_ptr(), input.len()));
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while cleat_session_dirty(session) == CleatDirtyState::Clean && std::time::Instant::now() < deadline {
+                cleat_session_poll(session);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_ne!(cleat_session_dirty(session), CleatDirtyState::Clean, "session did not produce scrollback output");
+
+            let mut bottom = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut bottom));
+            assert_eq!(bottom.scrollbar.viewport_kind, CLEAT_VIEWPORT_LIVE_NORMAL);
+            assert!(bottom.scrollbar.total_rows > bottom.scrollbar.viewport_rows as u64, "expected scrollback: {:?}", bottom.scrollbar);
+            assert!(bottom.scrollbar.at_bottom);
+            let bottom_generation = bottom.render_generation;
+            assert!(cleat_session_mark_observed(session, bottom_generation));
+            cleat_session_release_snapshot(session, &mut bottom);
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
+            let wake_count_before_scroll = wake_count.load(Ordering::SeqCst);
+
+            let command = CleatViewportCommand { kind: CLEAT_VIEWPORT_COMMAND_DELTA_ROWS, delta_rows: -2 };
+            let mut result = CleatViewportCommandResult::default();
+            assert!(cleat_session_scroll_viewport(session, &command, &mut result));
+            assert_eq!(result.outcome, CLEAT_VIEWPORT_OUTCOME_MOVED);
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Full);
+            assert_eq!(wake_count.load(Ordering::SeqCst), wake_count_before_scroll + 1);
+
+            let mut scrolled = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut scrolled));
+            assert!(scrolled.render_generation > bottom_generation);
+            assert_eq!(scrolled.viewport_kind, CLEAT_VIEWPORT_NORMAL_SCROLLBACK);
+            assert_eq!(scrolled.scrollbar.viewport_kind, CLEAT_VIEWPORT_NORMAL_SCROLLBACK);
+            assert!(!scrolled.scrollbar.at_bottom);
+            let scrolled_generation = scrolled.render_generation;
+            assert!(cleat_session_mark_observed(session, scrolled_generation));
+            cleat_session_release_snapshot(session, &mut scrolled);
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
+
+            let wheel = CleatInputEvent {
+                kind: CLEAT_INPUT_MOUSE,
+                mouse_kind: CLEAT_MOUSE_WHEEL,
+                mouse_button: CLEAT_MOUSE_BUTTON_NONE,
+                wheel_delta_y: -2.0,
+                ..CleatInputEvent::default()
+            };
+            let wake_count_before_wheel = wake_count.load(Ordering::SeqCst);
+            let mut input_result = CleatInputResult::default();
+            assert!(cleat_session_send_input_ex(session, &wheel, &mut input_result));
+            assert_eq!(input_result, CleatInputResult { first_sequence: 1, count: 0 });
+            assert_eq!(cleat_session_dirty(session), CleatDirtyState::Full);
+            assert_eq!(wake_count.load(Ordering::SeqCst), wake_count_before_wheel + 1);
+
+            let mut wheel_snapshot = CleatSnapshot::default();
+            assert!(cleat_session_snapshot(session, &mut wheel_snapshot));
+            assert!(wheel_snapshot.render_generation > scrolled_generation);
+            assert_eq!(wheel_snapshot.viewport_kind, CLEAT_VIEWPORT_LIVE_NORMAL);
+            assert!(wheel_snapshot.scrollbar.at_bottom);
+            cleat_session_release_snapshot(session, &mut wheel_snapshot);
+
             cleat_session_destroy(session);
             cleat_provider_close(provider);
         }

@@ -10,10 +10,10 @@ use crate::{
     da::DeviceAttributeTracker,
     platform::pty::{exit_code_from_wait_status, PtyChild},
     protocol::{InspectResult, SignalTarget},
-    provider::{DirtyState, TerminalSnapshot},
+    provider::{DirtyState, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, ViewportCommand, ViewportCommandOutcome},
     recording::SessionRecorder,
     runtime::SessionMetadata,
-    vt::{self, VtEngine},
+    vt::{self, TerminalModeState, VtEngine},
 };
 
 const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
@@ -128,7 +128,29 @@ impl SessionRuntime {
     }
 
     pub(crate) fn snapshot(&mut self, dirty: DirtyState) -> Result<TerminalSnapshot, String> {
-        self.vt_engine.screen_grid().map(|grid| TerminalSnapshot::from_screen_grid(grid, dirty))
+        let grid = self.vt_engine.screen_grid()?;
+        let scrollbar = self.vt_engine.scrollbar_state()?;
+        let mut snapshot = TerminalSnapshot::from_screen_grid(grid, dirty);
+        snapshot.viewport_kind = scrollbar.viewport_kind;
+        snapshot.scrollbar = scrollbar;
+        snapshot.scrollback_offset_rows = scrollbar.viewport_top_row;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn scrollback_extent(&self) -> Result<TerminalScrollbackExtent, String> {
+        self.vt_engine.scrollback_extent()
+    }
+
+    pub(crate) fn scrollbar_state(&self) -> Result<TerminalScrollbarState, String> {
+        self.vt_engine.scrollbar_state()
+    }
+
+    pub(crate) fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
+        self.vt_engine.scroll_viewport(command)
+    }
+
+    pub(crate) fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
+        self.vt_engine.terminal_mode_state()
     }
 
     pub(crate) fn write_input(&mut self, bytes: &[u8]) -> Result<(), String> {

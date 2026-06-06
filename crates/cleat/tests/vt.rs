@@ -1,3 +1,5 @@
+#[cfg(feature = "ghostty-vt")]
+use cleat::provider::{TerminalViewportKind, ViewportCommand, ViewportCommandOutcome};
 use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, VtEngine};
 
 mod vt_contracts;
@@ -219,6 +221,33 @@ fn vt_ghostty_screen_grid_returns_cached_when_clean() {
     // Second call with no new input should return cached result
     let grid2 = engine.screen_grid().expect("second screen_grid (cached)");
     assert_eq!(grid1, grid2);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_scrollbar_and_viewport_commands_track_scrollback() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+    for line in 0..8 {
+        engine.feed(format!("line {line}\r\n").as_bytes()).expect("feed line");
+    }
+
+    let bottom = engine.scrollbar_state().expect("initial scrollbar");
+    assert_eq!(bottom.viewport_kind, TerminalViewportKind::LiveNormal);
+    assert!(bottom.total_rows > bottom.viewport_rows as u64, "expected scrollback after feeding lines: {bottom:?}");
+    assert!(bottom.at_bottom);
+
+    assert_eq!(engine.scroll_viewport(ViewportCommand::DeltaRows(-2)).expect("scroll up"), ViewportCommandOutcome::Moved);
+    let scrolled = engine.scrollbar_state().expect("scrolled scrollbar");
+    assert_eq!(scrolled.viewport_kind, TerminalViewportKind::NormalScrollback);
+    assert!(scrolled.viewport_top_row < bottom.viewport_top_row);
+    assert!(!scrolled.at_bottom);
+
+    assert_eq!(engine.scroll_viewport(ViewportCommand::Bottom).expect("scroll bottom"), ViewportCommandOutcome::Moved);
+    let restored = engine.scrollbar_state().expect("restored scrollbar");
+    assert_eq!(restored.viewport_kind, TerminalViewportKind::LiveNormal);
+    assert!(restored.at_bottom);
+
+    assert_eq!(engine.scroll_viewport(ViewportCommand::Bottom).expect("bottom no-op"), ViewportCommandOutcome::NoOp);
 }
 
 #[cfg(feature = "ghostty-vt")]

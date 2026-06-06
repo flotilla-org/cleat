@@ -26,6 +26,7 @@ pub struct TerminalSnapshot {
     pub geometry: TerminalGeometry,
     pub viewport_kind: TerminalViewportKind,
     pub scrollback_offset_rows: u64,
+    pub scrollbar: TerminalScrollbarState,
     pub render_generation: u64,
     pub cells: Vec<TerminalCell>,
     pub cursor: TerminalCursor,
@@ -41,6 +42,7 @@ impl TerminalSnapshot {
             geometry: TerminalGeometry::default(),
             viewport_kind: TerminalViewportKind::LiveNormal,
             scrollback_offset_rows: 0,
+            scrollbar: TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, grid.rows),
             render_generation: 0,
             cells: grid.cells.into_iter().map(TerminalCell::from_resolved_cell).collect(),
             cursor: TerminalCursor::from_cursor_state(grid.cursor),
@@ -63,6 +65,41 @@ pub struct TerminalScrollbackExtent {
     pub normal_scrollback_rows: u64,
     pub live_rows: u16,
     pub alternate_screen: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalScrollbarState {
+    pub viewport_kind: TerminalViewportKind,
+    pub total_rows: u64,
+    pub viewport_rows: u16,
+    pub viewport_top_row: u64,
+    pub at_bottom: bool,
+}
+
+impl TerminalScrollbarState {
+    pub fn new(viewport_kind: TerminalViewportKind, total_rows: u64, viewport_rows: u16, viewport_top_row: u64) -> Self {
+        let bottom_top_row = total_rows.saturating_sub(viewport_rows as u64);
+        let viewport_top_row = viewport_top_row.min(bottom_top_row);
+        Self { viewport_kind, total_rows, viewport_rows, viewport_top_row, at_bottom: viewport_top_row >= bottom_top_row }
+    }
+
+    pub fn for_live_viewport(viewport_kind: TerminalViewportKind, viewport_rows: u16) -> Self {
+        Self::new(viewport_kind, viewport_rows as u64, viewport_rows, 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewportCommand {
+    Top,
+    Bottom,
+    DeltaRows(i64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewportCommandOutcome {
+    Moved,
+    NoOp,
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -420,6 +457,7 @@ mod tests {
         assert_eq!(snapshot.geometry, TerminalGeometry::default());
         assert_eq!(snapshot.viewport_kind, TerminalViewportKind::LiveNormal);
         assert_eq!(snapshot.scrollback_offset_rows, 0);
+        assert_eq!(snapshot.scrollbar, TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, 1));
         assert_eq!(snapshot.render_generation, 0);
         assert_eq!(snapshot.dirty, DirtyState::Full);
         assert!(snapshot.dirty_rows.is_empty());
@@ -432,6 +470,24 @@ mod tests {
         assert_eq!(snapshot.cells[0].flags, TerminalCellFlags::BOLD | TerminalCellFlags::ITALIC | TerminalCellFlags::UNDERLINE);
         assert_eq!(snapshot.cells[0].width, TerminalCellWidth::Wide);
         assert_eq!(snapshot.cells[1].width, TerminalCellWidth::SpacerTail);
+    }
+
+    #[test]
+    fn scrollbar_state_clamps_to_valid_range() {
+        assert_eq!(TerminalScrollbarState::new(TerminalViewportKind::LiveNormal, 10, 3, 99), TerminalScrollbarState {
+            viewport_kind: TerminalViewportKind::LiveNormal,
+            total_rows: 10,
+            viewport_rows: 3,
+            viewport_top_row: 7,
+            at_bottom: true,
+        });
+        assert_eq!(TerminalScrollbarState::new(TerminalViewportKind::LiveNormal, 2, 5, 3), TerminalScrollbarState {
+            viewport_kind: TerminalViewportKind::LiveNormal,
+            total_rows: 2,
+            viewport_rows: 5,
+            viewport_top_row: 0,
+            at_bottom: true,
+        });
     }
 
     #[test]

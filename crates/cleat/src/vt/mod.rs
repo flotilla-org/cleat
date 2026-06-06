@@ -13,6 +13,8 @@ pub use support::{
     FUNCTIONAL_ENGINE_STATUS, NONFUNCTIONAL_BUILD_MESSAGE, PLACEHOLDER_ENGINE_STATUS, VT_ENGINE_HELP, VT_SUPPORT_POLICY,
 };
 
+use crate::provider::{TerminalScrollbackExtent, TerminalScrollbarState, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ClientCapabilities {
@@ -138,6 +140,16 @@ impl ScreenGrid {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalModeState {
+    pub active_alternate_screen: bool,
+    pub application_cursor_keys: bool,
+    pub alternate_scroll: bool,
+    pub mouse_tracking: bool,
+    pub mouse_sgr: bool,
+    pub mouse_sgr_pixels: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum VtEngineKind {
@@ -180,6 +192,23 @@ pub trait VtEngine {
     fn screen_text(&self) -> Result<String, String>;
     fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
     fn size(&self) -> (u16, u16);
+    fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
+        Ok(TerminalModeState::default())
+    }
+    fn scrollback_extent(&self) -> Result<TerminalScrollbackExtent, String> {
+        let (_, rows) = self.size();
+        Ok(TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: rows, alternate_screen: false })
+    }
+    fn scrollbar_state(&self) -> Result<TerminalScrollbarState, String> {
+        let extent = self.scrollback_extent()?;
+        let kind = if extent.alternate_screen { TerminalViewportKind::LiveAlternate } else { TerminalViewportKind::LiveNormal };
+        Ok(TerminalScrollbarState::for_live_viewport(kind, extent.live_rows))
+    }
+    fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
+        match command {
+            ViewportCommand::Top | ViewportCommand::Bottom | ViewportCommand::DeltaRows(_) => Ok(ViewportCommandOutcome::NoOp),
+        }
+    }
 
     /// Reply bytes (DSR, DECRQM, DA, ...) the engine has buffered since the
     /// last call. Default is empty for engines that don't synthesize replies.

@@ -84,6 +84,12 @@ extern "C" {
 #define CLEAT_VIEWPORT_LIVE_NORMAL 1u
 #define CLEAT_VIEWPORT_LIVE_ALTERNATE 2u
 #define CLEAT_VIEWPORT_NORMAL_SCROLLBACK 3u
+#define CLEAT_VIEWPORT_COMMAND_TOP 1u
+#define CLEAT_VIEWPORT_COMMAND_BOTTOM 2u
+#define CLEAT_VIEWPORT_COMMAND_DELTA_ROWS 3u
+#define CLEAT_VIEWPORT_OUTCOME_MOVED 1u
+#define CLEAT_VIEWPORT_OUTCOME_NO_OP 2u
+#define CLEAT_VIEWPORT_OUTCOME_UNSUPPORTED 3u
 
 typedef struct CleatProvider cleat_provider;
 typedef struct CleatSession cleat_session;
@@ -148,12 +154,21 @@ typedef struct cleat_terminal_geometry {
     float content_height_px;
 } cleat_terminal_geometry;
 
+typedef struct cleat_terminal_scrollbar_state {
+    uint32_t viewport_kind;
+    uint64_t total_rows;
+    uint16_t viewport_rows;
+    uint64_t viewport_top_row;
+    bool at_bottom;
+} cleat_terminal_scrollbar_state;
+
 typedef struct cleat_snapshot {
     uint16_t cols;
     uint16_t rows;
     cleat_terminal_geometry geometry;
     uint32_t viewport_kind;
     uint64_t scrollback_offset_rows;
+    cleat_terminal_scrollbar_state scrollbar;
     uint64_t render_generation;
     const cleat_cell *cells;
     size_t cell_count;
@@ -172,6 +187,7 @@ typedef struct cleat_input_event {
     uint32_t kind;
     uint16_t modifiers;
     uint16_t consumed_modifiers;
+    bool focused;
     uint32_t key_action;
     uint32_t key_kind;
     uint32_t key_code;
@@ -206,6 +222,15 @@ typedef struct cleat_viewport_request {
     uint32_t kind;
     uint64_t scrollback_offset_rows;
 } cleat_viewport_request;
+
+typedef struct cleat_viewport_command {
+    uint32_t kind;
+    int64_t delta_rows;
+} cleat_viewport_command;
+
+typedef struct cleat_viewport_command_result {
+    uint32_t outcome;
+} cleat_viewport_command_result;
 
 uint32_t cleat_provider_abi_version(void);
 
@@ -247,6 +272,10 @@ bool cleat_session_mark_observed(cleat_session *session, uint64_t generation);
  * backend exposes scrollback rows.
  */
 bool cleat_session_scrollback_extent(cleat_session *session, cleat_scrollback_extent *out);
+bool cleat_session_scrollbar_state(cleat_session *session, cleat_terminal_scrollbar_state *out);
+bool cleat_session_scroll_viewport(cleat_session *session,
+                                   const cleat_viewport_command *command,
+                                   cleat_viewport_command_result *out);
 
 /*
  * Only one snapshot may be live per session. Call

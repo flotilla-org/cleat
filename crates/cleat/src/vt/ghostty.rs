@@ -1,10 +1,14 @@
 use super::{
     ghostty_ffi::{
         self, GhosttyCellWide, GhosttyFormatterFormat, GhosttyFormatterTerminalOptions, GhosttyRenderStateCursorVisualStyle,
-        GhosttyRenderStateDirty, GhosttyStyle, RenderStateHandle, RowCellsHandle, RowIteratorHandle, TerminalHandle,
+        GhosttyRenderStateDirty, GhosttyStyle, GhosttyTerminalScreen, GhosttyTerminalScrollViewport, RenderStateHandle, RowCellsHandle,
+        RowIteratorHandle, TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_SGR_MOUSE,
+        GHOSTTY_MODE_SGR_PIXELS_MOUSE,
     },
-    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, ResolvedCell, Rgb, ScreenGrid, VtEngine,
+    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, ResolvedCell, Rgb, ScreenGrid, TerminalModeState,
+    VtEngine,
 };
+use crate::provider::{TerminalScrollbackExtent, TerminalScrollbarState, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome};
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
 
@@ -198,6 +202,70 @@ impl VtEngine for GhosttyVtEngine {
 
     fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
+    }
+
+    fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
+        Ok(TerminalModeState {
+            active_alternate_screen: self.terminal.active_screen()? == GhosttyTerminalScreen::Alternate,
+            application_cursor_keys: self.terminal.mode_enabled(GHOSTTY_MODE_DECCKM)?,
+            alternate_scroll: self.terminal.mode_enabled(GHOSTTY_MODE_ALT_SCROLL)?,
+            mouse_tracking: self.terminal.mouse_tracking()?,
+            mouse_sgr: self.terminal.mode_enabled(GHOSTTY_MODE_SGR_MOUSE)?,
+            mouse_sgr_pixels: self.terminal.mode_enabled(GHOSTTY_MODE_SGR_PIXELS_MOUSE)?,
+        })
+    }
+
+    fn scrollback_extent(&self) -> Result<TerminalScrollbackExtent, String> {
+        Ok(TerminalScrollbackExtent {
+            normal_scrollback_rows: self.terminal.scrollback_rows()? as u64,
+            live_rows: self.rows,
+            alternate_screen: self.terminal.active_screen()? == GhosttyTerminalScreen::Alternate,
+        })
+    }
+
+    fn scrollbar_state(&self) -> Result<TerminalScrollbarState, String> {
+        let scrollbar = self.terminal.scrollbar()?;
+        let active_screen = self.terminal.active_screen()?;
+        let viewport_rows = u16::try_from(scrollbar.len).unwrap_or(u16::MAX);
+        let initial_kind = if active_screen == GhosttyTerminalScreen::Alternate {
+            TerminalViewportKind::LiveAlternate
+        } else {
+            TerminalViewportKind::LiveNormal
+        };
+        let state = TerminalScrollbarState::new(initial_kind, scrollbar.total, viewport_rows, scrollbar.offset);
+        let viewport_kind = match active_screen {
+            GhosttyTerminalScreen::Alternate => TerminalViewportKind::LiveAlternate,
+            GhosttyTerminalScreen::Primary if state.at_bottom => TerminalViewportKind::LiveNormal,
+            GhosttyTerminalScreen::Primary => TerminalViewportKind::NormalScrollback,
+        };
+        Ok(TerminalScrollbarState { viewport_kind, ..state })
+    }
+
+    fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
+        if self.terminal.active_screen()? == GhosttyTerminalScreen::Alternate {
+            return Ok(ViewportCommandOutcome::Unsupported);
+        }
+        if matches!(command, ViewportCommand::DeltaRows(0)) {
+            return Ok(ViewportCommandOutcome::NoOp);
+        }
+
+        let before = self.terminal.scrollbar()?;
+        let behavior = match command {
+            ViewportCommand::Top => GhosttyTerminalScrollViewport::top(),
+            ViewportCommand::Bottom => GhosttyTerminalScrollViewport::bottom(),
+            ViewportCommand::DeltaRows(delta) => {
+                let delta = isize::try_from(delta).unwrap_or(if delta.is_negative() { isize::MIN } else { isize::MAX });
+                GhosttyTerminalScrollViewport::delta(delta)
+            }
+        };
+        self.terminal.scroll_viewport(behavior);
+        let after = self.terminal.scrollbar()?;
+        if before == after {
+            Ok(ViewportCommandOutcome::NoOp)
+        } else {
+            self.cached_grid = None;
+            Ok(ViewportCommandOutcome::Moved)
+        }
     }
 }
 

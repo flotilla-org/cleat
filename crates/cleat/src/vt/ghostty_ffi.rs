@@ -21,6 +21,98 @@ pub struct GhosttyTerminalOptions {
 
 #[allow(dead_code)]
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyTerminalScrollViewportTag {
+    Top = 0,
+    Bottom = 1,
+    Delta = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union GhosttyTerminalScrollViewportValue {
+    pub delta: isize,
+    pub _padding: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyTerminalScrollViewport {
+    pub tag: GhosttyTerminalScrollViewportTag,
+    pub value: GhosttyTerminalScrollViewportValue,
+}
+
+impl GhosttyTerminalScrollViewport {
+    pub fn top() -> Self {
+        Self { tag: GhosttyTerminalScrollViewportTag::Top, value: GhosttyTerminalScrollViewportValue { _padding: [0; 2] } }
+    }
+
+    pub fn bottom() -> Self {
+        Self { tag: GhosttyTerminalScrollViewportTag::Bottom, value: GhosttyTerminalScrollViewportValue { _padding: [0; 2] } }
+    }
+
+    pub fn delta(delta: isize) -> Self {
+        Self { tag: GhosttyTerminalScrollViewportTag::Delta, value: GhosttyTerminalScrollViewportValue { delta } }
+    }
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyTerminalScreen {
+    Primary = 0,
+    Alternate = 1,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GhosttyTerminalScrollbar {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyTerminalData {
+    Invalid = 0,
+    Cols = 1,
+    Rows = 2,
+    CursorX = 3,
+    CursorY = 4,
+    CursorPendingWrap = 5,
+    ActiveScreen = 6,
+    CursorVisible = 7,
+    KittyKeyboardFlags = 8,
+    Scrollbar = 9,
+    CursorStyle = 10,
+    MouseTracking = 11,
+    Title = 12,
+    Pwd = 13,
+    TotalRows = 14,
+    ScrollbackRows = 15,
+    WidthPx = 16,
+    HeightPx = 17,
+    ColorForeground = 18,
+    ColorBackground = 19,
+    ColorCursor = 20,
+    ColorPalette = 21,
+    ColorForegroundDefault = 22,
+    ColorBackgroundDefault = 23,
+    ColorCursorDefault = 24,
+    ColorPaletteDefault = 25,
+}
+
+pub type GhosttyMode = u16;
+
+pub const GHOSTTY_MODE_DECCKM: GhosttyMode = 1;
+pub const GHOSTTY_MODE_SGR_MOUSE: GhosttyMode = 1006;
+pub const GHOSTTY_MODE_ALT_SCROLL: GhosttyMode = 1007;
+pub const GHOSTTY_MODE_SGR_PIXELS_MOUSE: GhosttyMode = 1016;
+
+#[allow(dead_code)]
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub enum GhosttyFormatterFormat {
     Plain = 0,
@@ -374,6 +466,8 @@ const _: () = assert!(std::mem::size_of::<GhosttyStyleColor>() == 16);
 const _: () = assert!(std::mem::size_of::<GhosttyStyle>() == 72);
 const _: () = assert!(std::mem::size_of::<GhosttyColorRgb>() == 3);
 const _: () = assert!(std::mem::size_of::<GhosttyRenderStateColors>() == 792);
+const _: () = assert!(std::mem::size_of::<GhosttyTerminalScrollViewport>() == 24);
+const _: () = assert!(std::mem::size_of::<GhosttyTerminalScrollbar>() == 24);
 
 pub enum GhosttyRenderStateOpaque {}
 pub enum GhosttyRowIteratorOpaque {}
@@ -388,6 +482,9 @@ unsafe extern "C" {
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> GhosttyResult;
     fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
+    fn ghostty_terminal_scroll_viewport(terminal: GhosttyTerminal, behavior: GhosttyTerminalScrollViewport);
+    fn ghostty_terminal_get(terminal: GhosttyTerminal, data: GhosttyTerminalData, out: *mut c_void) -> GhosttyResult;
+    fn ghostty_terminal_mode_get(terminal: GhosttyTerminal, mode: GhosttyMode, out_value: *mut bool) -> GhosttyResult;
     fn ghostty_terminal_set(terminal: GhosttyTerminal, option: GhosttyTerminalOption, value: *const c_void) -> GhosttyResult;
 
     fn ghostty_formatter_terminal_new(
@@ -537,6 +634,50 @@ impl TerminalHandle {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         unsafe { ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len()) };
+    }
+
+    pub fn active_screen(&self) -> Result<GhosttyTerminalScreen, String> {
+        let mut screen = GhosttyTerminalScreen::Primary;
+        let result = unsafe {
+            ghostty_terminal_get(self.raw, GhosttyTerminalData::ActiveScreen, &mut screen as *mut GhosttyTerminalScreen as *mut c_void)
+        };
+        check_result(result, "ghostty_terminal_get(ActiveScreen)")?;
+        Ok(screen)
+    }
+
+    pub fn scrollbar(&self) -> Result<GhosttyTerminalScrollbar, String> {
+        let mut scrollbar = GhosttyTerminalScrollbar::default();
+        let result = unsafe {
+            ghostty_terminal_get(self.raw, GhosttyTerminalData::Scrollbar, &mut scrollbar as *mut GhosttyTerminalScrollbar as *mut c_void)
+        };
+        check_result(result, "ghostty_terminal_get(Scrollbar)")?;
+        Ok(scrollbar)
+    }
+
+    pub fn scrollback_rows(&self) -> Result<usize, String> {
+        let mut rows = 0usize;
+        let result = unsafe { ghostty_terminal_get(self.raw, GhosttyTerminalData::ScrollbackRows, &mut rows as *mut usize as *mut c_void) };
+        check_result(result, "ghostty_terminal_get(ScrollbackRows)")?;
+        Ok(rows)
+    }
+
+    pub fn mode_enabled(&self, mode: GhosttyMode) -> Result<bool, String> {
+        let mut enabled = false;
+        let result = unsafe { ghostty_terminal_mode_get(self.raw, mode, &mut enabled) };
+        check_result(result, "ghostty_terminal_mode_get")?;
+        Ok(enabled)
+    }
+
+    pub fn mouse_tracking(&self) -> Result<bool, String> {
+        let mut enabled = false;
+        let result =
+            unsafe { ghostty_terminal_get(self.raw, GhosttyTerminalData::MouseTracking, &mut enabled as *mut bool as *mut c_void) };
+        check_result(result, "ghostty_terminal_get(MouseTracking)")?;
+        Ok(enabled)
+    }
+
+    pub fn scroll_viewport(&mut self, behavior: GhosttyTerminalScrollViewport) {
+        unsafe { ghostty_terminal_scroll_viewport(self.raw, behavior) };
     }
 
     pub fn raw(&self) -> GhosttyTerminal {

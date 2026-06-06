@@ -3,7 +3,7 @@ use cleat::{
     cli::{self, execute, Cli, Command, ExecResult},
     runtime::RuntimeLayout,
     server::SessionService,
-    vt::{self, VtEngineKind},
+    vt::{self, Rgb, VtEngineKind},
 };
 
 #[test]
@@ -257,9 +257,37 @@ fn launch_record_flag() {
 
 #[test]
 fn serve_parses_all_flags() {
-    let cli = Cli::try_parse_from(["cleat", "serve", "--id", "alpha", "--vt", "passthrough", "--cmd", "bash", "--cwd", "/tmp", "--record"])
-        .expect("parse serve");
-    assert!(matches!(cli.command, Command::Serve { ref id, record: true, .. } if id == "alpha"));
+    let cli = Cli::try_parse_from([
+        "cleat",
+        "serve",
+        "--id",
+        "alpha",
+        "--vt",
+        "passthrough",
+        "--cmd",
+        "bash",
+        "--cwd",
+        "/tmp",
+        "--record",
+        "--color-foreground",
+        "123456",
+        "--color-background",
+        "#abcdef",
+        "--color-cursor",
+        "fedcba",
+    ])
+    .expect("parse serve");
+    assert!(matches!(
+        cli.command,
+        Command::Serve {
+            ref id,
+            record: true,
+            color_foreground: Some(Rgb { r: 0x12, g: 0x34, b: 0x56 }),
+            color_background: Some(Rgb { r: 0xab, g: 0xcd, b: 0xef }),
+            color_cursor: Some(Rgb { r: 0xfe, g: 0xdc, b: 0xba }),
+            ..
+        } if id == "alpha"
+    ));
 }
 
 #[test]

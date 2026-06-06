@@ -224,6 +224,7 @@ pub fn ensure_session_started(
     cwd: Option<PathBuf>,
     cmd: Option<String>,
     record: bool,
+    colors: vt::TerminalColors,
 ) -> Result<SessionMetadata, String> {
     // If a named session directory already exists with a live socket, reuse it.
     if let Some(ref id_str) = id {
@@ -232,7 +233,7 @@ pub fn ensure_session_started(
             // Daemon is running — return the id. The caller should use inspect()
             // if it needs the session's actual config.
             let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-            return Ok(SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record });
+            return Ok(SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record, colors });
         }
     }
 
@@ -241,6 +242,7 @@ pub fn ensure_session_started(
     vt_engine.ensure_available()?;
     let mut session = layout.create_session(id, vt_engine, cwd, cmd)?;
     session.record = record;
+    session.colors = colors;
 
     let socket_path = session_socket_path(layout.root(), &session.id);
     spawn_daemon_process(layout.root(), &session)?;
@@ -288,9 +290,9 @@ pub fn foreground_path(root: &Path, id: &str) -> PathBuf {
     root.join(id).join(FOREGROUND_NAME)
 }
 
-fn default_vt_engine(kind: VtEngineKind) -> Result<Box<dyn VtEngine>, String> {
+fn default_vt_engine(session: &SessionMetadata) -> Result<Box<dyn VtEngine>, String> {
     #[cfg(test)]
-    if kind == VtEngineKind::Ghostty {
+    if session.vt_engine == VtEngineKind::Ghostty {
         return Ok(Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)));
     }
 
@@ -299,7 +301,7 @@ fn default_vt_engine(kind: VtEngineKind) -> Result<Box<dyn VtEngine>, String> {
     {
         return Ok(Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)));
     }
-    vt::make_vt_engine(kind, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
+    vt::make_vt_engine_with_colors(session.vt_engine, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS, session.colors)
 }
 
 #[derive(Debug)]
@@ -425,7 +427,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     set_listener_nonblocking(&listener, true)?;
     fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let mut runtime = SessionRuntime::spawn(session_dir.clone(), session, default_vt_engine(session.vt_engine)?)?;
+    let mut runtime = SessionRuntime::spawn(session_dir.clone(), session, default_vt_engine(session)?)?;
     let mut active_client: Option<ActiveClient> = None;
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
@@ -1103,7 +1105,7 @@ mod tests {
     };
     use crate::{
         http_uds::read_http_request_for_test,
-        runtime::RuntimeLayout,
+        runtime::{RuntimeLayout, SessionMetadata},
         vt::{self, VtEngine},
     };
 
@@ -1198,7 +1200,15 @@ mod tests {
 
     #[test]
     fn default_vt_engine_starts_with_default_size() {
-        let engine = default_vt_engine(vt::default_vt_engine_kind()).expect("create default vt engine");
+        let session = SessionMetadata {
+            id: "test".to_string(),
+            vt_engine: vt::default_vt_engine_kind(),
+            cwd: None,
+            cmd: None,
+            record: false,
+            colors: vt::TerminalColors::default(),
+        };
+        let engine = default_vt_engine(&session).expect("create default vt engine");
         assert_eq!(engine.size(), (super::DEFAULT_TERMINAL_COLS, super::DEFAULT_TERMINAL_ROWS));
         #[cfg(feature = "ghostty-vt")]
         assert!(engine.supports_replay());
@@ -1212,7 +1222,15 @@ mod tests {
 
     #[test]
     fn vt_engine_helpers_feed_and_resize_default_engine() {
-        let mut engine = default_vt_engine(vt::default_vt_engine_kind()).expect("create default vt engine");
+        let session = SessionMetadata {
+            id: "test".to_string(),
+            vt_engine: vt::default_vt_engine_kind(),
+            cwd: None,
+            cmd: None,
+            record: false,
+            colors: vt::TerminalColors::default(),
+        };
+        let mut engine = default_vt_engine(&session).expect("create default vt engine");
         record_pty_output(engine.as_mut(), b"hello").expect("feed output");
         let replay =
             apply_attach_state(engine.as_mut(), 132, 40, &vt::ClientCapabilities::conservative_fallback()).expect("apply attach state");

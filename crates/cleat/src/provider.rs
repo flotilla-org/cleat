@@ -263,6 +263,7 @@ pub struct TerminalCursor {
     pub row: u16,
     pub visible: bool,
     pub style: TerminalCursorStyle,
+    pub blink: bool,
     pub wide_tail: bool,
 }
 
@@ -273,6 +274,7 @@ impl TerminalCursor {
             row: cursor.row,
             visible: cursor.visible,
             style: TerminalCursorStyle::from_cursor_style(cursor.style),
+            blink: cursor.blink,
             wide_tail: cursor.wide_tail,
         }
     }
@@ -437,7 +439,7 @@ mod tests {
         let grid = ScreenGrid {
             cols: 2,
             rows: 1,
-            cursor: CursorState { col: 1, row: 0, visible: true, style: CursorStyle::Bar, wide_tail: true },
+            cursor: CursorState { col: 1, row: 0, visible: true, style: CursorStyle::Bar, blink: true, wide_tail: true },
             cells: vec![
                 ResolvedCell {
                     graphemes: vec!['Z' as u32, 0x0301],
@@ -462,6 +464,7 @@ mod tests {
         assert_eq!(snapshot.dirty, DirtyState::Full);
         assert!(snapshot.dirty_rows.is_empty());
         assert_eq!(snapshot.cursor.style, TerminalCursorStyle::Bar);
+        assert!(snapshot.cursor.blink);
         assert!(snapshot.cursor.visible);
         assert!(snapshot.cursor.wide_tail);
         assert_eq!(snapshot.cells[0].graphemes, vec!['Z' as u32, 0x0301]);

@@ -47,6 +47,13 @@ pub struct Rgb {
     pub b: u8,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalColors {
+    pub default_foreground: Option<Rgb>,
+    pub default_background: Option<Rgb>,
+    pub default_cursor: Option<Rgb>,
+}
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct CellFlags: u16 {
@@ -95,6 +102,7 @@ pub struct CursorState {
     pub row: u16,
     pub visible: bool,
     pub style: CursorStyle,
+    pub blink: bool,
     pub wide_tail: bool,
 }
 
@@ -219,12 +227,18 @@ pub trait VtEngine {
 
 #[cfg(test)]
 pub(crate) fn make_default_vt_engine(cols: u16, rows: u16) -> Box<dyn VtEngine> {
-    make_vt_engine(default_vt_engine_kind(), cols, rows).expect("default vt engine should always be available")
+    make_vt_engine_with_colors(default_vt_engine_kind(), cols, rows, TerminalColors::default())
+        .expect("default vt engine should always be available")
 }
 
-pub(crate) fn make_vt_engine(kind: VtEngineKind, cols: u16, rows: u16) -> Result<Box<dyn VtEngine>, String> {
+pub(crate) fn make_vt_engine_with_colors(
+    kind: VtEngineKind,
+    cols: u16,
+    rows: u16,
+    colors: TerminalColors,
+) -> Result<Box<dyn VtEngine>, String> {
     kind.ensure_available()?;
-    Ok(select_vt_engine(kind, cols, rows))
+    Ok(select_vt_engine(kind, cols, rows, colors))
 }
 
 pub fn default_vt_engine_kind() -> VtEngineKind {
@@ -232,10 +246,10 @@ pub fn default_vt_engine_kind() -> VtEngineKind {
 }
 
 #[cfg(feature = "ghostty-vt")]
-fn select_vt_engine(kind: VtEngineKind, cols: u16, rows: u16) -> Box<dyn VtEngine> {
+fn select_vt_engine(kind: VtEngineKind, cols: u16, rows: u16, colors: TerminalColors) -> Box<dyn VtEngine> {
     match kind {
         VtEngineKind::Passthrough => Box::new(passthrough::PassthroughVtEngine::new(cols, rows)),
-        VtEngineKind::Ghostty => Box::new(ghostty::GhosttyVtEngine::new(cols, rows)),
+        VtEngineKind::Ghostty => Box::new(ghostty::GhosttyVtEngine::new_with_colors(cols, rows, colors)),
     }
 }
 
@@ -245,7 +259,7 @@ fn select_default_vt_engine_kind() -> VtEngineKind {
 }
 
 #[cfg(not(feature = "ghostty-vt"))]
-fn select_vt_engine(kind: VtEngineKind, cols: u16, rows: u16) -> Box<dyn VtEngine> {
+fn select_vt_engine(kind: VtEngineKind, cols: u16, rows: u16, _colors: TerminalColors) -> Box<dyn VtEngine> {
     match kind {
         VtEngineKind::Passthrough => Box::new(passthrough::PassthroughVtEngine::new(cols, rows)),
         VtEngineKind::Ghostty => unreachable!("availability check should reject ghostty when feature-disabled"),
@@ -259,7 +273,7 @@ fn select_default_vt_engine_kind() -> VtEngineKind {
 
 #[cfg(test)]
 mod tests {
-    use super::VtEngineKind;
+    use super::{TerminalColors, VtEngineKind};
 
     #[cfg(feature = "ghostty-vt")]
     #[test]
@@ -276,13 +290,13 @@ mod tests {
 
     #[test]
     fn passthrough_engine_is_always_available() {
-        assert!(super::make_vt_engine(VtEngineKind::Passthrough, 80, 24).is_ok());
+        assert!(super::make_vt_engine_with_colors(VtEngineKind::Passthrough, 80, 24, TerminalColors::default()).is_ok());
     }
 
     #[cfg(not(feature = "ghostty-vt"))]
     #[test]
     fn ghostty_engine_is_rejected_when_feature_disabled() {
-        let err = match super::make_vt_engine(VtEngineKind::Ghostty, 80, 24) {
+        let err = match super::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, TerminalColors::default()) {
             Ok(_) => panic!("ghostty should be unavailable"),
             Err(err) => err,
         };

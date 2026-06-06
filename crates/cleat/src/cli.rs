@@ -7,7 +7,7 @@ use crate::{
     protocol::{WaitCondition, WaitStatus},
     runtime::SessionMetadata,
     server::{EndBound, FallbackReason, SessionService, StartBound},
-    vt::VtEngineKind,
+    vt::{Rgb, TerminalColors, VtEngineKind},
 };
 
 #[derive(Debug, Parser)]
@@ -334,6 +334,12 @@ resolved through the live daemon socket. \n\
         cwd: Option<PathBuf>,
         #[arg(long, env = "CLEAT_RECORD")]
         record: bool,
+        #[arg(long, hide = true, value_parser = parse_rgb)]
+        color_foreground: Option<Rgb>,
+        #[arg(long, hide = true, value_parser = parse_rgb)]
+        color_background: Option<Rgb>,
+        #[arg(long, hide = true, value_parser = parse_rgb)]
+        color_cursor: Option<Rgb>,
     },
 }
 
@@ -634,8 +640,19 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
         }
-        Command::Serve { id, vt, cmd, cwd, record } => {
-            let session = SessionMetadata { id, vt_engine: vt, cwd, cmd, record };
+        Command::Serve { id, vt, cmd, cwd, record, color_foreground, color_background, color_cursor } => {
+            let session = SessionMetadata {
+                id,
+                vt_engine: vt,
+                cwd,
+                cmd,
+                record,
+                colors: TerminalColors {
+                    default_foreground: color_foreground,
+                    default_background: color_background,
+                    default_cursor: color_cursor,
+                },
+            };
             match service.serve(&session) {
                 Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),
@@ -836,6 +853,17 @@ fn parse_signal_target(target: &str) -> Result<crate::protocol::SignalTarget, St
         "tree" => Err("tree signal target is not yet implemented".to_string()),
         other => Err(format!("unknown signal target: {other}")),
     }
+}
+
+fn parse_rgb(value: &str) -> Result<Rgb, String> {
+    let value = value.strip_prefix('#').unwrap_or(value);
+    if value.len() != 6 {
+        return Err("RGB colors must use six hex digits".to_string());
+    }
+    let r = u8::from_str_radix(&value[0..2], 16).map_err(|err| format!("parse red channel: {err}"))?;
+    let g = u8::from_str_radix(&value[2..4], 16).map_err(|err| format!("parse green channel: {err}"))?;
+    let b = u8::from_str_radix(&value[4..6], 16).map_err(|err| format!("parse blue channel: {err}"))?;
+    Ok(Rgb { r, g, b })
 }
 
 fn parse_repeat(value: &str) -> Result<usize, String> {

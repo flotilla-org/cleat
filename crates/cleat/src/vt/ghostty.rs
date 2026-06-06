@@ -5,8 +5,8 @@ use super::{
         RowIteratorHandle, TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_SGR_MOUSE,
         GHOSTTY_MODE_SGR_PIXELS_MOUSE,
     },
-    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, ResolvedCell, Rgb, ScreenGrid, TerminalModeState,
-    VtEngine,
+    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, ResolvedCell, Rgb, ScreenGrid, TerminalColors,
+    TerminalModeState, VtEngine,
 };
 use crate::provider::{TerminalScrollbackExtent, TerminalScrollbarState, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome};
 
@@ -25,7 +25,13 @@ pub struct GhosttyVtEngine {
 
 impl GhosttyVtEngine {
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::new_with_colors(cols, rows, TerminalColors::default())
+    }
+
+    pub fn new_with_colors(cols: u16, rows: u16, colors: TerminalColors) -> Self {
         let terminal = TerminalHandle::new(cols, rows, DEFAULT_MAX_SCROLLBACK).expect("create ghostty terminal");
+        let mut terminal = terminal;
+        apply_colors(&mut terminal, colors).expect("configure ghostty terminal colors");
         let render_state = RenderStateHandle::new().expect("create ghostty render state");
         let row_iter = RowIteratorHandle::new().expect("create ghostty row iterator");
         let row_cells = RowCellsHandle::new().expect("create ghostty row cells");
@@ -49,10 +55,22 @@ impl GhosttyVtEngine {
             GhosttyRenderStateCursorVisualStyle::BlockHollow => CursorStyle::BlockHollow,
         };
 
+        let blink = self.render_state.get_cursor_blinking()?;
         let wide_tail = self.render_state.get_cursor_viewport_wide_tail()?;
 
-        Ok(CursorState { col, row, visible, style, wide_tail })
+        Ok(CursorState { col, row, visible, style, blink, wide_tail })
     }
+}
+
+fn apply_colors(terminal: &mut TerminalHandle, colors: TerminalColors) -> Result<(), String> {
+    terminal.set_default_foreground(colors.default_foreground.map(rgb_to_ghostty))?;
+    terminal.set_default_background(colors.default_background.map(rgb_to_ghostty))?;
+    terminal.set_default_cursor(colors.default_cursor.map(rgb_to_ghostty))?;
+    Ok(())
+}
+
+fn rgb_to_ghostty(rgb: Rgb) -> ghostty_ffi::GhosttyColorRgb {
+    ghostty_ffi::GhosttyColorRgb { r: rgb.r, g: rgb.g, b: rgb.b }
 }
 
 impl VtEngine for GhosttyVtEngine {
@@ -114,7 +132,10 @@ impl VtEngine for GhosttyVtEngine {
         let dirty = self.render_state.get_dirty()?;
         if dirty == GhosttyRenderStateDirty::False {
             if let Some(ref cached) = self.cached_grid {
-                return Ok(cached.clone());
+                let mut grid = cached.clone();
+                grid.cursor = self.read_cursor_state()?;
+                self.cached_grid = Some(grid.clone());
+                return Ok(grid);
             }
         }
 

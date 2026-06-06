@@ -20,10 +20,10 @@ use crate::{
     runtime::RuntimeLayout,
     session::{ensure_session_started, session_socket_path},
     session_runtime::{PtyOutput, SessionRuntime},
-    vt::{self, VtEngineKind},
+    vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 1;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 2;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -149,6 +149,7 @@ pub struct CleatSessionDesc {
     pub cwd: *const u8,
     pub cwd_len: usize,
     pub record: bool,
+    pub colors: *const CleatSessionColors,
 }
 
 #[repr(C)]
@@ -157,6 +158,18 @@ pub struct CleatRgb {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleatSessionColors {
+    pub size: usize,
+    pub has_foreground: bool,
+    pub foreground: CleatRgb,
+    pub has_background: bool,
+    pub background: CleatRgb,
+    pub has_cursor: bool,
+    pub cursor: CleatRgb,
 }
 
 #[repr(C)]
@@ -177,6 +190,7 @@ pub struct CleatCursor {
     pub row: u16,
     pub visible: bool,
     pub style: u32,
+    pub blink: bool,
     pub wide_tail: bool,
 }
 
@@ -580,8 +594,11 @@ pub unsafe extern "C" fn cleat_provider_open(desc: *const CleatProviderDesc) -> 
 /// # Safety
 ///
 /// `provider` must be a valid provider pointer. `user_data` is stored
-/// opaquely and passed back to `wake` when provider state transitions from
-/// clean to dirty.
+/// opaquely and passed back to `wake` when provider state transitions to dirty.
+/// The callback is a scheduling nudge: it may run synchronously from a Cleat
+/// API call today, and future backends may call it from provider-owned IO
+/// threads. Callers should bounce to their session-owner thread before calling
+/// session APIs.
 #[no_mangle]
 pub unsafe extern "C" fn cleat_provider_set_wake_callback(provider: *mut CleatProvider, wake: CleatWakeFn, user_data: *mut c_void) {
     if let Some(provider) = unsafe { provider.as_mut() } {
@@ -627,6 +644,7 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         cwd: ptr::null(),
         cwd_len: 0,
         record: false,
+        colors: ptr::null(),
     });
     let geometry = TerminalGeometry::from_cell_size(desc.cols.max(1), desc.rows.max(1), desc.cell_width_px, desc.cell_height_px);
     let backend = match provider.backend {
@@ -1043,6 +1061,10 @@ pub unsafe extern "C" fn cleat_session_write_bytes(session: *mut CleatSession, b
 /// # Safety
 ///
 /// `session` must be a valid session pointer.
+///
+/// Services provider/session progress and returns known dirty state. For the
+/// in-process backend this currently pumps PTY output; `cleat_session_dirty`
+/// only reports already-known state.
 #[no_mangle]
 pub unsafe extern "C" fn cleat_session_poll(session: *mut CleatSession) -> CleatDirtyState {
     let session = match unsafe { session.as_mut() } {
@@ -1069,6 +1091,8 @@ pub unsafe extern "C" fn cleat_session_poll(session: *mut CleatSession) -> Cleat
 /// # Safety
 ///
 /// `session` must be a valid session pointer.
+///
+/// Returns already-known dirty state without pumping provider IO.
 #[no_mangle]
 pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> CleatDirtyState {
     unsafe { session.as_ref() }
@@ -1359,13 +1383,18 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let layout = RuntimeLayout::new(provider.runtime_root.clone());
     let vt_engine = vt_engine_from_tag(desc.vt_engine)?;
     vt_engine.ensure_available()?;
+    let colors = session_colors_from_desc(desc);
 
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
     let cwd = read_optional_utf8(desc.cwd, desc.cwd_len).map_err(|err| format!("cwd is not valid UTF-8: {err}"))?.map(PathBuf::from);
     let mut metadata = layout.create_session(None, vt_engine, cwd, cmd)?;
     metadata.record = desc.record;
     let session_dir = layout.root().join(&metadata.id);
-    let mut runtime = SessionRuntime::spawn(session_dir, &metadata, vt::make_vt_engine(vt_engine, desc.cols.max(1), desc.rows.max(1))?)?;
+    let mut runtime = SessionRuntime::spawn(
+        session_dir,
+        &metadata,
+        vt::make_vt_engine_with_colors(vt_engine, desc.cols.max(1), desc.rows.max(1), colors)?,
+    )?;
     runtime.resize(desc.cols.max(1), desc.rows.max(1))?;
 
     Ok(InProcessSession { runtime, observation: ObservationState::new(desc.rows.max(1)), exited: false })
@@ -1374,9 +1403,10 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
 fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
     let layout = RuntimeLayout::new(provider.runtime_root.clone());
     let vt_engine = vt_engine_from_tag(desc.vt_engine)?;
+    let colors = session_colors_from_desc(desc);
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
     let cwd = read_optional_utf8(desc.cwd, desc.cwd_len).map_err(|err| format!("cwd is not valid UTF-8: {err}"))?.map(PathBuf::from);
-    let metadata = ensure_session_started(&layout, None, Some(vt_engine), cwd, cmd, desc.record)?;
+    let metadata = ensure_session_started(&layout, None, Some(vt_engine), cwd, cmd, desc.record, colors)?;
     let mut session = DaemonSession {
         id: metadata.id,
         runtime_root: provider.runtime_root.clone(),
@@ -1394,6 +1424,24 @@ fn vt_engine_from_tag(tag: u32) -> Result<VtEngineKind, String> {
         CLEAT_PROVIDER_VT_GHOSTTY => Ok(VtEngineKind::Ghostty),
         other => Err(format!("unsupported vt engine tag {other}")),
     }
+}
+
+fn session_colors_from_desc(desc: CleatSessionDesc) -> TerminalColors {
+    let Some(colors) = (unsafe { desc.colors.as_ref() }) else {
+        return TerminalColors::default();
+    };
+    if colors.size < std::mem::size_of::<CleatSessionColors>() {
+        return TerminalColors::default();
+    }
+    TerminalColors {
+        default_foreground: colors.has_foreground.then_some(rgb_from_ffi(colors.foreground)),
+        default_background: colors.has_background.then_some(rgb_from_ffi(colors.background)),
+        default_cursor: colors.has_cursor.then_some(rgb_from_ffi(colors.cursor)),
+    }
+}
+
+fn rgb_from_ffi(rgb: CleatRgb) -> Rgb {
+    Rgb { r: rgb.r, g: rgb.g, b: rgb.b }
 }
 
 fn daemon_resize(session: &mut DaemonSession, cols: u16, rows: u16) -> Result<(), String> {
@@ -1469,6 +1517,7 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
             row: snapshot.cursor.row,
             visible: snapshot.cursor.visible,
             style: cursor_style_from_name(&snapshot.cursor.style)?,
+            blink: snapshot.cursor.blink,
             wide_tail: snapshot.cursor.wide_tail,
         },
         dirty: dirty_from_name(&snapshot.dirty)?,
@@ -1665,6 +1714,7 @@ fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> T
             row: 0,
             visible: true,
             style: TerminalCursorStyle::Block,
+            blink: false,
             wide_tail: false,
         },
         dirty,
@@ -1683,6 +1733,7 @@ fn cursor_to_ffi(cursor: TerminalCursor) -> CleatCursor {
             TerminalCursorStyle::Underline => CLEAT_CURSOR_STYLE_UNDERLINE,
             TerminalCursorStyle::BlockHollow => CLEAT_CURSOR_STYLE_BLOCK_HOLLOW,
         },
+        blink: cursor.blink,
         wide_tail: cursor.wide_tail,
     }
 }
@@ -1729,6 +1780,37 @@ mod tests {
         assert!(observation.mark_observed(3));
         assert_eq!(observation.dirty(), DirtyState::Clean);
         assert!(!observation.mark_observed(4));
+    }
+
+    #[test]
+    fn session_desc_colors_convert_to_terminal_defaults() {
+        let colors = CleatSessionColors {
+            size: std::mem::size_of::<CleatSessionColors>(),
+            has_foreground: true,
+            foreground: CleatRgb { r: 1, g: 2, b: 3 },
+            has_background: true,
+            background: CleatRgb { r: 4, g: 5, b: 6 },
+            has_cursor: false,
+            cursor: CleatRgb { r: 7, g: 8, b: 9 },
+        };
+        let converted = session_colors_from_desc(CleatSessionDesc { colors: &colors, ..CleatSessionDesc::default() });
+
+        assert_eq!(converted.default_foreground, Some(Rgb { r: 1, g: 2, b: 3 }));
+        assert_eq!(converted.default_background, Some(Rgb { r: 4, g: 5, b: 6 }));
+        assert_eq!(converted.default_cursor, None);
+    }
+
+    #[test]
+    fn undersized_session_colors_are_ignored() {
+        let colors = CleatSessionColors {
+            size: 0,
+            has_foreground: true,
+            foreground: CleatRgb { r: 1, g: 2, b: 3 },
+            ..CleatSessionColors::default()
+        };
+        let converted = session_colors_from_desc(CleatSessionDesc { colors: &colors, ..CleatSessionDesc::default() });
+
+        assert_eq!(converted, TerminalColors::default());
     }
 
     #[test]

@@ -449,6 +449,7 @@ mod tests {
             cwd: None,
             cmd: Some("true".to_string()),
             record: true,
+            colors: crate::vt::TerminalColors::default(),
         };
 
         let err = match SessionRuntime::spawn(temp.path().to_path_buf(), &session, Box::new(PassthroughVtEngine::new(80, 24))) {

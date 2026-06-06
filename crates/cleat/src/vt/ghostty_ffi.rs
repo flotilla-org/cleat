@@ -411,6 +411,11 @@ pub enum GhosttyTerminalOption {
     ColorScheme = 7,
     DeviceAttributes = 8,
     Title = 9,
+    Pwd = 10,
+    ColorForeground = 11,
+    ColorBackground = 12,
+    ColorCursor = 13,
+    ColorPalette = 14,
 }
 
 /// Callback fired synchronously from `ghostty_terminal_vt_write` when the
@@ -636,6 +641,24 @@ impl TerminalHandle {
         unsafe { ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len()) };
     }
 
+    pub fn set_default_foreground(&mut self, color: Option<GhosttyColorRgb>) -> Result<(), String> {
+        self.set_color(GhosttyTerminalOption::ColorForeground, color, "ColorForeground")
+    }
+
+    pub fn set_default_background(&mut self, color: Option<GhosttyColorRgb>) -> Result<(), String> {
+        self.set_color(GhosttyTerminalOption::ColorBackground, color, "ColorBackground")
+    }
+
+    pub fn set_default_cursor(&mut self, color: Option<GhosttyColorRgb>) -> Result<(), String> {
+        self.set_color(GhosttyTerminalOption::ColorCursor, color, "ColorCursor")
+    }
+
+    fn set_color(&mut self, option: GhosttyTerminalOption, color: Option<GhosttyColorRgb>, label: &str) -> Result<(), String> {
+        let value = color.as_ref().map_or(ptr::null(), |color| color as *const GhosttyColorRgb as *const c_void);
+        let result = unsafe { ghostty_terminal_set(self.raw, option, value) };
+        check_result(result, &format!("ghostty_terminal_set({label})"))
+    }
+
     pub fn active_screen(&self) -> Result<GhosttyTerminalScreen, String> {
         let mut screen = GhosttyTerminalScreen::Primary;
         let result = unsafe {
@@ -837,6 +860,15 @@ impl RenderStateHandle {
         };
         check_result(result, "ghostty_render_state_get(CursorVisualStyle)")?;
         Ok(style)
+    }
+
+    pub fn get_cursor_blinking(&self) -> Result<bool, String> {
+        let mut blinking = false;
+        let result = unsafe {
+            ghostty_render_state_get(self.raw, GhosttyRenderStateData::CursorBlinking, &mut blinking as *mut bool as *mut c_void)
+        };
+        check_result(result, "ghostty_render_state_get(CursorBlinking)")?;
+        Ok(blinking)
     }
 
     pub fn get_cursor_viewport_wide_tail(&self) -> Result<bool, String> {

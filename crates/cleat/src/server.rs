@@ -81,7 +81,7 @@ impl SessionService {
         cmd: Option<String>,
         record: bool,
     ) -> Result<SessionInfo, String> {
-        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, record)?;
+        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, record, crate::vt::TerminalColors::default())?;
         // If the daemon was already running, get real config via inspect.
         if let Ok(result) = self.inspect(&session.id) {
             return Ok(session_info_from_inspect(result, SessionStatus::Detached));
@@ -310,9 +310,9 @@ impl SessionService {
                 return Err(format!("session {id} has a stale daemon (cleaned up)"));
             }
             let vt_engine = vt_engine.unwrap_or_else(crate::vt::default_vt_engine_kind);
-            crate::runtime::SessionMetadata { id, vt_engine, cwd, cmd, record: false }
+            crate::runtime::SessionMetadata { id, vt_engine, cwd, cmd, record: false, colors: crate::vt::TerminalColors::default() }
         } else {
-            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, false)?
+            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, false, crate::vt::TerminalColors::default())?
         };
         // Get real config from the daemon before attaching (which takes the foreground slot).
         let info = if let Ok(result) = self.inspect(&session.id) {

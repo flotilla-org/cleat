@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 1u
+#define CLEAT_PROVIDER_ABI_VERSION 2u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -120,6 +120,7 @@ typedef struct cleat_session_desc {
     const uint8_t *cwd;
     size_t cwd_len;
     bool record;
+    const struct cleat_session_colors *colors;
 } cleat_session_desc;
 
 typedef struct cleat_rgb {
@@ -127,6 +128,22 @@ typedef struct cleat_rgb {
     uint8_t g;
     uint8_t b;
 } cleat_rgb;
+
+/*
+ * Optional terminal default colours for session creation. Set size to
+ * sizeof(cleat_session_colors). A false has_* flag leaves that default unset.
+ * Snapshots still contain resolved RGB cells after the provider applies these
+ * defaults.
+ */
+typedef struct cleat_session_colors {
+    size_t size;
+    bool has_foreground;
+    cleat_rgb foreground;
+    bool has_background;
+    cleat_rgb background;
+    bool has_cursor;
+    cleat_rgb cursor;
+} cleat_session_colors;
 
 typedef struct cleat_cell {
     const uint32_t *graphemes;
@@ -142,6 +159,7 @@ typedef struct cleat_cursor {
     uint16_t row;
     bool visible;
     uint32_t style;
+    bool blink;
     bool wide_tail;
 } cleat_cursor;
 
@@ -236,9 +254,11 @@ uint32_t cleat_provider_abi_version(void);
 
 cleat_provider *cleat_provider_open(const cleat_provider_desc *desc);
 /*
- * Registers an edge-triggered wake callback. The provider calls it when a
- * session transitions from observed/clean to dirty; callers should poll
- * sessions to find the one that needs attention.
+ * Registers an edge-triggered provider wake callback. The callback is a
+ * scheduling nudge, not a rendering callback: it may be invoked synchronously
+ * from the Cleat call that dirtied a session, and future backends may invoke it
+ * from provider-owned IO threads. Keep it non-blocking and bounce to the
+ * session-owner/UI thread before calling session APIs.
  */
 void cleat_provider_set_wake_callback(cleat_provider *provider, cleat_wake_fn *wake, void *user_data);
 void cleat_provider_close(cleat_provider *provider);
@@ -259,7 +279,15 @@ bool cleat_session_send_input_ex(cleat_session *session, const cleat_input_event
 bool cleat_session_send_input_batch(cleat_session *session, const cleat_input_event *events, size_t event_count, cleat_input_result *out);
 bool cleat_session_write_bytes(cleat_session *session, const uint8_t *bytes, size_t size);
 
+/*
+ * Services provider/session progress and returns known dirty state. For the
+ * in-process backend this currently pumps PTY output; cleat_session_dirty does
+ * not. Call this from the session-owner thread.
+ */
 cleat_dirty_state cleat_session_poll(cleat_session *session);
+/*
+ * Returns already-known dirty state without pumping provider IO.
+ */
 cleat_dirty_state cleat_session_dirty(const cleat_session *session);
 /*
  * Marks a render_generation returned by cleat_session_snapshot as observed.

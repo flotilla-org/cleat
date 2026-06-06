@@ -168,6 +168,41 @@ fn vt_ghostty_screen_grid_captures_cursor_position() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_screen_grid_refreshes_clean_cached_cursor_position() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    engine.feed(b"Hello").expect("feed bytes");
+    let initial = engine.screen_grid().expect("initial grid");
+    assert_eq!(initial.cursor.col, 5);
+
+    engine.feed(b"\x1b[2D").expect("move cursor left");
+    let moved = engine.screen_grid().expect("moved grid");
+    assert_eq!(moved.cursor.col, 3);
+
+    let cached = engine.screen_grid().expect("cached grid");
+    assert_eq!(cached.cursor.col, 3);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_reports_cursor_blink_policy() {
+    use cleat::vt::CursorStyle;
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    engine.feed(b"\x1b[5 q").expect("set blinking bar cursor");
+    let blinking = engine.screen_grid().expect("blinking grid");
+    assert_eq!(blinking.cursor.style, CursorStyle::Bar);
+    assert!(blinking.cursor.blink);
+
+    engine.feed(b"\x1b[6 q").expect("set steady bar cursor");
+    let steady = engine.screen_grid().expect("steady grid");
+    assert_eq!(steady.cursor.style, CursorStyle::Bar);
+    assert!(!steady.cursor.blink);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_screen_grid_row_text_returns_row_content() {
     let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(10, 3);
 
@@ -290,6 +325,23 @@ fn vt_ghostty_screen_grid_resolves_explicit_fg_and_bg_colors() {
     let untouched_cell = grid.cell(39, 4).unwrap();
     assert_eq!(default_cell.fg, untouched_cell.fg, "post-reset fg should match untouched cell default");
     assert_eq!(default_cell.bg, untouched_cell.bg, "post-reset bg should match untouched cell default");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_uses_configured_default_colors() {
+    use cleat::vt::{Rgb, TerminalColors};
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new_with_colors(4, 2, TerminalColors {
+        default_foreground: Some(Rgb { r: 0x12, g: 0x34, b: 0x56 }),
+        default_background: Some(Rgb { r: 0xAB, g: 0xCD, b: 0xEF }),
+        default_cursor: Some(Rgb { r: 0xFE, g: 0xDC, b: 0xBA }),
+    });
+
+    let grid = engine.screen_grid().expect("screen grid");
+    let untouched_cell = grid.cell(3, 1).unwrap();
+    assert_eq!(untouched_cell.fg, Rgb { r: 0x12, g: 0x34, b: 0x56 });
+    assert_eq!(untouched_cell.bg, Rgb { r: 0xAB, g: 0xCD, b: 0xEF });
 }
 
 #[cfg(feature = "ghostty-vt")]

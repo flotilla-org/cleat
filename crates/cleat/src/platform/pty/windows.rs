@@ -422,6 +422,7 @@ mod tests {
             cwd: None,
             cmd: Some("echo ready".into()),
             record: false,
+            colors: crate::vt::TerminalColors::default(),
         };
 
         let command = windows_shell_command(&session);

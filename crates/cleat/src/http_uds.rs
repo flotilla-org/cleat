@@ -276,6 +276,8 @@ pub(crate) struct CursorResponse {
     pub row: u16,
     pub visible: bool,
     pub style: String,
+    #[serde(default)]
+    pub blink: bool,
     pub wide_tail: bool,
 }
 
@@ -516,6 +518,7 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
             row: snapshot.cursor.row,
             visible: snapshot.cursor.visible,
             style: cursor_style_name(snapshot.cursor.style).to_string(),
+            blink: snapshot.cursor.blink,
             wide_tail: snapshot.cursor.wide_tail,
         },
         dirty: dirty_name(snapshot.dirty).to_string(),

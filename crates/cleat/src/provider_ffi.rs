@@ -12,7 +12,7 @@ use crate::{
     },
     runtime::RuntimeLayout,
     session::{ensure_session_started, session_socket_path},
-    session_runtime::SessionRuntime,
+    session_runtime::{PtyOutput, SessionRuntime},
     vt::{self, VtEngineKind},
 };
 
@@ -461,6 +461,27 @@ pub unsafe extern "C" fn cleat_session_write_bytes(session: *mut CleatSession, b
 ///
 /// `session` must be a valid session pointer.
 #[no_mangle]
+pub unsafe extern "C" fn cleat_session_poll(session: *mut CleatSession) -> CleatDirtyState {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return CleatDirtyState::Full,
+    };
+    match &mut session.backend {
+        SessionBackend::Mock(mock) => mock.dirty.into(),
+        SessionBackend::InProcess(in_process) => {
+            if pump_in_process_session(in_process).is_err() {
+                in_process.dirty = DirtyState::Full;
+            }
+            in_process.dirty.into()
+        }
+        SessionBackend::Daemon(daemon) => daemon.dirty.into(),
+    }
+}
+
+/// # Safety
+///
+/// `session` must be a valid session pointer.
+#[no_mangle]
 pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> CleatDirtyState {
     unsafe { session.as_ref() }
         .map(|session| match &session.backend {
@@ -496,18 +517,7 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
             snapshot
         }
         SessionBackend::InProcess(in_process) => {
-            let mut exited_now = false;
-            if let Ok(Some(exit_code)) = in_process.runtime.exit_code_if_exited() {
-                in_process.runtime.record_exit_code(exit_code);
-                in_process.exited = true;
-                exited_now = true;
-            }
-            let output = if exited_now {
-                in_process.runtime.drain_output_after_exit(false)
-            } else {
-                in_process.runtime.read_available_output(false)
-            };
-            if output.is_err() {
+            if pump_in_process_session(in_process).is_err() {
                 return false;
             }
             let dirty = in_process.dirty;
@@ -530,6 +540,30 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
     *out = owned.snapshot;
     session.last_snapshot = Some(owned);
     true
+}
+
+fn pump_in_process_session(in_process: &mut InProcessSession) -> Result<(), String> {
+    let mut exited_now = false;
+    if !in_process.exited {
+        if let Some(exit_code) = in_process.runtime.exit_code_if_exited()? {
+            in_process.runtime.record_exit_code(exit_code);
+            in_process.exited = true;
+            exited_now = true;
+        }
+    }
+    let output = if exited_now {
+        in_process.runtime.drain_output_after_exit(false)?
+    } else if in_process.exited {
+        PtyOutput { chunks: Vec::new() }
+    } else {
+        in_process.runtime.read_available_output(false)?
+    };
+    if exited_now {
+        in_process.dirty = DirtyState::Full;
+    } else if !output.chunks.is_empty() && in_process.dirty == DirtyState::Clean {
+        in_process.dirty = DirtyState::Partial;
+    }
+    Ok(())
 }
 
 /// # Safety

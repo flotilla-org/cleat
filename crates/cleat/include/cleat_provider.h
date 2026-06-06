@@ -131,6 +131,7 @@ bool cleat_session_resize(cleat_session *session, uint16_t cols, uint16_t rows, 
 bool cleat_session_send_input(cleat_session *session, const cleat_input_event *event);
 bool cleat_session_write_bytes(cleat_session *session, const uint8_t *bytes, size_t size);
 
+cleat_dirty_state cleat_session_poll(cleat_session *session);
 cleat_dirty_state cleat_session_dirty(const cleat_session *session);
 
 /*

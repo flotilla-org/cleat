@@ -376,6 +376,23 @@ fn vt_ghostty_render_update_exposes_kitty_image_resource_and_placement() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_kitty_image_placement_pixel_size_uses_cell_size() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+    engine.set_cell_size(8, 16).expect("set cell size");
+
+    engine.feed(b"\x1b_Ga=T,t=d,f=24,i=2,p=1,s=1,v=2,c=10,r=1;////////\x1b\\").expect("feed kitty image");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+    assert_eq!(update.image_placements.len(), 1);
+    let placement = &update.image_placements[0];
+    assert_eq!(placement.grid_cols, 10);
+    assert_eq!(placement.grid_rows, 1);
+    assert_eq!(placement.pixel_width, 80);
+    assert_eq!(placement.pixel_height, 16);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_render_update_partial_emits_row_replace_ops_for_dirty_rows() {
     let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
 

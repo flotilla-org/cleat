@@ -26,6 +26,8 @@ pub struct GhosttyVtEngine {
     row_cells: RowCellsHandle,
     cols: u16,
     rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
     saw_output: bool,
     cached_grid: Option<ScreenGrid>,
 }
@@ -43,7 +45,18 @@ impl GhosttyVtEngine {
         let render_state = RenderStateHandle::new().expect("create ghostty render state");
         let row_iter = RowIteratorHandle::new().expect("create ghostty row iterator");
         let row_cells = RowCellsHandle::new().expect("create ghostty row cells");
-        Self { terminal, render_state, row_iter, row_cells, cols, rows, saw_output: false, cached_grid: None }
+        Self {
+            terminal,
+            render_state,
+            row_iter,
+            row_cells,
+            cols,
+            rows,
+            cell_width_px: 1,
+            cell_height_px: 1,
+            saw_output: false,
+            cached_grid: None,
+        }
     }
 
     fn read_cursor_state(&self) -> Result<CursorState, String> {
@@ -191,10 +204,16 @@ impl VtEngine for GhosttyVtEngine {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
-        self.terminal.resize(cols, rows)?;
+        self.terminal.resize(cols, rows, self.cell_width_px, self.cell_height_px)?;
         self.cols = cols;
         self.rows = rows;
         Ok(())
+    }
+
+    fn set_cell_size(&mut self, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
+        self.cell_width_px = cell_width_px.max(1);
+        self.cell_height_px = cell_height_px.max(1);
+        self.terminal.resize(self.cols, self.rows, self.cell_width_px, self.cell_height_px)
     }
 
     fn supports_replay(&self) -> bool {

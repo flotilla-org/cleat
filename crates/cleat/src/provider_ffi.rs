@@ -645,6 +645,11 @@ enum InProcessCommand {
         rows: u16,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    SetCellSize {
+        cell_width_px: u32,
+        cell_height_px: u32,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
     WriteInput {
         bytes: Vec<u8>,
         reply: mpsc::Sender<Result<(), String>>,
@@ -669,9 +674,6 @@ enum InProcessCommand {
         callback: CleatImageResourceDataFn,
         user_data: usize,
         reply: mpsc::Sender<Result<bool, String>>,
-    },
-    MarkFull {
-        reply: mpsc::Sender<()>,
     },
     Dirty {
         reply: mpsc::Sender<DirtyState>,
@@ -1157,15 +1159,38 @@ pub unsafe extern "C" fn cleat_session_update_geometry(session: *mut CleatSessio
     if session.geometry == geometry {
         return true;
     }
-    session.geometry = geometry;
     match &mut session.backend {
-        SessionBackend::Mock(mock) => mark_full_and_wake(&mut mock.observation, mock.rows, &session.wake),
-        SessionBackend::InProcess(in_process) => {
-            in_process_request(in_process, |reply| InProcessCommand::MarkFull { reply }, ());
+        SessionBackend::Mock(mock) => {
+            session.geometry = geometry;
+            mark_full_and_wake(&mut mock.observation, mock.rows, &session.wake);
         }
-        SessionBackend::Daemon(daemon) => mark_full_and_wake(&mut daemon.observation, 1, &session.wake),
+        SessionBackend::InProcess(in_process) => {
+            let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(geometry);
+            if in_process_request_result(in_process, |reply| InProcessCommand::SetCellSize { cell_width_px, cell_height_px, reply })
+                .is_err()
+            {
+                return false;
+            }
+            session.geometry = geometry;
+        }
+        SessionBackend::Daemon(daemon) => {
+            session.geometry = geometry;
+            mark_full_and_wake(&mut daemon.observation, 1, &session.wake);
+        }
     }
     true
+}
+
+fn geometry_cell_size_to_backend(geometry: TerminalGeometry) -> (u32, u32) {
+    (cell_px_to_backend(geometry.cell_width_px), cell_px_to_backend(geometry.cell_height_px))
+}
+
+fn cell_px_to_backend(value: f32) -> u32 {
+    if value.is_finite() && value > 0.0 {
+        value.round().max(1.0).min(u32::MAX as f32) as u32
+    } else {
+        1
+    }
 }
 
 /// # Safety
@@ -1962,6 +1987,13 @@ fn in_process_actor_handle_command(
             });
             let _ = reply.send(result);
         }
+        InProcessCommand::SetCellSize { cell_width_px, cell_height_px, reply } => {
+            let result = runtime.set_cell_size(cell_width_px, cell_height_px).map(|_| {
+                let rows = runtime.inspect(false).terminal.rows;
+                mark_full_and_wake(observation, rows, wake);
+            });
+            let _ = reply.send(result);
+        }
         InProcessCommand::WriteInput { bytes, reply } => {
             let _ = reply.send(runtime.write_input(&bytes));
         }
@@ -2001,11 +2033,6 @@ fn in_process_actor_handle_command(
                 None => Ok(false),
             };
             let _ = reply.send(result);
-        }
-        InProcessCommand::MarkFull { reply } => {
-            let rows = runtime.inspect(false).terminal.rows;
-            mark_full_and_wake(observation, rows, wake);
-            let _ = reply.send(());
         }
         InProcessCommand::Dirty { reply } => {
             let _ = reply.send(observation.dirty());
@@ -2099,13 +2126,16 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let session_dir = layout.root().join(&metadata.id);
     let cols = desc.cols.max(1);
     let rows = desc.rows.max(1);
+    let initial_geometry = TerminalGeometry::from_cell_size(cols, rows, desc.cell_width_px, desc.cell_height_px);
+    let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(initial_geometry);
     let wake = provider.wake.clone();
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let result = (|| {
-            let mut runtime =
-                SessionRuntime::spawn(session_dir, &metadata, vt::make_vt_engine_with_colors(vt_engine, cols, rows, colors)?)?;
+            let mut vt_engine = vt::make_vt_engine_with_colors(vt_engine, cols, rows, colors)?;
+            vt_engine.set_cell_size(cell_width_px, cell_height_px)?;
+            let mut runtime = SessionRuntime::spawn(session_dir, &metadata, vt_engine)?;
             runtime.resize(cols, rows)?;
             Ok(runtime)
         })();

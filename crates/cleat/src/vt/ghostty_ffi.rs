@@ -826,8 +826,8 @@ impl TerminalHandle {
         Ok(Self { raw, reply_buf })
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
-        let result = unsafe { ghostty_terminal_resize(self.raw, cols, rows, 1, 1) };
+    pub fn resize(&mut self, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
+        let result = unsafe { ghostty_terminal_resize(self.raw, cols, rows, cell_width_px.max(1), cell_height_px.max(1)) };
         check_result(result, "ghostty_terminal_resize")
     }
 

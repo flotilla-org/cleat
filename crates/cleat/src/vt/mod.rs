@@ -204,6 +204,9 @@ impl VtEngineKind {
 pub trait VtEngine {
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String>;
+    fn set_cell_size(&mut self, _cell_width_px: u32, _cell_height_px: u32) -> Result<(), String> {
+        Ok(())
+    }
     fn supports_replay(&self) -> bool;
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;
     fn screen_text(&self) -> Result<String, String>;

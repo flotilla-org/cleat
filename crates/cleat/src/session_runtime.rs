@@ -200,6 +200,10 @@ impl SessionRuntime {
         self.vt_engine.resize(cols, rows)
     }
 
+    pub(crate) fn set_cell_size(&mut self, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
+        self.vt_engine.set_cell_size(cell_width_px, cell_height_px)
+    }
+
     pub(crate) fn inspect(&self, has_controller: bool) -> InspectResult {
         let (cols, rows) = self.vt_engine.size();
         let foreground_pgid = self.pty_child.foreground_pgid();

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ffi::c_void, ptr, slice};
+use std::{collections::BTreeMap, ffi::c_void, io::Cursor, ptr, slice, sync::OnceLock};
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -475,6 +475,18 @@ pub enum GhosttyTerminalOption {
 pub type GhosttyTerminalWritePtyFn = unsafe extern "C" fn(terminal: GhosttyTerminal, userdata: *mut c_void, data: *const u8, len: usize);
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GhosttySizeReportSize {
+    pub rows: u16,
+    pub columns: u16,
+    pub cell_width: u32,
+    pub cell_height: u32,
+}
+
+pub type GhosttyTerminalSizeFn =
+    unsafe extern "C" fn(terminal: GhosttyTerminal, userdata: *mut c_void, out_size: *mut GhosttySizeReportSize) -> bool;
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct GhosttyDeviceAttributesPrimary {
     pub conformance_level: u16,
@@ -545,6 +557,34 @@ pub type GhosttyKittyGraphics = *mut GhosttyKittyGraphicsOpaque;
 pub type GhosttyKittyGraphicsImage = *const GhosttyKittyGraphicsImageOpaque;
 #[allow(dead_code)]
 pub type GhosttyKittyGraphicsPlacementIterator = *mut GhosttyKittyGraphicsPlacementIteratorOpaque;
+
+pub enum GhosttyAllocator {}
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttySysOption {
+    Userdata = 0,
+    DecodePng = 1,
+    Log = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GhosttySysImage {
+    pub width: u32,
+    pub height: u32,
+    pub data: *mut u8,
+    pub data_len: usize,
+}
+
+pub type GhosttySysDecodePngFn = unsafe extern "C" fn(
+    userdata: *mut c_void,
+    allocator: *const GhosttyAllocator,
+    data: *const u8,
+    data_len: usize,
+    out: *mut GhosttySysImage,
+) -> bool;
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -644,6 +684,8 @@ pub struct KittyImagePlacementInfo {
 }
 
 unsafe extern "C" {
+    fn ghostty_alloc(allocator: *const GhosttyAllocator, len: usize) -> *mut u8;
+    fn ghostty_sys_set(option: GhosttySysOption, value: *const c_void) -> GhosttyResult;
     fn ghostty_terminal_new(allocator: *const c_void, terminal: *mut GhosttyTerminal, options: GhosttyTerminalOptions) -> GhosttyResult;
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> GhosttyResult;
@@ -738,11 +780,16 @@ unsafe extern "C" {
 pub struct TerminalHandle {
     raw: GhosttyTerminal,
     /// Heap-allocated so the address stays stable while the C side holds
-    /// a pointer to it via userdata. The callback pushes reply bytes here.
-    /// `Box<Vec<_>>` is deliberate — `Box` gives a stable heap slot for the
-    /// `Vec` header (ptr/len/cap), which is what we hand to libghostty.
-    #[allow(clippy::box_collection)]
-    reply_buf: Box<Vec<u8>>,
+    /// a pointer to it via userdata.
+    effects: Box<TerminalEffects>,
+}
+
+struct TerminalEffects {
+    reply_buf: Vec<u8>,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
 }
 
 /// DA1 feature code for ANSI color (see device.h: GHOSTTY_DA_FEATURE_ANSI_COLOR).
@@ -781,23 +828,128 @@ unsafe extern "C" fn write_pty_trampoline(_terminal: GhosttyTerminal, userdata: 
     if userdata.is_null() || data.is_null() || len == 0 {
         return;
     }
-    // SAFETY: userdata is the raw pointer to a Box<Vec<u8>> we registered
-    // when constructing this terminal; ghostty calls us synchronously from
-    // vt_write, so the Box is live for the duration of the call.
-    let buf = unsafe { &mut *(userdata as *mut Vec<u8>) };
+    // SAFETY: userdata is the raw pointer to a Box<TerminalEffects> we
+    // registered when constructing this terminal; ghostty calls us
+    // synchronously from vt_write, so the Box is live for the duration.
+    let effects = unsafe { &mut *(userdata as *mut TerminalEffects) };
     let slice = unsafe { std::slice::from_raw_parts(data, len) };
-    buf.extend_from_slice(slice);
+    effects.reply_buf.extend_from_slice(slice);
+}
+
+unsafe extern "C" fn size_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void, out_size: *mut GhosttySizeReportSize) -> bool {
+    if userdata.is_null() || out_size.is_null() {
+        return false;
+    }
+    let effects = unsafe { &*(userdata as *const TerminalEffects) };
+    unsafe {
+        *out_size = GhosttySizeReportSize {
+            rows: effects.rows,
+            columns: effects.cols,
+            cell_width: effects.cell_width_px.max(1),
+            cell_height: effects.cell_height_px.max(1),
+        };
+    }
+    true
+}
+
+static GHOSTTY_SYS_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn ensure_sys_callbacks() -> Result<(), String> {
+    GHOSTTY_SYS_INIT
+        .get_or_init(|| {
+            let decode_png_cb: GhosttySysDecodePngFn = decode_png_trampoline;
+            let result = unsafe { ghostty_sys_set(GhosttySysOption::DecodePng, decode_png_cb as *const c_void) };
+            check_result(result, "ghostty_sys_set(DecodePng)")
+        })
+        .clone()
+}
+
+unsafe extern "C" fn decode_png_trampoline(
+    _userdata: *mut c_void,
+    allocator: *const GhosttyAllocator,
+    data: *const u8,
+    data_len: usize,
+    out: *mut GhosttySysImage,
+) -> bool {
+    if data.is_null() || out.is_null() {
+        return false;
+    }
+    let png_bytes = unsafe { slice::from_raw_parts(data, data_len) };
+    let decoded = match decode_png_rgba(png_bytes) {
+        Ok(decoded) => decoded,
+        Err(_) => return false,
+    };
+    let Some(data_len) = decoded.width.checked_mul(decoded.height).and_then(|px| px.checked_mul(4)).map(|len| len as usize) else {
+        return false;
+    };
+    if decoded.rgba.len() != data_len {
+        return false;
+    }
+    let out_data = unsafe { ghostty_alloc(allocator, data_len) };
+    if out_data.is_null() {
+        return false;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(decoded.rgba.as_ptr(), out_data, data_len);
+        *out = GhosttySysImage { width: decoded.width, height: decoded.height, data: out_data, data_len };
+    }
+    true
+}
+
+struct DecodedPng {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+fn decode_png_rgba(data: &[u8]) -> Result<DecodedPng, String> {
+    let mut decoder = png::Decoder::new(Cursor::new(data));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|err| err.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|err| err.to_string())?;
+    let bytes = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => bytes.to_vec(),
+        png::ColorType::Rgb => {
+            let mut out = Vec::with_capacity(pixel_count(info.width, info.height)? * 4);
+            for rgb in bytes.chunks_exact(3) {
+                out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            out
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut out = Vec::with_capacity(pixel_count(info.width, info.height)? * 4);
+            for gray_alpha in bytes.chunks_exact(2) {
+                out.extend_from_slice(&[gray_alpha[0], gray_alpha[0], gray_alpha[0], gray_alpha[1]]);
+            }
+            out
+        }
+        png::ColorType::Grayscale => {
+            let mut out = Vec::with_capacity(pixel_count(info.width, info.height)? * 4);
+            for gray in bytes {
+                out.extend_from_slice(&[*gray, *gray, *gray, 255]);
+            }
+            out
+        }
+        png::ColorType::Indexed => return Err("indexed PNG was not expanded by decoder".to_string()),
+    };
+    Ok(DecodedPng { width: info.width, height: info.height, rgba })
+}
+
+fn pixel_count(width: u32, height: u32) -> Result<usize, String> {
+    width.checked_mul(height).and_then(|pixels| usize::try_from(pixels).ok()).ok_or_else(|| "PNG dimensions overflow".to_string())
 }
 
 impl TerminalHandle {
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self, String> {
+        ensure_sys_callbacks()?;
         let mut raw = ptr::null_mut();
         let result = unsafe { ghostty_terminal_new(ptr::null(), &mut raw, GhosttyTerminalOptions { cols, rows, max_scrollback }) };
         check_result(result, "ghostty_terminal_new")?;
 
-        let mut reply_buf: Box<Vec<u8>> = Box::<Vec<u8>>::default();
-        // The raw pointer to the *inner* Vec<u8> is what we pass as userdata.
-        let userdata_ptr: *mut c_void = (&mut *reply_buf as *mut Vec<u8>).cast();
+        let mut effects = Box::new(TerminalEffects { reply_buf: Vec::new(), cols, rows, cell_width_px: 1, cell_height_px: 1 });
+        let userdata_ptr: *mut c_void = (&mut *effects as *mut TerminalEffects).cast();
 
         let set_user = unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::Userdata, userdata_ptr as *const c_void) };
         if let Err(err) = check_result(set_user, "ghostty_terminal_set(Userdata)") {
@@ -823,12 +975,26 @@ impl TerminalHandle {
             return Err(err);
         }
 
-        Ok(Self { raw, reply_buf })
+        let size_cb: GhosttyTerminalSizeFn = size_trampoline;
+        let set_size = unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::Size, size_cb as *const c_void) };
+        if let Err(err) = check_result(set_size, "ghostty_terminal_set(Size)") {
+            unsafe { ghostty_terminal_free(raw) };
+            return Err(err);
+        }
+
+        Ok(Self { raw, effects })
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
-        let result = unsafe { ghostty_terminal_resize(self.raw, cols, rows, cell_width_px.max(1), cell_height_px.max(1)) };
-        check_result(result, "ghostty_terminal_resize")
+        let cell_width_px = cell_width_px.max(1);
+        let cell_height_px = cell_height_px.max(1);
+        let result = unsafe { ghostty_terminal_resize(self.raw, cols, rows, cell_width_px, cell_height_px) };
+        check_result(result, "ghostty_terminal_resize")?;
+        self.effects.cols = cols;
+        self.effects.rows = rows;
+        self.effects.cell_width_px = cell_width_px;
+        self.effects.cell_height_px = cell_height_px;
+        Ok(())
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -1060,17 +1226,17 @@ impl TerminalHandle {
 
     /// Take all reply bytes libghostty has accumulated since the last drain.
     pub fn drain_replies(&mut self) -> Vec<u8> {
-        std::mem::take(&mut *self.reply_buf)
+        std::mem::take(&mut self.effects.reply_buf)
     }
 }
 
 impl Drop for TerminalHandle {
     fn drop(&mut self) {
-        // Free the terminal BEFORE the reply_buf Box drops. libghostty will not
+        // Free the terminal BEFORE the effects Box drops. libghostty will not
         // call our callback after this point, so the raw pointer stored in its
         // userdata becomes dead at the same instant the Box is released.
         unsafe { ghostty_terminal_free(self.raw) };
-        // reply_buf drops automatically afterwards.
+        // effects drops automatically afterwards.
     }
 }
 
@@ -1591,6 +1757,35 @@ mod tests {
         term.feed(b"\x1b[>c");
         let reply = term.drain_replies();
         assert_eq!(reply, b"\x1b[>1;10;0c".to_vec());
+    }
+
+    #[test]
+    fn terminal_answers_xtwinops_size_reports() {
+        let mut term = TerminalHandle::new(80, 24, 1024).expect("new terminal");
+        term.resize(80, 24, 9, 18).expect("resize with cell geometry");
+
+        term.feed(b"\x1b[16t");
+        assert_eq!(term.drain_replies(), b"\x1b[6;18;9t".to_vec());
+
+        term.feed(b"\x1b[14t");
+        assert_eq!(term.drain_replies(), b"\x1b[4;432;720t".to_vec());
+
+        term.feed(b"\x1b[18t");
+        assert_eq!(term.drain_replies(), b"\x1b[8;24;80t".to_vec());
+    }
+
+    #[test]
+    fn png_decoder_returns_rgba_pixels() {
+        let decoded = decode_png_rgba(&[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0,
+            13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174,
+            66, 96, 130,
+        ])
+        .expect("decode png");
+
+        assert_eq!(decoded.width, 1);
+        assert_eq!(decoded.height, 1);
+        assert_eq!(decoded.rgba.len(), 4);
     }
 
     #[test]

@@ -393,6 +393,39 @@ fn vt_ghostty_kitty_image_placement_pixel_size_uses_cell_size() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_kitty_png_image_decodes_to_rgba_resource() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+    engine.set_cell_size(8, 16).expect("set cell size");
+
+    engine
+        .feed(
+            b"\x1b_Ga=T,t=d,f=100,i=3,p=1;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\",
+        )
+        .expect("feed png kitty image");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+    assert_eq!(update.image_resources.len(), 1);
+    let resource = &update.image_resources[0];
+    assert_eq!(resource.image_id, 3);
+    assert_eq!(resource.width_px, 1);
+    assert_eq!(resource.height_px, 1);
+    assert_eq!(resource.format, 1);
+    assert_eq!(resource.compression, 0);
+    assert_eq!(resource.data_len, 4);
+    assert_eq!(update.image_placements.len(), 1);
+
+    let mut copied = Vec::new();
+    assert!(engine
+        .with_image_resource_data(resource.image_id, resource.generation, &mut |bytes| {
+            copied.extend_from_slice(bytes);
+            true
+        })
+        .expect("borrow decoded png bytes"));
+    assert_eq!(copied.len(), 4);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_render_update_partial_emits_row_replace_ops_for_dirty_rows() {
     let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
 

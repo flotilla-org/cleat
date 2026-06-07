@@ -13,7 +13,10 @@ pub use support::{
     FUNCTIONAL_ENGINE_STATUS, NONFUNCTIONAL_BUILD_MESSAGE, PLACEHOLDER_ENGINE_STATUS, VT_ENGINE_HELP, VT_SUPPORT_POLICY,
 };
 
-use crate::provider::{TerminalScrollbackExtent, TerminalScrollbarState, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome};
+use crate::provider::{
+    DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
+    ViewportCommand, ViewportCommandOutcome,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -83,8 +86,13 @@ pub struct ResolvedCell {
     pub graphemes: Vec<u32>,
     pub fg: Rgb,
     pub bg: Rgb,
+    pub underline_color: Option<Rgb>,
     pub flags: CellFlags,
+    pub underline_style: u32,
     pub width: CellWidth,
+    pub protected: bool,
+    pub semantic: u32,
+    pub has_hyperlink: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -112,6 +120,7 @@ pub struct ScreenGrid {
     pub cols: u16,
     pub rows: u16,
     pub cursor: CursorState,
+    pub dirty_rows: Vec<u16>,
 }
 
 impl ScreenGrid {
@@ -199,6 +208,10 @@ pub trait VtEngine {
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;
     fn screen_text(&self) -> Result<String, String>;
     fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
+    fn render_update(&mut self, dirty: DirtyState) -> Result<TerminalRenderUpdate, String> {
+        let snapshot = TerminalSnapshot::from_screen_grid(self.screen_grid()?, dirty);
+        Ok(TerminalRenderUpdate::from_snapshot(snapshot))
+    }
     fn size(&self) -> (u16, u16);
     fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
         Ok(TerminalModeState::default())

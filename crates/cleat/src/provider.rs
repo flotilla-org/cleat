@@ -8,6 +8,7 @@ bitflags::bitflags! {
         const STRUCTURED_MOUSE_INPUT = 1 << 2;
         const IMAGE_STATE = 1 << 3;
         const REMOTE_TARGETS = 1 << 4;
+        const RENDER_UPDATES = 1 << 5;
     }
 }
 
@@ -36,6 +37,7 @@ pub struct TerminalSnapshot {
 
 impl TerminalSnapshot {
     pub fn from_screen_grid(grid: ScreenGrid, dirty: DirtyState) -> Self {
+        let dirty_rows = grid.dirty_rows.clone();
         Self {
             cols: grid.cols,
             rows: grid.rows,
@@ -47,8 +49,220 @@ impl TerminalSnapshot {
             cells: grid.cells.into_iter().map(TerminalCell::from_resolved_cell).collect(),
             cursor: TerminalCursor::from_cursor_state(grid.cursor),
             dirty,
-            dirty_rows: Vec::new(),
+            dirty_rows,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalRenderUpdateOpKind {
+    #[default]
+    FullVisibleReplace,
+    RowReplace,
+    ScrollCopy,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalRenderUpdateOp {
+    pub kind: TerminalRenderUpdateOpKind,
+    pub first_row: u16,
+    pub row_count: u16,
+    pub col_count: u16,
+    pub rows: Vec<TerminalRenderRow>,
+    pub src_row: u16,
+    pub dst_row: u16,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalRenderRow {
+    pub row: u16,
+    pub col_count: u16,
+    pub cells: Vec<TerminalRenderCell>,
+    pub wrap: bool,
+    pub wrap_continuation: bool,
+    pub has_graphemes: bool,
+    pub has_styling: bool,
+    pub has_hyperlink: bool,
+    pub semantic_prompt: u32,
+    pub has_kitty_virtual_placeholder: bool,
+    pub dirty: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalRenderCell {
+    pub graphemes: Vec<u32>,
+    pub style: TerminalRenderStyle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalRenderStyle {
+    pub flags: TerminalCellFlags,
+    pub width: TerminalCellWidth,
+    pub resolved_fg: TerminalRgb,
+    pub resolved_bg: TerminalRgb,
+    pub fg_color: TerminalStyleColor,
+    pub bg_color: TerminalStyleColor,
+    pub underline_style: u32,
+    pub underline_color: TerminalStyleColor,
+    pub protected: bool,
+    pub semantic: u32,
+    pub has_hyperlink: bool,
+    pub hyperlink_id: u64,
+    pub content_tag: u32,
+    pub has_text: bool,
+    pub has_styling: bool,
+    pub style_id: u16,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalStyleColor {
+    pub tag: TerminalStyleColorTag,
+    pub palette_index: u8,
+    pub rgb: Option<TerminalRgb>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalStyleColorTag {
+    #[default]
+    None,
+    Palette,
+    Rgb,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalRenderUpdate {
+    pub cols: u16,
+    pub rows: u16,
+    pub geometry: TerminalGeometry,
+    pub viewport_kind: TerminalViewportKind,
+    pub scrollback_offset_rows: u64,
+    pub scrollbar: TerminalScrollbarState,
+    pub render_generation: u64,
+    pub cursor: TerminalCursor,
+    pub dirty: DirtyState,
+    pub ops: Vec<TerminalRenderUpdateOp>,
+}
+
+impl TerminalRenderUpdate {
+    pub fn from_snapshot(snapshot: TerminalSnapshot) -> Self {
+        let mut ops = Vec::new();
+        let cols = snapshot.cols as usize;
+        match snapshot.dirty {
+            DirtyState::Clean => {}
+            DirtyState::Partial if !snapshot.dirty_rows.is_empty() && cols != 0 => {
+                for row in snapshot.dirty_rows.iter().copied() {
+                    let row_idx = row as usize;
+                    if row_idx < snapshot.rows as usize {
+                        let start = row_idx * cols;
+                        let end = start.saturating_add(cols).min(snapshot.cells.len());
+                        ops.push(TerminalRenderUpdateOp {
+                            kind: TerminalRenderUpdateOpKind::RowReplace,
+                            first_row: row,
+                            row_count: 1,
+                            col_count: snapshot.cols,
+                            rows: vec![TerminalRenderRow::from_cells(row, snapshot.cols, snapshot.cells[start..end].iter().cloned(), true)],
+                            src_row: 0,
+                            dst_row: 0,
+                        });
+                    }
+                }
+            }
+            DirtyState::Partial | DirtyState::Full => {
+                let rows = rows_from_snapshot_cells(snapshot.cols, snapshot.rows, &snapshot.cells, snapshot.dirty);
+                ops.push(TerminalRenderUpdateOp {
+                    kind: TerminalRenderUpdateOpKind::FullVisibleReplace,
+                    first_row: 0,
+                    row_count: snapshot.rows,
+                    col_count: snapshot.cols,
+                    rows,
+                    src_row: 0,
+                    dst_row: 0,
+                });
+            }
+        }
+        Self {
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            geometry: snapshot.geometry,
+            viewport_kind: snapshot.viewport_kind,
+            scrollback_offset_rows: snapshot.scrollback_offset_rows,
+            scrollbar: snapshot.scrollbar,
+            render_generation: snapshot.render_generation,
+            cursor: snapshot.cursor,
+            dirty: snapshot.dirty,
+            ops,
+        }
+    }
+}
+
+fn rows_from_snapshot_cells(cols: u16, rows: u16, cells: &[TerminalCell], dirty: DirtyState) -> Vec<TerminalRenderRow> {
+    let cols_usize = cols as usize;
+    if cols_usize == 0 {
+        return Vec::new();
+    }
+    (0..rows)
+        .map(|row| {
+            let start = row as usize * cols_usize;
+            let end = start.saturating_add(cols_usize).min(cells.len());
+            TerminalRenderRow::from_cells(row, cols, cells[start..end].iter().cloned(), dirty != DirtyState::Clean)
+        })
+        .collect()
+}
+
+impl TerminalRenderRow {
+    pub fn from_cells(row: u16, col_count: u16, cells: impl IntoIterator<Item = TerminalCell>, dirty: bool) -> Self {
+        let cells: Vec<TerminalRenderCell> = cells.into_iter().map(TerminalRenderCell::from_terminal_cell).collect();
+        Self {
+            row,
+            col_count,
+            cells,
+            wrap: false,
+            wrap_continuation: false,
+            has_graphemes: false,
+            has_styling: false,
+            has_hyperlink: false,
+            semantic_prompt: 0,
+            has_kitty_virtual_placeholder: false,
+            dirty,
+        }
+    }
+}
+
+impl TerminalRenderCell {
+    fn from_terminal_cell(cell: TerminalCell) -> Self {
+        let fg = cell.fg;
+        let bg = cell.bg;
+        Self {
+            graphemes: cell.graphemes,
+            style: TerminalRenderStyle {
+                flags: cell.flags,
+                width: cell.width,
+                resolved_fg: fg,
+                resolved_bg: bg,
+                fg_color: TerminalStyleColor::rgb(fg),
+                bg_color: TerminalStyleColor::rgb(bg),
+                underline_style: cell.underline_style,
+                underline_color: cell.underline_color.map(TerminalStyleColor::rgb).unwrap_or_default(),
+                protected: cell.protected,
+                semantic: cell.semantic,
+                has_hyperlink: cell.has_hyperlink,
+                hyperlink_id: 0,
+                content_tag: 0,
+                has_text: true,
+                has_styling: !cell.flags.is_empty(),
+                style_id: 0,
+            },
+        }
+    }
+}
+
+impl TerminalStyleColor {
+    pub fn palette(palette_index: u8) -> Self {
+        Self { tag: TerminalStyleColorTag::Palette, palette_index, rgb: None }
+    }
+
+    pub fn rgb(rgb: TerminalRgb) -> Self {
+        Self { tag: TerminalStyleColorTag::Rgb, palette_index: 0, rgb: Some(rgb) }
     }
 }
 
@@ -159,8 +373,13 @@ pub struct TerminalCell {
     pub graphemes: Vec<u32>,
     pub fg: TerminalRgb,
     pub bg: TerminalRgb,
+    pub underline_color: Option<TerminalRgb>,
     pub flags: TerminalCellFlags,
+    pub underline_style: u32,
     pub width: TerminalCellWidth,
+    pub protected: bool,
+    pub semantic: u32,
+    pub has_hyperlink: bool,
 }
 
 impl TerminalCell {
@@ -169,8 +388,13 @@ impl TerminalCell {
             graphemes: cell.graphemes,
             fg: TerminalRgb::from_rgb(cell.fg),
             bg: TerminalRgb::from_rgb(cell.bg),
+            underline_color: cell.underline_color.map(TerminalRgb::from_rgb),
             flags: TerminalCellFlags::from_cell_flags(cell.flags),
+            underline_style: cell.underline_style,
             width: TerminalCellWidth::from_cell_width(cell.width),
+            protected: cell.protected,
+            semantic: cell.semantic,
+            has_hyperlink: cell.has_hyperlink,
         }
     }
 }
@@ -440,13 +664,19 @@ mod tests {
             cols: 2,
             rows: 1,
             cursor: CursorState { col: 1, row: 0, visible: true, style: CursorStyle::Bar, blink: true, wide_tail: true },
+            dirty_rows: Vec::new(),
             cells: vec![
                 ResolvedCell {
                     graphemes: vec!['Z' as u32, 0x0301],
                     fg: Rgb { r: 10, g: 20, b: 30 },
                     bg: Rgb { r: 40, g: 50, b: 60 },
+                    underline_color: Some(Rgb { r: 70, g: 80, b: 90 }),
                     flags: CellFlags::BOLD | CellFlags::ITALIC | CellFlags::UNDERLINE,
+                    underline_style: 3,
                     width: CellWidth::Wide,
+                    protected: true,
+                    semantic: 2,
+                    has_hyperlink: true,
                 },
                 ResolvedCell { width: CellWidth::SpacerTail, ..ResolvedCell::default() },
             ],
@@ -470,9 +700,65 @@ mod tests {
         assert_eq!(snapshot.cells[0].graphemes, vec!['Z' as u32, 0x0301]);
         assert_eq!(snapshot.cells[0].fg, TerminalRgb { r: 10, g: 20, b: 30 });
         assert_eq!(snapshot.cells[0].bg, TerminalRgb { r: 40, g: 50, b: 60 });
+        assert_eq!(snapshot.cells[0].underline_color, Some(TerminalRgb { r: 70, g: 80, b: 90 }));
         assert_eq!(snapshot.cells[0].flags, TerminalCellFlags::BOLD | TerminalCellFlags::ITALIC | TerminalCellFlags::UNDERLINE);
+        assert_eq!(snapshot.cells[0].underline_style, 3);
         assert_eq!(snapshot.cells[0].width, TerminalCellWidth::Wide);
+        assert!(snapshot.cells[0].protected);
+        assert_eq!(snapshot.cells[0].semantic, 2);
+        assert!(snapshot.cells[0].has_hyperlink);
         assert_eq!(snapshot.cells[1].width, TerminalCellWidth::SpacerTail);
+    }
+
+    #[test]
+    fn render_update_uses_row_ops_for_partial_dirty_rows() {
+        let snapshot = TerminalSnapshot {
+            cols: 2,
+            rows: 2,
+            dirty: DirtyState::Partial,
+            dirty_rows: vec![1],
+            cells: vec![
+                TerminalCell { graphemes: vec!['a' as u32], ..TerminalCell::default() },
+                TerminalCell { graphemes: vec!['b' as u32], ..TerminalCell::default() },
+                TerminalCell { graphemes: vec!['c' as u32], ..TerminalCell::default() },
+                TerminalCell { graphemes: vec!['d' as u32], ..TerminalCell::default() },
+            ],
+            ..TerminalSnapshot::default()
+        };
+
+        let update = TerminalRenderUpdate::from_snapshot(snapshot);
+
+        assert_eq!(update.ops.len(), 1);
+        assert_eq!(update.ops[0].kind, TerminalRenderUpdateOpKind::RowReplace);
+        assert_eq!(update.ops[0].first_row, 1);
+        assert_eq!(update.ops[0].row_count, 1);
+        assert_eq!(update.ops[0].col_count, 2);
+        assert_eq!(update.ops[0].rows[0].cells[0].graphemes, vec!['c' as u32]);
+        assert_eq!(update.ops[0].rows[0].cells[1].graphemes, vec!['d' as u32]);
+    }
+
+    #[test]
+    fn render_update_uses_full_replace_when_damage_is_full_or_unknown() {
+        let full = TerminalRenderUpdate::from_snapshot(TerminalSnapshot {
+            cols: 2,
+            rows: 1,
+            dirty: DirtyState::Full,
+            cells: vec![TerminalCell::default(), TerminalCell::default()],
+            ..TerminalSnapshot::default()
+        });
+        assert_eq!(full.ops.len(), 1);
+        assert_eq!(full.ops[0].kind, TerminalRenderUpdateOpKind::FullVisibleReplace);
+        assert_eq!(full.ops[0].rows[0].cells.len(), 2);
+
+        let partial_unknown = TerminalRenderUpdate::from_snapshot(TerminalSnapshot {
+            cols: 2,
+            rows: 1,
+            dirty: DirtyState::Partial,
+            cells: vec![TerminalCell::default(), TerminalCell::default()],
+            ..TerminalSnapshot::default()
+        });
+        assert_eq!(partial_unknown.ops.len(), 1);
+        assert_eq!(partial_unknown.ops[0].kind, TerminalRenderUpdateOpKind::FullVisibleReplace);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 #[cfg(feature = "ghostty-vt")]
-use cleat::provider::{TerminalViewportKind, ViewportCommand, ViewportCommandOutcome};
+use cleat::provider::{
+    DirtyState, TerminalRenderUpdateOpKind, TerminalStyleColorTag, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
+};
 use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, VtEngine};
 
 mod vt_contracts;
@@ -298,6 +300,53 @@ fn vt_ghostty_screen_grid_updates_after_new_input() {
     let grid2 = engine.screen_grid().expect("second screen_grid after new input");
     assert_eq!(grid2.row_text(0).trim_end(), "aaabbb");
     assert_ne!(grid1, grid2);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_full_exposes_rows_and_structured_style() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    engine.feed(b"\x1b[38;2;10;20;30mX\x1b[0m").expect("feed truecolor text");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+
+    assert_eq!(update.dirty, DirtyState::Full);
+    assert_eq!(update.ops.len(), 1);
+    assert_eq!(update.ops[0].kind, TerminalRenderUpdateOpKind::FullVisibleReplace);
+    assert_eq!(update.ops[0].rows.len(), 3);
+    assert_eq!(update.ops[0].rows[0].row, 0);
+    assert_eq!(update.ops[0].rows[0].col_count, 20);
+    assert!(update.ops[0].rows[0].dirty);
+
+    let cell = &update.ops[0].rows[0].cells[0];
+    assert_eq!(cell.graphemes, vec!['X' as u32]);
+    assert_eq!(cell.style.resolved_fg.r, 10);
+    assert_eq!(cell.style.resolved_fg.g, 20);
+    assert_eq!(cell.style.resolved_fg.b, 30);
+    assert_eq!(cell.style.fg_color.tag, TerminalStyleColorTag::Rgb);
+    assert!(cell.style.has_text);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_partial_emits_row_replace_ops_for_dirty_rows() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    engine.feed(b"first").expect("feed initial text");
+    let full = engine.render_update(DirtyState::Full).expect("initial render update");
+    assert_eq!(full.ops[0].kind, TerminalRenderUpdateOpKind::FullVisibleReplace);
+
+    engine.feed(b"\x1b[2;1Hsecond").expect("feed second row text");
+    let partial = engine.render_update(DirtyState::Partial).expect("partial render update");
+
+    assert_eq!(partial.dirty, DirtyState::Partial);
+    assert!(partial.ops.len() < 3, "partial update should not replace the full visible screen");
+    assert!(partial.ops.iter().all(|op| op.kind == TerminalRenderUpdateOpKind::RowReplace));
+    let row_one = partial.ops.iter().find(|op| op.first_row == 1).expect("row containing new text should be dirty");
+    assert_eq!(row_one.rows.len(), 1);
+    assert_eq!(row_one.rows[0].row, 1);
+    assert_eq!(row_one.rows[0].cells[0].graphemes, vec!['s' as u32]);
 }
 
 #[cfg(feature = "ghostty-vt")]

@@ -10,7 +10,10 @@ use crate::{
     da::DeviceAttributeTracker,
     platform::pty::{exit_code_from_wait_status, PtyChild},
     protocol::{InspectResult, SignalTarget},
-    provider::{DirtyState, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, ViewportCommand, ViewportCommandOutcome},
+    provider::{
+        DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, ViewportCommand,
+        ViewportCommandOutcome,
+    },
     recording::SessionRecorder,
     runtime::SessionMetadata,
     vt::{self, TerminalModeState, VtEngine},
@@ -135,6 +138,15 @@ impl SessionRuntime {
         snapshot.scrollbar = scrollbar;
         snapshot.scrollback_offset_rows = scrollbar.viewport_top_row;
         Ok(snapshot)
+    }
+
+    pub(crate) fn render_update(&mut self, dirty: DirtyState) -> Result<TerminalRenderUpdate, String> {
+        let scrollbar = self.vt_engine.scrollbar_state()?;
+        let mut update = self.vt_engine.render_update(dirty)?;
+        update.viewport_kind = scrollbar.viewport_kind;
+        update.scrollbar = scrollbar;
+        update.scrollback_offset_rows = scrollbar.viewport_top_row;
+        Ok(update)
     }
 
     pub(crate) fn scrollback_extent(&self) -> Result<TerminalScrollbackExtent, String> {
@@ -421,6 +433,7 @@ mod tests {
             cols: 2,
             rows: 1,
             cursor: CursorState { col: 1, row: 0, visible: true, ..CursorState::default() },
+            dirty_rows: Vec::new(),
             cells: vec![
                 ResolvedCell {
                     graphemes: vec!['A' as u32],
@@ -428,6 +441,7 @@ mod tests {
                     bg: Rgb { r: 4, g: 5, b: 6 },
                     flags: CellFlags::BOLD | CellFlags::UNDERLINE,
                     width: CellWidth::Wide,
+                    ..ResolvedCell::default()
                 },
                 ResolvedCell { width: CellWidth::SpacerTail, ..ResolvedCell::default() },
             ],

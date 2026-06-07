@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 2u
+#define CLEAT_PROVIDER_ABI_VERSION 3u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -90,6 +90,19 @@ extern "C" {
 #define CLEAT_VIEWPORT_OUTCOME_MOVED 1u
 #define CLEAT_VIEWPORT_OUTCOME_NO_OP 2u
 #define CLEAT_VIEWPORT_OUTCOME_UNSUPPORTED 3u
+#define CLEAT_PROVIDER_FEATURE_CELL_SNAPSHOTS (1u << 0)
+#define CLEAT_PROVIDER_FEATURE_DAMAGE_ROWS (1u << 1)
+#define CLEAT_PROVIDER_FEATURE_STRUCTURED_MOUSE_INPUT (1u << 2)
+#define CLEAT_PROVIDER_FEATURE_IMAGE_STATE (1u << 3)
+#define CLEAT_PROVIDER_FEATURE_REMOTE_TARGETS (1u << 4)
+#define CLEAT_PROVIDER_FEATURE_RENDER_UPDATES (1u << 5)
+#define CLEAT_RENDER_UPDATE_VERSION 1u
+#define CLEAT_RENDER_OP_FULL_VISIBLE_REPLACE 1u
+#define CLEAT_RENDER_OP_ROW_REPLACE 2u
+#define CLEAT_RENDER_OP_SCROLL_COPY 3u
+#define CLEAT_STYLE_COLOR_NONE 0u
+#define CLEAT_STYLE_COLOR_PALETTE 1u
+#define CLEAT_STYLE_COLOR_RGB 2u
 
 typedef struct CleatProvider cleat_provider;
 typedef struct CleatSession cleat_session;
@@ -195,6 +208,86 @@ typedef struct cleat_snapshot {
     cleat_cursor cursor;
     cleat_dirty_state dirty;
 } cleat_snapshot;
+
+typedef struct cleat_style_color {
+    size_t size;
+    uint32_t tag;
+    uint8_t palette_index;
+    cleat_rgb rgb;
+} cleat_style_color;
+
+typedef struct cleat_render_style {
+    size_t size;
+    uint32_t flags;
+    uint32_t width;
+    cleat_rgb fg;
+    cleat_rgb bg;
+    cleat_style_color fg_color;
+    cleat_style_color bg_color;
+    uint32_t underline_style;
+    cleat_style_color underline_color;
+    bool protected_cell;
+    bool has_hyperlink;
+    uint32_t semantic;
+    uint64_t hyperlink_id;
+    uint32_t content_tag;
+    bool has_text;
+    bool has_styling;
+    uint16_t style_id;
+} cleat_render_style;
+
+typedef struct cleat_render_cell {
+    size_t size;
+    const uint32_t *graphemes;
+    size_t grapheme_count;
+    cleat_render_style style;
+} cleat_render_cell;
+
+typedef struct cleat_render_row {
+    size_t size;
+    uint16_t row;
+    uint16_t col_count;
+    const cleat_render_cell *cells;
+    size_t cell_count;
+    bool wrap;
+    bool wrap_continuation;
+    bool has_graphemes;
+    bool has_styling;
+    bool has_hyperlink;
+    uint32_t semantic_prompt;
+    bool has_kitty_virtual_placeholder;
+    bool dirty;
+} cleat_render_row;
+
+typedef struct cleat_render_update_op {
+    size_t size;
+    uint32_t kind;
+    uint16_t first_row;
+    uint16_t row_count;
+    uint16_t col_count;
+    const cleat_render_row *rows;
+    size_t row_desc_count;
+    const cleat_render_cell *cells;
+    size_t cell_count;
+    uint16_t src_row;
+    uint16_t dst_row;
+} cleat_render_update_op;
+
+typedef struct cleat_render_update {
+    size_t size;
+    uint32_t version;
+    uint16_t cols;
+    uint16_t rows;
+    cleat_terminal_geometry geometry;
+    uint32_t viewport_kind;
+    uint64_t scrollback_offset_rows;
+    cleat_terminal_scrollbar_state scrollbar;
+    uint64_t render_generation;
+    cleat_cursor cursor;
+    cleat_dirty_state dirty;
+    const cleat_render_update_op *ops;
+    size_t op_count;
+} cleat_render_update;
 
 /*
  * For mouse events, cell_col/cell_row are the authoritative terminal-cell
@@ -314,11 +407,20 @@ bool cleat_session_scroll_viewport(cleat_session *session,
  */
 bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
 /*
+ * Returns a versioned, operation-shaped render update. The initial/full-dirty
+ * path uses CLEAT_RENDER_OP_FULL_VISIBLE_REPLACE. Partial dirty rows use
+ * CLEAT_RENDER_OP_ROW_REPLACE when the VT backend exposes exact row damage.
+ * Scrolling currently falls back to full visible replacement until Ghostty
+ * exposes scroll/copy damage.
+ */
+bool cleat_session_render_update(cleat_session *session, cleat_render_update *out);
+/*
  * Returns a snapshot for a requested terminal viewport. Unsupported viewport
  * kinds or offsets return false.
  */
 bool cleat_session_viewport_snapshot(cleat_session *session, const cleat_viewport_request *request, cleat_snapshot *out);
 void cleat_session_release_snapshot(cleat_session *session, cleat_snapshot *snapshot);
+void cleat_session_release_render_update(cleat_session *session, cleat_render_update *update);
 
 #ifdef __cplusplus
 }

@@ -285,6 +285,17 @@ pub enum GhosttyRenderStateRowCellsData {
 }
 
 pub type GhosttyCell = u64;
+pub type GhosttyRow = u64;
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyCellContentTag {
+    Codepoint = 0,
+    CodepointGrapheme = 1,
+    BgColorPalette = 2,
+    BgColorRgb = 3,
+}
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -314,6 +325,39 @@ pub enum GhosttyCellWide {
     SpacerHead = 3,
 }
 
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyCellSemanticContent {
+    Output = 0,
+    Input = 1,
+    Prompt = 2,
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyRowSemanticPrompt {
+    None = 0,
+    Prompt = 1,
+    PromptContinuation = 2,
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyRowData {
+    Invalid = 0,
+    Wrap = 1,
+    WrapContinuation = 2,
+    Grapheme = 3,
+    Styled = 4,
+    Hyperlink = 5,
+    SemanticPrompt = 6,
+    KittyVirtualPlaceholder = 7,
+    Dirty = 8,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GhosttyColorRgb {
@@ -324,7 +368,7 @@ pub struct GhosttyColorRgb {
 
 #[allow(dead_code)]
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GhosttyStyleColorTag {
     None = 0,
     Palette = 1,
@@ -539,6 +583,7 @@ unsafe extern "C" {
 
     // --- Cell data ---
     fn ghostty_cell_get(cell: GhosttyCell, data: GhosttyCellData, out: *mut c_void) -> GhosttyResult;
+    fn ghostty_row_get(row: GhosttyRow, data: GhosttyRowData, out: *mut c_void) -> GhosttyResult;
 }
 
 pub struct TerminalHandle {
@@ -922,6 +967,14 @@ impl RowIteratorHandle {
         Ok(dirty)
     }
 
+    pub fn get_raw_row(&self) -> Result<GhosttyRow, String> {
+        let mut row: GhosttyRow = 0;
+        let result =
+            unsafe { ghostty_render_state_row_get(self.raw, GhosttyRenderStateRowData::Raw, &mut row as *mut GhosttyRow as *mut c_void) };
+        check_result(result, "ghostty_render_state_row_get(Raw)")?;
+        Ok(row)
+    }
+
     pub fn populate_cells(&self, cells: &mut RowCellsHandle) -> Result<(), String> {
         let result = unsafe {
             ghostty_render_state_row_get(
@@ -1040,6 +1093,79 @@ impl RowCellsHandle {
         check_result(result, "ghostty_cell_get(Wide)")?;
         Ok(wide)
     }
+
+    pub fn get_content_tag(&self) -> Result<GhosttyCellContentTag, String> {
+        let cell = self.get_raw_cell()?;
+        let mut tag = GhosttyCellContentTag::Codepoint;
+        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::ContentTag, &mut tag as *mut GhosttyCellContentTag as *mut c_void) };
+        check_result(result, "ghostty_cell_get(ContentTag)")?;
+        Ok(tag)
+    }
+
+    pub fn get_has_text(&self) -> Result<bool, String> {
+        let cell = self.get_raw_cell()?;
+        let mut has_text = false;
+        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::HasText, &mut has_text as *mut bool as *mut c_void) };
+        check_result(result, "ghostty_cell_get(HasText)")?;
+        Ok(has_text)
+    }
+
+    pub fn get_has_styling(&self) -> Result<bool, String> {
+        let cell = self.get_raw_cell()?;
+        let mut has_styling = false;
+        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::HasStyling, &mut has_styling as *mut bool as *mut c_void) };
+        check_result(result, "ghostty_cell_get(HasStyling)")?;
+        Ok(has_styling)
+    }
+
+    pub fn get_style_id(&self) -> Result<u16, String> {
+        let cell = self.get_raw_cell()?;
+        let mut style_id = 0;
+        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::StyleId, &mut style_id as *mut u16 as *mut c_void) };
+        check_result(result, "ghostty_cell_get(StyleId)")?;
+        Ok(style_id)
+    }
+
+    pub fn get_protected(&self) -> Result<bool, String> {
+        let cell = self.get_raw_cell()?;
+        let mut protected = false;
+        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::Protected, &mut protected as *mut bool as *mut c_void) };
+        check_result(result, "ghostty_cell_get(Protected)")?;
+        Ok(protected)
+    }
+
+    pub fn get_has_hyperlink(&self) -> Result<bool, String> {
+        let cell = self.get_raw_cell()?;
+        let mut has_hyperlink = false;
+        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::HasHyperlink, &mut has_hyperlink as *mut bool as *mut c_void) };
+        check_result(result, "ghostty_cell_get(HasHyperlink)")?;
+        Ok(has_hyperlink)
+    }
+
+    pub fn get_semantic_content(&self) -> Result<GhosttyCellSemanticContent, String> {
+        let cell = self.get_raw_cell()?;
+        let mut semantic = GhosttyCellSemanticContent::Output;
+        let result = unsafe {
+            ghostty_cell_get(cell, GhosttyCellData::SemanticContent, &mut semantic as *mut GhosttyCellSemanticContent as *mut c_void)
+        };
+        check_result(result, "ghostty_cell_get(SemanticContent)")?;
+        Ok(semantic)
+    }
+}
+
+pub fn row_get_bool(row: GhosttyRow, data: GhosttyRowData, label: &'static str) -> Result<bool, String> {
+    let mut value = false;
+    let result = unsafe { ghostty_row_get(row, data, &mut value as *mut bool as *mut c_void) };
+    check_result(result, label)?;
+    Ok(value)
+}
+
+pub fn row_get_semantic_prompt(row: GhosttyRow) -> Result<GhosttyRowSemanticPrompt, String> {
+    let mut value = GhosttyRowSemanticPrompt::None;
+    let result =
+        unsafe { ghostty_row_get(row, GhosttyRowData::SemanticPrompt, &mut value as *mut GhosttyRowSemanticPrompt as *mut c_void) };
+    check_result(result, "ghostty_row_get(SemanticPrompt)")?;
+    Ok(value)
 }
 
 impl Drop for RowCellsHandle {

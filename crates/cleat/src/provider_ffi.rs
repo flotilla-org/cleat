@@ -16,8 +16,9 @@ use crate::{
     protocol::SignalTarget,
     provider::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
-        TerminalGeometry, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalRgb, TerminalScrollbackExtent, TerminalScrollbarState,
-        TerminalSnapshot, TerminalStyleColor, TerminalStyleColorTag, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
+        TerminalGeometry, TerminalImagePlacement, TerminalImageResource, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalRgb,
+        TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalStyleColor, TerminalStyleColorTag,
+        TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
     },
     runtime::RuntimeLayout,
     session::{ensure_session_started, session_socket_path},
@@ -25,7 +26,7 @@ use crate::{
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 3;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 4;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -113,8 +114,17 @@ pub const CLEAT_RENDER_OP_SCROLL_COPY: u32 = 3;
 pub const CLEAT_STYLE_COLOR_NONE: u32 = 0;
 pub const CLEAT_STYLE_COLOR_PALETTE: u32 = 1;
 pub const CLEAT_STYLE_COLOR_RGB: u32 = 2;
+pub const CLEAT_IMAGE_FORMAT_RGB: u32 = 0;
+pub const CLEAT_IMAGE_FORMAT_RGBA: u32 = 1;
+pub const CLEAT_IMAGE_FORMAT_PNG: u32 = 2;
+pub const CLEAT_IMAGE_FORMAT_GRAY_ALPHA: u32 = 3;
+pub const CLEAT_IMAGE_FORMAT_GRAY: u32 = 4;
+pub const CLEAT_IMAGE_COMPRESSION_NONE: u32 = 0;
+pub const CLEAT_IMAGE_COMPRESSION_ZLIB_DEFLATE: u32 = 1;
 
 const POSIX_SIGTERM: i32 = 15;
+
+pub type CleatImageResourceDataFn = Option<unsafe extern "C" fn(user_data: *mut c_void, data: *const u8, data_len: usize) -> bool>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -335,6 +345,41 @@ pub struct CleatRenderUpdateOp {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CleatImageResource {
+    pub size: usize,
+    pub image_id: u32,
+    pub generation: u64,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub format: u32,
+    pub compression: u32,
+    pub data_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CleatImagePlacement {
+    pub size: usize,
+    pub image_id: u32,
+    pub generation: u64,
+    pub placement_id: u32,
+    pub z: i32,
+    pub viewport_col: i32,
+    pub viewport_row: i32,
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub x_offset_px: u32,
+    pub y_offset_px: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CleatRenderUpdate {
     pub size: usize,
     pub version: u32,
@@ -349,6 +394,10 @@ pub struct CleatRenderUpdate {
     pub dirty: CleatDirtyState,
     pub ops: *const CleatRenderUpdateOp,
     pub op_count: usize,
+    pub image_resources: *const CleatImageResource,
+    pub image_resource_count: usize,
+    pub image_placements: *const CleatImagePlacement,
+    pub image_placement_count: usize,
 }
 
 #[repr(C)]
@@ -591,18 +640,55 @@ struct CleatWheelEvent {
 }
 
 enum InProcessCommand {
-    Resize { cols: u16, rows: u16, reply: mpsc::Sender<Result<(), String>> },
-    WriteInput { bytes: Vec<u8>, reply: mpsc::Sender<Result<(), String>> },
-    Wheel { event: CleatWheelEvent, reply: mpsc::Sender<Result<usize, String>> },
-    ScrollViewport { command: ViewportCommand, reply: mpsc::Sender<Result<ViewportCommandOutcome, String>> },
-    Snapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
-    RenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
-    MarkFull { reply: mpsc::Sender<()> },
-    Dirty { reply: mpsc::Sender<DirtyState> },
-    MarkObserved { generation: u64, reply: mpsc::Sender<bool> },
-    ScrollbackExtent { reply: mpsc::Sender<TerminalScrollbackExtent> },
-    ScrollbarState { reply: mpsc::Sender<TerminalScrollbarState> },
-    Stop { terminate: bool },
+    Resize {
+        cols: u16,
+        rows: u16,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    WriteInput {
+        bytes: Vec<u8>,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    Wheel {
+        event: CleatWheelEvent,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
+    ScrollViewport {
+        command: ViewportCommand,
+        reply: mpsc::Sender<Result<ViewportCommandOutcome, String>>,
+    },
+    Snapshot {
+        reply: mpsc::Sender<Result<TerminalSnapshot, String>>,
+    },
+    RenderUpdate {
+        reply: mpsc::Sender<Result<TerminalRenderUpdate, String>>,
+    },
+    ImageResourceData {
+        image_id: u32,
+        generation: u64,
+        callback: CleatImageResourceDataFn,
+        user_data: usize,
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
+    MarkFull {
+        reply: mpsc::Sender<()>,
+    },
+    Dirty {
+        reply: mpsc::Sender<DirtyState>,
+    },
+    MarkObserved {
+        generation: u64,
+        reply: mpsc::Sender<bool>,
+    },
+    ScrollbackExtent {
+        reply: mpsc::Sender<TerminalScrollbackExtent>,
+    },
+    ScrollbarState {
+        reply: mpsc::Sender<TerminalScrollbarState>,
+    },
+    Stop {
+        terminate: bool,
+    },
 }
 
 struct OwnedSnapshot {
@@ -617,6 +703,8 @@ struct OwnedRenderUpdate {
     ops: Vec<CleatRenderUpdateOp>,
     rows: Vec<CleatRenderRow>,
     cells: Vec<CleatRenderCell>,
+    image_resources: Vec<CleatImageResource>,
+    image_placements: Vec<CleatImagePlacement>,
     _graphemes: Vec<Vec<u32>>,
 }
 
@@ -731,6 +819,8 @@ impl OwnedRenderUpdate {
                 dst_row: op.dst_row,
             });
         }
+        let image_resources: Vec<CleatImageResource> = update.image_resources.iter().map(image_resource_to_ffi).collect();
+        let image_placements: Vec<CleatImagePlacement> = update.image_placements.iter().map(image_placement_to_ffi).collect();
         let mut owned = Box::new(Self {
             update: CleatRenderUpdate {
                 size: std::mem::size_of::<CleatRenderUpdate>(),
@@ -746,10 +836,16 @@ impl OwnedRenderUpdate {
                 dirty: update.dirty.into(),
                 ops: ptr::null(),
                 op_count: ops.len(),
+                image_resources: ptr::null(),
+                image_resource_count: image_resources.len(),
+                image_placements: ptr::null(),
+                image_placement_count: image_placements.len(),
             },
             ops,
             rows,
             cells,
+            image_resources,
+            image_placements,
             _graphemes: graphemes,
         });
         for (cell, graphemes) in owned.cells.iter_mut().zip(owned._graphemes.iter()) {
@@ -775,7 +871,44 @@ impl OwnedRenderUpdate {
             owned.ops[op_idx].row_desc_count = row_desc_count;
         }
         owned.update.ops = if owned.ops.is_empty() { ptr::null() } else { owned.ops.as_ptr() };
+        owned.update.image_resources = if owned.image_resources.is_empty() { ptr::null() } else { owned.image_resources.as_ptr() };
+        owned.update.image_placements = if owned.image_placements.is_empty() { ptr::null() } else { owned.image_placements.as_ptr() };
         owned
+    }
+}
+
+fn image_resource_to_ffi(resource: &TerminalImageResource) -> CleatImageResource {
+    CleatImageResource {
+        size: std::mem::size_of::<CleatImageResource>(),
+        image_id: resource.image_id,
+        generation: resource.generation,
+        width_px: resource.width_px,
+        height_px: resource.height_px,
+        format: resource.format,
+        compression: resource.compression,
+        data_len: resource.data_len,
+    }
+}
+
+fn image_placement_to_ffi(placement: &TerminalImagePlacement) -> CleatImagePlacement {
+    CleatImagePlacement {
+        size: std::mem::size_of::<CleatImagePlacement>(),
+        image_id: placement.image_id,
+        generation: placement.generation,
+        placement_id: placement.placement_id,
+        z: placement.z,
+        viewport_col: placement.viewport_col,
+        viewport_row: placement.viewport_row,
+        grid_cols: placement.grid_cols,
+        grid_rows: placement.grid_rows,
+        pixel_width: placement.pixel_width,
+        pixel_height: placement.pixel_height,
+        source_x: placement.source_x,
+        source_y: placement.source_y,
+        source_width: placement.source_width,
+        source_height: placement.source_height,
+        x_offset_px: placement.x_offset_px,
+        y_offset_px: placement.y_offset_px,
     }
 }
 
@@ -1608,6 +1741,41 @@ pub unsafe extern "C" fn cleat_session_render_update(session: *mut CleatSession,
 
 /// # Safety
 ///
+/// `session` must be a valid session pointer. `callback`, when non-null, is
+/// called synchronously with bytes borrowed from the terminal backend. The data
+/// pointer is only valid for the duration of the callback. The callback must not
+/// call back into this session.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_with_image_resource_data(
+    session: *mut CleatSession,
+    image_id: u32,
+    generation: u64,
+    callback: CleatImageResourceDataFn,
+    user_data: *mut c_void,
+) -> bool {
+    let callback = match callback {
+        Some(callback) => callback,
+        None => return false,
+    };
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    match &mut session.backend {
+        SessionBackend::Mock(_) | SessionBackend::Daemon(_) => false,
+        SessionBackend::InProcess(in_process) => in_process_request_result(in_process, |reply| InProcessCommand::ImageResourceData {
+            image_id,
+            generation,
+            callback: Some(callback),
+            user_data: user_data as usize,
+            reply,
+        })
+        .unwrap_or(false),
+    }
+}
+
+/// # Safety
+///
 /// `session` must be a valid session pointer. `request`, when non-null, must
 /// point to a valid `CleatViewportRequest`. `out` must point to writable
 /// storage for a `CleatSnapshot`.
@@ -1822,6 +1990,16 @@ fn in_process_actor_handle_command(
                 observation.annotate_render_update(&mut update);
                 update
             });
+            let _ = reply.send(result);
+        }
+        InProcessCommand::ImageResourceData { image_id, generation, callback, user_data, reply } => {
+            let result = match callback {
+                Some(callback) => {
+                    let mut call_client = |bytes: &[u8]| unsafe { callback(user_data as *mut c_void, bytes.as_ptr(), bytes.len()) };
+                    runtime.with_image_resource_data(image_id, generation, &mut call_client)
+                }
+                None => Ok(false),
+            };
             let _ = reply.send(result);
         }
         InProcessCommand::MarkFull { reply } => {
@@ -2301,7 +2479,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::provider::{TerminalRenderCell, TerminalRenderRow, TerminalRenderStyle, TerminalRenderUpdateOp};
+    use crate::provider::{
+        TerminalImagePlacement, TerminalImageResource, TerminalRenderCell, TerminalRenderRow, TerminalRenderStyle, TerminalRenderUpdateOp,
+    };
 
     unsafe extern "C" fn count_wake(user_data: *mut c_void) {
         let counter = unsafe { &*(user_data as *const AtomicUsize) };
@@ -2607,6 +2787,33 @@ mod tests {
             rows: 1,
             render_generation: 7,
             dirty: DirtyState::Full,
+            image_resources: vec![TerminalImageResource {
+                image_id: 11,
+                generation: 99,
+                width_px: 3,
+                height_px: 4,
+                format: CLEAT_IMAGE_FORMAT_RGB,
+                compression: CLEAT_IMAGE_COMPRESSION_NONE,
+                data_len: 36,
+            }],
+            image_placements: vec![TerminalImagePlacement {
+                image_id: 11,
+                generation: 99,
+                placement_id: 2,
+                z: -1,
+                viewport_col: 5,
+                viewport_row: -1,
+                grid_cols: 3,
+                grid_rows: 2,
+                pixel_width: 30,
+                pixel_height: 20,
+                source_x: 1,
+                source_y: 2,
+                source_width: 3,
+                source_height: 4,
+                x_offset_px: 6,
+                y_offset_px: 7,
+            }],
             ops: vec![TerminalRenderUpdateOp {
                 kind: TerminalRenderUpdateOpKind::FullVisibleReplace,
                 first_row: 0,
@@ -2684,6 +2891,37 @@ mod tests {
         assert!(style.has_text);
         assert!(style.has_styling);
         assert_eq!(style.style_id, 9);
+
+        assert_eq!(owned.update.image_resource_count, 1);
+        let resources = unsafe { slice::from_raw_parts(owned.update.image_resources, owned.update.image_resource_count) };
+        assert_eq!(resources[0].size, std::mem::size_of::<CleatImageResource>());
+        assert_eq!(resources[0].image_id, 11);
+        assert_eq!(resources[0].generation, 99);
+        assert_eq!(resources[0].width_px, 3);
+        assert_eq!(resources[0].height_px, 4);
+        assert_eq!(resources[0].format, CLEAT_IMAGE_FORMAT_RGB);
+        assert_eq!(resources[0].compression, CLEAT_IMAGE_COMPRESSION_NONE);
+        assert_eq!(resources[0].data_len, 36);
+
+        assert_eq!(owned.update.image_placement_count, 1);
+        let placements = unsafe { slice::from_raw_parts(owned.update.image_placements, owned.update.image_placement_count) };
+        assert_eq!(placements[0].size, std::mem::size_of::<CleatImagePlacement>());
+        assert_eq!(placements[0].image_id, 11);
+        assert_eq!(placements[0].generation, 99);
+        assert_eq!(placements[0].placement_id, 2);
+        assert_eq!(placements[0].z, -1);
+        assert_eq!(placements[0].viewport_col, 5);
+        assert_eq!(placements[0].viewport_row, -1);
+        assert_eq!(placements[0].grid_cols, 3);
+        assert_eq!(placements[0].grid_rows, 2);
+        assert_eq!(placements[0].pixel_width, 30);
+        assert_eq!(placements[0].pixel_height, 20);
+        assert_eq!(placements[0].source_x, 1);
+        assert_eq!(placements[0].source_y, 2);
+        assert_eq!(placements[0].source_width, 3);
+        assert_eq!(placements[0].source_height, 4);
+        assert_eq!(placements[0].x_offset_px, 6);
+        assert_eq!(placements[0].y_offset_px, 7);
     }
 
     #[test]

@@ -141,6 +141,39 @@ pub struct TerminalRenderUpdate {
     pub cursor: TerminalCursor,
     pub dirty: DirtyState,
     pub ops: Vec<TerminalRenderUpdateOp>,
+    pub image_resources: Vec<TerminalImageResource>,
+    pub image_placements: Vec<TerminalImagePlacement>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TerminalImageResource {
+    pub image_id: u32,
+    pub generation: u64,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub format: u32,
+    pub compression: u32,
+    pub data_len: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TerminalImagePlacement {
+    pub image_id: u32,
+    pub generation: u64,
+    pub placement_id: u32,
+    pub z: i32,
+    pub viewport_col: i32,
+    pub viewport_row: i32,
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub x_offset_px: u32,
+    pub y_offset_px: u32,
 }
 
 impl TerminalRenderUpdate {
@@ -191,6 +224,8 @@ impl TerminalRenderUpdate {
             cursor: snapshot.cursor,
             dirty: snapshot.dirty,
             ops,
+            image_resources: Vec::new(),
+            image_placements: Vec::new(),
         }
     }
 }

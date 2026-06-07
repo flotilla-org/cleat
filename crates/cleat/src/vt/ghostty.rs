@@ -11,12 +11,13 @@ use super::{
 };
 use crate::provider::{
     DirtyState, TerminalCellFlags, TerminalCellWidth, TerminalCursor as ProviderCursor, TerminalCursorStyle as ProviderCursorStyle,
-    TerminalRenderCell, TerminalRenderRow, TerminalRenderStyle, TerminalRenderUpdate, TerminalRenderUpdateOp, TerminalRenderUpdateOpKind,
-    TerminalRgb, TerminalScrollbackExtent, TerminalScrollbarState, TerminalStyleColor, TerminalStyleColorTag, TerminalViewportKind,
-    ViewportCommand, ViewportCommandOutcome,
+    TerminalImagePlacement, TerminalImageResource, TerminalRenderCell, TerminalRenderRow, TerminalRenderStyle, TerminalRenderUpdate,
+    TerminalRenderUpdateOp, TerminalRenderUpdateOpKind, TerminalRgb, TerminalScrollbackExtent, TerminalScrollbarState, TerminalStyleColor,
+    TerminalStyleColorTag, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
 };
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
+const DEFAULT_KITTY_IMAGE_STORAGE_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub struct GhosttyVtEngine {
     terminal: TerminalHandle,
@@ -38,6 +39,7 @@ impl GhosttyVtEngine {
         let terminal = TerminalHandle::new(cols, rows, DEFAULT_MAX_SCROLLBACK).expect("create ghostty terminal");
         let mut terminal = terminal;
         apply_colors(&mut terminal, colors).expect("configure ghostty terminal colors");
+        terminal.set_kitty_image_storage_limit(DEFAULT_KITTY_IMAGE_STORAGE_LIMIT).expect("configure ghostty kitty image storage");
         let render_state = RenderStateHandle::new().expect("create ghostty render state");
         let row_iter = RowIteratorHandle::new().expect("create ghostty row iterator");
         let row_cells = RowCellsHandle::new().expect("create ghostty row cells");
@@ -421,14 +423,58 @@ impl VtEngine for GhosttyVtEngine {
                 .collect(),
         };
 
+        let (image_resources, image_placements) = self.terminal.kitty_image_state()?;
+
         Ok(TerminalRenderUpdate {
             cols,
             rows,
             cursor: provider_cursor_from_vt(cursor),
             dirty: effective_dirty,
             ops,
+            image_resources: image_resources
+                .into_iter()
+                .map(|resource| TerminalImageResource {
+                    image_id: resource.image_id,
+                    generation: resource.generation,
+                    width_px: resource.width_px,
+                    height_px: resource.height_px,
+                    format: resource.format,
+                    compression: resource.compression,
+                    data_len: resource.data_len,
+                })
+                .collect(),
+            image_placements: image_placements
+                .into_iter()
+                .map(|placement| TerminalImagePlacement {
+                    image_id: placement.image_id,
+                    generation: placement.generation,
+                    placement_id: placement.placement_id,
+                    z: placement.z,
+                    viewport_col: placement.viewport_col,
+                    viewport_row: placement.viewport_row,
+                    grid_cols: placement.grid_cols,
+                    grid_rows: placement.grid_rows,
+                    pixel_width: placement.pixel_width,
+                    pixel_height: placement.pixel_height,
+                    source_x: placement.source_x,
+                    source_y: placement.source_y,
+                    source_width: placement.source_width,
+                    source_height: placement.source_height,
+                    x_offset_px: placement.x_offset_px,
+                    y_offset_px: placement.y_offset_px,
+                })
+                .collect(),
             ..TerminalRenderUpdate::default()
         })
+    }
+
+    fn with_image_resource_data(
+        &mut self,
+        image_id: u32,
+        generation: u64,
+        callback: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, String> {
+        self.terminal.with_kitty_image_data(image_id, generation, callback)
     }
 
     fn size(&self) -> (u16, u16) {

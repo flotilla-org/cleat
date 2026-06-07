@@ -212,6 +212,14 @@ pub trait VtEngine {
         let snapshot = TerminalSnapshot::from_screen_grid(self.screen_grid()?, dirty);
         Ok(TerminalRenderUpdate::from_snapshot(snapshot))
     }
+    fn with_image_resource_data(
+        &mut self,
+        _image_id: u32,
+        _generation: u64,
+        _callback: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     fn size(&self) -> (u16, u16);
     fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
         Ok(TerminalModeState::default())

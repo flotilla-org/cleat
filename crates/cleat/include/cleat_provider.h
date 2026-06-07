@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 3u
+#define CLEAT_PROVIDER_ABI_VERSION 4u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -103,10 +103,18 @@ extern "C" {
 #define CLEAT_STYLE_COLOR_NONE 0u
 #define CLEAT_STYLE_COLOR_PALETTE 1u
 #define CLEAT_STYLE_COLOR_RGB 2u
+#define CLEAT_IMAGE_FORMAT_RGB 0u
+#define CLEAT_IMAGE_FORMAT_RGBA 1u
+#define CLEAT_IMAGE_FORMAT_PNG 2u
+#define CLEAT_IMAGE_FORMAT_GRAY_ALPHA 3u
+#define CLEAT_IMAGE_FORMAT_GRAY 4u
+#define CLEAT_IMAGE_COMPRESSION_NONE 0u
+#define CLEAT_IMAGE_COMPRESSION_ZLIB_DEFLATE 1u
 
 typedef struct CleatProvider cleat_provider;
 typedef struct CleatSession cleat_session;
 typedef void cleat_wake_fn(void *user_data);
+typedef bool cleat_image_resource_data_fn(void *user_data, const uint8_t *data, size_t data_len);
 
 typedef enum cleat_dirty_state {
     CLEAT_DIRTY_CLEAN = 0,
@@ -273,6 +281,37 @@ typedef struct cleat_render_update_op {
     uint16_t dst_row;
 } cleat_render_update_op;
 
+typedef struct cleat_image_resource {
+    size_t size;
+    uint32_t image_id;
+    uint64_t generation;
+    uint32_t width_px;
+    uint32_t height_px;
+    uint32_t format;
+    uint32_t compression;
+    size_t data_len;
+} cleat_image_resource;
+
+typedef struct cleat_image_placement {
+    size_t size;
+    uint32_t image_id;
+    uint64_t generation;
+    uint32_t placement_id;
+    int32_t z;
+    int32_t viewport_col;
+    int32_t viewport_row;
+    uint32_t grid_cols;
+    uint32_t grid_rows;
+    uint32_t pixel_width;
+    uint32_t pixel_height;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t x_offset_px;
+    uint32_t y_offset_px;
+} cleat_image_placement;
+
 typedef struct cleat_render_update {
     size_t size;
     uint32_t version;
@@ -287,6 +326,10 @@ typedef struct cleat_render_update {
     cleat_dirty_state dirty;
     const cleat_render_update_op *ops;
     size_t op_count;
+    const cleat_image_resource *image_resources;
+    size_t image_resource_count;
+    const cleat_image_placement *image_placements;
+    size_t image_placement_count;
 } cleat_render_update;
 
 /*
@@ -414,6 +457,18 @@ bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
  * exposes scroll/copy damage.
  */
 bool cleat_session_render_update(cleat_session *session, cleat_render_update *out);
+/*
+ * Borrows image bytes for an image resource reported by
+ * cleat_session_render_update. The callback is invoked synchronously and the
+ * data pointer is valid only for the duration of that callback. This currently
+ * succeeds only for in-process sessions. The callback must not call back into
+ * this session.
+ */
+bool cleat_session_with_image_resource_data(cleat_session *session,
+                                            uint32_t image_id,
+                                            uint64_t generation,
+                                            cleat_image_resource_data_fn *callback,
+                                            void *user_data);
 /*
  * Returns a snapshot for a requested terminal viewport. Unsupported viewport
  * kinds or offsets return false.

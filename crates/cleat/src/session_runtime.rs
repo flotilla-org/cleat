@@ -149,6 +149,15 @@ impl SessionRuntime {
         Ok(update)
     }
 
+    pub(crate) fn with_image_resource_data(
+        &mut self,
+        image_id: u32,
+        generation: u64,
+        callback: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, String> {
+        self.vt_engine.with_image_resource_data(image_id, generation, callback)
+    }
+
     pub(crate) fn scrollback_extent(&self) -> Result<TerminalScrollbackExtent, String> {
         self.vt_engine.scrollback_extent()
     }

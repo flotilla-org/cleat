@@ -330,6 +330,52 @@ fn vt_ghostty_render_update_full_exposes_rows_and_structured_style() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_render_update_exposes_kitty_image_resource_and_placement() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    engine.feed(b"\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2,c=10,r=1;////////\x1b\\").expect("feed kitty image");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+
+    assert_eq!(update.image_resources.len(), 1);
+    let resource = &update.image_resources[0];
+    assert_eq!(resource.image_id, 1);
+    assert!(resource.generation > 0);
+    assert_eq!(resource.width_px, 1);
+    assert_eq!(resource.height_px, 2);
+    assert_eq!(resource.format, 0);
+    assert_eq!(resource.compression, 0);
+    assert_eq!(resource.data_len, 6);
+
+    assert_eq!(update.image_placements.len(), 1);
+    let placement = &update.image_placements[0];
+    assert_eq!(placement.image_id, resource.image_id);
+    assert_eq!(placement.generation, resource.generation);
+    assert_eq!(placement.placement_id, 1);
+    assert_eq!(placement.viewport_col, 0);
+    assert_eq!(placement.viewport_row, 0);
+    assert_eq!(placement.source_width, 1);
+    assert_eq!(placement.source_height, 2);
+
+    let mut copied = Vec::new();
+    let borrowed = engine
+        .with_image_resource_data(resource.image_id, resource.generation, &mut |bytes| {
+            copied.extend_from_slice(bytes);
+            true
+        })
+        .expect("borrow image bytes");
+    assert!(borrowed);
+    assert_eq!(copied.len(), resource.data_len);
+    assert_eq!(copied, vec![255; 6]);
+
+    let stale = engine
+        .with_image_resource_data(resource.image_id, resource.generation.saturating_add(1), &mut |_| true)
+        .expect("stale image generation lookup");
+    assert!(!stale);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_render_update_partial_emits_row_replace_ops_for_dirty_rows() {
     let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
 

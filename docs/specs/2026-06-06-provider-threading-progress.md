@@ -125,6 +125,22 @@ Kitty virtual placeholder presence, and row dirty state. Render cells carry
 graphemes plus resolved RGB colors and structured Ghostty style color tags for
 foreground/background/underline color.
 
+Render updates also carry Kitty image state for visible non-virtual placements.
+`cleat_image_resource` records identify image content by `(image_id,
+generation)` and report dimensions, pixel format, compression, and byte length.
+`cleat_image_placement` records describe where that content should be rendered
+in the current viewport, including grid position, pixel size, source rectangle,
+cell offsets, and z index.
+
+Image bytes are intentionally not embedded in `cleat_render_update`.
+In-process embedders call `cleat_session_with_image_resource_data` with the
+reported `(image_id, generation)` key. The callback is synchronous, receives a
+borrowed byte pointer that is valid only for the callback duration, and should
+copy into the embedder's own CPU/GPU cache before returning. It must not call
+back into the same Cleat session. This avoids forcing Cleat to persist an extra
+image copy while respecting libghostty-vt's rule that borrowed Kitty graphics
+handles are invalidated by later terminal mutation.
+
 `CLEAT_RENDER_OP_SCROLL_COPY` is reserved in the ABI, but scrolling currently
 falls back to full visible replacement until Ghostty/libghostty-vt exposes a
 scroll/copy damage operation.
@@ -133,6 +149,8 @@ scroll/copy damage operation.
 
 - Add a daemon wake/subscription bridge if daemon-backed UI embeddings need the
   same callback semantics.
+- Add a daemon-safe image byte transport if remote provider clients need Kitty
+  image resources outside the in-process ABI.
 - Decide whether the API needs an explicit thread-safe command queue for calls
   made from non-owner threads.
 - Keep snapshot buffers owner-thread scoped unless a later API explicitly states

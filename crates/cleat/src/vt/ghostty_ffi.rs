@@ -102,6 +102,11 @@ pub enum GhosttyTerminalData {
     ColorBackgroundDefault = 23,
     ColorCursorDefault = 24,
     ColorPaletteDefault = 25,
+    KittyImageStorageLimit = 26,
+    KittyImageMediumFile = 27,
+    KittyImageMediumTempFile = 28,
+    KittyImageMediumSharedMem = 29,
+    KittyGraphics = 30,
 }
 
 pub type GhosttyMode = u16;
@@ -182,6 +187,7 @@ pub struct GhosttyFormatterTerminalOptions {
     pub unwrap: bool,
     pub trim: bool,
     pub extra: GhosttyFormatterTerminalExtra,
+    pub selection: *const c_void,
 }
 
 impl GhosttyFormatterTerminalOptions {
@@ -192,6 +198,7 @@ impl GhosttyFormatterTerminalOptions {
             unwrap: false,
             trim: false,
             extra: GhosttyFormatterTerminalExtra::init(),
+            selection: ptr::null(),
         }
     }
 }
@@ -460,6 +467,7 @@ pub enum GhosttyTerminalOption {
     ColorBackground = 12,
     ColorCursor = 13,
     ColorPalette = 14,
+    KittyImageStorageLimit = 15,
 }
 
 /// Callback fired synchronously from `ghostty_terminal_vt_write` when the
@@ -521,10 +529,34 @@ const _: () = assert!(std::mem::size_of::<GhosttyTerminalScrollbar>() == 24);
 pub enum GhosttyRenderStateOpaque {}
 pub enum GhosttyRowIteratorOpaque {}
 pub enum GhosttyRowCellsOpaque {}
+#[allow(dead_code)]
+pub enum GhosttyKittyGraphicsOpaque {}
+#[allow(dead_code)]
+pub enum GhosttyKittyGraphicsImageOpaque {}
 
 pub type GhosttyRenderState = *mut GhosttyRenderStateOpaque;
 pub type GhosttyRenderStateRowIterator = *mut GhosttyRowIteratorOpaque;
 pub type GhosttyRenderStateRowCells = *mut GhosttyRowCellsOpaque;
+#[allow(dead_code)]
+pub type GhosttyKittyGraphics = *mut GhosttyKittyGraphicsOpaque;
+#[allow(dead_code)]
+pub type GhosttyKittyGraphicsImage = *const GhosttyKittyGraphicsImageOpaque;
+
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GhosttyKittyGraphicsImageData {
+    Invalid = 0,
+    Id = 1,
+    Number = 2,
+    Width = 3,
+    Height = 4,
+    Format = 5,
+    Compression = 6,
+    DataPtr = 7,
+    DataLen = 8,
+    Generation = 9,
+}
 
 unsafe extern "C" {
     fn ghostty_terminal_new(allocator: *const c_void, terminal: *mut GhosttyTerminal, options: GhosttyTerminalOptions) -> GhosttyResult;
@@ -535,6 +567,14 @@ unsafe extern "C" {
     fn ghostty_terminal_get(terminal: GhosttyTerminal, data: GhosttyTerminalData, out: *mut c_void) -> GhosttyResult;
     fn ghostty_terminal_mode_get(terminal: GhosttyTerminal, mode: GhosttyMode, out_value: *mut bool) -> GhosttyResult;
     fn ghostty_terminal_set(terminal: GhosttyTerminal, option: GhosttyTerminalOption, value: *const c_void) -> GhosttyResult;
+    #[allow(dead_code)]
+    fn ghostty_kitty_graphics_image(graphics: GhosttyKittyGraphics, image_id: u32) -> GhosttyKittyGraphicsImage;
+    #[allow(dead_code)]
+    fn ghostty_kitty_graphics_image_get(
+        image: GhosttyKittyGraphicsImage,
+        data: GhosttyKittyGraphicsImageData,
+        out: *mut c_void,
+    ) -> GhosttyResult;
 
     fn ghostty_formatter_terminal_new(
         allocator: *const c_void,
@@ -696,6 +736,37 @@ impl TerminalHandle {
 
     pub fn set_default_cursor(&mut self, color: Option<GhosttyColorRgb>) -> Result<(), String> {
         self.set_color(GhosttyTerminalOption::ColorCursor, color, "ColorCursor")
+    }
+
+    #[allow(dead_code)]
+    pub fn set_kitty_image_storage_limit(&mut self, limit: u64) -> Result<(), String> {
+        let result =
+            unsafe { ghostty_terminal_set(self.raw, GhosttyTerminalOption::KittyImageStorageLimit, &limit as *const u64 as *const c_void) };
+        check_result(result, "ghostty_terminal_set(KittyImageStorageLimit)")
+    }
+
+    #[allow(dead_code)]
+    pub fn kitty_image_generation(&self, image_id: u32) -> Result<Option<u64>, String> {
+        let mut graphics: GhosttyKittyGraphics = ptr::null_mut();
+        let result = unsafe {
+            ghostty_terminal_get(self.raw, GhosttyTerminalData::KittyGraphics, &mut graphics as *mut GhosttyKittyGraphics as *mut c_void)
+        };
+        check_result(result, "ghostty_terminal_get(KittyGraphics)")?;
+        if graphics.is_null() {
+            return Ok(None);
+        }
+
+        let image = unsafe { ghostty_kitty_graphics_image(graphics, image_id) };
+        if image.is_null() {
+            return Ok(None);
+        }
+
+        let mut generation = 0u64;
+        let result = unsafe {
+            ghostty_kitty_graphics_image_get(image, GhosttyKittyGraphicsImageData::Generation, &mut generation as *mut u64 as *mut c_void)
+        };
+        check_result(result, "ghostty_kitty_graphics_image_get(Generation)")?;
+        Ok(Some(generation))
     }
 
     fn set_color(&mut self, option: GhosttyTerminalOption, color: Option<GhosttyColorRgb>, label: &str) -> Result<(), String> {
@@ -1201,5 +1272,20 @@ mod tests {
         term.feed(b"\x1b[>c");
         let reply = term.drain_replies();
         assert_eq!(reply, b"\x1b[>1;10;0c".to_vec());
+    }
+
+    #[test]
+    fn kitty_image_generation_changes_when_same_id_is_retransmitted() {
+        let mut term = TerminalHandle::new(80, 24, 1024).expect("new terminal");
+        term.set_kitty_image_storage_limit(64 * 1024 * 1024).expect("enable kitty image storage");
+
+        term.feed(b"\x1b_Ga=t,t=d,f=24,i=1,s=1,v=1;AAAA\x1b\\");
+        let first = term.kitty_image_generation(1).expect("first image generation").expect("first image exists");
+        assert!(first > 0);
+
+        term.feed(b"\x1b_Ga=t,t=d,f=24,i=1,s=1,v=1;////\x1b\\");
+        let second = term.kitty_image_generation(1).expect("second image generation").expect("second image exists");
+
+        assert_ne!(first, second);
     }
 }

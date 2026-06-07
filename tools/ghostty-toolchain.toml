@@ -2,6 +2,6 @@
 version = "0.15.2"
 
 [ghostty]
-repo = "https://github.com/ghostty-org/ghostty.git"
-ref = "f6e6bb0238cbf4ce8c154c07f5df8c5109dc9f03"
+repo = "https://github.com/rjwittams/ghostty.git"
+ref = "b20171ae71216bb27bea368a35736f5ea6bb7563"
 build_step = "-Demit-lib-vt=true"

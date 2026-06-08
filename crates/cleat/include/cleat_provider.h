@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 4u
+#define CLEAT_PROVIDER_ABI_VERSION 6u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -73,6 +73,16 @@ extern "C" {
 #define CLEAT_MOUSE_BUTTON_FLAG_RIGHT 4u
 #define CLEAT_MOUSE_BUTTON_FLAG_BACK 8u
 #define CLEAT_MOUSE_BUTTON_FLAG_FORWARD 16u
+/* Reported mouse tracking level (cleat_terminal_mode_state.mouse_tracking_mode). */
+#define CLEAT_MOUSE_TRACKING_NONE 0u
+#define CLEAT_MOUSE_TRACKING_X10 1u
+#define CLEAT_MOUSE_TRACKING_NORMAL 2u
+#define CLEAT_MOUSE_TRACKING_BUTTON 3u
+#define CLEAT_MOUSE_TRACKING_ANY 4u
+/* Reported mouse report format (cleat_terminal_mode_state.mouse_report_format). */
+#define CLEAT_MOUSE_FORMAT_LEGACY 0u
+#define CLEAT_MOUSE_FORMAT_SGR 1u
+#define CLEAT_MOUSE_FORMAT_SGR_PIXELS 2u
 #define CLEAT_CELL_WIDTH_NARROW 0u
 #define CLEAT_CELL_WIDTH_WIDE 1u
 #define CLEAT_CELL_WIDTH_SPACER_TAIL 2u
@@ -110,6 +120,7 @@ extern "C" {
 #define CLEAT_IMAGE_FORMAT_GRAY 4u
 #define CLEAT_IMAGE_COMPRESSION_NONE 0u
 #define CLEAT_IMAGE_COMPRESSION_ZLIB_DEFLATE 1u
+#define CLEAT_IMAGE_PLACEMENT_VIRTUAL (1u << 0)
 
 typedef struct CleatProvider cleat_provider;
 typedef struct CleatSession cleat_session;
@@ -201,6 +212,17 @@ typedef struct cleat_terminal_scrollbar_state {
     bool at_bottom;
 } cleat_terminal_scrollbar_state;
 
+typedef struct cleat_terminal_mode_state {
+    bool mouse_tracking;
+    uint32_t mouse_tracking_mode;
+    uint32_t mouse_report_format;
+    bool mouse_sgr;
+    bool mouse_sgr_pixels;
+    bool active_alternate_screen;
+    bool application_cursor_keys;
+    bool alternate_scroll;
+} cleat_terminal_mode_state;
+
 typedef struct cleat_snapshot {
     uint16_t cols;
     uint16_t rows;
@@ -208,6 +230,7 @@ typedef struct cleat_snapshot {
     uint32_t viewport_kind;
     uint64_t scrollback_offset_rows;
     cleat_terminal_scrollbar_state scrollbar;
+    cleat_terminal_mode_state terminal_modes;
     uint64_t render_generation;
     const cleat_cell *cells;
     size_t cell_count;
@@ -310,6 +333,7 @@ typedef struct cleat_image_placement {
     uint32_t source_height;
     uint32_t x_offset_px;
     uint32_t y_offset_px;
+    uint32_t flags;
 } cleat_image_placement;
 
 typedef struct cleat_render_update {
@@ -321,6 +345,7 @@ typedef struct cleat_render_update {
     uint32_t viewport_kind;
     uint64_t scrollback_offset_rows;
     cleat_terminal_scrollbar_state scrollbar;
+    cleat_terminal_mode_state terminal_modes;
     uint64_t render_generation;
     cleat_cursor cursor;
     cleat_dirty_state dirty;

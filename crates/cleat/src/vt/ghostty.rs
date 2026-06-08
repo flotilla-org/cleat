@@ -15,7 +15,7 @@ use crate::provider::{
     DirtyState, TerminalCellFlags, TerminalCellWidth, TerminalCursor as ProviderCursor, TerminalCursorStyle as ProviderCursorStyle,
     TerminalImagePlacement, TerminalImageResource, TerminalRenderCell, TerminalRenderRow, TerminalRenderStyle, TerminalRenderUpdate,
     TerminalRenderUpdateOp, TerminalRenderUpdateOpKind, TerminalRgb, TerminalScrollbackExtent, TerminalScrollbarState, TerminalStyleColor,
-    TerminalStyleColorTag, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
+    TerminalStyleColorTag, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome, TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
 };
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
@@ -550,6 +550,7 @@ impl VtEngine for GhosttyVtEngine {
                     source_height: placement.source_height,
                     x_offset_px: placement.x_offset_px,
                     y_offset_px: placement.y_offset_px,
+                    flags: if placement.is_virtual { TERMINAL_IMAGE_PLACEMENT_VIRTUAL } else { 0 },
                 })
                 .collect(),
             ..TerminalRenderUpdate::default()

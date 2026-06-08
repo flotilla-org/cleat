@@ -159,6 +159,8 @@ pub struct TerminalImageResource {
     pub data_len: usize,
 }
 
+pub const TERMINAL_IMAGE_PLACEMENT_VIRTUAL: u32 = 1 << 0;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminalImagePlacement {
     pub image_id: u32,
@@ -177,6 +179,7 @@ pub struct TerminalImagePlacement {
     pub source_height: u32,
     pub x_offset_px: u32,
     pub y_offset_px: u32,
+    pub flags: u32,
 }
 
 impl TerminalRenderUpdate {

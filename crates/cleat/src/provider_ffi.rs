@@ -18,7 +18,7 @@ use crate::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
         TerminalGeometry, TerminalImagePlacement, TerminalImageResource, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalRgb,
         TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalStyleColor, TerminalStyleColorTag,
-        TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
+        TerminalViewportKind, ViewportCommand, ViewportCommandOutcome, TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
     },
     runtime::RuntimeLayout,
     session::{ensure_session_started, session_socket_path},
@@ -26,7 +26,7 @@ use crate::{
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 5;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 6;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -129,6 +129,7 @@ pub const CLEAT_IMAGE_FORMAT_GRAY_ALPHA: u32 = 3;
 pub const CLEAT_IMAGE_FORMAT_GRAY: u32 = 4;
 pub const CLEAT_IMAGE_COMPRESSION_NONE: u32 = 0;
 pub const CLEAT_IMAGE_COMPRESSION_ZLIB_DEFLATE: u32 = 1;
+pub const CLEAT_IMAGE_PLACEMENT_VIRTUAL: u32 = TERMINAL_IMAGE_PLACEMENT_VIRTUAL;
 
 const POSIX_SIGTERM: i32 = 15;
 
@@ -398,6 +399,7 @@ pub struct CleatImagePlacement {
     pub source_height: u32,
     pub x_offset_px: u32,
     pub y_offset_px: u32,
+    pub flags: u32,
 }
 
 #[repr(C)]
@@ -964,6 +966,7 @@ fn image_placement_to_ffi(placement: &TerminalImagePlacement) -> CleatImagePlace
         source_height: placement.source_height,
         x_offset_px: placement.x_offset_px,
         y_offset_px: placement.y_offset_px,
+        flags: placement.flags,
     }
 }
 
@@ -3050,6 +3053,7 @@ mod tests {
                 source_height: 4,
                 x_offset_px: 6,
                 y_offset_px: 7,
+                flags: TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
             }],
             ops: vec![TerminalRenderUpdateOp {
                 kind: TerminalRenderUpdateOpKind::FullVisibleReplace,
@@ -3159,6 +3163,7 @@ mod tests {
         assert_eq!(placements[0].source_height, 4);
         assert_eq!(placements[0].x_offset_px, 6);
         assert_eq!(placements[0].y_offset_px, 7);
+        assert_eq!(placements[0].flags, CLEAT_IMAGE_PLACEMENT_VIRTUAL);
     }
 
     #[test]

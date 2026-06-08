@@ -125,12 +125,15 @@ Kitty virtual placeholder presence, and row dirty state. Render cells carry
 graphemes plus resolved RGB colors and structured Ghostty style color tags for
 foreground/background/underline color.
 
-Render updates also carry Kitty image state for visible non-virtual placements.
+Render updates also carry Kitty image state for visible placements, including
+resolved Kitty unicode virtual-placement fragments.
 `cleat_image_resource` records identify image content by `(image_id,
 generation)` and report dimensions, pixel format, compression, and byte length.
 `cleat_image_placement` records describe where that content should be rendered
 in the current viewport, including grid position, pixel size, source rectangle,
-cell offsets, and z index.
+cell offsets, z index, and placement flags. `CLEAT_IMAGE_PLACEMENT_VIRTUAL`
+identifies fragments whose drawable position came from unicode placeholder cells
+rather than a direct stored placement.
 
 Image bytes are intentionally not embedded in `cleat_render_update`.
 In-process embedders call `cleat_session_with_image_resource_data` with the

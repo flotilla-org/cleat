@@ -1,6 +1,7 @@
 #[cfg(feature = "ghostty-vt")]
 use cleat::provider::{
     DirtyState, TerminalRenderUpdateOpKind, TerminalStyleColorTag, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
+    TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
 };
 use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, VtEngine};
 #[cfg(feature = "ghostty-vt")]
@@ -372,6 +373,7 @@ fn vt_ghostty_render_update_exposes_kitty_image_resource_and_placement() {
     assert_eq!(placement.image_id, resource.image_id);
     assert_eq!(placement.generation, resource.generation);
     assert_eq!(placement.placement_id, 1);
+    assert_eq!(placement.flags, 0);
     assert_eq!(placement.viewport_col, 0);
     assert_eq!(placement.viewport_row, 0);
     assert_eq!(placement.source_width, 1);
@@ -392,6 +394,65 @@ fn vt_ghostty_render_update_exposes_kitty_image_resource_and_placement() {
         .with_image_resource_data(resource.image_id, resource.generation.saturating_add(1), &mut |_| true)
         .expect("stale image generation lookup");
     assert!(!stale);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_exposes_kitty_virtual_image_placements() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(10, 4);
+    engine.set_cell_size(10, 10).expect("set cell size");
+
+    let transmit = "\x1b_Ga=T,t=d,f=24,i=1,U=1,s=4,v=2,c=4,r=2;////////////////////////////////\x1b\\";
+    engine.feed(transmit.as_bytes()).expect("feed virtual kitty image");
+
+    let row0 = "\x1b[38;2;0;0;1m\
+        \u{10EEEE}\u{0305}\u{0305}\
+        \u{10EEEE}\u{0305}\u{030D}\
+        \u{10EEEE}\u{0305}\u{030E}\
+        \u{10EEEE}\u{0305}\u{0310}\
+        \x1b[39m";
+    let row1 = "\x1b[2;1H\x1b[38;2;0;0;1m\
+        \u{10EEEE}\u{030D}\u{0305}\
+        \u{10EEEE}\u{030D}\u{030D}\
+        \u{10EEEE}\u{030D}\u{030E}\
+        \u{10EEEE}\u{030D}\u{0310}\
+        \x1b[39m";
+    engine.feed(row0.as_bytes()).expect("feed first virtual row");
+    engine.feed(row1.as_bytes()).expect("feed second virtual row");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+
+    assert_eq!(update.image_resources.len(), 1);
+    let resource = &update.image_resources[0];
+    assert_eq!(resource.image_id, 1);
+    assert!(resource.generation > 0);
+    assert_eq!(resource.width_px, 4);
+    assert_eq!(resource.height_px, 2);
+    assert_eq!(resource.data_len, 24);
+
+    assert_eq!(update.image_placements.len(), 2);
+    let first = &update.image_placements[0];
+    assert_eq!(first.image_id, resource.image_id);
+    assert_eq!(first.generation, resource.generation);
+    assert_eq!(first.flags, TERMINAL_IMAGE_PLACEMENT_VIRTUAL);
+    assert_eq!(first.viewport_col, 0);
+    assert_eq!(first.viewport_row, 0);
+    assert_eq!(first.grid_cols, 4);
+    assert_eq!(first.grid_rows, 1);
+    assert_eq!(first.pixel_width, 40);
+    assert_eq!(first.pixel_height, 10);
+    assert_eq!(first.source_x, 0);
+    assert_eq!(first.source_y, 0);
+    assert_eq!(first.source_width, 4);
+    assert_eq!(first.source_height, 1);
+
+    let second = &update.image_placements[1];
+    assert_eq!(second.image_id, resource.image_id);
+    assert_eq!(second.generation, resource.generation);
+    assert_eq!(second.flags, TERMINAL_IMAGE_PLACEMENT_VIRTUAL);
+    assert_eq!(second.viewport_col, 0);
+    assert_eq!(second.viewport_row, 1);
+    assert_eq!(second.source_y, 1);
 }
 
 #[cfg(feature = "ghostty-vt")]

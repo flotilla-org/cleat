@@ -554,6 +554,8 @@ pub enum GhosttyKittyGraphicsOpaque {}
 pub enum GhosttyKittyGraphicsImageOpaque {}
 #[allow(dead_code)]
 pub enum GhosttyKittyGraphicsPlacementIteratorOpaque {}
+#[allow(dead_code)]
+pub enum GhosttyKittyGraphicsVirtualPlacementIteratorOpaque {}
 
 pub type GhosttyRenderState = *mut GhosttyRenderStateOpaque;
 pub type GhosttyRenderStateRowIterator = *mut GhosttyRowIteratorOpaque;
@@ -564,6 +566,8 @@ pub type GhosttyKittyGraphics = *mut GhosttyKittyGraphicsOpaque;
 pub type GhosttyKittyGraphicsImage = *const GhosttyKittyGraphicsImageOpaque;
 #[allow(dead_code)]
 pub type GhosttyKittyGraphicsPlacementIterator = *mut GhosttyKittyGraphicsPlacementIteratorOpaque;
+#[allow(dead_code)]
+pub type GhosttyKittyGraphicsVirtualPlacementIterator = *mut GhosttyKittyGraphicsVirtualPlacementIteratorOpaque;
 
 pub enum GhosttyAllocator {}
 
@@ -659,6 +663,33 @@ impl GhosttyKittyGraphicsPlacementRenderInfo {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GhosttyKittyGraphicsVirtualPlacementInfo {
+    pub size: usize,
+    pub image_id: u32,
+    pub placement_id: u32,
+    pub z: i32,
+    pub viewport_col: i32,
+    pub viewport_row: i32,
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub x_offset: u32,
+    pub y_offset: u32,
+}
+
+impl GhosttyKittyGraphicsVirtualPlacementInfo {
+    fn init() -> Self {
+        Self { size: std::mem::size_of::<Self>(), ..Self::default() }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KittyImageResourceInfo {
     pub image_id: u32,
@@ -675,6 +706,7 @@ pub struct KittyImagePlacementInfo {
     pub image_id: u32,
     pub generation: u64,
     pub placement_id: u32,
+    pub is_virtual: bool,
     pub z: i32,
     pub viewport_col: i32,
     pub viewport_row: i32,
@@ -732,6 +764,23 @@ unsafe extern "C" {
         image: GhosttyKittyGraphicsImage,
         terminal: GhosttyTerminal,
         out_info: *mut GhosttyKittyGraphicsPlacementRenderInfo,
+    ) -> GhosttyResult;
+    #[allow(dead_code)]
+    fn ghostty_kitty_graphics_virtual_placement_iterator_new(
+        allocator: *const c_void,
+        out_iterator: *mut GhosttyKittyGraphicsVirtualPlacementIterator,
+    ) -> GhosttyResult;
+    #[allow(dead_code)]
+    fn ghostty_kitty_graphics_virtual_placement_iterator_free(iterator: GhosttyKittyGraphicsVirtualPlacementIterator);
+    #[allow(dead_code)]
+    fn ghostty_kitty_graphics_virtual_placement_iterator_reset(
+        iterator: GhosttyKittyGraphicsVirtualPlacementIterator,
+        terminal: GhosttyTerminal,
+    ) -> GhosttyResult;
+    #[allow(dead_code)]
+    fn ghostty_kitty_graphics_virtual_placement_next(
+        iterator: GhosttyKittyGraphicsVirtualPlacementIterator,
+        out_info: *mut GhosttyKittyGraphicsVirtualPlacementInfo,
     ) -> GhosttyResult;
 
     fn ghostty_formatter_terminal_new(
@@ -1331,6 +1380,7 @@ impl TerminalHandle {
                 image_id,
                 generation: resource.generation,
                 placement_id: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::PlacementId, "PlacementId")?,
+                is_virtual: false,
                 z: placement_i32(iterator.raw, GhosttyKittyGraphicsPlacementData::Z, "Z")?,
                 viewport_col: render_info.viewport_col,
                 viewport_row: render_info.viewport_row,
@@ -1347,6 +1397,54 @@ impl TerminalHandle {
             };
             resources.entry((resource.image_id, resource.generation)).or_insert(resource);
             placements.push(placement);
+        }
+
+        let virtual_iterator = VirtualPlacementIteratorHandle::new()?;
+        let result = unsafe { ghostty_kitty_graphics_virtual_placement_iterator_reset(virtual_iterator.raw, self.raw) };
+        match result {
+            GhosttyResult::Success => loop {
+                let mut info = GhosttyKittyGraphicsVirtualPlacementInfo::init();
+                let result = unsafe { ghostty_kitty_graphics_virtual_placement_next(virtual_iterator.raw, &mut info) };
+                match result {
+                    GhosttyResult::Success => {}
+                    GhosttyResult::NoValue => break,
+                    other => {
+                        check_result(other, "ghostty_kitty_graphics_virtual_placement_next")?;
+                        unreachable!("check_result returned Ok for non-success virtual placement result");
+                    }
+                }
+
+                let image = unsafe { ghostty_kitty_graphics_image(graphics, info.image_id) };
+                if image.is_null() {
+                    continue;
+                }
+                let resource = image_resource_info(image)?;
+                let generation = resource.generation;
+                resources.entry((resource.image_id, generation)).or_insert(resource);
+                placements.push(KittyImagePlacementInfo {
+                    image_id: info.image_id,
+                    generation,
+                    placement_id: info.placement_id,
+                    is_virtual: true,
+                    z: info.z,
+                    viewport_col: info.viewport_col,
+                    viewport_row: info.viewport_row,
+                    grid_cols: info.grid_cols,
+                    grid_rows: info.grid_rows,
+                    pixel_width: info.pixel_width,
+                    pixel_height: info.pixel_height,
+                    source_x: info.source_x,
+                    source_y: info.source_y,
+                    source_width: info.source_width,
+                    source_height: info.source_height,
+                    x_offset_px: info.x_offset,
+                    y_offset_px: info.y_offset,
+                });
+            },
+            GhosttyResult::NoValue => {}
+            other => {
+                check_result(other, "ghostty_kitty_graphics_virtual_placement_iterator_reset")?;
+            }
         }
 
         Ok((resources.into_values().collect(), placements))
@@ -1479,6 +1577,28 @@ impl PlacementIteratorHandle {
 impl Drop for PlacementIteratorHandle {
     fn drop(&mut self) {
         unsafe { ghostty_kitty_graphics_placement_iterator_free(self.raw) };
+    }
+}
+
+struct VirtualPlacementIteratorHandle {
+    raw: GhosttyKittyGraphicsVirtualPlacementIterator,
+}
+
+impl VirtualPlacementIteratorHandle {
+    fn new() -> Result<Self, String> {
+        let mut raw = ptr::null_mut();
+        let result = unsafe { ghostty_kitty_graphics_virtual_placement_iterator_new(ptr::null(), &mut raw) };
+        check_result(result, "ghostty_kitty_graphics_virtual_placement_iterator_new")?;
+        if raw.is_null() {
+            return Err("ghostty_kitty_graphics_virtual_placement_iterator_new returned null iterator".to_string());
+        }
+        Ok(Self { raw })
+    }
+}
+
+impl Drop for VirtualPlacementIteratorHandle {
+    fn drop(&mut self) {
+        unsafe { ghostty_kitty_graphics_virtual_placement_iterator_free(self.raw) };
     }
 }
 

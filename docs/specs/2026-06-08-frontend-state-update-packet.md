@@ -131,6 +131,18 @@ Future frontend-readable scalar fields should follow the same pattern: add them
 to the packet state, include them in the observation snapshot diff, and avoid a
 side-channel query.
 
+**Future: pack the mode booleans into a `u64` flags word.** The reported modes
+(`mouse_tracking`, `mouse_sgr`, alt-screen, app-cursor-keys, …, and the ones still
+to come: bracketed paste, focus reporting) are currently one C `bool` field each.
+That makes every new mode a struct-layout change — ABI bump, header edit, rebuild
+everyone (the churn that added `terminal_modes`). A single `u64 mode_flags` makes
+a new mode just a new *bit*: struct size/layout unchanged, no version bump, old
+clients ignore bits they don't know. It also collapses "did the modes change?" to
+one `u64` compare in the snapshot diff. The non-boolean enums
+(`mouse_tracking_mode`, `mouse_report_format`) stay as small int fields alongside.
+Worth doing before the mode set actually starts growing, since that's when the
+bool-per-mode tax compounds.
+
 ## Non-goals
 
 - Not proposing an event/notification channel for state changes - state rides the

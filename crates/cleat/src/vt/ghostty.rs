@@ -17,7 +17,11 @@ use crate::provider::{
 };
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
-const DEFAULT_KITTY_IMAGE_STORAGE_LIMIT: u64 = 64 * 1024 * 1024;
+// Match libghostty-vt's own default (320 MB). A lower limit silently evicts the
+// oldest images (placements included) once the decoded RGBA footprint exceeds
+// it. For example, three 2269x2620 images are ~22.7 MB each = ~68 MB, which a
+// 64 MB cap would push the oldest placement out of.
+const DEFAULT_KITTY_IMAGE_STORAGE_LIMIT: u64 = 320 * 1000 * 1000;
 
 pub struct GhosttyVtEngine {
     terminal: TerminalHandle,

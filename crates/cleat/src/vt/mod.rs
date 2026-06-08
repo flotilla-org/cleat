@@ -158,11 +158,31 @@ impl ScreenGrid {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MouseTrackingMode {
+    #[default]
+    None,
+    X10,
+    Normal,
+    Button,
+    Any,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MouseReportFormat {
+    #[default]
+    Legacy,
+    Sgr,
+    SgrPixels,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TerminalModeState {
     pub active_alternate_screen: bool,
     pub application_cursor_keys: bool,
     pub alternate_scroll: bool,
     pub mouse_tracking: bool,
+    pub mouse_tracking_mode: MouseTrackingMode,
+    pub mouse_report_format: MouseReportFormat,
     pub mouse_sgr: bool,
     pub mouse_sgr_pixels: bool,
 }

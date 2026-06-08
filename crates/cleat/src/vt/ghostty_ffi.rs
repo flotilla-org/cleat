@@ -112,6 +112,10 @@ pub enum GhosttyTerminalData {
 pub type GhosttyMode = u16;
 
 pub const GHOSTTY_MODE_DECCKM: GhosttyMode = 1;
+pub const GHOSTTY_MODE_MOUSE_X10: GhosttyMode = 9;
+pub const GHOSTTY_MODE_MOUSE_NORMAL: GhosttyMode = 1000;
+pub const GHOSTTY_MODE_MOUSE_BUTTON: GhosttyMode = 1002;
+pub const GHOSTTY_MODE_MOUSE_ANY: GhosttyMode = 1003;
 pub const GHOSTTY_MODE_SGR_MOUSE: GhosttyMode = 1006;
 pub const GHOSTTY_MODE_ALT_SCROLL: GhosttyMode = 1007;
 pub const GHOSTTY_MODE_SGR_PIXELS_MOUSE: GhosttyMode = 1016;
@@ -1429,14 +1433,6 @@ impl TerminalHandle {
         let mut enabled = false;
         let result = unsafe { ghostty_terminal_mode_get(self.raw, mode, &mut enabled) };
         check_result(result, "ghostty_terminal_mode_get")?;
-        Ok(enabled)
-    }
-
-    pub fn mouse_tracking(&self) -> Result<bool, String> {
-        let mut enabled = false;
-        let result =
-            unsafe { ghostty_terminal_get(self.raw, GhosttyTerminalData::MouseTracking, &mut enabled as *mut bool as *mut c_void) };
-        check_result(result, "ghostty_terminal_get(MouseTracking)")?;
         Ok(enabled)
     }
 

@@ -114,11 +114,26 @@ When we wire the mouse-mode exposure:
 3. uishell (or the web UI) caches them from the stream; uses them to gate hover
    and switch local-selection vs. forwarding. Encoder still re-gates.
 
+## Implementation status
+
+The first application of this rule is implemented for mouse state:
+
+- `TerminalSnapshot` and `TerminalRenderUpdate` carry `TerminalModeState`.
+- `TerminalModeState` includes mouse tracking level (`none / x10 / normal /
+  button / any`) and report format (`legacy / sgr / sgr_pixels`), while keeping
+  the coarse booleans used by existing input paths.
+- The C provider ABI exposes the same state in `CleatTerminalModeState`.
+- In-process observation tracks scalar terminal mode state; a scalar-only change
+  advances the render generation and can produce a partial update with no row
+  operations.
+
+Future frontend-readable scalar fields should follow the same pattern: add them
+to the packet state, include them in the observation snapshot diff, and avoid a
+side-channel query.
+
 ## Non-goals
 
 - Not proposing an event/notification channel for state changes - state rides the
   existing packet stream.
 - Not reworking the cell-grid dirty tracking; only the scalar state moves to
   snapshot-diff.
-- The mouse-mode exposure itself is deferred; this records the shape so it (and every
-  later "expose X to the frontend") follows the same rule.

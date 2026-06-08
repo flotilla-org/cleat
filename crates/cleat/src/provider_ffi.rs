@@ -26,7 +26,7 @@ use crate::{
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 4;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 5;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -90,6 +90,14 @@ pub const CLEAT_MOUSE_BUTTON_FLAG_MIDDLE: u16 = 2;
 pub const CLEAT_MOUSE_BUTTON_FLAG_RIGHT: u16 = 4;
 pub const CLEAT_MOUSE_BUTTON_FLAG_BACK: u16 = 8;
 pub const CLEAT_MOUSE_BUTTON_FLAG_FORWARD: u16 = 16;
+pub const CLEAT_MOUSE_TRACKING_NONE: u32 = 0;
+pub const CLEAT_MOUSE_TRACKING_X10: u32 = 1;
+pub const CLEAT_MOUSE_TRACKING_NORMAL: u32 = 2;
+pub const CLEAT_MOUSE_TRACKING_BUTTON: u32 = 3;
+pub const CLEAT_MOUSE_TRACKING_ANY: u32 = 4;
+pub const CLEAT_MOUSE_FORMAT_LEGACY: u32 = 0;
+pub const CLEAT_MOUSE_FORMAT_SGR: u32 = 1;
+pub const CLEAT_MOUSE_FORMAT_SGR_PIXELS: u32 = 2;
 pub const CLEAT_CELL_WIDTH_NARROW: u32 = 0;
 pub const CLEAT_CELL_WIDTH_WIDE: u32 = 1;
 pub const CLEAT_CELL_WIDTH_SPACER_TAIL: u32 = 2;
@@ -253,6 +261,19 @@ impl From<TerminalGeometry> for CleatTerminalGeometry {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CleatTerminalModeState {
+    pub mouse_tracking: bool,
+    pub mouse_tracking_mode: u32,
+    pub mouse_report_format: u32,
+    pub mouse_sgr: bool,
+    pub mouse_sgr_pixels: bool,
+    pub active_alternate_screen: bool,
+    pub application_cursor_keys: bool,
+    pub alternate_scroll: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CleatSnapshot {
     pub cols: u16,
     pub rows: u16,
@@ -260,6 +281,7 @@ pub struct CleatSnapshot {
     pub viewport_kind: u32,
     pub scrollback_offset_rows: u64,
     pub scrollbar: CleatTerminalScrollbarState,
+    pub terminal_modes: CleatTerminalModeState,
     pub render_generation: u64,
     pub cells: *const CleatCell,
     pub cell_count: usize,
@@ -389,6 +411,7 @@ pub struct CleatRenderUpdate {
     pub viewport_kind: u32,
     pub scrollback_offset_rows: u64,
     pub scrollbar: CleatTerminalScrollbarState,
+    pub terminal_modes: CleatTerminalModeState,
     pub render_generation: u64,
     pub cursor: CleatCursor,
     pub dirty: CleatDirtyState,
@@ -534,11 +557,13 @@ struct ObservationState {
     observed_generation: u64,
     dirty: DirtyState,
     dirty_rows: Vec<u16>,
+    terminal_modes: Option<vt::TerminalModeState>,
 }
 
 impl ObservationState {
     fn new(rows: u16) -> Self {
-        let mut state = Self { render_generation: 0, observed_generation: 0, dirty: DirtyState::Clean, dirty_rows: Vec::new() };
+        let mut state =
+            Self { render_generation: 0, observed_generation: 0, dirty: DirtyState::Clean, dirty_rows: Vec::new(), terminal_modes: None };
         state.mark_full(rows);
         state
     }
@@ -584,6 +609,15 @@ impl ObservationState {
         was_clean
     }
 
+    fn sync_terminal_modes(&mut self, terminal_modes: vt::TerminalModeState) -> bool {
+        let previous = self.terminal_modes.replace(terminal_modes);
+        match previous {
+            None => false,
+            Some(previous) if previous == terminal_modes => false,
+            Some(_) => self.mark_partial_unknown(),
+        }
+    }
+
     fn mark_observed(&mut self, generation: u64) -> bool {
         if generation > self.render_generation {
             return false;
@@ -612,9 +646,12 @@ impl ObservationState {
 
     fn annotate_render_update(&self, update: &mut TerminalRenderUpdate) {
         update.render_generation = self.render_generation;
-        if self.dirty() == DirtyState::Clean {
+        let dirty = self.dirty();
+        if dirty == DirtyState::Clean {
             update.dirty = DirtyState::Clean;
             update.ops.clear();
+        } else if update.dirty == DirtyState::Clean {
+            update.dirty = dirty;
         }
     }
 }
@@ -748,6 +785,7 @@ impl OwnedSnapshot {
                 viewport_kind: viewport_kind_to_ffi(snapshot.viewport_kind),
                 scrollback_offset_rows: snapshot.scrollback_offset_rows,
                 scrollbar: scrollbar_to_ffi(snapshot.scrollbar),
+                terminal_modes: terminal_modes_to_ffi(snapshot.terminal_modes),
                 render_generation: snapshot.render_generation,
                 cells: ptr::null(),
                 cell_count: cells.len(),
@@ -847,6 +885,7 @@ impl OwnedRenderUpdate {
                 viewport_kind: viewport_kind_to_ffi(update.viewport_kind),
                 scrollback_offset_rows: update.scrollback_offset_rows,
                 scrollbar: scrollbar_to_ffi(update.scrollbar),
+                terminal_modes: terminal_modes_to_ffi(update.terminal_modes),
                 render_generation: update.render_generation,
                 cursor: cursor_to_ffi(update.cursor),
                 dirty: update.dirty.into(),
@@ -925,6 +964,29 @@ fn image_placement_to_ffi(placement: &TerminalImagePlacement) -> CleatImagePlace
         source_height: placement.source_height,
         x_offset_px: placement.x_offset_px,
         y_offset_px: placement.y_offset_px,
+    }
+}
+
+fn terminal_modes_to_ffi(modes: vt::TerminalModeState) -> CleatTerminalModeState {
+    CleatTerminalModeState {
+        mouse_tracking: modes.mouse_tracking,
+        mouse_tracking_mode: match modes.mouse_tracking_mode {
+            vt::MouseTrackingMode::None => CLEAT_MOUSE_TRACKING_NONE,
+            vt::MouseTrackingMode::X10 => CLEAT_MOUSE_TRACKING_X10,
+            vt::MouseTrackingMode::Normal => CLEAT_MOUSE_TRACKING_NORMAL,
+            vt::MouseTrackingMode::Button => CLEAT_MOUSE_TRACKING_BUTTON,
+            vt::MouseTrackingMode::Any => CLEAT_MOUSE_TRACKING_ANY,
+        },
+        mouse_report_format: match modes.mouse_report_format {
+            vt::MouseReportFormat::Legacy => CLEAT_MOUSE_FORMAT_LEGACY,
+            vt::MouseReportFormat::Sgr => CLEAT_MOUSE_FORMAT_SGR,
+            vt::MouseReportFormat::SgrPixels => CLEAT_MOUSE_FORMAT_SGR_PIXELS,
+        },
+        mouse_sgr: modes.mouse_sgr,
+        mouse_sgr_pixels: modes.mouse_sgr_pixels,
+        active_alternate_screen: modes.active_alternate_screen,
+        application_cursor_keys: modes.application_cursor_keys,
+        alternate_scroll: modes.alternate_scroll,
     }
 }
 
@@ -1979,6 +2041,14 @@ fn mark_partial_unknown_and_wake(observation: &mut ObservationState, wake: &Arc<
     }
 }
 
+fn sync_terminal_modes_and_wake(runtime: &SessionRuntime, observation: &mut ObservationState, wake: &Arc<Mutex<WakeCallback>>) {
+    if let Ok(terminal_modes) = runtime.terminal_mode_state() {
+        if observation.sync_terminal_modes(terminal_modes) {
+            notify_wake(wake);
+        }
+    }
+}
+
 fn notify_wake(wake: &Arc<Mutex<WakeCallback>>) {
     let callback = match wake.lock() {
         Ok(callback) => *callback,
@@ -2078,6 +2148,7 @@ fn in_process_actor_handle_command(
             let _ = reply.send(result);
         }
         InProcessCommand::Snapshot { reply } => {
+            sync_terminal_modes_and_wake(runtime, observation, wake);
             let result = runtime.snapshot(observation.dirty()).map(|mut snapshot| {
                 observation.annotate_snapshot(&mut snapshot);
                 snapshot
@@ -2085,6 +2156,7 @@ fn in_process_actor_handle_command(
             let _ = reply.send(result);
         }
         InProcessCommand::RenderUpdate { reply } => {
+            sync_terminal_modes_and_wake(runtime, observation, wake);
             let result = runtime.render_update(observation.dirty()).map(|mut update| {
                 observation.annotate_render_update(&mut update);
                 update
@@ -2102,6 +2174,7 @@ fn in_process_actor_handle_command(
             let _ = reply.send(result);
         }
         InProcessCommand::Dirty { reply } => {
+            sync_terminal_modes_and_wake(runtime, observation, wake);
             let _ = reply.send(observation.dirty());
         }
         InProcessCommand::MarkObserved { generation, reply } => {
@@ -2148,6 +2221,7 @@ fn in_process_actor_pump(
             mark_full_and_wake(observation, rows, wake);
         }
     }
+    sync_terminal_modes_and_wake(runtime, observation, wake);
 }
 
 /// # Safety
@@ -2320,6 +2394,7 @@ fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<T
         viewport_kind: viewport_kind_from_name(&snapshot.viewport_kind)?,
         scrollback_offset_rows: snapshot.scrollback_offset_rows,
         scrollbar: scrollbar_from_http(snapshot.scrollbar)?,
+        terminal_modes: terminal_modes_from_http(snapshot.terminal_modes)?,
         render_generation: 0,
         cells: snapshot
             .cells
@@ -2369,6 +2444,21 @@ fn geometry_from_http(geometry: http_uds::GeometryResponse) -> TerminalGeometry 
     .sanitized()
 }
 
+fn terminal_modes_from_http(modes: http_uds::TerminalModeResponse) -> Result<vt::TerminalModeState, String> {
+    let mouse_tracking_mode = mouse_tracking_mode_from_name(&modes.mouse_tracking_mode)?;
+    let mouse_report_format = mouse_report_format_from_name(&modes.mouse_report_format)?;
+    Ok(vt::TerminalModeState {
+        active_alternate_screen: modes.active_alternate_screen,
+        application_cursor_keys: modes.application_cursor_keys,
+        alternate_scroll: modes.alternate_scroll,
+        mouse_tracking: modes.mouse_tracking,
+        mouse_tracking_mode,
+        mouse_report_format,
+        mouse_sgr: modes.mouse_sgr,
+        mouse_sgr_pixels: modes.mouse_sgr_pixels,
+    })
+}
+
 fn dirty_from_name(name: &str) -> Result<DirtyState, String> {
     match name {
         "clean" => Ok(DirtyState::Clean),
@@ -2404,6 +2494,26 @@ fn viewport_kind_from_name(name: &str) -> Result<TerminalViewportKind, String> {
         "live_alternate" => Ok(TerminalViewportKind::LiveAlternate),
         "normal_scrollback" => Ok(TerminalViewportKind::NormalScrollback),
         other => Err(format!("unknown viewport kind {other}")),
+    }
+}
+
+fn mouse_tracking_mode_from_name(name: &str) -> Result<vt::MouseTrackingMode, String> {
+    match name {
+        "none" => Ok(vt::MouseTrackingMode::None),
+        "x10" => Ok(vt::MouseTrackingMode::X10),
+        "normal" => Ok(vt::MouseTrackingMode::Normal),
+        "button" => Ok(vt::MouseTrackingMode::Button),
+        "any" => Ok(vt::MouseTrackingMode::Any),
+        other => Err(format!("unknown mouse tracking mode {other}")),
+    }
+}
+
+fn mouse_report_format_from_name(name: &str) -> Result<vt::MouseReportFormat, String> {
+    match name {
+        "legacy" => Ok(vt::MouseReportFormat::Legacy),
+        "sgr" => Ok(vt::MouseReportFormat::Sgr),
+        "sgr_pixels" => Ok(vt::MouseReportFormat::SgrPixels),
+        other => Err(format!("unknown mouse report format {other}")),
     }
 }
 
@@ -2531,6 +2641,7 @@ fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> T
         viewport_kind: TerminalViewportKind::LiveNormal,
         scrollback_offset_rows: 0,
         scrollbar: TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, rows),
+        terminal_modes: vt::TerminalModeState::default(),
         render_generation: 0,
         cells,
         cursor: TerminalCursor {
@@ -2607,6 +2718,33 @@ mod tests {
         assert!(observation.mark_observed(3));
         assert_eq!(observation.dirty(), DirtyState::Clean);
         assert!(!observation.mark_observed(4));
+    }
+
+    #[test]
+    fn observation_generation_advances_for_terminal_mode_changes() {
+        let mut observation = ObservationState::new(24);
+        assert_eq!(observation.render_generation, 1);
+        assert!(!observation.sync_terminal_modes(vt::TerminalModeState::default()));
+        assert_eq!(observation.render_generation, 1);
+        assert!(observation.mark_observed(1));
+        assert_eq!(observation.dirty(), DirtyState::Clean);
+
+        let modes = vt::TerminalModeState {
+            mouse_tracking: true,
+            mouse_tracking_mode: vt::MouseTrackingMode::Any,
+            mouse_report_format: vt::MouseReportFormat::Sgr,
+            mouse_sgr: true,
+            ..vt::TerminalModeState::default()
+        };
+        assert!(observation.sync_terminal_modes(modes));
+        assert_eq!(observation.render_generation, 2);
+        assert_eq!(observation.dirty(), DirtyState::Partial);
+
+        let mut update = TerminalRenderUpdate { dirty: DirtyState::Clean, ..TerminalRenderUpdate::default() };
+        observation.annotate_render_update(&mut update);
+        assert_eq!(update.render_generation, 2);
+        assert_eq!(update.dirty, DirtyState::Partial);
+        assert!(update.ops.is_empty());
     }
 
     #[test]
@@ -2834,6 +2972,8 @@ mod tests {
             let mut initial = CleatRenderUpdate::default();
             assert!(cleat_session_render_update(session, &mut initial));
             assert_eq!(initial.version, CLEAT_RENDER_UPDATE_VERSION);
+            assert_eq!(initial.terminal_modes.mouse_tracking_mode, CLEAT_MOUSE_TRACKING_NONE);
+            assert_eq!(initial.terminal_modes.mouse_report_format, CLEAT_MOUSE_FORMAT_LEGACY);
             assert_eq!(initial.dirty, CleatDirtyState::Full);
             assert_eq!(initial.op_count, 1);
             let initial_ops = slice::from_raw_parts(initial.ops, initial.op_count);

@@ -6,8 +6,12 @@ use http::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{
-    DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalGeometry, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
+use crate::{
+    provider::{
+        DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalGeometry, TerminalScrollbarState, TerminalSnapshot,
+        TerminalViewportKind,
+    },
+    vt,
 };
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -205,9 +209,22 @@ pub(crate) struct SnapshotResponse {
     pub viewport_kind: String,
     pub scrollback_offset_rows: u64,
     pub scrollbar: ScrollbarResponse,
+    pub terminal_modes: TerminalModeResponse,
     pub cells: Vec<CellResponse>,
     pub cursor: CursorResponse,
     pub dirty: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
+pub(crate) struct TerminalModeResponse {
+    pub active_alternate_screen: bool,
+    pub application_cursor_keys: bool,
+    pub alternate_scroll: bool,
+    pub mouse_tracking: bool,
+    pub mouse_tracking_mode: String,
+    pub mouse_report_format: String,
+    pub mouse_sgr: bool,
+    pub mouse_sgr_pixels: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
@@ -502,6 +519,7 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
         viewport_kind: viewport_kind_name(snapshot.viewport_kind).to_string(),
         scrollback_offset_rows: snapshot.scrollback_offset_rows,
         scrollbar: snapshot.scrollbar.into(),
+        terminal_modes: terminal_modes_response(snapshot.terminal_modes),
         cells: snapshot
             .cells
             .into_iter()
@@ -522,6 +540,19 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
             wide_tail: snapshot.cursor.wide_tail,
         },
         dirty: dirty_name(snapshot.dirty).to_string(),
+    }
+}
+
+fn terminal_modes_response(modes: vt::TerminalModeState) -> TerminalModeResponse {
+    TerminalModeResponse {
+        active_alternate_screen: modes.active_alternate_screen,
+        application_cursor_keys: modes.application_cursor_keys,
+        alternate_scroll: modes.alternate_scroll,
+        mouse_tracking: modes.mouse_tracking,
+        mouse_tracking_mode: mouse_tracking_mode_name(modes.mouse_tracking_mode).to_string(),
+        mouse_report_format: mouse_report_format_name(modes.mouse_report_format).to_string(),
+        mouse_sgr: modes.mouse_sgr,
+        mouse_sgr_pixels: modes.mouse_sgr_pixels,
     }
 }
 
@@ -624,6 +655,24 @@ fn viewport_kind_name(kind: TerminalViewportKind) -> &'static str {
         TerminalViewportKind::LiveNormal => "live_normal",
         TerminalViewportKind::LiveAlternate => "live_alternate",
         TerminalViewportKind::NormalScrollback => "normal_scrollback",
+    }
+}
+
+fn mouse_tracking_mode_name(mode: vt::MouseTrackingMode) -> &'static str {
+    match mode {
+        vt::MouseTrackingMode::None => "none",
+        vt::MouseTrackingMode::X10 => "x10",
+        vt::MouseTrackingMode::Normal => "normal",
+        vt::MouseTrackingMode::Button => "button",
+        vt::MouseTrackingMode::Any => "any",
+    }
+}
+
+fn mouse_report_format_name(format: vt::MouseReportFormat) -> &'static str {
+    match format {
+        vt::MouseReportFormat::Legacy => "legacy",
+        vt::MouseReportFormat::Sgr => "sgr",
+        vt::MouseReportFormat::SgrPixels => "sgr_pixels",
     }
 }
 

@@ -4,11 +4,12 @@ use super::{
         GhosttyMods, GhosttyMouseAction, GhosttyMouseButton, GhosttyRenderStateCursorVisualStyle, GhosttyRenderStateDirty, GhosttyRowData,
         GhosttyRowSemanticPrompt, GhosttyStyle, GhosttyStyleColor, GhosttyStyleColorTag, GhosttyTerminalScreen,
         GhosttyTerminalScrollViewport, MouseEncodeEvent, MouseEncoder, RenderStateHandle, RowCellsHandle, RowIteratorHandle,
-        TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE,
-        GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
+        TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_MOUSE_ANY, GHOSTTY_MODE_MOUSE_BUTTON,
+        GHOSTTY_MODE_MOUSE_NORMAL, GHOSTTY_MODE_MOUSE_X10, GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODS_ALT,
+        GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
     },
-    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, MouseAction, MouseButton, MouseModifiers, ResolvedCell,
-    Rgb, ScreenGrid, TerminalColors, TerminalModeState, VtEngine,
+    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, MouseAction, MouseButton, MouseModifiers,
+    MouseReportFormat, MouseTrackingMode, ResolvedCell, Rgb, ScreenGrid, TerminalColors, TerminalModeState, VtEngine,
 };
 use crate::provider::{
     DirtyState, TerminalCellFlags, TerminalCellWidth, TerminalCursor as ProviderCursor, TerminalCursorStyle as ProviderCursorStyle,
@@ -514,6 +515,7 @@ impl VtEngine for GhosttyVtEngine {
         Ok(TerminalRenderUpdate {
             cols,
             rows,
+            terminal_modes: self.terminal_mode_state()?,
             cursor: provider_cursor_from_vt(cursor),
             dirty: effective_dirty,
             ops,
@@ -568,13 +570,35 @@ impl VtEngine for GhosttyVtEngine {
     }
 
     fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
+        let mouse_tracking_mode = if self.terminal.mode_enabled(GHOSTTY_MODE_MOUSE_ANY)? {
+            MouseTrackingMode::Any
+        } else if self.terminal.mode_enabled(GHOSTTY_MODE_MOUSE_BUTTON)? {
+            MouseTrackingMode::Button
+        } else if self.terminal.mode_enabled(GHOSTTY_MODE_MOUSE_NORMAL)? {
+            MouseTrackingMode::Normal
+        } else if self.terminal.mode_enabled(GHOSTTY_MODE_MOUSE_X10)? {
+            MouseTrackingMode::X10
+        } else {
+            MouseTrackingMode::None
+        };
+        let mouse_sgr = self.terminal.mode_enabled(GHOSTTY_MODE_SGR_MOUSE)?;
+        let mouse_sgr_pixels = self.terminal.mode_enabled(GHOSTTY_MODE_SGR_PIXELS_MOUSE)?;
+        let mouse_report_format = if mouse_sgr_pixels {
+            MouseReportFormat::SgrPixels
+        } else if mouse_sgr {
+            MouseReportFormat::Sgr
+        } else {
+            MouseReportFormat::Legacy
+        };
         Ok(TerminalModeState {
             active_alternate_screen: self.terminal.active_screen()? == GhosttyTerminalScreen::Alternate,
             application_cursor_keys: self.terminal.mode_enabled(GHOSTTY_MODE_DECCKM)?,
             alternate_scroll: self.terminal.mode_enabled(GHOSTTY_MODE_ALT_SCROLL)?,
-            mouse_tracking: self.terminal.mouse_tracking()?,
-            mouse_sgr: self.terminal.mode_enabled(GHOSTTY_MODE_SGR_MOUSE)?,
-            mouse_sgr_pixels: self.terminal.mode_enabled(GHOSTTY_MODE_SGR_PIXELS_MOUSE)?,
+            mouse_tracking: mouse_tracking_mode != MouseTrackingMode::None,
+            mouse_tracking_mode,
+            mouse_report_format,
+            mouse_sgr,
+            mouse_sgr_pixels,
         })
     }
 

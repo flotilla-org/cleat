@@ -3,6 +3,8 @@ use cleat::provider::{
     DirtyState, TerminalRenderUpdateOpKind, TerminalStyleColorTag, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
 };
 use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, VtEngine};
+#[cfg(feature = "ghostty-vt")]
+use cleat::vt::{MouseReportFormat, MouseTrackingMode};
 
 mod vt_contracts;
 
@@ -326,6 +328,24 @@ fn vt_ghostty_render_update_full_exposes_rows_and_structured_style() {
     assert_eq!(cell.style.resolved_fg.b, 30);
     assert_eq!(cell.style.fg_color.tag, TerminalStyleColorTag::Rgb);
     assert!(cell.style.has_text);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_exposes_mouse_tracking_level_and_format() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    let initial = engine.render_update(DirtyState::Full).expect("initial render update");
+    assert_eq!(initial.terminal_modes.mouse_tracking_mode, MouseTrackingMode::None);
+    assert_eq!(initial.terminal_modes.mouse_report_format, MouseReportFormat::Legacy);
+    assert!(!initial.terminal_modes.mouse_tracking);
+
+    engine.feed(b"\x1b[?1003h\x1b[?1016h").expect("enable any-event mouse and SGR-pixels");
+    let update = engine.render_update(DirtyState::Partial).expect("mouse mode render update");
+    assert_eq!(update.terminal_modes.mouse_tracking_mode, MouseTrackingMode::Any);
+    assert_eq!(update.terminal_modes.mouse_report_format, MouseReportFormat::SgrPixels);
+    assert!(update.terminal_modes.mouse_tracking);
+    assert!(update.terminal_modes.mouse_sgr_pixels);
 }
 
 #[cfg(feature = "ghostty-vt")]

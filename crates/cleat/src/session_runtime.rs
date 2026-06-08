@@ -150,6 +150,7 @@ impl SessionRuntime {
         snapshot.viewport_kind = scrollbar.viewport_kind;
         snapshot.scrollbar = scrollbar;
         snapshot.scrollback_offset_rows = scrollbar.viewport_top_row;
+        snapshot.terminal_modes = self.vt_engine.terminal_mode_state()?;
         Ok(snapshot)
     }
 
@@ -159,6 +160,7 @@ impl SessionRuntime {
         update.viewport_kind = scrollbar.viewport_kind;
         update.scrollbar = scrollbar;
         update.scrollback_offset_rows = scrollbar.viewport_top_row;
+        update.terminal_modes = self.vt_engine.terminal_mode_state()?;
         Ok(update)
     }
 

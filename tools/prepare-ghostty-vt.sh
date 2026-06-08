@@ -67,6 +67,18 @@ mkdir -p "$INSTALL_DIR"
 # shellcheck disable=SC2086
 (cd "$SOURCE_DIR" && zig build $build_step --prefix "$INSTALL_DIR")
 
+# Produce a co-located .dSYM for the dylib on macOS so the libghostty-vt frames
+# symbolicate when profiling/debugging the embedding app. Zig leaves DWARF in the
+# .zig-cache object files referenced by the dylib's debug map, so dsymutil must
+# run from SOURCE_DIR (where .zig-cache lives) right after the build, before the
+# cache is GC'd.
+if [ "$(uname -s)" = "Darwin" ] && command -v dsymutil >/dev/null 2>&1; then
+  for dylib in "$INSTALL_DIR"/lib/libghostty-vt*.dylib; do
+    [ -f "$dylib" ] || continue
+    (cd "$SOURCE_DIR" && dsymutil "$dylib") || echo "warning: dsymutil failed for $dylib" >&2
+  done
+fi
+
 test -f "$INSTALL_DIR/include/ghostty/vt.h"
 
 case "$(uname -s)" in

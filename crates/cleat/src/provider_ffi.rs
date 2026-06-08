@@ -639,6 +639,16 @@ struct CleatWheelEvent {
     wheel_delta_y: f32,
 }
 
+#[derive(Clone, Copy)]
+struct CleatMouseEvent {
+    mouse_kind: u32,
+    mouse_button: u32,
+    mouse_buttons: u16,
+    modifiers: u16,
+    x_px: f32,
+    y_px: f32,
+}
+
 enum InProcessCommand {
     Resize {
         cols: u16,
@@ -656,6 +666,10 @@ enum InProcessCommand {
     },
     Wheel {
         event: CleatWheelEvent,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
+    Mouse {
+        event: CleatMouseEvent,
         reply: mpsc::Sender<Result<usize, String>>,
     },
     ScrollViewport {
@@ -1275,6 +1289,7 @@ fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> Opti
         SessionBackend::InProcess(in_process) => match input_event_bytes(event) {
             Ok(Some(bytes)) => in_process_request_result(in_process, |reply| InProcessCommand::WriteInput { bytes, reply }).ok().map(|_| 1),
             Ok(None) if is_wheel_event(event) => route_in_process_wheel_event(in_process, event),
+            Ok(None) if event.kind == CLEAT_INPUT_MOUSE => route_in_process_mouse_event(in_process, event),
             Ok(None) => Some(0),
             Err(_) => None,
         },
@@ -1306,6 +1321,55 @@ fn route_in_process_wheel_event(in_process: &InProcessSession, event: &CleatInpu
         wheel_delta_y: event.wheel_delta_y,
     };
     in_process_request_result(in_process, |reply| InProcessCommand::Wheel { event: wheel, reply }).ok()
+}
+
+fn route_in_process_mouse_event(in_process: &InProcessSession, event: &CleatInputEvent) -> Option<usize> {
+    let mouse = CleatMouseEvent {
+        mouse_kind: event.mouse_kind,
+        mouse_button: event.mouse_button,
+        mouse_buttons: event.mouse_buttons,
+        modifiers: event.modifiers,
+        x_px: event.x_px,
+        y_px: event.y_px,
+    };
+    in_process_request_result(in_process, |reply| InProcessCommand::Mouse { event: mouse, reply }).ok()
+}
+
+/// Map a Cleat button id to a backend-neutral named button. Wheel directions are
+/// handled separately (the wheel path), so this only covers physical buttons.
+fn cleat_mouse_button(button: u32) -> Option<vt::MouseButton> {
+    match button {
+        CLEAT_MOUSE_BUTTON_LEFT => Some(vt::MouseButton::Left),
+        CLEAT_MOUSE_BUTTON_MIDDLE => Some(vt::MouseButton::Middle),
+        CLEAT_MOUSE_BUTTON_RIGHT => Some(vt::MouseButton::Right),
+        CLEAT_MOUSE_BUTTON_BACK => Some(vt::MouseButton::Eight),
+        CLEAT_MOUSE_BUTTON_FORWARD => Some(vt::MouseButton::Nine),
+        _ => None,
+    }
+}
+
+fn route_in_process_mouse_event_on_actor(runtime: &mut SessionRuntime, event: CleatMouseEvent) -> Result<usize, String> {
+    let action = match event.mouse_kind {
+        CLEAT_MOUSE_PRESS => vt::MouseAction::Press,
+        CLEAT_MOUSE_RELEASE => vt::MouseAction::Release,
+        CLEAT_MOUSE_MOVE => vt::MouseAction::Motion,
+        _ => return Ok(0),
+    };
+    let button = cleat_mouse_button(event.mouse_button);
+    let any_button_pressed = event.mouse_buttons != 0;
+    let modifiers = vt::MouseModifiers {
+        shift: event.modifiers & CLEAT_MOD_SHIFT != 0,
+        ctrl: event.modifiers & CLEAT_MOD_CTRL != 0,
+        alt: event.modifiers & CLEAT_MOD_ALT != 0,
+    };
+    // The encoder gates against the live tracking mode and dedupes motion, so an
+    // empty result just means "nothing to report" for this event.
+    let bytes = runtime.encode_mouse(action, button, any_button_pressed, modifiers, event.x_px, event.y_px)?;
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    runtime.write_input(&bytes)?;
+    Ok(1)
 }
 
 fn route_in_process_wheel_event_on_actor(
@@ -2000,6 +2064,9 @@ fn in_process_actor_handle_command(
         InProcessCommand::Wheel { event, reply } => {
             let result = route_in_process_wheel_event_on_actor(wake, runtime, observation, event);
             let _ = reply.send(result);
+        }
+        InProcessCommand::Mouse { event, reply } => {
+            let _ = reply.send(route_in_process_mouse_event_on_actor(runtime, event));
         }
         InProcessCommand::ScrollViewport { command, reply } => {
             let result = runtime.scroll_viewport(command).inspect(|outcome| {

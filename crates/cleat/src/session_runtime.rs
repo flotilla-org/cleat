@@ -187,6 +187,18 @@ impl SessionRuntime {
         self.vt_engine.terminal_mode_state()
     }
 
+    pub(crate) fn encode_mouse(
+        &mut self,
+        action: vt::MouseAction,
+        button: Option<vt::MouseButton>,
+        any_button_pressed: bool,
+        modifiers: vt::MouseModifiers,
+        x_px: f32,
+        y_px: f32,
+    ) -> Result<Vec<u8>, String> {
+        self.vt_engine.encode_mouse(action, button, any_button_pressed, modifiers, x_px, y_px)
+    }
+
     pub(crate) fn write_input(&mut self, bytes: &[u8]) -> Result<(), String> {
         if let Some(ref mut recorder) = self.recorder {
             recorder.input(bytes, self.epoch.elapsed());

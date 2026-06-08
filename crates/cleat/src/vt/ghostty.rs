@@ -1,13 +1,14 @@
 use super::{
     ghostty_ffi::{
         self, GhosttyCellContentTag, GhosttyCellSemanticContent, GhosttyCellWide, GhosttyFormatterFormat, GhosttyFormatterTerminalOptions,
-        GhosttyRenderStateCursorVisualStyle, GhosttyRenderStateDirty, GhosttyRowData, GhosttyRowSemanticPrompt, GhosttyStyle,
-        GhosttyStyleColor, GhosttyStyleColorTag, GhosttyTerminalScreen, GhosttyTerminalScrollViewport, RenderStateHandle, RowCellsHandle,
-        RowIteratorHandle, TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_SGR_MOUSE,
-        GHOSTTY_MODE_SGR_PIXELS_MOUSE,
+        GhosttyMods, GhosttyMouseAction, GhosttyMouseButton, GhosttyRenderStateCursorVisualStyle, GhosttyRenderStateDirty, GhosttyRowData,
+        GhosttyRowSemanticPrompt, GhosttyStyle, GhosttyStyleColor, GhosttyStyleColorTag, GhosttyTerminalScreen,
+        GhosttyTerminalScrollViewport, MouseEncodeEvent, MouseEncoder, RenderStateHandle, RowCellsHandle, RowIteratorHandle,
+        TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE,
+        GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
     },
-    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, ResolvedCell, Rgb, ScreenGrid, TerminalColors,
-    TerminalModeState, VtEngine,
+    CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, MouseAction, MouseButton, MouseModifiers, ResolvedCell,
+    Rgb, ScreenGrid, TerminalColors, TerminalModeState, VtEngine,
 };
 use crate::provider::{
     DirtyState, TerminalCellFlags, TerminalCellWidth, TerminalCursor as ProviderCursor, TerminalCursorStyle as ProviderCursorStyle,
@@ -32,6 +33,7 @@ pub struct GhosttyVtEngine {
     rows: u16,
     cell_width_px: u32,
     cell_height_px: u32,
+    mouse_encoder: MouseEncoder,
     saw_output: bool,
     cached_grid: Option<ScreenGrid>,
 }
@@ -52,6 +54,9 @@ impl GhosttyVtEngine {
         let render_state = RenderStateHandle::new().expect("create ghostty render state");
         let row_iter = RowIteratorHandle::new().expect("create ghostty row iterator");
         let row_cells = RowCellsHandle::new().expect("create ghostty row cells");
+        let mut mouse_encoder = MouseEncoder::new().expect("create ghostty mouse encoder");
+        // Refined once the real cell size arrives via set_cell_size.
+        mouse_encoder.set_size(u32::from(cols), u32::from(rows), 1, 1);
         Self {
             terminal,
             render_state,
@@ -61,8 +66,31 @@ impl GhosttyVtEngine {
             rows,
             cell_width_px: 1,
             cell_height_px: 1,
+            mouse_encoder,
             saw_output: false,
             cached_grid: None,
+        }
+    }
+
+    /// Keep the mouse encoder's renderer geometry in sync with the grid + cell
+    /// size so it maps surface pixels to cells/pixels correctly.
+    fn refresh_mouse_encoder_size(&mut self) {
+        let screen_width = u32::from(self.cols).saturating_mul(self.cell_width_px);
+        let screen_height = u32::from(self.rows).saturating_mul(self.cell_height_px);
+        self.mouse_encoder.set_size(screen_width, screen_height, self.cell_width_px, self.cell_height_px);
+    }
+
+    fn ghostty_button(button: MouseButton) -> GhosttyMouseButton {
+        match button {
+            MouseButton::Left => GhosttyMouseButton::Left,
+            MouseButton::Middle => GhosttyMouseButton::Middle,
+            MouseButton::Right => GhosttyMouseButton::Right,
+            MouseButton::Four => GhosttyMouseButton::Four,
+            MouseButton::Five => GhosttyMouseButton::Five,
+            MouseButton::Six => GhosttyMouseButton::Six,
+            MouseButton::Seven => GhosttyMouseButton::Seven,
+            MouseButton::Eight => GhosttyMouseButton::Eight,
+            MouseButton::Nine => GhosttyMouseButton::Nine,
         }
     }
 
@@ -214,13 +242,45 @@ impl VtEngine for GhosttyVtEngine {
         self.terminal.resize(cols, rows, self.cell_width_px, self.cell_height_px)?;
         self.cols = cols;
         self.rows = rows;
+        self.refresh_mouse_encoder_size();
         Ok(())
     }
 
     fn set_cell_size(&mut self, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
         self.cell_width_px = cell_width_px.max(1);
         self.cell_height_px = cell_height_px.max(1);
-        self.terminal.resize(self.cols, self.rows, self.cell_width_px, self.cell_height_px)
+        self.terminal.resize(self.cols, self.rows, self.cell_width_px, self.cell_height_px)?;
+        self.refresh_mouse_encoder_size();
+        Ok(())
+    }
+
+    fn encode_mouse(
+        &mut self,
+        action: MouseAction,
+        button: Option<MouseButton>,
+        any_button_pressed: bool,
+        modifiers: MouseModifiers,
+        x_px: f32,
+        y_px: f32,
+    ) -> Result<Vec<u8>, String> {
+        let action = match action {
+            MouseAction::Press => GhosttyMouseAction::Press,
+            MouseAction::Release => GhosttyMouseAction::Release,
+            MouseAction::Motion => GhosttyMouseAction::Motion,
+        };
+        let button = button.map(Self::ghostty_button);
+        let mut mods: GhosttyMods = 0;
+        if modifiers.shift {
+            mods |= GHOSTTY_MODS_SHIFT;
+        }
+        if modifiers.ctrl {
+            mods |= GHOSTTY_MODS_CTRL;
+        }
+        if modifiers.alt {
+            mods |= GHOSTTY_MODS_ALT;
+        }
+        let terminal = self.terminal.raw_terminal();
+        Ok(self.mouse_encoder.encode(terminal, MouseEncodeEvent { action, button, any_button_pressed, mods, x_px, y_px }))
     }
 
     fn supports_replay(&self) -> bool {

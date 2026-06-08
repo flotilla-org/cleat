@@ -199,6 +199,37 @@ impl VtEngineKind {
     }
 }
 
+/// Backend-neutral mouse event action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+/// Backend-neutral mouse button identity (named, not numbered: the wire
+/// button codes differ between Cleat and Ghostty and are resolved per backend).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight,
+    Nine,
+}
+
+/// Keyboard modifiers relevant to mouse encoding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MouseModifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
 // NOTE: VtEngine is intentionally not Send. Engines may wrap foreign terminal-state
 // handles that are only accessed from the single session daemon event loop.
 pub trait VtEngine {
@@ -206,6 +237,22 @@ pub trait VtEngine {
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String>;
     fn set_cell_size(&mut self, _cell_width_px: u32, _cell_height_px: u32) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Encode a mouse event into terminal report bytes, gated by the engine's
+    /// live mouse tracking mode. Returns empty bytes when the event is not
+    /// reported (no mouse mode, deduped motion, out of viewport, ...). Default
+    /// is a no-op for engines without a mouse encoder.
+    fn encode_mouse(
+        &mut self,
+        _action: MouseAction,
+        _button: Option<MouseButton>,
+        _any_button_pressed: bool,
+        _modifiers: MouseModifiers,
+        _x_px: f32,
+        _y_px: f32,
+    ) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
     }
     fn supports_replay(&self) -> bool;
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;

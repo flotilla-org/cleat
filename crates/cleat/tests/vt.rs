@@ -611,3 +611,35 @@ fn inspect_linkage(exe: &std::path::Path) -> std::process::Output {
         Command::new("otool").arg("-L").arg(exe).output().expect("run otool")
     }
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn mouse_encoder_gates_and_encodes_through_libghostty() {
+    use cleat::vt::{MouseAction, MouseButton, MouseModifiers};
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+    engine.set_cell_size(8, 16).expect("set cell size");
+    let mods = MouseModifiers::default();
+    let press = |engine: &mut cleat::vt::ghostty::GhosttyVtEngine, button| {
+        engine.encode_mouse(MouseAction::Press, Some(button), false, mods, 20.0, 40.0).expect("encode mouse")
+    };
+
+    // No tracking mode enabled => the encoder reports nothing.
+    assert!(press(&mut engine, MouseButton::Left).is_empty(), "no mouse mode should emit no report");
+
+    // Any-event tracking + SGR. A left press at (20,40)px with an 8x16 cell lands
+    // on grid cell (2,2) => 1-based SGR coordinates (3,3).
+    engine.feed(b"\x1b[?1003h\x1b[?1006h").expect("enable sgr mouse");
+    assert_eq!(press(&mut engine, MouseButton::Left), b"\x1b[<0;3;3M");
+    // Named-button mapping: Cleat/Ghostty disagree on the numeric order, so this
+    // guards the Right->2 / Middle->1 SGR button codes.
+    assert_eq!(press(&mut engine, MouseButton::Middle), b"\x1b[<1;3;3M");
+    assert_eq!(press(&mut engine, MouseButton::Right), b"\x1b[<2;3;3M");
+
+    // SGR-pixels: coordinates switch from cells to pixels (different from above).
+    engine.feed(b"\x1b[?1016h").expect("enable sgr-pixels mouse");
+    let pixels = press(&mut engine, MouseButton::Left);
+    let text = String::from_utf8_lossy(&pixels);
+    assert!(text.starts_with("\x1b[<0;") && text.ends_with('M'), "sgr-pixels format, got {text:?}");
+    assert_ne!(pixels.as_slice(), b"\x1b[<0;3;3M", "sgr-pixels should differ from cell coords");
+}

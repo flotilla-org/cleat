@@ -780,6 +780,202 @@ unsafe extern "C" {
     fn ghostty_row_get(row: GhosttyRow, data: GhosttyRowData, out: *mut c_void) -> GhosttyResult;
 }
 
+// ---------------------------------------------------------------------------
+// Mouse encoding (libghostty `ghostty/vt/mouse.h`).
+//
+// The encoder owns the wire protocol: it gates events against the terminal's
+// live tracking mode, dedupes motion, picks the output format (SGR / SGR-pixels
+// / X10 / urxvt), and converts surface-space pixel positions into cell or pixel
+// coordinates from the renderer size. Cleat just feeds it events + the size.
+// ---------------------------------------------------------------------------
+
+pub enum GhosttyMouseEncoderOpaque {}
+pub type GhosttyMouseEncoder = *mut GhosttyMouseEncoderOpaque;
+pub enum GhosttyMouseEventOpaque {}
+pub type GhosttyMouseEvent = *mut GhosttyMouseEventOpaque;
+
+/// Keyboard modifier bitmask (`GhosttyMods` = uint16). Only shift/ctrl/alt
+/// affect mouse encoding. See `ghostty/vt/key/event.h`.
+pub type GhosttyMods = u16;
+pub const GHOSTTY_MODS_SHIFT: GhosttyMods = 1 << 0;
+pub const GHOSTTY_MODS_CTRL: GhosttyMods = 1 << 1;
+pub const GHOSTTY_MODS_ALT: GhosttyMods = 1 << 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum GhosttyMouseAction {
+    Press = 0,
+    Release = 1,
+    Motion = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum GhosttyMouseButton {
+    Left = 1,
+    Right = 2,
+    Middle = 3,
+    Four = 4,
+    Five = 5,
+    Six = 6,
+    Seven = 7,
+    Eight = 8,
+    Nine = 9,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub enum GhosttyMouseEncoderOption {
+    Event = 0,
+    Format = 1,
+    Size = 2,
+    AnyButtonPressed = 3,
+    TrackLastCell = 4,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyMousePosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyMouseEncoderSize {
+    pub size: usize,
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub cell_width: u32,
+    pub cell_height: u32,
+    pub padding_top: u32,
+    pub padding_bottom: u32,
+    pub padding_right: u32,
+    pub padding_left: u32,
+}
+
+pub struct MouseEncodeEvent {
+    pub action: GhosttyMouseAction,
+    pub button: Option<GhosttyMouseButton>,
+    pub any_button_pressed: bool,
+    pub mods: GhosttyMods,
+    pub x_px: f32,
+    pub y_px: f32,
+}
+
+unsafe extern "C" {
+    fn ghostty_mouse_encoder_new(allocator: *const c_void, encoder: *mut GhosttyMouseEncoder) -> GhosttyResult;
+    fn ghostty_mouse_encoder_free(encoder: GhosttyMouseEncoder);
+    fn ghostty_mouse_encoder_setopt(encoder: GhosttyMouseEncoder, option: GhosttyMouseEncoderOption, value: *const c_void);
+    fn ghostty_mouse_encoder_setopt_from_terminal(encoder: GhosttyMouseEncoder, terminal: GhosttyTerminal);
+    fn ghostty_mouse_encoder_encode(
+        encoder: GhosttyMouseEncoder,
+        event: GhosttyMouseEvent,
+        out_buf: *mut u8,
+        out_buf_size: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+    fn ghostty_mouse_event_new(allocator: *const c_void, event: *mut GhosttyMouseEvent) -> GhosttyResult;
+    fn ghostty_mouse_event_free(event: GhosttyMouseEvent);
+    fn ghostty_mouse_event_set_action(event: GhosttyMouseEvent, action: GhosttyMouseAction);
+    fn ghostty_mouse_event_set_button(event: GhosttyMouseEvent, button: GhosttyMouseButton);
+    fn ghostty_mouse_event_clear_button(event: GhosttyMouseEvent);
+    fn ghostty_mouse_event_set_mods(event: GhosttyMouseEvent, mods: GhosttyMods);
+    fn ghostty_mouse_event_set_position(event: GhosttyMouseEvent, position: GhosttyMousePosition);
+}
+
+/// Owns a libghostty mouse encoder + a reusable event handle.
+pub struct MouseEncoder {
+    encoder: GhosttyMouseEncoder,
+    event: GhosttyMouseEvent,
+}
+
+// SAFETY: the raw handles are owned solely by this struct and only touched
+// while `&mut self` is held (the in-process actor thread owns the engine).
+unsafe impl Send for MouseEncoder {}
+
+impl MouseEncoder {
+    pub fn new() -> Result<Self, String> {
+        let mut encoder: GhosttyMouseEncoder = ptr::null_mut();
+        check_result(unsafe { ghostty_mouse_encoder_new(ptr::null(), &mut encoder) }, "ghostty_mouse_encoder_new")?;
+        let mut event: GhosttyMouseEvent = ptr::null_mut();
+        if let Err(err) = check_result(unsafe { ghostty_mouse_event_new(ptr::null(), &mut event) }, "ghostty_mouse_event_new") {
+            unsafe { ghostty_mouse_encoder_free(encoder) };
+            return Err(err);
+        }
+        // Dedupe motion: suppress motion reports until the target cell changes
+        // (the encoder exempts sgr-pixels internally).
+        let track = true;
+        unsafe { ghostty_mouse_encoder_setopt(encoder, GhosttyMouseEncoderOption::TrackLastCell, (&track as *const bool).cast()) };
+        Ok(Self { encoder, event })
+    }
+
+    /// Push the renderer geometry used to map surface pixels to cells / pixels.
+    pub fn set_size(&mut self, screen_width: u32, screen_height: u32, cell_width: u32, cell_height: u32) {
+        let size = GhosttyMouseEncoderSize {
+            size: std::mem::size_of::<GhosttyMouseEncoderSize>(),
+            screen_width,
+            screen_height,
+            cell_width: cell_width.max(1),
+            cell_height: cell_height.max(1),
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        };
+        unsafe {
+            ghostty_mouse_encoder_setopt(self.encoder, GhosttyMouseEncoderOption::Size, (&size as *const GhosttyMouseEncoderSize).cast())
+        };
+    }
+
+    /// Encode one event, syncing tracking mode + format from `terminal`.
+    /// Returns the report bytes (empty when the encoder gates the event out).
+    pub fn encode(&mut self, terminal: GhosttyTerminal, event: MouseEncodeEvent) -> Vec<u8> {
+        unsafe {
+            ghostty_mouse_encoder_setopt_from_terminal(self.encoder, terminal);
+            let any = event.any_button_pressed;
+            ghostty_mouse_encoder_setopt(self.encoder, GhosttyMouseEncoderOption::AnyButtonPressed, (&any as *const bool).cast());
+            ghostty_mouse_event_set_action(self.event, event.action);
+            match event.button {
+                Some(button) => ghostty_mouse_event_set_button(self.event, button),
+                None => ghostty_mouse_event_clear_button(self.event),
+            }
+            ghostty_mouse_event_set_mods(self.event, event.mods);
+            ghostty_mouse_event_set_position(self.event, GhosttyMousePosition { x: event.x_px, y: event.y_px });
+
+            let mut buf = [0u8; 64];
+            let mut written: usize = 0;
+            match ghostty_mouse_encoder_encode(self.encoder, self.event, buf.as_mut_ptr(), buf.len(), &mut written) {
+                GhosttyResult::Success => buf[..written.min(buf.len())].to_vec(),
+                GhosttyResult::OutOfSpace => {
+                    // Mouse reports never exceed ~20 bytes, but honor the contract.
+                    let mut big = vec![0u8; written];
+                    let mut w2: usize = 0;
+                    if ghostty_mouse_encoder_encode(self.encoder, self.event, big.as_mut_ptr(), big.len(), &mut w2)
+                        == GhosttyResult::Success
+                    {
+                        big.truncate(w2);
+                        big
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
+}
+
+impl Drop for MouseEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            ghostty_mouse_event_free(self.event);
+            ghostty_mouse_encoder_free(self.encoder);
+        }
+    }
+}
+
 pub struct TerminalHandle {
     raw: GhosttyTerminal,
     /// Heap-allocated so the address stays stable while the C side holds
@@ -945,6 +1141,12 @@ fn pixel_count(width: u32, height: u32) -> Result<usize, String> {
 }
 
 impl TerminalHandle {
+    /// Raw handle, for C APIs that read live terminal state (e.g. the mouse
+    /// encoder's `setopt_from_terminal`). The handle stays valid for `&self`.
+    pub fn raw_terminal(&self) -> GhosttyTerminal {
+        self.raw
+    }
+
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self, String> {
         ensure_sys_callbacks()?;
         let mut raw = ptr::null_mut();

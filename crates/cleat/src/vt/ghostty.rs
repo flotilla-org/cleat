@@ -46,6 +46,9 @@ impl GhosttyVtEngine {
         let mut terminal = terminal;
         apply_colors(&mut terminal, colors).expect("configure ghostty terminal colors");
         terminal.set_kitty_image_storage_limit(DEFAULT_KITTY_IMAGE_STORAGE_LIMIT).expect("configure ghostty kitty image storage");
+        // In-process backend: the VT runs co-located with the program, so file /
+        // temp-file / shared-memory transmission media can be read directly.
+        terminal.set_kitty_image_media(true, true, true).expect("enable ghostty kitty image media");
         let render_state = RenderStateHandle::new().expect("create ghostty render state");
         let row_iter = RowIteratorHandle::new().expect("create ghostty row iterator");
         let row_cells = RowCellsHandle::new().expect("create ghostty row cells");

@@ -468,6 +468,9 @@ pub enum GhosttyTerminalOption {
     ColorCursor = 13,
     ColorPalette = 14,
     KittyImageStorageLimit = 15,
+    KittyImageMediumFile = 16,
+    KittyImageMediumTempFile = 17,
+    KittyImageMediumSharedMem = 18,
 }
 
 /// Callback fired synchronously from `ghostty_terminal_vt_write` when the
@@ -1018,6 +1021,25 @@ impl TerminalHandle {
         let result =
             unsafe { ghostty_terminal_set(self.raw, GhosttyTerminalOption::KittyImageStorageLimit, &limit as *const u64 as *const c_void) };
         check_result(result, "ghostty_terminal_set(KittyImageStorageLimit)")
+    }
+
+    /// Enable reading Kitty images transmitted via file / temporary-file /
+    /// shared-memory media. libghostty-vt performs the filesystem/shm reads
+    /// itself (and deletes temp files), so this is only appropriate where the
+    /// VT runs co-located with the program emitting the escape codes; i.e. the
+    /// in-process backend. A future `load_media` embedder callback should
+    /// replace this direct-read path so Cleat owns media access (vfs, remoting,
+    /// testing).
+    pub fn set_kitty_image_media(&mut self, file: bool, temp_file: bool, shared_memory: bool) -> Result<(), String> {
+        for (option, value) in [
+            (GhosttyTerminalOption::KittyImageMediumFile, file),
+            (GhosttyTerminalOption::KittyImageMediumTempFile, temp_file),
+            (GhosttyTerminalOption::KittyImageMediumSharedMem, shared_memory),
+        ] {
+            let result = unsafe { ghostty_terminal_set(self.raw, option, &value as *const bool as *const c_void) };
+            check_result(result, "ghostty_terminal_set(KittyImageMedium)")?;
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

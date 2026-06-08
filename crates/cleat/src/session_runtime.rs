@@ -32,6 +32,12 @@ pub(crate) struct SessionRuntime {
     markers: HashMap<String, u64>,
     epoch: Instant,
     last_pty_output_at: Option<Instant>,
+    // Current cell pixel size, used to fill the PTY winsize ws_xpixel/ws_ypixel
+    // so TIOCGWINSZ-based apps (e.g. katzensteg) can compute image aspect. Zero
+    // until the first geometry/set_cell_size, matching a terminal that hasn't
+    // reported a pixel size yet.
+    cell_width_px: u32,
+    cell_height_px: u32,
 }
 
 pub(crate) struct PtyOutput {
@@ -68,7 +74,13 @@ impl SessionRuntime {
             markers: HashMap::new(),
             epoch: Instant::now(),
             last_pty_output_at: None,
+            cell_width_px: 0,
+            cell_height_px: 0,
         })
+    }
+
+    fn pty_pixel_size(&self, cols: u16, rows: u16) -> (u32, u32) {
+        ((cols as u32).saturating_mul(self.cell_width_px), (rows as u32).saturating_mul(self.cell_height_px))
     }
 
     pub(crate) fn pty_child(&self) -> &PtyChild {
@@ -109,7 +121,8 @@ impl SessionRuntime {
         rows: u16,
         capabilities: &vt::ClientCapabilities,
     ) -> Result<Option<Vec<u8>>, String> {
-        self.pty_child.resize(cols, rows)?;
+        let (width_px, height_px) = self.pty_pixel_size(cols, rows);
+        self.pty_child.resize(cols, rows, width_px, height_px)?;
         self.vt_engine.resize(cols, rows)?;
         if self.vt_engine.supports_replay() {
             self.vt_engine.replay_payload(capabilities)
@@ -196,12 +209,20 @@ impl SessionRuntime {
         if let Some(ref mut recorder) = self.recorder {
             recorder.event(crate::asciicast::EventCode::Resize, &format!("{}x{}", cols, rows), self.epoch.elapsed());
         }
-        self.pty_child.resize(cols, rows)?;
+        let (width_px, height_px) = self.pty_pixel_size(cols, rows);
+        self.pty_child.resize(cols, rows, width_px, height_px)?;
         self.vt_engine.resize(cols, rows)
     }
 
     pub(crate) fn set_cell_size(&mut self, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
-        self.vt_engine.set_cell_size(cell_width_px, cell_height_px)
+        self.cell_width_px = cell_width_px;
+        self.cell_height_px = cell_height_px;
+        self.vt_engine.set_cell_size(cell_width_px, cell_height_px)?;
+        // Refresh the PTY winsize pixel fields for the current grid so apps that
+        // read TIOCGWINSZ pick up the new cell size even if cols/rows are unchanged.
+        let (cols, rows) = self.vt_engine.size();
+        let (width_px, height_px) = self.pty_pixel_size(cols, rows);
+        self.pty_child.resize(cols, rows, width_px, height_px)
     }
 
     pub(crate) fn inspect(&self, has_controller: bool) -> InspectResult {

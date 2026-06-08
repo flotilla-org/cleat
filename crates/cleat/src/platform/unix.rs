@@ -58,8 +58,8 @@ impl PtyChild {
         write_fd_all(self.master_fd, bytes)
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-        resize_pty(self.master_fd, cols, rows)
+    pub fn resize(&self, cols: u16, rows: u16, width_px: u32, height_px: u32) -> Result<(), String> {
+        resize_pty(self.master_fd, cols, rows, width_px, height_px)
     }
 
     pub fn exited(&self) -> Result<Option<WaitStatus>, String> {
@@ -225,8 +225,13 @@ fn wait_for_writable(fd: RawFd) -> Result<(), String> {
     Ok(())
 }
 
-fn resize_pty(fd: RawFd, cols: u16, rows: u16) -> Result<(), String> {
-    let winsize = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+fn resize_pty(fd: RawFd, cols: u16, rows: u16, width_px: u32, height_px: u32) -> Result<(), String> {
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: width_px.min(u16::MAX as u32) as u16,
+        ws_ypixel: height_px.min(u16::MAX as u32) as u16,
+    };
     // SAFETY: ioctl updates the window size for a valid PTY master fd using a properly initialized winsize.
     let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
     if rc == 0 {

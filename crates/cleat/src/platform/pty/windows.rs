@@ -90,7 +90,9 @@ impl PtyChild {
         write_handle_all(self.input_write, bytes)
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+    // ConPTY sizing is character-cell only; the pixel dimensions (used for the
+    // unix PTY winsize) have no ConPTY equivalent and are ignored here.
+    pub fn resize(&self, cols: u16, rows: u16, _width_px: u32, _height_px: u32) -> Result<(), String> {
         let result = unsafe { ResizePseudoConsole(self.conpty, COORD { X: cols as i16, Y: rows as i16 }) };
         if result < 0 {
             Err(format!("ResizePseudoConsole failed with HRESULT 0x{result:08x}"))

@@ -46,6 +46,16 @@ pub(crate) struct PtyOutput {
 
 impl SessionRuntime {
     pub(crate) fn spawn(session_dir: PathBuf, session: &SessionMetadata, mut vt_engine: Box<dyn VtEngine>) -> Result<Self, String> {
+        // Recreation from recording (ADR 0001): if the session dir already holds
+        // a recording from a prior activation, replay it into the fresh engine so
+        // its history returns as scrollback above the freshly-invoked command.
+        // Detection is by cast presence — a brand-new session has an empty dir.
+        let cast_path = session_dir.join(crate::recording::CAST_FILE_NAME);
+        let recreating = std::fs::metadata(&cast_path).map(|meta| meta.is_file() && meta.len() > 0).unwrap_or(false);
+        if recreating {
+            crate::recreate::seed_engine_from_cast(&mut *vt_engine, &cast_path)?;
+        }
+
         let pty_child = PtyChild::spawn(session)?;
         pty_child.set_nonblocking()?;
         let detached_da = match session.vt_engine {
@@ -56,8 +66,17 @@ impl SessionRuntime {
             vt::VtEngineKind::Ghostty => None,
         };
         let recorder = if session.record {
-            let mut recorder = SessionRecorder::new(&session_dir, vt_engine.size().0, vt_engine.size().1, session.vt_engine.as_str())
-                .map_err(|err| format!("failed to start recording: {err}"))?;
+            // Recording appends across activations (ADR 0002): on recreation,
+            // reopen the existing cast (writing a boundary marker) rather than
+            // truncating it with a new header.
+            let mut recorder = if recreating {
+                SessionRecorder::reopen_append(&session_dir, Duration::ZERO).map_err(|err| format!("failed to resume recording: {err}"))?
+            } else {
+                SessionRecorder::new(&session_dir, vt_engine.size().0, vt_engine.size().1, session.vt_engine.as_str())
+                    .map_err(|err| format!("failed to start recording: {err}"))?
+            };
+            // Snapshot the (possibly seeded) state. For recreation this checkpoints
+            // the activation boundary; for a fresh session it is the initial frame.
             write_replay_snapshot(&mut *vt_engine, &mut recorder, session.vt_engine.as_str(), Duration::ZERO);
             Some(recorder)
         } else {
@@ -525,5 +544,58 @@ mod tests {
 
         assert!(err.contains("failed to start recording"), "{err}");
         assert!(err.contains(crate::recording::CAST_FILE_NAME), "{err}");
+    }
+
+    #[cfg(all(unix, feature = "ghostty-vt"))]
+    #[test]
+    fn recreation_seeds_scrollback_from_prior_recording() {
+        fn pump_until_screen_contains(rt: &mut SessionRuntime, needle: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                rt.read_available_output(false).expect("read pty output");
+                if rt.screen_contains(needle) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {needle:?}; screen was {:?}", rt.capture_text());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().to_path_buf();
+        let colors = crate::vt::TerminalColors::default();
+
+        // Activation 1: print a marker, then idle so it stays on screen and the
+        // recording captures it before we tear the runtime down.
+        let session1 = SessionMetadata {
+            id: "recreate".to_string(),
+            vt_engine: VtEngineKind::Ghostty,
+            cwd: None,
+            cmd: Some("sh -c 'printf RECREATE_MARKER; sleep 30'".to_string()),
+            record: true,
+            colors,
+        };
+        let engine1 = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).expect("engine 1");
+        let mut rt1 = SessionRuntime::spawn(session_dir.clone(), &session1, engine1).expect("spawn activation 1");
+        pump_until_screen_contains(&mut rt1, "RECREATE_MARKER");
+        rt1.flush_recording();
+        drop(rt1);
+
+        // Activation 2: recreate the same session dir with a different command.
+        // Seeding happens synchronously in spawn, so the prior marker is on the
+        // recreated screen before the new command produces any output.
+        let session2 = SessionMetadata { cmd: Some("sleep 30".to_string()), ..session1.clone() };
+        let engine2 = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).expect("engine 2");
+        let rt2 = SessionRuntime::spawn(session_dir.clone(), &session2, engine2).expect("spawn activation 2");
+
+        assert!(
+            rt2.screen_contains("RECREATE_MARKER"),
+            "recreated session should restore prior output; screen was {:?}",
+            rt2.capture_text()
+        );
+
+        // The recording continues in the same cast across the activation boundary.
+        let raw = std::fs::read_to_string(session_dir.join(crate::recording::CAST_FILE_NAME)).expect("read cast");
+        assert!(raw.contains("session-recreated"), "activation boundary marker recorded");
     }
 }

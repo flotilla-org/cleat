@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser};
 use cleat::{
-    cli::{self, execute, Cli, Command, ExecResult},
+    cli::{self, execute, Cli, Command, ExecResult, RecordFlags},
     runtime::RuntimeLayout,
     server::SessionService,
     vt::{self, Rgb, VtEngineKind},
@@ -54,13 +54,27 @@ fn help_surfaces_vt_support_policy() {
 #[test]
 fn attach_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "attach", "demo"]).expect("attach positional parses");
-    assert_eq!(cli.command, Command::Attach { id: Some("demo".into()), no_create: false, vt: None, cwd: None, cmd: None, record: false });
+    assert_eq!(cli.command, Command::Attach {
+        id: Some("demo".into()),
+        no_create: false,
+        vt: None,
+        cwd: None,
+        cmd: None,
+        record: RecordFlags::default()
+    });
 }
 
 #[test]
 fn attach_command_parses_no_create() {
     let cli = Cli::try_parse_from(["cleat", "attach", "--no-create", "demo"]).expect("attach --no-create parses");
-    assert_eq!(cli.command, Command::Attach { id: Some("demo".into()), no_create: true, vt: None, cwd: None, cmd: None, record: false });
+    assert_eq!(cli.command, Command::Attach {
+        id: Some("demo".into()),
+        no_create: true,
+        vt: None,
+        cwd: None,
+        cmd: None,
+        record: RecordFlags::default()
+    });
 }
 
 #[test]
@@ -72,14 +86,21 @@ fn attach_command_parses_vt() {
         vt: Some(VtEngineKind::Passthrough),
         cwd: None,
         cmd: None,
-        record: false
+        record: RecordFlags::default()
     });
 }
 
 #[test]
 fn launch_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--cmd", "bash"]).expect("launch parses");
-    assert_eq!(cli.command, Command::Launch { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
+    assert_eq!(cli.command, Command::Launch {
+        id: None,
+        json: false,
+        vt: None,
+        cwd: None,
+        cmd: Some("bash".into()),
+        record: RecordFlags::default()
+    });
 }
 
 #[test]
@@ -91,14 +112,21 @@ fn launch_command_parses_positional_name() {
         vt: None,
         cwd: None,
         cmd: Some("bash".into()),
-        record: false
+        record: RecordFlags::default()
     });
 }
 
 #[test]
 fn launch_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
-    assert_eq!(cli.command, Command::Launch { id: Some("demo".into()), json: true, vt: None, cwd: None, cmd: None, record: false });
+    assert_eq!(cli.command, Command::Launch {
+        id: Some("demo".into()),
+        json: true,
+        vt: None,
+        cwd: None,
+        cmd: None,
+        record: RecordFlags::default()
+    });
 }
 
 #[test]
@@ -110,14 +138,21 @@ fn launch_command_parses_vt() {
         vt: Some(VtEngineKind::Ghostty),
         cwd: None,
         cmd: None,
-        record: false
+        record: RecordFlags::default()
     });
 }
 
 #[test]
 fn create_alias_still_parses_as_launch() {
     let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create alias parses");
-    assert_eq!(cli.command, Command::Launch { id: None, json: false, vt: None, cwd: None, cmd: Some("bash".into()), record: false });
+    assert_eq!(cli.command, Command::Launch {
+        id: None,
+        json: false,
+        vt: None,
+        cwd: None,
+        cmd: Some("bash".into()),
+        record: RecordFlags::default()
+    });
 }
 
 #[test]
@@ -252,7 +287,32 @@ fn record_parses_session_id() {
 #[test]
 fn launch_record_flag() {
     let cli = Cli::try_parse_from(["cleat", "launch", "alpha", "--record"]).expect("parse launch --record");
-    assert!(matches!(cli.command, Command::Launch { record: true, .. }));
+    assert!(matches!(cli.command, Command::Launch { record: RecordFlags { record: true, .. }, .. }));
+}
+
+#[test]
+fn launch_no_record_flag_parses() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "alpha", "--no-record"]).expect("parse launch --no-record");
+    assert!(matches!(cli.command, Command::Launch { record: RecordFlags { no_record: true, .. }, .. }));
+}
+
+#[test]
+fn record_flags_default_to_on() {
+    // No flag set: recording is on by default (CLEAT_RECORD unset in normal runs).
+    let flags = RecordFlags::default();
+    assert!(flags.enabled());
+}
+
+#[test]
+fn record_flags_no_record_disables() {
+    let flags = RecordFlags { record: false, no_record: true };
+    assert!(!flags.enabled());
+}
+
+#[test]
+fn record_flags_explicit_record_enables() {
+    let flags = RecordFlags { record: true, no_record: false };
+    assert!(flags.enabled());
 }
 
 #[test]

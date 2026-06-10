@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::{
     keys::encode_send_keys,
@@ -37,6 +37,48 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Recording flags shared by the session-creating commands. Recording is on by
+/// default; `--no-record` opts out, and `CLEAT_RECORD` sets a boolish baseline
+/// (`CLEAT_RECORD=0` disables) that an explicit flag overrides.
+#[derive(Debug, Clone, Default, PartialEq, Args)]
+pub struct RecordFlags {
+    /// Record output to an asciicast file (default)
+    #[arg(long, overrides_with = "no_record")]
+    pub record: bool,
+    /// Disable output recording
+    #[arg(long = "no-record", overrides_with = "record")]
+    pub no_record: bool,
+}
+
+impl RecordFlags {
+    /// Resolve the effective recording setting. Default is on; `CLEAT_RECORD`
+    /// provides a boolish opt-out baseline that an explicit flag overrides.
+    pub fn enabled(&self) -> bool {
+        if self.record {
+            true
+        } else if self.no_record {
+            false
+        } else {
+            record_default_from_env()
+        }
+    }
+}
+
+fn record_default_from_env() -> bool {
+    match std::env::var("CLEAT_RECORD") {
+        Ok(value) => parse_boolish(&value).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+fn parse_boolish(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Subcommand, PartialEq)]
 pub enum Command {
     /// Attach to a session interactively
@@ -58,8 +100,8 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long, help = "Command to run (default: user's shell)")]
         cmd: Option<String>,
-        #[arg(long, env = "CLEAT_RECORD", help = "Enable output recording")]
-        record: bool,
+        #[command(flatten)]
+        record: RecordFlags,
     },
     /// Create a new session
     #[command(
@@ -77,8 +119,8 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long, help = "Command to run (default: user's shell)")]
         cmd: Option<String>,
-        #[arg(long, env = "CLEAT_RECORD", help = "Enable output recording")]
-        record: bool,
+        #[command(flatten)]
+        record: RecordFlags,
     },
     /// List all sessions
     List {
@@ -332,7 +374,9 @@ resolved through the live daemon socket. \n\
         cmd: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
-        #[arg(long, env = "CLEAT_RECORD")]
+        // Internal: the daemon spawner passes the already-resolved value as a
+        // presence flag, so there is no default-on / env handling here.
+        #[arg(long)]
         record: bool,
         #[arg(long, hide = true, value_parser = parse_rgb)]
         color_foreground: Option<Rgb>,
@@ -403,7 +447,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
-            if record {
+            if record.enabled() {
                 if let Err(e) = service.record(&attached.id, true) {
                     return ExecResult::Err(e);
                 }
@@ -420,7 +464,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             if !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
             }
-            let created = match service.create(id, vt, cwd, cmd, record) {
+            let created = match service.create(id, vt, cwd, cmd, record.enabled()) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };

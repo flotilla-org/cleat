@@ -151,6 +151,13 @@ typedef struct cleat_session_desc {
     size_t command_len;
     const uint8_t *cwd;
     size_t cwd_len;
+    /*
+     * Optional client-supplied session id (UTF-8, not NUL-terminated). When set,
+     * the session reuses this durable identity across recreations; when id is
+     * NULL the provider allocates one. Pair the pointer with id_len.
+     */
+    const uint8_t *id;
+    size_t id_len;
     bool record;
     const struct cleat_session_colors *colors;
 } cleat_session_desc;

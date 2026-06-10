@@ -176,6 +176,8 @@ pub struct CleatSessionDesc {
     pub command_len: usize,
     pub cwd: *const u8,
     pub cwd_len: usize,
+    pub id: *const u8,
+    pub id_len: usize,
     pub record: bool,
     pub colors: *const CleatSessionColors,
 }
@@ -1152,6 +1154,8 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         command_len: 0,
         cwd: ptr::null(),
         cwd_len: 0,
+        id: ptr::null(),
+        id_len: 0,
         record: false,
         colors: ptr::null(),
     });
@@ -2265,7 +2269,8 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
 
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
     let cwd = read_optional_utf8(desc.cwd, desc.cwd_len).map_err(|err| format!("cwd is not valid UTF-8: {err}"))?.map(PathBuf::from);
-    let mut metadata = layout.create_session(None, vt_engine, cwd, cmd)?;
+    let id = read_optional_utf8(desc.id, desc.id_len).map_err(|err| format!("id is not valid UTF-8: {err}"))?;
+    let mut metadata = layout.create_session(id, vt_engine, cwd, cmd)?;
     metadata.record = desc.record;
     let session_dir = layout.root().join(&metadata.id);
     let cols = desc.cols.max(1);
@@ -2305,7 +2310,8 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let colors = session_colors_from_desc(desc);
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
     let cwd = read_optional_utf8(desc.cwd, desc.cwd_len).map_err(|err| format!("cwd is not valid UTF-8: {err}"))?.map(PathBuf::from);
-    let metadata = ensure_session_started(&layout, None, Some(vt_engine), cwd, cmd, desc.record, colors)?;
+    let id = read_optional_utf8(desc.id, desc.id_len).map_err(|err| format!("id is not valid UTF-8: {err}"))?;
+    let metadata = ensure_session_started(&layout, id, Some(vt_engine), cwd, cmd, desc.record, colors)?;
     let mut session = DaemonSession {
         id: metadata.id,
         runtime_root: provider.runtime_root.clone(),

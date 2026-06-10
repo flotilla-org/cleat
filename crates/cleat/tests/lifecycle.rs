@@ -390,6 +390,47 @@ fn daemon_provider_keeps_session_alive_after_provider_close() {
     service.kill(&sessions[0].id).expect("kill daemon session");
 }
 
+#[test]
+fn daemon_provider_uses_client_supplied_id() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::Builder::new().prefix("cleat-provider-").tempdir_in("/tmp").expect("tempdir");
+    let root = temp.path().to_string_lossy();
+    let command = b"sleep 30";
+    let id = b"client-chosen-id";
+
+    unsafe {
+        let provider = cleat_provider_open(&CleatProviderDesc {
+            abi_version: CLEAT_PROVIDER_ABI_VERSION,
+            requested_features: ProviderFeatures::CELL_SNAPSHOTS.bits(),
+            backend: CLEAT_PROVIDER_BACKEND_DAEMON,
+            runtime_root: root.as_ptr(),
+            runtime_root_len: root.len(),
+        });
+        assert!(!provider.is_null());
+
+        let session = cleat_session_create(provider, &CleatSessionDesc {
+            cols: 80,
+            rows: 24,
+            vt_engine: CLEAT_PROVIDER_VT_PASSTHROUGH,
+            command: command.as_ptr(),
+            command_len: command.len(),
+            id: id.as_ptr(),
+            id_len: id.len(),
+            ..CleatSessionDesc::default()
+        });
+        assert!(!session.is_null());
+
+        cleat_session_destroy(session);
+        cleat_provider_close(provider);
+    }
+
+    let service = service_for(temp.path());
+    let sessions = service.list().expect("list sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "client-chosen-id");
+    service.kill("client-chosen-id").expect("kill daemon session");
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn capture_returns_text_for_ghostty_sessions() {

@@ -119,6 +119,48 @@ pub const GHOSTTY_MODE_MOUSE_ANY: GhosttyMode = 1003;
 pub const GHOSTTY_MODE_SGR_MOUSE: GhosttyMode = 1006;
 pub const GHOSTTY_MODE_ALT_SCROLL: GhosttyMode = 1007;
 pub const GHOSTTY_MODE_SGR_PIXELS_MOUSE: GhosttyMode = 1016;
+pub const GHOSTTY_MODE_BRACKETED_PASTE: GhosttyMode = 2004;
+
+// Paste encoding (libghostty `ghostty/vt/paste.h`). Wraps paste data in
+// bracketed-paste markers when the program enabled mode 2004, strips unsafe
+// bytes, and normalizes newlines, so Cleat never hand-rolls this.
+unsafe extern "C" {
+    fn ghostty_paste_encode(
+        data: *mut u8,
+        data_len: usize,
+        bracketed: bool,
+        out_buf: *mut u8,
+        buf_len: usize,
+        out_written: *mut usize,
+    ) -> GhosttyResult;
+}
+
+/// Encode paste `text` for the PTY, bracketing it when `bracketed` is set.
+pub fn paste_encode(text: &[u8], bracketed: bool) -> Vec<u8> {
+    let mut input = text.to_vec();
+    unsafe {
+        let mut needed: usize = 0;
+        // Query the required length (out buffer null/0 => out_of_space + size).
+        // The Ghostty encoder may sanitize the input buffer while sizing, so
+        // always pass owned mutable bytes.
+        match ghostty_paste_encode(input.as_mut_ptr(), input.len(), bracketed, ptr::null_mut(), 0, &mut needed) {
+            GhosttyResult::Success if needed == 0 => return Vec::new(),
+            GhosttyResult::Success | GhosttyResult::OutOfSpace => {}
+            _ => return text.to_vec(),
+        }
+        let mut out = vec![0u8; needed];
+        let mut written: usize = 0;
+        match ghostty_paste_encode(input.as_mut_ptr(), input.len(), bracketed, out.as_mut_ptr(), out.len(), &mut written) {
+            GhosttyResult::Success => {
+                out.truncate(written);
+                out
+            }
+            // Defensive: preserve the paste without reintroducing bytes that
+            // the sizing call already sanitized.
+            _ => input,
+        }
+    }
+}
 
 #[allow(dead_code)]
 #[repr(C)]

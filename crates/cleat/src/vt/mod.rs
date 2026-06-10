@@ -274,6 +274,13 @@ pub trait VtEngine {
     ) -> Result<Vec<u8>, String> {
         Ok(Vec::new())
     }
+
+    /// Encode paste `text` for the PTY, wrapping it in bracketed-paste markers
+    /// when the program has bracketed paste (mode 2004) enabled. Default is a raw
+    /// passthrough for engines without a paste encoder.
+    fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(text.to_vec())
+    }
     fn supports_replay(&self) -> bool;
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;
     fn screen_text(&self) -> Result<String, String>;

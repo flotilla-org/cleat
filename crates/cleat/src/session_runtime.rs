@@ -201,6 +201,10 @@ impl SessionRuntime {
         self.vt_engine.encode_mouse(action, button, any_button_pressed, modifiers, x_px, y_px)
     }
 
+    pub(crate) fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {
+        self.vt_engine.encode_paste(text)
+    }
+
     pub(crate) fn write_input(&mut self, bytes: &[u8]) -> Result<(), String> {
         if let Some(ref mut recorder) = self.recorder {
             recorder.input(bytes, self.epoch.elapsed());

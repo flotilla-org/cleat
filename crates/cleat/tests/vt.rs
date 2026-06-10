@@ -724,3 +724,16 @@ fn mouse_encoder_gates_and_encodes_through_libghostty() {
     assert!(text.starts_with("\x1b[<0;") && text.ends_with('M'), "sgr-pixels format, got {text:?}");
     assert_ne!(pixels.as_slice(), b"\x1b[<0;3;3M", "sgr-pixels should differ from cell coords");
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn encode_paste_brackets_when_mode_2004_enabled() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+    assert_eq!(engine.encode_paste(b"hello").expect("encode paste"), b"hello");
+    assert_eq!(engine.encode_paste(b"hello\nworld").expect("encode paste"), b"hello\rworld");
+    assert_eq!(engine.encode_paste(b"hel\x1blo\x00world").expect("encode paste"), b"hel lo world");
+
+    engine.feed(b"\x1b[?2004h").expect("enable bracketed paste");
+    assert_eq!(engine.encode_paste(b"hello").expect("encode paste"), b"\x1b[200~hello\x1b[201~");
+    assert_eq!(engine.encode_paste(b"hel\x1blo\x00world").expect("encode paste"), b"\x1b[200~hel lo world\x1b[201~");
+}

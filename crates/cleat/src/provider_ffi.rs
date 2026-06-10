@@ -713,6 +713,10 @@ enum InProcessCommand {
         event: CleatMouseEvent,
         reply: mpsc::Sender<Result<usize, String>>,
     },
+    Paste {
+        text: Vec<u8>,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
     ScrollViewport {
         command: ViewportCommand,
         reply: mpsc::Sender<Result<ViewportCommandOutcome, String>>,
@@ -1352,6 +1356,15 @@ fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> Opti
                 mark_partial_rows_and_wake(&mut mock.observation, [0], &session.wake);
                 Some(1)
             }
+            Ok(None) if event.kind == CLEAT_INPUT_PASTE => match read_event_text_bytes(event) {
+                Ok(bytes) if bytes.is_empty() => Some(0),
+                Ok(_) => {
+                    mock.input_count = mock.input_count.saturating_add(1);
+                    mark_partial_rows_and_wake(&mut mock.observation, [0], &session.wake);
+                    Some(1)
+                }
+                Err(_) => None,
+            },
             Ok(None) => Some(0),
             Err(_) => None,
         },
@@ -1359,6 +1372,7 @@ fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> Opti
             Ok(Some(bytes)) => in_process_request_result(in_process, |reply| InProcessCommand::WriteInput { bytes, reply }).ok().map(|_| 1),
             Ok(None) if is_wheel_event(event) => route_in_process_wheel_event(in_process, event),
             Ok(None) if event.kind == CLEAT_INPUT_MOUSE => route_in_process_mouse_event(in_process, event),
+            Ok(None) if event.kind == CLEAT_INPUT_PASTE => route_in_process_paste_event(in_process, event),
             Ok(None) => Some(0),
             Err(_) => None,
         },
@@ -1390,6 +1404,22 @@ fn route_in_process_wheel_event(in_process: &InProcessSession, event: &CleatInpu
         wheel_delta_y: event.wheel_delta_y,
     };
     in_process_request_result(in_process, |reply| InProcessCommand::Wheel { event: wheel, reply }).ok()
+}
+
+fn route_in_process_paste_event(in_process: &InProcessSession, event: &CleatInputEvent) -> Option<usize> {
+    let text = read_event_text_bytes(event).ok()?;
+    in_process_request_result(in_process, |reply| InProcessCommand::Paste { text, reply }).ok()
+}
+
+fn route_in_process_paste_on_actor(runtime: &mut SessionRuntime, text: &[u8]) -> Result<usize, String> {
+    // The engine wraps in bracketed-paste markers when the program enabled mode
+    // 2004 and strips unsafe bytes; otherwise it returns the text unchanged.
+    let bytes = runtime.encode_paste(text)?;
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    runtime.write_input(&bytes)?;
+    Ok(1)
 }
 
 fn route_in_process_mouse_event(in_process: &InProcessSession, event: &CleatInputEvent) -> Option<usize> {
@@ -2145,6 +2175,9 @@ fn in_process_actor_handle_command(
         InProcessCommand::Mouse { event, reply } => {
             let _ = reply.send(route_in_process_mouse_event_on_actor(runtime, event));
         }
+        InProcessCommand::Paste { text, reply } => {
+            let _ = reply.send(route_in_process_paste_on_actor(runtime, &text));
+        }
         InProcessCommand::ScrollViewport { command, reply } => {
             let result = runtime.scroll_viewport(command).inspect(|outcome| {
                 if *outcome == ViewportCommandOutcome::Moved {
@@ -2547,7 +2580,10 @@ fn read_optional_utf8(ptr: *const u8, len: usize) -> Result<Option<String>, Utf8
 
 fn input_event_bytes(event: &CleatInputEvent) -> Result<Option<Vec<u8>>, Utf8Error> {
     match event.kind {
-        CLEAT_INPUT_TEXT | CLEAT_INPUT_PASTE => read_event_text_bytes(event).map(Some),
+        CLEAT_INPUT_TEXT => read_event_text_bytes(event).map(Some),
+        // Paste is routed through the engine's paste encoder (bracketed-paste
+        // wrapping + unsafe-byte stripping) rather than written raw.
+        CLEAT_INPUT_PASTE => Ok(None),
         CLEAT_INPUT_KEY => key_event_bytes(event),
         CLEAT_INPUT_RESIZE | CLEAT_INPUT_MOUSE | CLEAT_INPUT_FOCUS => Ok(None),
         _ => Ok(None),
@@ -3408,6 +3444,23 @@ mod tests {
             assert!(cleat_session_send_input_ex(session, &press, &mut press_result));
             assert_eq!(press_result, CleatInputResult { first_sequence: 1, count: 1 });
 
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn mock_provider_paste_is_semantic_input_and_consumes_sequence_number() {
+        let text = b"hello";
+        let paste = CleatInputEvent { kind: CLEAT_INPUT_PASTE, text: text.as_ptr(), text_len: text.len(), ..CleatInputEvent::default() };
+        assert_eq!(input_event_bytes(&paste).expect("paste input bytes"), None);
+
+        unsafe {
+            let provider = cleat_provider_open(ptr::null());
+            let session = cleat_session_create(provider, ptr::null());
+            let mut result = CleatInputResult::default();
+            assert!(cleat_session_send_input_ex(session, &paste, &mut result));
+            assert_eq!(result, CleatInputResult { first_sequence: 1, count: 1 });
             cleat_session_destroy(session);
             cleat_provider_close(provider);
         }

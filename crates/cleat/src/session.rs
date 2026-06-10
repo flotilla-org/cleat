@@ -778,8 +778,12 @@ fn handle_http_request(
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
-                http_uds::InputRequest::Text { text } | http_uds::InputRequest::Paste { text } => {
+                http_uds::InputRequest::Text { text } => {
                     state.runtime.write_input(text.as_bytes())?;
+                }
+                http_uds::InputRequest::Paste { text } => {
+                    let bytes = state.runtime.encode_paste(text.as_bytes())?;
+                    state.runtime.write_input(&bytes)?;
                 }
                 http_uds::InputRequest::Key { key } => {
                     let bytes = http_input_key_bytes(key);

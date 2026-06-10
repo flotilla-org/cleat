@@ -4,9 +4,9 @@ use super::{
         GhosttyMods, GhosttyMouseAction, GhosttyMouseButton, GhosttyRenderStateCursorVisualStyle, GhosttyRenderStateDirty, GhosttyRowData,
         GhosttyRowSemanticPrompt, GhosttyStyle, GhosttyStyleColor, GhosttyStyleColorTag, GhosttyTerminalScreen,
         GhosttyTerminalScrollViewport, MouseEncodeEvent, MouseEncoder, RenderStateHandle, RowCellsHandle, RowIteratorHandle,
-        TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_MOUSE_ANY, GHOSTTY_MODE_MOUSE_BUTTON,
-        GHOSTTY_MODE_MOUSE_NORMAL, GHOSTTY_MODE_MOUSE_X10, GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODS_ALT,
-        GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
+        TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_BRACKETED_PASTE, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_MOUSE_ANY,
+        GHOSTTY_MODE_MOUSE_BUTTON, GHOSTTY_MODE_MOUSE_NORMAL, GHOSTTY_MODE_MOUSE_X10, GHOSTTY_MODE_SGR_MOUSE,
+        GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
     },
     CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, MouseAction, MouseButton, MouseModifiers,
     MouseReportFormat, MouseTrackingMode, ResolvedCell, Rgb, ScreenGrid, TerminalColors, TerminalModeState, VtEngine,
@@ -282,6 +282,11 @@ impl VtEngine for GhosttyVtEngine {
         }
         let terminal = self.terminal.raw_terminal();
         Ok(self.mouse_encoder.encode(terminal, MouseEncodeEvent { action, button, any_button_pressed, mods, x_px, y_px }))
+    }
+
+    fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {
+        let bracketed = self.terminal.mode_enabled(GHOSTTY_MODE_BRACKETED_PASTE)?;
+        Ok(ghostty_ffi::paste_encode(text, bracketed))
     }
 
     fn supports_replay(&self) -> bool {

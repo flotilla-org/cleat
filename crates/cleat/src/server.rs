@@ -122,7 +122,12 @@ impl SessionService {
                 continue;
             }
             if !is_session_daemon_alive(self.layout.root(), &id) {
-                let _ = self.layout.remove_session(&id);
+                // Stale daemon. Only garbage-collect it if there is nothing to
+                // recreate from; a crashed session with a recording survives so a
+                // later create/attach can respawn it from its prior output.
+                if !crate::recreate::session_is_recreatable(&path) {
+                    let _ = self.layout.remove_session(&id);
+                }
                 continue;
             }
             match self.inspect(&id) {
@@ -306,6 +311,12 @@ impl SessionService {
                 return Err(format!("missing session {id}"));
             }
             if !is_session_daemon_alive(self.layout.root(), &id) {
+                // The daemon crashed. --no-create forbids respawning, so report it
+                // as stale. Preserve a recoverable recording (a later attach without
+                // --no-create recreates from it); only remove a non-recreatable husk.
+                if crate::recreate::session_is_recreatable(&self.layout.root().join(&id)) {
+                    return Err(format!("session {id} has a stale daemon (use attach without --no-create to recreate)"));
+                }
                 let _ = self.layout.remove_session(&id);
                 return Err(format!("session {id} has a stale daemon (cleaned up)"));
             }
@@ -827,5 +838,24 @@ mod tests {
         let sessions = service.list().expect("list sessions");
         assert!(sessions.is_empty(), "stale session should not appear in list");
         assert!(!session_dir.exists(), "stale session directory should be cleaned up");
+    }
+
+    #[test]
+    fn list_preserves_stale_sessions_that_have_a_recording() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+        // A crashed daemon: stale socket + dead PID, but a recording survives.
+        let session_dir = temp.path().join("crashed-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let socket_path = session_socket_path(temp.path(), "crashed-session");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        drop(listener);
+        fs::write(daemon_pid_path(temp.path(), "crashed-session"), "999999999").expect("write pid");
+        fs::write(session_dir.join(crate::recording::CAST_FILE_NAME), b"{\"version\":3}\n").expect("write cast");
+
+        let sessions = service.list().expect("list sessions");
+        assert!(sessions.is_empty(), "stale session should not appear in list");
+        assert!(session_dir.exists(), "a recreatable session directory must survive the stale sweep");
     }
 }

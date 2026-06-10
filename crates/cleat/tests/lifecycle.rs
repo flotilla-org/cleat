@@ -12,7 +12,7 @@ use std::{
 
 use clap::Parser;
 #[cfg(feature = "ghostty-vt")]
-use cleat::session::{daemon_pid_path, foreground_path};
+use cleat::session::foreground_path;
 use cleat::{
     cli::{self, Cli, ExecResult},
     protocol::{Frame, SessionInfo},
@@ -21,9 +21,10 @@ use cleat::{
         cleat_provider_close, cleat_provider_open, cleat_session_create, cleat_session_destroy, cleat_session_write_bytes,
         CleatProviderDesc, CleatSessionDesc, CLEAT_PROVIDER_ABI_VERSION, CLEAT_PROVIDER_BACKEND_DAEMON, CLEAT_PROVIDER_VT_PASSTHROUGH,
     },
+    recording::{SessionRecorder, CAST_FILE_NAME},
     runtime::RuntimeLayout,
     server::{EndBound, SessionService, StartBound},
-    session::session_socket_path,
+    session::{daemon_pid_path, session_socket_path},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
 
@@ -429,6 +430,46 @@ fn daemon_provider_uses_client_supplied_id() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, "client-chosen-id");
     service.kill("client-chosen-id").expect("kill daemon session");
+}
+
+// A crashed daemon leaves its socket and PID files behind without going through
+// the graceful-exit cleanup. Re-creating the session must respawn a live daemon
+// from the surviving recording rather than reusing the stale socket.
+#[test]
+fn create_respawns_over_a_stale_crashed_daemon() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::Builder::new().prefix("cleat-crash-").tempdir_in("/tmp").expect("tempdir");
+    let root = temp.path();
+    let id = "crashed";
+
+    // Hand-build the husk a crashed recording daemon leaves behind: a session dir
+    // with a real recording, a leftover socket file with no listener, and a PID
+    // file pointing at a process that is not a live cleat.
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir).expect("create session dir");
+    let mut recorder = SessionRecorder::new(&dir, 80, 24, "passthrough").expect("recorder");
+    recorder.output(b"prior activation output\r\n", Duration::from_millis(1));
+    recorder.flush();
+    drop(recorder);
+    assert!(dir.join(CAST_FILE_NAME).exists(), "recording should exist before respawn");
+
+    let socket_path = session_socket_path(root, id);
+    let stale = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stale socket");
+    drop(stale);
+    std::fs::write(daemon_pid_path(root, id), "999999999").expect("write stale pid");
+
+    // Re-create with the same id: must respawn rather than reuse the dead socket.
+    let service = service_for(root);
+    service
+        .create(Some(id.into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true)
+        .expect("respawn over stale daemon");
+    wait_for_socket(&socket_path);
+
+    // The respawned daemon answers control requests and is the live session.
+    let sessions = service.list().expect("list sessions");
+    assert_eq!(sessions.len(), 1, "exactly one live session after respawn");
+    assert_eq!(sessions[0].id, id);
+    service.kill(id).expect("kill respawned session");
 }
 
 #[cfg(feature = "ghostty-vt")]

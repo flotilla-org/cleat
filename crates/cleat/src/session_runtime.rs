@@ -51,7 +51,7 @@ impl SessionRuntime {
         // its history returns as scrollback above the freshly-invoked command.
         // Detection is by cast presence — a brand-new session has an empty dir.
         let cast_path = session_dir.join(crate::recording::CAST_FILE_NAME);
-        let recreating = std::fs::metadata(&cast_path).map(|meta| meta.is_file() && meta.len() > 0).unwrap_or(false);
+        let recreating = crate::recreate::session_is_recreatable(&session_dir);
         if recreating {
             crate::recreate::seed_engine_from_cast(&mut *vt_engine, &cast_path)?;
         }

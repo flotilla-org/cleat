@@ -10,6 +10,16 @@ use std::path::Path;
 
 use crate::vt::VtEngine;
 
+/// Returns true if `session_dir` holds a recording we can recreate from: a
+/// non-empty cast file. A crashed session that is recreatable must not be
+/// garbage-collected by the stale-daemon sweep, since respawning it restores its
+/// prior output as scrollback. This is the same signal `SessionRuntime::spawn`
+/// uses to decide whether to seed the engine.
+pub fn session_is_recreatable(session_dir: &Path) -> bool {
+    let cast_path = session_dir.join(crate::recording::CAST_FILE_NAME);
+    std::fs::metadata(&cast_path).map(|meta| meta.is_file() && meta.len() > 0).unwrap_or(false)
+}
+
 /// Replay every recorded output event from `cast_path` into `engine`, instantly
 /// (no inter-event delays). Returns the number of output bytes fed.
 ///

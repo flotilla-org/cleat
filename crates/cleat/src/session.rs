@@ -18,7 +18,7 @@ use http::StatusCode;
 use crate::{
     http_uds,
     platform::{
-        daemon::spawn_daemon_process,
+        daemon::{is_session_daemon_alive, spawn_daemon_process},
         ipc::{
             bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
             set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
@@ -230,10 +230,18 @@ pub fn ensure_session_started(
     if let Some(ref id_str) = id {
         let socket_path = session_socket_path(layout.root(), id_str);
         if socket_path.exists() {
-            // Daemon is running — return the id. The caller should use inspect()
-            // if it needs the session's actual config.
-            let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-            return Ok(SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record, colors });
+            if is_session_daemon_alive(layout.root(), id_str) {
+                // Daemon is running — return the id. The caller should use inspect()
+                // if it needs the session's actual config.
+                let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
+                return Ok(SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record, colors });
+            }
+            // Stale socket from a crashed daemon. Remove it so the respawned daemon
+            // binds cleanly and wait_for_socket waits for the new listener rather
+            // than returning on the leftover file. The session directory and its
+            // recording survive, so falling through to the create path recreates
+            // the session from its prior output (see recreate::seed_engine_from_cast).
+            let _ = fs::remove_file(&socket_path);
         }
     }
 

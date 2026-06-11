@@ -10,10 +10,13 @@ use crate::{
     da::DeviceAttributeTracker,
     platform::pty::{exit_code_from_wait_status, PtyChild},
     protocol::{InspectResult, SignalTarget},
-    provider::{DirtyState, TerminalSnapshot},
+    provider::{
+        DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, ViewportCommand,
+        ViewportCommandOutcome,
+    },
     recording::SessionRecorder,
     runtime::SessionMetadata,
-    vt::{self, VtEngine},
+    vt::{self, TerminalModeState, VtEngine},
 };
 
 const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
@@ -29,6 +32,12 @@ pub(crate) struct SessionRuntime {
     markers: HashMap<String, u64>,
     epoch: Instant,
     last_pty_output_at: Option<Instant>,
+    // Current cell pixel size, used to fill the PTY winsize ws_xpixel/ws_ypixel
+    // so TIOCGWINSZ-based apps (e.g. katzensteg) can compute image aspect. Zero
+    // until the first geometry/set_cell_size, matching a terminal that hasn't
+    // reported a pixel size yet.
+    cell_width_px: u32,
+    cell_height_px: u32,
 }
 
 pub(crate) struct PtyOutput {
@@ -37,6 +46,16 @@ pub(crate) struct PtyOutput {
 
 impl SessionRuntime {
     pub(crate) fn spawn(session_dir: PathBuf, session: &SessionMetadata, mut vt_engine: Box<dyn VtEngine>) -> Result<Self, String> {
+        // Recreation from recording (ADR 0001): if the session dir already holds
+        // a recording from a prior activation, replay it into the fresh engine so
+        // its history returns as scrollback above the freshly-invoked command.
+        // Detection is by cast presence — a brand-new session has an empty dir.
+        let cast_path = session_dir.join(crate::recording::CAST_FILE_NAME);
+        let recreating = crate::recreate::session_is_recreatable(&session_dir);
+        if recreating {
+            crate::recreate::seed_engine_from_cast(&mut *vt_engine, &cast_path)?;
+        }
+
         let pty_child = PtyChild::spawn(session)?;
         pty_child.set_nonblocking()?;
         let detached_da = match session.vt_engine {
@@ -46,16 +65,23 @@ impl SessionRuntime {
             vt::VtEngineKind::Passthrough => Some(DeviceAttributeTracker::new()),
             vt::VtEngineKind::Ghostty => None,
         };
-        let mut recorder = None;
-        if session.record {
-            match SessionRecorder::new(&session_dir, vt_engine.size().0, vt_engine.size().1, session.vt_engine.as_str()) {
-                Ok(mut r) => {
-                    write_replay_snapshot(&mut *vt_engine, &mut r, session.vt_engine.as_str(), Duration::ZERO);
-                    recorder = Some(r);
-                }
-                Err(err) => eprintln!("failed to start recording: {err}"),
-            }
-        }
+        let recorder = if session.record {
+            // Recording appends across activations (ADR 0002): on recreation,
+            // reopen the existing cast (writing a boundary marker) rather than
+            // truncating it with a new header.
+            let mut recorder = if recreating {
+                SessionRecorder::reopen_append(&session_dir, Duration::ZERO).map_err(|err| format!("failed to resume recording: {err}"))?
+            } else {
+                SessionRecorder::new(&session_dir, vt_engine.size().0, vt_engine.size().1, session.vt_engine.as_str())
+                    .map_err(|err| format!("failed to start recording: {err}"))?
+            };
+            // Snapshot the (possibly seeded) state. For recreation this checkpoints
+            // the activation boundary; for a fresh session it is the initial frame.
+            write_replay_snapshot(&mut *vt_engine, &mut recorder, session.vt_engine.as_str(), Duration::ZERO);
+            Some(recorder)
+        } else {
+            None
+        };
 
         Ok(Self {
             session: session.clone(),
@@ -67,7 +93,13 @@ impl SessionRuntime {
             markers: HashMap::new(),
             epoch: Instant::now(),
             last_pty_output_at: None,
+            cell_width_px: 0,
+            cell_height_px: 0,
         })
+    }
+
+    fn pty_pixel_size(&self, cols: u16, rows: u16) -> (u32, u32) {
+        ((cols as u32).saturating_mul(self.cell_width_px), (rows as u32).saturating_mul(self.cell_height_px))
     }
 
     pub(crate) fn pty_child(&self) -> &PtyChild {
@@ -108,7 +140,8 @@ impl SessionRuntime {
         rows: u16,
         capabilities: &vt::ClientCapabilities,
     ) -> Result<Option<Vec<u8>>, String> {
-        self.pty_child.resize(cols, rows)?;
+        let (width_px, height_px) = self.pty_pixel_size(cols, rows);
+        self.pty_child.resize(cols, rows, width_px, height_px)?;
         self.vt_engine.resize(cols, rows)?;
         if self.vt_engine.supports_replay() {
             self.vt_engine.replay_payload(capabilities)
@@ -130,7 +163,65 @@ impl SessionRuntime {
     }
 
     pub(crate) fn snapshot(&mut self, dirty: DirtyState) -> Result<TerminalSnapshot, String> {
-        self.vt_engine.screen_grid().map(|grid| TerminalSnapshot::from_screen_grid(grid, dirty))
+        let grid = self.vt_engine.screen_grid()?;
+        let scrollbar = self.vt_engine.scrollbar_state()?;
+        let mut snapshot = TerminalSnapshot::from_screen_grid(grid, dirty);
+        snapshot.viewport_kind = scrollbar.viewport_kind;
+        snapshot.scrollbar = scrollbar;
+        snapshot.scrollback_offset_rows = scrollbar.viewport_top_row;
+        snapshot.terminal_modes = self.vt_engine.terminal_mode_state()?;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn render_update(&mut self, dirty: DirtyState) -> Result<TerminalRenderUpdate, String> {
+        let scrollbar = self.vt_engine.scrollbar_state()?;
+        let mut update = self.vt_engine.render_update(dirty)?;
+        update.viewport_kind = scrollbar.viewport_kind;
+        update.scrollbar = scrollbar;
+        update.scrollback_offset_rows = scrollbar.viewport_top_row;
+        update.terminal_modes = self.vt_engine.terminal_mode_state()?;
+        Ok(update)
+    }
+
+    pub(crate) fn with_image_resource_data(
+        &mut self,
+        image_id: u32,
+        generation: u64,
+        callback: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, String> {
+        self.vt_engine.with_image_resource_data(image_id, generation, callback)
+    }
+
+    pub(crate) fn scrollback_extent(&self) -> Result<TerminalScrollbackExtent, String> {
+        self.vt_engine.scrollback_extent()
+    }
+
+    pub(crate) fn scrollbar_state(&self) -> Result<TerminalScrollbarState, String> {
+        self.vt_engine.scrollbar_state()
+    }
+
+    pub(crate) fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
+        self.vt_engine.scroll_viewport(command)
+    }
+
+    pub(crate) fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
+        self.vt_engine.terminal_mode_state()
+    }
+
+    pub(crate) fn encode_mouse(
+        &mut self,
+        action: vt::MouseAction,
+        button: Option<vt::MouseButton>,
+        any_button_pressed: bool,
+        modifiers: vt::MouseModifiers,
+        x_px: f32,
+        y_px: f32,
+    ) -> Result<Vec<u8>, String> {
+        self.vt_engine.encode_mouse(action, button, any_button_pressed, modifiers, x_px, y_px)
+    }
+
+    pub(crate) fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {
+        self.vt_engine.encode_paste(text)
     }
 
     pub(crate) fn write_input(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -155,8 +246,20 @@ impl SessionRuntime {
         if let Some(ref mut recorder) = self.recorder {
             recorder.event(crate::asciicast::EventCode::Resize, &format!("{}x{}", cols, rows), self.epoch.elapsed());
         }
-        self.pty_child.resize(cols, rows)?;
+        let (width_px, height_px) = self.pty_pixel_size(cols, rows);
+        self.pty_child.resize(cols, rows, width_px, height_px)?;
         self.vt_engine.resize(cols, rows)
+    }
+
+    pub(crate) fn set_cell_size(&mut self, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
+        self.cell_width_px = cell_width_px;
+        self.cell_height_px = cell_height_px;
+        self.vt_engine.set_cell_size(cell_width_px, cell_height_px)?;
+        // Refresh the PTY winsize pixel fields for the current grid so apps that
+        // read TIOCGWINSZ pick up the new cell size even if cols/rows are unchanged.
+        let (cols, rows) = self.vt_engine.size();
+        let (width_px, height_px) = self.pty_pixel_size(cols, rows);
+        self.pty_child.resize(cols, rows, width_px, height_px)
     }
 
     pub(crate) fn inspect(&self, has_controller: bool) -> InspectResult {
@@ -355,7 +458,7 @@ fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vt::{CellFlags, CellWidth, CursorState, ResolvedCell, Rgb, ScreenGrid};
+    use crate::vt::{passthrough::PassthroughVtEngine, CellFlags, CellWidth, CursorState, ResolvedCell, Rgb, ScreenGrid, VtEngineKind};
 
     #[derive(Debug)]
     struct GridEngine {
@@ -401,6 +504,7 @@ mod tests {
             cols: 2,
             rows: 1,
             cursor: CursorState { col: 1, row: 0, visible: true, ..CursorState::default() },
+            dirty_rows: Vec::new(),
             cells: vec![
                 ResolvedCell {
                     graphemes: vec!['A' as u32],
@@ -408,6 +512,7 @@ mod tests {
                     bg: Rgb { r: 4, g: 5, b: 6 },
                     flags: CellFlags::BOLD | CellFlags::UNDERLINE,
                     width: CellWidth::Wide,
+                    ..ResolvedCell::default()
                 },
                 ResolvedCell { width: CellWidth::SpacerTail, ..ResolvedCell::default() },
             ],
@@ -416,5 +521,81 @@ mod tests {
 
         assert_eq!(engine.screen_grid().expect("screen grid"), grid);
         assert_eq!(engine.screen_text().expect("screen text"), "A");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_fails_when_requested_recording_cannot_start() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(temp.path().join(crate::recording::CAST_FILE_NAME)).expect("create cast path directory");
+        let session = SessionMetadata {
+            id: "alpha".to_string(),
+            vt_engine: VtEngineKind::Passthrough,
+            cwd: None,
+            cmd: Some("true".to_string()),
+            record: true,
+            colors: crate::vt::TerminalColors::default(),
+        };
+
+        let err = match SessionRuntime::spawn(temp.path().to_path_buf(), &session, Box::new(PassthroughVtEngine::new(80, 24))) {
+            Ok(_) => panic!("requested recording startup failure should fail session spawn"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("failed to start recording"), "{err}");
+        assert!(err.contains(crate::recording::CAST_FILE_NAME), "{err}");
+    }
+
+    #[cfg(all(unix, feature = "ghostty-vt"))]
+    #[test]
+    fn recreation_seeds_scrollback_from_prior_recording() {
+        fn pump_until_screen_contains(rt: &mut SessionRuntime, needle: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                rt.read_available_output(false).expect("read pty output");
+                if rt.screen_contains(needle) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {needle:?}; screen was {:?}", rt.capture_text());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().to_path_buf();
+        let colors = crate::vt::TerminalColors::default();
+
+        // Activation 1: print a marker, then idle so it stays on screen and the
+        // recording captures it before we tear the runtime down.
+        let session1 = SessionMetadata {
+            id: "recreate".to_string(),
+            vt_engine: VtEngineKind::Ghostty,
+            cwd: None,
+            cmd: Some("sh -c 'printf RECREATE_MARKER; sleep 30'".to_string()),
+            record: true,
+            colors,
+        };
+        let engine1 = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).expect("engine 1");
+        let mut rt1 = SessionRuntime::spawn(session_dir.clone(), &session1, engine1).expect("spawn activation 1");
+        pump_until_screen_contains(&mut rt1, "RECREATE_MARKER");
+        rt1.flush_recording();
+        drop(rt1);
+
+        // Activation 2: recreate the same session dir with a different command.
+        // Seeding happens synchronously in spawn, so the prior marker is on the
+        // recreated screen before the new command produces any output.
+        let session2 = SessionMetadata { cmd: Some("sleep 30".to_string()), ..session1.clone() };
+        let engine2 = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).expect("engine 2");
+        let rt2 = SessionRuntime::spawn(session_dir.clone(), &session2, engine2).expect("spawn activation 2");
+
+        assert!(
+            rt2.screen_contains("RECREATE_MARKER"),
+            "recreated session should restore prior output; screen was {:?}",
+            rt2.capture_text()
+        );
+
+        // The recording continues in the same cast across the activation boundary.
+        let raw = std::fs::read_to_string(session_dir.join(crate::recording::CAST_FILE_NAME)).expect("read cast");
+        assert!(raw.contains("session-recreated"), "activation boundary marker recorded");
     }
 }

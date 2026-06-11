@@ -18,7 +18,7 @@ use http::StatusCode;
 use crate::{
     http_uds,
     platform::{
-        daemon::spawn_daemon_process,
+        daemon::{is_session_daemon_alive, spawn_daemon_process},
         ipc::{
             bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
             set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
@@ -224,15 +224,32 @@ pub fn ensure_session_started(
     cwd: Option<PathBuf>,
     cmd: Option<String>,
     record: bool,
+    colors: vt::TerminalColors,
 ) -> Result<SessionMetadata, String> {
     // If a named session directory already exists with a live socket, reuse it.
     if let Some(ref id_str) = id {
         let socket_path = session_socket_path(layout.root(), id_str);
         if socket_path.exists() {
-            // Daemon is running — return the id. The caller should use inspect()
-            // if it needs the session's actual config.
-            let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-            return Ok(SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record });
+            if is_session_daemon_alive(layout.root(), id_str) {
+                // Daemon is running — return the id. The caller should use inspect()
+                // if it needs the session's actual config.
+                let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
+                return Ok(SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record, colors });
+            }
+            // Stale socket from a crashed daemon. Remove it so the respawned daemon
+            // binds cleanly and wait_for_socket waits for the new listener rather
+            // than returning on the leftover file. The session directory and its
+            // recording survive, so falling through to the create path recreates
+            // the session from its prior output (see recreate::seed_engine_from_cast).
+            //
+            // A removal failure other than "already gone" (e.g. a permissions
+            // problem) would otherwise surface downstream as an opaque socket-bind
+            // error (EADDRINUSE), so report the real cause here instead.
+            match fs::remove_file(&socket_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("remove stale session socket {}: {err}", socket_path.display())),
+            }
         }
     }
 
@@ -241,6 +258,7 @@ pub fn ensure_session_started(
     vt_engine.ensure_available()?;
     let mut session = layout.create_session(id, vt_engine, cwd, cmd)?;
     session.record = record;
+    session.colors = colors;
 
     let socket_path = session_socket_path(layout.root(), &session.id);
     spawn_daemon_process(layout.root(), &session)?;
@@ -288,9 +306,9 @@ pub fn foreground_path(root: &Path, id: &str) -> PathBuf {
     root.join(id).join(FOREGROUND_NAME)
 }
 
-fn default_vt_engine(kind: VtEngineKind) -> Result<Box<dyn VtEngine>, String> {
+fn default_vt_engine(session: &SessionMetadata) -> Result<Box<dyn VtEngine>, String> {
     #[cfg(test)]
-    if kind == VtEngineKind::Ghostty {
+    if session.vt_engine == VtEngineKind::Ghostty {
         return Ok(Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)));
     }
 
@@ -299,7 +317,7 @@ fn default_vt_engine(kind: VtEngineKind) -> Result<Box<dyn VtEngine>, String> {
     {
         return Ok(Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)));
     }
-    vt::make_vt_engine(kind, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
+    vt::make_vt_engine_with_colors(session.vt_engine, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS, session.colors)
 }
 
 #[derive(Debug)]
@@ -425,7 +443,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     set_listener_nonblocking(&listener, true)?;
     fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let mut runtime = SessionRuntime::spawn(session_dir.clone(), session, default_vt_engine(session.vt_engine)?)?;
+    let mut runtime = SessionRuntime::spawn(session_dir.clone(), session, default_vt_engine(session)?)?;
     let mut active_client: Option<ActiveClient> = None;
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
@@ -724,7 +742,9 @@ fn handle_http_request(
         }
         http_uds::Route::SessionDetach { id } if id == daemon_id => {
             let _ = fs::remove_file(foreground_path(root, daemon_id));
-            state.runtime.record_detach();
+            if state.active_client.is_some() {
+                state.runtime.record_detach();
+            }
             *state.active_client = None;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP detach response: {err}"))
         }
@@ -774,8 +794,12 @@ fn handle_http_request(
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
-                http_uds::InputRequest::Text { text } | http_uds::InputRequest::Paste { text } => {
+                http_uds::InputRequest::Text { text } => {
                     state.runtime.write_input(text.as_bytes())?;
+                }
+                http_uds::InputRequest::Paste { text } => {
+                    let bytes = state.runtime.encode_paste(text.as_bytes())?;
+                    state.runtime.write_input(&bytes)?;
                 }
                 http_uds::InputRequest::Key { key } => {
                     let bytes = http_input_key_bytes(key);
@@ -1101,7 +1125,7 @@ mod tests {
     };
     use crate::{
         http_uds::read_http_request_for_test,
-        runtime::RuntimeLayout,
+        runtime::{RuntimeLayout, SessionMetadata},
         vt::{self, VtEngine},
     };
 
@@ -1196,7 +1220,15 @@ mod tests {
 
     #[test]
     fn default_vt_engine_starts_with_default_size() {
-        let engine = default_vt_engine(vt::default_vt_engine_kind()).expect("create default vt engine");
+        let session = SessionMetadata {
+            id: "test".to_string(),
+            vt_engine: vt::default_vt_engine_kind(),
+            cwd: None,
+            cmd: None,
+            record: false,
+            colors: vt::TerminalColors::default(),
+        };
+        let engine = default_vt_engine(&session).expect("create default vt engine");
         assert_eq!(engine.size(), (super::DEFAULT_TERMINAL_COLS, super::DEFAULT_TERMINAL_ROWS));
         #[cfg(feature = "ghostty-vt")]
         assert!(engine.supports_replay());
@@ -1210,7 +1242,15 @@ mod tests {
 
     #[test]
     fn vt_engine_helpers_feed_and_resize_default_engine() {
-        let mut engine = default_vt_engine(vt::default_vt_engine_kind()).expect("create default vt engine");
+        let session = SessionMetadata {
+            id: "test".to_string(),
+            vt_engine: vt::default_vt_engine_kind(),
+            cwd: None,
+            cmd: None,
+            record: false,
+            colors: vt::TerminalColors::default(),
+        };
+        let mut engine = default_vt_engine(&session).expect("create default vt engine");
         record_pty_output(engine.as_mut(), b"hello").expect("feed output");
         let replay =
             apply_attach_state(engine.as_mut(), 132, 40, &vt::ClientCapabilities::conservative_fallback()).expect("apply attach state");

@@ -10,7 +10,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
-ghostty-vt = []
+ghostty-vt = ["dep:png"]
 
 [dependencies]
 bitflags = "2"
@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"
 nix = { version = "0.31.2", features = ["fs", "poll", "process", "signal", "term"] }
+png = { version = "0.17", optional = true }
 sysinfo = "0.38"
 uuid = { version = "1", features = ["v4"] }
 

@@ -13,6 +13,11 @@ pub use support::{
     FUNCTIONAL_ENGINE_STATUS, NONFUNCTIONAL_BUILD_MESSAGE, PLACEHOLDER_ENGINE_STATUS, VT_ENGINE_HELP, VT_SUPPORT_POLICY,
 };
 
+use crate::provider::{
+    DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
+    ViewportCommand, ViewportCommandOutcome,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ClientCapabilities {
@@ -45,6 +50,13 @@ pub struct Rgb {
     pub b: u8,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalColors {
+    pub default_foreground: Option<Rgb>,
+    pub default_background: Option<Rgb>,
+    pub default_cursor: Option<Rgb>,
+}
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct CellFlags: u16 {
@@ -74,8 +86,13 @@ pub struct ResolvedCell {
     pub graphemes: Vec<u32>,
     pub fg: Rgb,
     pub bg: Rgb,
+    pub underline_color: Option<Rgb>,
     pub flags: CellFlags,
+    pub underline_style: u32,
     pub width: CellWidth,
+    pub protected: bool,
+    pub semantic: u32,
+    pub has_hyperlink: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -93,6 +110,7 @@ pub struct CursorState {
     pub row: u16,
     pub visible: bool,
     pub style: CursorStyle,
+    pub blink: bool,
     pub wide_tail: bool,
 }
 
@@ -102,6 +120,7 @@ pub struct ScreenGrid {
     pub cols: u16,
     pub rows: u16,
     pub cursor: CursorState,
+    pub dirty_rows: Vec<u16>,
 }
 
 impl ScreenGrid {
@@ -138,6 +157,36 @@ impl ScreenGrid {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MouseTrackingMode {
+    #[default]
+    None,
+    X10,
+    Normal,
+    Button,
+    Any,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MouseReportFormat {
+    #[default]
+    Legacy,
+    Sgr,
+    SgrPixels,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalModeState {
+    pub active_alternate_screen: bool,
+    pub application_cursor_keys: bool,
+    pub alternate_scroll: bool,
+    pub mouse_tracking: bool,
+    pub mouse_tracking_mode: MouseTrackingMode,
+    pub mouse_report_format: MouseReportFormat,
+    pub mouse_sgr: bool,
+    pub mouse_sgr_pixels: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum VtEngineKind {
@@ -170,16 +219,102 @@ impl VtEngineKind {
     }
 }
 
+/// Backend-neutral mouse event action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+/// Backend-neutral mouse button identity (named, not numbered: the wire
+/// button codes differ between Cleat and Ghostty and are resolved per backend).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight,
+    Nine,
+}
+
+/// Keyboard modifiers relevant to mouse encoding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MouseModifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
 // NOTE: VtEngine is intentionally not Send. Engines may wrap foreign terminal-state
 // handles that are only accessed from the single session daemon event loop.
 pub trait VtEngine {
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String>;
+    fn set_cell_size(&mut self, _cell_width_px: u32, _cell_height_px: u32) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Encode a mouse event into terminal report bytes, gated by the engine's
+    /// live mouse tracking mode. Returns empty bytes when the event is not
+    /// reported (no mouse mode, deduped motion, out of viewport, ...). Default
+    /// is a no-op for engines without a mouse encoder.
+    fn encode_mouse(
+        &mut self,
+        _action: MouseAction,
+        _button: Option<MouseButton>,
+        _any_button_pressed: bool,
+        _modifiers: MouseModifiers,
+        _x_px: f32,
+        _y_px: f32,
+    ) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Encode paste `text` for the PTY, wrapping it in bracketed-paste markers
+    /// when the program has bracketed paste (mode 2004) enabled. Default is a raw
+    /// passthrough for engines without a paste encoder.
+    fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(text.to_vec())
+    }
     fn supports_replay(&self) -> bool;
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;
     fn screen_text(&self) -> Result<String, String>;
     fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
+    fn render_update(&mut self, dirty: DirtyState) -> Result<TerminalRenderUpdate, String> {
+        let snapshot = TerminalSnapshot::from_screen_grid(self.screen_grid()?, dirty);
+        Ok(TerminalRenderUpdate::from_snapshot(snapshot))
+    }
+    fn with_image_resource_data(
+        &mut self,
+        _image_id: u32,
+        _generation: u64,
+        _callback: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     fn size(&self) -> (u16, u16);
+    fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
+        Ok(TerminalModeState::default())
+    }
+    fn scrollback_extent(&self) -> Result<TerminalScrollbackExtent, String> {
+        let (_, rows) = self.size();
+        Ok(TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: rows, alternate_screen: false })
+    }
+    fn scrollbar_state(&self) -> Result<TerminalScrollbarState, String> {
+        let extent = self.scrollback_extent()?;
+        let kind = if extent.alternate_screen { TerminalViewportKind::LiveAlternate } else { TerminalViewportKind::LiveNormal };
+        Ok(TerminalScrollbarState::for_live_viewport(kind, extent.live_rows))
+    }
+    fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
+        match command {
+            ViewportCommand::Top | ViewportCommand::Bottom | ViewportCommand::DeltaRows(_) => Ok(ViewportCommandOutcome::NoOp),
+        }
+    }
 
     /// Reply bytes (DSR, DECRQM, DA, ...) the engine has buffered since the
     /// last call. Default is empty for engines that don't synthesize replies.
@@ -190,12 +325,18 @@ pub trait VtEngine {
 
 #[cfg(test)]
 pub(crate) fn make_default_vt_engine(cols: u16, rows: u16) -> Box<dyn VtEngine> {
-    make_vt_engine(default_vt_engine_kind(), cols, rows).expect("default vt engine should always be available")
+    make_vt_engine_with_colors(default_vt_engine_kind(), cols, rows, TerminalColors::default())
+        .expect("default vt engine should always be available")
 }
 
-pub(crate) fn make_vt_engine(kind: VtEngineKind, cols: u16, rows: u16) -> Result<Box<dyn VtEngine>, String> {
+pub(crate) fn make_vt_engine_with_colors(
+    kind: VtEngineKind,
+    cols: u16,
+    rows: u16,
+    colors: TerminalColors,
+) -> Result<Box<dyn VtEngine>, String> {
     kind.ensure_available()?;
-    Ok(select_vt_engine(kind, cols, rows))
+    Ok(select_vt_engine(kind, cols, rows, colors))
 }
 
 pub fn default_vt_engine_kind() -> VtEngineKind {
@@ -203,10 +344,10 @@ pub fn default_vt_engine_kind() -> VtEngineKind {
 }
 
 #[cfg(feature = "ghostty-vt")]
-fn select_vt_engine(kind: VtEngineKind, cols: u16, rows: u16) -> Box<dyn VtEngine> {
+fn select_vt_engine(kind: VtEngineKind, cols: u16, rows: u16, colors: TerminalColors) -> Box<dyn VtEngine> {
     match kind {
         VtEngineKind::Passthrough => Box::new(passthrough::PassthroughVtEngine::new(cols, rows)),
-        VtEngineKind::Ghostty => Box::new(ghostty::GhosttyVtEngine::new(cols, rows)),
+        VtEngineKind::Ghostty => Box::new(ghostty::GhosttyVtEngine::new_with_colors(cols, rows, colors)),
     }
 }
 
@@ -216,7 +357,7 @@ fn select_default_vt_engine_kind() -> VtEngineKind {
 }
 
 #[cfg(not(feature = "ghostty-vt"))]
-fn select_vt_engine(kind: VtEngineKind, cols: u16, rows: u16) -> Box<dyn VtEngine> {
+fn select_vt_engine(kind: VtEngineKind, cols: u16, rows: u16, _colors: TerminalColors) -> Box<dyn VtEngine> {
     match kind {
         VtEngineKind::Passthrough => Box::new(passthrough::PassthroughVtEngine::new(cols, rows)),
         VtEngineKind::Ghostty => unreachable!("availability check should reject ghostty when feature-disabled"),
@@ -230,7 +371,7 @@ fn select_default_vt_engine_kind() -> VtEngineKind {
 
 #[cfg(test)]
 mod tests {
-    use super::VtEngineKind;
+    use super::{TerminalColors, VtEngineKind};
 
     #[cfg(feature = "ghostty-vt")]
     #[test]
@@ -247,13 +388,13 @@ mod tests {
 
     #[test]
     fn passthrough_engine_is_always_available() {
-        assert!(super::make_vt_engine(VtEngineKind::Passthrough, 80, 24).is_ok());
+        assert!(super::make_vt_engine_with_colors(VtEngineKind::Passthrough, 80, 24, TerminalColors::default()).is_ok());
     }
 
     #[cfg(not(feature = "ghostty-vt"))]
     #[test]
     fn ghostty_engine_is_rejected_when_feature_disabled() {
-        let err = match super::make_vt_engine(VtEngineKind::Ghostty, 80, 24) {
+        let err = match super::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, TerminalColors::default()) {
             Ok(_) => panic!("ghostty should be unavailable"),
             Err(err) => err,
         };

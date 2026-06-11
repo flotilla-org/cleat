@@ -12,7 +12,7 @@ use std::{
 
 use clap::Parser;
 #[cfg(feature = "ghostty-vt")]
-use cleat::session::{daemon_pid_path, foreground_path};
+use cleat::session::foreground_path;
 use cleat::{
     cli::{self, Cli, ExecResult},
     protocol::{Frame, SessionInfo},
@@ -21,9 +21,10 @@ use cleat::{
         cleat_provider_close, cleat_provider_open, cleat_session_create, cleat_session_destroy, cleat_session_write_bytes,
         CleatProviderDesc, CleatSessionDesc, CLEAT_PROVIDER_ABI_VERSION, CLEAT_PROVIDER_BACKEND_DAEMON, CLEAT_PROVIDER_VT_PASSTHROUGH,
     },
+    recording::{SessionRecorder, CAST_FILE_NAME},
     runtime::RuntimeLayout,
     server::{EndBound, SessionService, StartBound},
-    session::session_socket_path,
+    session::{daemon_pid_path, session_socket_path},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
 
@@ -390,6 +391,87 @@ fn daemon_provider_keeps_session_alive_after_provider_close() {
     service.kill(&sessions[0].id).expect("kill daemon session");
 }
 
+#[test]
+fn daemon_provider_uses_client_supplied_id() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::Builder::new().prefix("cleat-provider-").tempdir_in("/tmp").expect("tempdir");
+    let root = temp.path().to_string_lossy();
+    let command = b"sleep 30";
+    let id = b"client-chosen-id";
+
+    unsafe {
+        let provider = cleat_provider_open(&CleatProviderDesc {
+            abi_version: CLEAT_PROVIDER_ABI_VERSION,
+            requested_features: ProviderFeatures::CELL_SNAPSHOTS.bits(),
+            backend: CLEAT_PROVIDER_BACKEND_DAEMON,
+            runtime_root: root.as_ptr(),
+            runtime_root_len: root.len(),
+        });
+        assert!(!provider.is_null());
+
+        let session = cleat_session_create(provider, &CleatSessionDesc {
+            cols: 80,
+            rows: 24,
+            vt_engine: CLEAT_PROVIDER_VT_PASSTHROUGH,
+            command: command.as_ptr(),
+            command_len: command.len(),
+            id: id.as_ptr(),
+            id_len: id.len(),
+            ..CleatSessionDesc::default()
+        });
+        assert!(!session.is_null());
+
+        cleat_session_destroy(session);
+        cleat_provider_close(provider);
+    }
+
+    let service = service_for(temp.path());
+    let sessions = service.list().expect("list sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "client-chosen-id");
+    service.kill("client-chosen-id").expect("kill daemon session");
+}
+
+// A crashed daemon leaves its socket and PID files behind without going through
+// the graceful-exit cleanup. Re-creating the session must respawn a live daemon
+// from the surviving recording rather than reusing the stale socket.
+#[test]
+fn create_respawns_over_a_stale_crashed_daemon() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::Builder::new().prefix("cleat-crash-").tempdir_in("/tmp").expect("tempdir");
+    let root = temp.path();
+    let id = "crashed";
+
+    // Hand-build the husk a crashed recording daemon leaves behind: a session dir
+    // with a real recording, a leftover socket file with no listener, and a PID
+    // file pointing at a process that is not a live cleat.
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir).expect("create session dir");
+    let mut recorder = SessionRecorder::new(&dir, 80, 24, "passthrough").expect("recorder");
+    recorder.output(b"prior activation output\r\n", Duration::from_millis(1));
+    recorder.flush();
+    drop(recorder);
+    assert!(dir.join(CAST_FILE_NAME).exists(), "recording should exist before respawn");
+
+    let socket_path = session_socket_path(root, id);
+    let stale = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stale socket");
+    drop(stale);
+    std::fs::write(daemon_pid_path(root, id), "999999999").expect("write stale pid");
+
+    // Re-create with the same id: must respawn rather than reuse the dead socket.
+    let service = service_for(root);
+    service
+        .create(Some(id.into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true)
+        .expect("respawn over stale daemon");
+    wait_for_socket(&socket_path);
+
+    // The respawned daemon answers control requests and is the live session.
+    let sessions = service.list().expect("list sessions");
+    assert_eq!(sessions.len(), 1, "exactly one live session after respawn");
+    assert_eq!(sessions[0].id, id);
+    service.kill(id).expect("kill respawned session");
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn capture_returns_text_for_ghostty_sessions() {
@@ -528,6 +610,33 @@ fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_c
 
     let err = service.attach(Some("alpha".into()), None, None, None, false).expect_err("second attach should fail");
     assert!(err.contains("foreground client"));
+}
+
+#[test]
+fn http_detach_records_only_real_foreground_transition() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).expect("create alpha");
+
+    let attach_stream = http_attach_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback());
+
+    let first_detach = http_session_request(temp.path(), "alpha", "POST /sessions/alpha/detach HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(first_detach.starts_with("HTTP/1.1 204 No Content\r\n"), "{first_detach}");
+
+    let second_detach = http_session_request(temp.path(), "alpha", "POST /sessions/alpha/detach HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(second_detach.starts_with("HTTP/1.1 204 No Content\r\n"), "{second_detach}");
+    drop(attach_stream);
+
+    let cast_path = temp.path().join("alpha").join(cleat::recording::CAST_FILE_NAME);
+    let events = cleat::cast_reader::read_all_events_since(&cast_path, 0).expect("read cast events");
+    let attach_count = events.iter().filter(|event| matches!(event.code, cleat::asciicast::EventCode::Custom('a'))).count();
+    let detach_count = events.iter().filter(|event| matches!(event.code, cleat::asciicast::EventCode::Custom('d'))).count();
+
+    assert_eq!(attach_count, 1, "expected one foreground attach event, got {events:?}");
+    assert_eq!(detach_count, 1, "expected one foreground detach event, got {events:?}");
+
+    service.kill("alpha").expect("kill session");
 }
 
 #[test]

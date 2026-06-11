@@ -6,7 +6,11 @@ use std::{
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-use crate::{platform::process, runtime::SessionMetadata};
+use crate::{
+    platform::process,
+    runtime::SessionMetadata,
+    vt::{Rgb, TerminalColors},
+};
 
 const PID_NAME: &str = "daemon.pid";
 
@@ -27,10 +31,27 @@ pub fn spawn_daemon_process(root: &Path, session: &SessionMetadata) -> Result<()
     if session.record {
         command.arg("--record");
     }
+    add_color_args(&mut command, session.colors);
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let child = command.spawn().map_err(|err| format!("spawn session daemon for {}: {err}", session.id))?;
     fs::write(daemon_pid_path(root, &session.id), child.id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
     Ok(())
+}
+
+fn add_color_args(command: &mut Command, colors: TerminalColors) {
+    if let Some(color) = colors.default_foreground {
+        command.arg("--color-foreground").arg(format_rgb_arg(color));
+    }
+    if let Some(color) = colors.default_background {
+        command.arg("--color-background").arg(format_rgb_arg(color));
+    }
+    if let Some(color) = colors.default_cursor {
+        command.arg("--color-cursor").arg(format_rgb_arg(color));
+    }
+}
+
+fn format_rgb_arg(color: Rgb) -> String {
+    format!("{:02x}{:02x}{:02x}", color.r, color.g, color.b)
 }
 
 /// Returns true if the daemon is alive, or if no PID file exists yet because

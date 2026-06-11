@@ -167,6 +167,36 @@ impl SessionRecorder {
         })
     }
 
+    /// Reopen an existing `session.cast` to append a new activation's events,
+    /// without rewriting the header. Emits an activation-boundary gap marker
+    /// ("session-recreated") so the stream records where recreation occurred,
+    /// and the new activation's time deltas restart from zero after it.
+    ///
+    /// Use this instead of [`Self::new`] when recreating a session from its
+    /// recording (recording appends across activations — see
+    /// docs/adr/0002-recording-on-by-default.md). The boundary marker is also
+    /// the natural safe cut point for future front-truncation.
+    pub fn reopen_append(session_dir: &Path, time: Duration) -> Result<Self, String> {
+        let cast_path = session_dir.join(CAST_FILE_NAME);
+        let cast_file = OpenOptions::new()
+            .append(true)
+            .open(&cast_path)
+            .map_err(|err| format!("open cast file for append {}: {err}", cast_path.display()))?;
+        let existing_len = cast_file.metadata().map_err(|err| format!("stat cast file {}: {err}", cast_path.display()))?.len();
+
+        let mut recorder = Self {
+            session_dir: session_dir.to_path_buf(),
+            cast_file,
+            bytes_written: existing_len,
+            prev_time: Duration::ZERO,
+            coalesce: CoalesceBuffer::new(),
+            output_bytes_since_snapshot: 0,
+            paused: false,
+        };
+        recorder.emit_gap("session-recreated", time);
+        Ok(recorder)
+    }
+
     /// Pause recording. Flushes the buffer first. Output/input calls become no-ops.
     pub fn pause(&mut self, time: Duration) {
         if !self.paused {
@@ -311,7 +341,34 @@ impl SessionRecorder {
 mod tests {
     use std::time::Duration;
 
-    use super::CoalesceBuffer;
+    use super::{CoalesceBuffer, SessionRecorder, CAST_FILE_NAME};
+
+    #[test]
+    fn reopen_append_preserves_prior_events_and_marks_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let mut rec = SessionRecorder::new(dir.path(), 80, 24, "passthrough").expect("new recorder");
+            rec.output(b"first", Duration::from_millis(5));
+            rec.flush();
+        }
+        {
+            let mut rec = SessionRecorder::reopen_append(dir.path(), Duration::ZERO).expect("reopen append");
+            rec.output(b"second", Duration::from_millis(5));
+            rec.flush();
+        }
+
+        let cast_path = dir.path().join(CAST_FILE_NAME);
+        let raw = std::fs::read_to_string(&cast_path).expect("read cast");
+
+        // The header (a JSON object line) is written exactly once; events are
+        // JSON arrays, so only the header starts with '{'.
+        assert_eq!(raw.lines().filter(|l| l.trim_start().starts_with('{')).count(), 1, "header written once");
+        assert!(raw.contains("session-recreated"), "activation boundary marker present");
+
+        let outputs: Vec<String> =
+            crate::cast_reader::iter_output_between(&cast_path, 0, u64::MAX).expect("iter").map(|e| e.expect("event").data).collect();
+        assert_eq!(outputs, vec!["first".to_string(), "second".to_string()], "both activations' output preserved in order");
+    }
 
     #[test]
     fn drain_complete_utf8_emits_all_bytes() {

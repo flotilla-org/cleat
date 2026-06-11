@@ -10,6 +10,7 @@ pub mod protocol;
 pub mod provider;
 pub mod provider_ffi;
 pub mod recording;
+pub mod recreate;
 pub mod replay;
 pub mod runtime;
 pub mod server;

@@ -1,7 +1,18 @@
 [zig]
 version = "0.15.2"
 
+# We pin a fork rather than upstream ghostty because cleat depends on
+# libghostty-vt work not yet upstreamed: the C VT library emit step
+# (-Demit-lib-vt), the virtual-placement resolver, and Kitty relative-placement
+# resolution (P/Q/H/V + virtual parent). `ref` is the `cleat-integration` head,
+# which merges those feature branches onto ghostty main with --no-ff.
+#
+# Maintenance: bumping `ref` is a pin update, not an API change, as long as the
+# vendored include/ghostty/*.h headers are byte-identical across the bump (the
+# changes are behavioural). If a header diff appears, the FFI bindings in
+# crates/cleat/src/vt/ghostty_ffi.rs must be reviewed before accepting it. As the
+# libvt branches upstream, retire this fork and re-pin to ghostty-org/ghostty.
 [ghostty]
-repo = "https://github.com/ghostty-org/ghostty.git"
-ref = "f6e6bb0238cbf4ce8c154c07f5df8c5109dc9f03"
+repo = "https://github.com/rjwittams/ghostty.git"
+ref = "5ac386088664b2209c0e0f8fce161977d2b1d31c"
 build_step = "-Demit-lib-vt=true"

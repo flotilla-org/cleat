@@ -1,4 +1,11 @@
+#[cfg(feature = "ghostty-vt")]
+use cleat::provider::{
+    DirtyState, TerminalRenderUpdateOpKind, TerminalStyleColorTag, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
+    TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
+};
 use cleat::vt::{passthrough::PassthroughVtEngine, ClientCapabilities, ColorLevel, VtEngine};
+#[cfg(feature = "ghostty-vt")]
+use cleat::vt::{MouseReportFormat, MouseTrackingMode};
 
 mod vt_contracts;
 
@@ -166,6 +173,41 @@ fn vt_ghostty_screen_grid_captures_cursor_position() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_screen_grid_refreshes_clean_cached_cursor_position() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    engine.feed(b"Hello").expect("feed bytes");
+    let initial = engine.screen_grid().expect("initial grid");
+    assert_eq!(initial.cursor.col, 5);
+
+    engine.feed(b"\x1b[2D").expect("move cursor left");
+    let moved = engine.screen_grid().expect("moved grid");
+    assert_eq!(moved.cursor.col, 3);
+
+    let cached = engine.screen_grid().expect("cached grid");
+    assert_eq!(cached.cursor.col, 3);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_reports_cursor_blink_policy() {
+    use cleat::vt::CursorStyle;
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(40, 5);
+
+    engine.feed(b"\x1b[5 q").expect("set blinking bar cursor");
+    let blinking = engine.screen_grid().expect("blinking grid");
+    assert_eq!(blinking.cursor.style, CursorStyle::Bar);
+    assert!(blinking.cursor.blink);
+
+    engine.feed(b"\x1b[6 q").expect("set steady bar cursor");
+    let steady = engine.screen_grid().expect("steady grid");
+    assert_eq!(steady.cursor.style, CursorStyle::Bar);
+    assert!(!steady.cursor.blink);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_screen_grid_row_text_returns_row_content() {
     let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(10, 3);
 
@@ -223,6 +265,33 @@ fn vt_ghostty_screen_grid_returns_cached_when_clean() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_scrollbar_and_viewport_commands_track_scrollback() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+    for line in 0..8 {
+        engine.feed(format!("line {line}\r\n").as_bytes()).expect("feed line");
+    }
+
+    let bottom = engine.scrollbar_state().expect("initial scrollbar");
+    assert_eq!(bottom.viewport_kind, TerminalViewportKind::LiveNormal);
+    assert!(bottom.total_rows > bottom.viewport_rows as u64, "expected scrollback after feeding lines: {bottom:?}");
+    assert!(bottom.at_bottom);
+
+    assert_eq!(engine.scroll_viewport(ViewportCommand::DeltaRows(-2)).expect("scroll up"), ViewportCommandOutcome::Moved);
+    let scrolled = engine.scrollbar_state().expect("scrolled scrollbar");
+    assert_eq!(scrolled.viewport_kind, TerminalViewportKind::NormalScrollback);
+    assert!(scrolled.viewport_top_row < bottom.viewport_top_row);
+    assert!(!scrolled.at_bottom);
+
+    assert_eq!(engine.scroll_viewport(ViewportCommand::Bottom).expect("scroll bottom"), ViewportCommandOutcome::Moved);
+    let restored = engine.scrollbar_state().expect("restored scrollbar");
+    assert_eq!(restored.viewport_kind, TerminalViewportKind::LiveNormal);
+    assert!(restored.at_bottom);
+
+    assert_eq!(engine.scroll_viewport(ViewportCommand::Bottom).expect("bottom no-op"), ViewportCommandOutcome::NoOp);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_screen_grid_updates_after_new_input() {
     let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
 
@@ -234,6 +303,227 @@ fn vt_ghostty_screen_grid_updates_after_new_input() {
     let grid2 = engine.screen_grid().expect("second screen_grid after new input");
     assert_eq!(grid2.row_text(0).trim_end(), "aaabbb");
     assert_ne!(grid1, grid2);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_full_exposes_rows_and_structured_style() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    engine.feed(b"\x1b[38;2;10;20;30mX\x1b[0m").expect("feed truecolor text");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+
+    assert_eq!(update.dirty, DirtyState::Full);
+    assert_eq!(update.ops.len(), 1);
+    assert_eq!(update.ops[0].kind, TerminalRenderUpdateOpKind::FullVisibleReplace);
+    assert_eq!(update.ops[0].rows.len(), 3);
+    assert_eq!(update.ops[0].rows[0].row, 0);
+    assert_eq!(update.ops[0].rows[0].col_count, 20);
+    assert!(update.ops[0].rows[0].dirty);
+
+    let cell = &update.ops[0].rows[0].cells[0];
+    assert_eq!(cell.graphemes, vec!['X' as u32]);
+    assert_eq!(cell.style.resolved_fg.r, 10);
+    assert_eq!(cell.style.resolved_fg.g, 20);
+    assert_eq!(cell.style.resolved_fg.b, 30);
+    assert_eq!(cell.style.fg_color.tag, TerminalStyleColorTag::Rgb);
+    assert!(cell.style.has_text);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_exposes_mouse_tracking_level_and_format() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    let initial = engine.render_update(DirtyState::Full).expect("initial render update");
+    assert_eq!(initial.terminal_modes.mouse_tracking_mode, MouseTrackingMode::None);
+    assert_eq!(initial.terminal_modes.mouse_report_format, MouseReportFormat::Legacy);
+    assert!(!initial.terminal_modes.mouse_tracking);
+
+    engine.feed(b"\x1b[?1003h\x1b[?1016h").expect("enable any-event mouse and SGR-pixels");
+    let update = engine.render_update(DirtyState::Partial).expect("mouse mode render update");
+    assert_eq!(update.terminal_modes.mouse_tracking_mode, MouseTrackingMode::Any);
+    assert_eq!(update.terminal_modes.mouse_report_format, MouseReportFormat::SgrPixels);
+    assert!(update.terminal_modes.mouse_tracking);
+    assert!(update.terminal_modes.mouse_sgr_pixels);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_exposes_kitty_image_resource_and_placement() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    engine.feed(b"\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2,c=10,r=1;////////\x1b\\").expect("feed kitty image");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+
+    assert_eq!(update.image_resources.len(), 1);
+    let resource = &update.image_resources[0];
+    assert_eq!(resource.image_id, 1);
+    assert!(resource.generation > 0);
+    assert_eq!(resource.width_px, 1);
+    assert_eq!(resource.height_px, 2);
+    assert_eq!(resource.format, 0);
+    assert_eq!(resource.compression, 0);
+    assert_eq!(resource.data_len, 6);
+
+    assert_eq!(update.image_placements.len(), 1);
+    let placement = &update.image_placements[0];
+    assert_eq!(placement.image_id, resource.image_id);
+    assert_eq!(placement.generation, resource.generation);
+    assert_eq!(placement.placement_id, 1);
+    assert_eq!(placement.flags, 0);
+    assert_eq!(placement.viewport_col, 0);
+    assert_eq!(placement.viewport_row, 0);
+    assert_eq!(placement.source_width, 1);
+    assert_eq!(placement.source_height, 2);
+
+    let mut copied = Vec::new();
+    let borrowed = engine
+        .with_image_resource_data(resource.image_id, resource.generation, &mut |bytes| {
+            copied.extend_from_slice(bytes);
+            true
+        })
+        .expect("borrow image bytes");
+    assert!(borrowed);
+    assert_eq!(copied.len(), resource.data_len);
+    assert_eq!(copied, vec![255; 6]);
+
+    let stale = engine
+        .with_image_resource_data(resource.image_id, resource.generation.saturating_add(1), &mut |_| true)
+        .expect("stale image generation lookup");
+    assert!(!stale);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_exposes_kitty_virtual_image_placements() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(10, 4);
+    engine.set_cell_size(10, 10).expect("set cell size");
+
+    let transmit = "\x1b_Ga=T,t=d,f=24,i=1,U=1,s=4,v=2,c=4,r=2;////////////////////////////////\x1b\\";
+    engine.feed(transmit.as_bytes()).expect("feed virtual kitty image");
+
+    let row0 = "\x1b[38;2;0;0;1m\
+        \u{10EEEE}\u{0305}\u{0305}\
+        \u{10EEEE}\u{0305}\u{030D}\
+        \u{10EEEE}\u{0305}\u{030E}\
+        \u{10EEEE}\u{0305}\u{0310}\
+        \x1b[39m";
+    let row1 = "\x1b[2;1H\x1b[38;2;0;0;1m\
+        \u{10EEEE}\u{030D}\u{0305}\
+        \u{10EEEE}\u{030D}\u{030D}\
+        \u{10EEEE}\u{030D}\u{030E}\
+        \u{10EEEE}\u{030D}\u{0310}\
+        \x1b[39m";
+    engine.feed(row0.as_bytes()).expect("feed first virtual row");
+    engine.feed(row1.as_bytes()).expect("feed second virtual row");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+
+    assert_eq!(update.image_resources.len(), 1);
+    let resource = &update.image_resources[0];
+    assert_eq!(resource.image_id, 1);
+    assert!(resource.generation > 0);
+    assert_eq!(resource.width_px, 4);
+    assert_eq!(resource.height_px, 2);
+    assert_eq!(resource.data_len, 24);
+
+    assert_eq!(update.image_placements.len(), 2);
+    let first = &update.image_placements[0];
+    assert_eq!(first.image_id, resource.image_id);
+    assert_eq!(first.generation, resource.generation);
+    assert_eq!(first.flags, TERMINAL_IMAGE_PLACEMENT_VIRTUAL);
+    assert_eq!(first.viewport_col, 0);
+    assert_eq!(first.viewport_row, 0);
+    assert_eq!(first.grid_cols, 4);
+    assert_eq!(first.grid_rows, 1);
+    assert_eq!(first.pixel_width, 40);
+    assert_eq!(first.pixel_height, 10);
+    assert_eq!(first.source_x, 0);
+    assert_eq!(first.source_y, 0);
+    assert_eq!(first.source_width, 4);
+    assert_eq!(first.source_height, 1);
+
+    let second = &update.image_placements[1];
+    assert_eq!(second.image_id, resource.image_id);
+    assert_eq!(second.generation, resource.generation);
+    assert_eq!(second.flags, TERMINAL_IMAGE_PLACEMENT_VIRTUAL);
+    assert_eq!(second.viewport_col, 0);
+    assert_eq!(second.viewport_row, 1);
+    assert_eq!(second.source_y, 1);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_kitty_image_placement_pixel_size_uses_cell_size() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+    engine.set_cell_size(8, 16).expect("set cell size");
+
+    engine.feed(b"\x1b_Ga=T,t=d,f=24,i=2,p=1,s=1,v=2,c=10,r=1;////////\x1b\\").expect("feed kitty image");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+    assert_eq!(update.image_placements.len(), 1);
+    let placement = &update.image_placements[0];
+    assert_eq!(placement.grid_cols, 10);
+    assert_eq!(placement.grid_rows, 1);
+    assert_eq!(placement.pixel_width, 80);
+    assert_eq!(placement.pixel_height, 16);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_kitty_png_image_decodes_to_rgba_resource() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+    engine.set_cell_size(8, 16).expect("set cell size");
+
+    engine
+        .feed(
+            b"\x1b_Ga=T,t=d,f=100,i=3,p=1;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\",
+        )
+        .expect("feed png kitty image");
+
+    let update = engine.render_update(DirtyState::Full).expect("render update");
+    assert_eq!(update.image_resources.len(), 1);
+    let resource = &update.image_resources[0];
+    assert_eq!(resource.image_id, 3);
+    assert_eq!(resource.width_px, 1);
+    assert_eq!(resource.height_px, 1);
+    assert_eq!(resource.format, 1);
+    assert_eq!(resource.compression, 0);
+    assert_eq!(resource.data_len, 4);
+    assert_eq!(update.image_placements.len(), 1);
+
+    let mut copied = Vec::new();
+    assert!(engine
+        .with_image_resource_data(resource.image_id, resource.generation, &mut |bytes| {
+            copied.extend_from_slice(bytes);
+            true
+        })
+        .expect("borrow decoded png bytes"));
+    assert_eq!(copied.len(), 4);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_render_update_partial_emits_row_replace_ops_for_dirty_rows() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+
+    engine.feed(b"first").expect("feed initial text");
+    let full = engine.render_update(DirtyState::Full).expect("initial render update");
+    assert_eq!(full.ops[0].kind, TerminalRenderUpdateOpKind::FullVisibleReplace);
+
+    engine.feed(b"\x1b[2;1Hsecond").expect("feed second row text");
+    let partial = engine.render_update(DirtyState::Partial).expect("partial render update");
+
+    assert_eq!(partial.dirty, DirtyState::Partial);
+    assert!(partial.ops.len() < 3, "partial update should not replace the full visible screen");
+    assert!(partial.ops.iter().all(|op| op.kind == TerminalRenderUpdateOpKind::RowReplace));
+    let row_one = partial.ops.iter().find(|op| op.first_row == 1).expect("row containing new text should be dirty");
+    assert_eq!(row_one.rows.len(), 1);
+    assert_eq!(row_one.rows[0].row, 1);
+    assert_eq!(row_one.rows[0].cells[0].graphemes, vec!['s' as u32]);
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -261,6 +551,23 @@ fn vt_ghostty_screen_grid_resolves_explicit_fg_and_bg_colors() {
     let untouched_cell = grid.cell(39, 4).unwrap();
     assert_eq!(default_cell.fg, untouched_cell.fg, "post-reset fg should match untouched cell default");
     assert_eq!(default_cell.bg, untouched_cell.bg, "post-reset bg should match untouched cell default");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_screen_grid_uses_configured_default_colors() {
+    use cleat::vt::{Rgb, TerminalColors};
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new_with_colors(4, 2, TerminalColors {
+        default_foreground: Some(Rgb { r: 0x12, g: 0x34, b: 0x56 }),
+        default_background: Some(Rgb { r: 0xAB, g: 0xCD, b: 0xEF }),
+        default_cursor: Some(Rgb { r: 0xFE, g: 0xDC, b: 0xBA }),
+    });
+
+    let grid = engine.screen_grid().expect("screen grid");
+    let untouched_cell = grid.cell(3, 1).unwrap();
+    assert_eq!(untouched_cell.fg, Rgb { r: 0x12, g: 0x34, b: 0x56 });
+    assert_eq!(untouched_cell.bg, Rgb { r: 0xAB, g: 0xCD, b: 0xEF });
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -384,4 +691,49 @@ fn inspect_linkage(exe: &std::path::Path) -> std::process::Output {
     {
         Command::new("otool").arg("-L").arg(exe).output().expect("run otool")
     }
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn mouse_encoder_gates_and_encodes_through_libghostty() {
+    use cleat::vt::{MouseAction, MouseButton, MouseModifiers};
+
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+    engine.set_cell_size(8, 16).expect("set cell size");
+    let mods = MouseModifiers::default();
+    let press = |engine: &mut cleat::vt::ghostty::GhosttyVtEngine, button| {
+        engine.encode_mouse(MouseAction::Press, Some(button), false, mods, 20.0, 40.0).expect("encode mouse")
+    };
+
+    // No tracking mode enabled => the encoder reports nothing.
+    assert!(press(&mut engine, MouseButton::Left).is_empty(), "no mouse mode should emit no report");
+
+    // Any-event tracking + SGR. A left press at (20,40)px with an 8x16 cell lands
+    // on grid cell (2,2) => 1-based SGR coordinates (3,3).
+    engine.feed(b"\x1b[?1003h\x1b[?1006h").expect("enable sgr mouse");
+    assert_eq!(press(&mut engine, MouseButton::Left), b"\x1b[<0;3;3M");
+    // Named-button mapping: Cleat/Ghostty disagree on the numeric order, so this
+    // guards the Right->2 / Middle->1 SGR button codes.
+    assert_eq!(press(&mut engine, MouseButton::Middle), b"\x1b[<1;3;3M");
+    assert_eq!(press(&mut engine, MouseButton::Right), b"\x1b[<2;3;3M");
+
+    // SGR-pixels: coordinates switch from cells to pixels (different from above).
+    engine.feed(b"\x1b[?1016h").expect("enable sgr-pixels mouse");
+    let pixels = press(&mut engine, MouseButton::Left);
+    let text = String::from_utf8_lossy(&pixels);
+    assert!(text.starts_with("\x1b[<0;") && text.ends_with('M'), "sgr-pixels format, got {text:?}");
+    assert_ne!(pixels.as_slice(), b"\x1b[<0;3;3M", "sgr-pixels should differ from cell coords");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn encode_paste_brackets_when_mode_2004_enabled() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+    assert_eq!(engine.encode_paste(b"hello").expect("encode paste"), b"hello");
+    assert_eq!(engine.encode_paste(b"hello\nworld").expect("encode paste"), b"hello\rworld");
+    assert_eq!(engine.encode_paste(b"hel\x1blo\x00world").expect("encode paste"), b"hel lo world");
+
+    engine.feed(b"\x1b[?2004h").expect("enable bracketed paste");
+    assert_eq!(engine.encode_paste(b"hello").expect("encode paste"), b"\x1b[200~hello\x1b[201~");
+    assert_eq!(engine.encode_paste(b"hel\x1blo\x00world").expect("encode paste"), b"\x1b[200~hel lo world\x1b[201~");
 }

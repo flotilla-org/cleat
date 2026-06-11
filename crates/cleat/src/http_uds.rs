@@ -6,7 +6,13 @@ use http::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalSnapshot};
+use crate::{
+    provider::{
+        DirtyState, TerminalCellWidth, TerminalCursorStyle, TerminalGeometry, TerminalScrollbarState, TerminalSnapshot,
+        TerminalViewportKind,
+    },
+    vt,
+};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -199,9 +205,70 @@ pub(crate) enum SignalTargetRequest {
 pub(crate) struct SnapshotResponse {
     pub cols: u16,
     pub rows: u16,
+    pub geometry: GeometryResponse,
+    pub viewport_kind: String,
+    pub scrollback_offset_rows: u64,
+    pub scrollbar: ScrollbarResponse,
+    pub terminal_modes: TerminalModeResponse,
     pub cells: Vec<CellResponse>,
     pub cursor: CursorResponse,
     pub dirty: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
+pub(crate) struct TerminalModeResponse {
+    pub active_alternate_screen: bool,
+    pub application_cursor_keys: bool,
+    pub alternate_scroll: bool,
+    pub mouse_tracking: bool,
+    pub mouse_tracking_mode: String,
+    pub mouse_report_format: String,
+    pub mouse_sgr: bool,
+    pub mouse_sgr_pixels: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
+pub(crate) struct ScrollbarResponse {
+    pub viewport_kind: String,
+    pub total_rows: u64,
+    pub viewport_rows: u16,
+    pub viewport_top_row: u64,
+    pub at_bottom: bool,
+}
+
+impl From<TerminalScrollbarState> for ScrollbarResponse {
+    fn from(value: TerminalScrollbarState) -> Self {
+        Self {
+            viewport_kind: viewport_kind_name(value.viewport_kind).to_string(),
+            total_rows: value.total_rows,
+            viewport_rows: value.viewport_rows,
+            viewport_top_row: value.viewport_top_row,
+            at_bottom: value.at_bottom,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Deserialize)]
+pub(crate) struct GeometryResponse {
+    pub cell_width_px: f32,
+    pub cell_height_px: f32,
+    pub content_x_px: f32,
+    pub content_y_px: f32,
+    pub content_width_px: f32,
+    pub content_height_px: f32,
+}
+
+impl From<TerminalGeometry> for GeometryResponse {
+    fn from(value: TerminalGeometry) -> Self {
+        Self {
+            cell_width_px: value.cell_width_px,
+            cell_height_px: value.cell_height_px,
+            content_x_px: value.content_x_px,
+            content_y_px: value.content_y_px,
+            content_width_px: value.content_width_px,
+            content_height_px: value.content_height_px,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
@@ -226,6 +293,8 @@ pub(crate) struct CursorResponse {
     pub row: u16,
     pub visible: bool,
     pub style: String,
+    #[serde(default)]
+    pub blink: bool,
     pub wide_tail: bool,
 }
 
@@ -446,6 +515,11 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
     SnapshotResponse {
         cols: snapshot.cols,
         rows: snapshot.rows,
+        geometry: snapshot.geometry.into(),
+        viewport_kind: viewport_kind_name(snapshot.viewport_kind).to_string(),
+        scrollback_offset_rows: snapshot.scrollback_offset_rows,
+        scrollbar: snapshot.scrollbar.into(),
+        terminal_modes: terminal_modes_response(snapshot.terminal_modes),
         cells: snapshot
             .cells
             .into_iter()
@@ -462,9 +536,23 @@ pub(crate) fn snapshot_response(snapshot: TerminalSnapshot) -> SnapshotResponse 
             row: snapshot.cursor.row,
             visible: snapshot.cursor.visible,
             style: cursor_style_name(snapshot.cursor.style).to_string(),
+            blink: snapshot.cursor.blink,
             wide_tail: snapshot.cursor.wide_tail,
         },
         dirty: dirty_name(snapshot.dirty).to_string(),
+    }
+}
+
+fn terminal_modes_response(modes: vt::TerminalModeState) -> TerminalModeResponse {
+    TerminalModeResponse {
+        active_alternate_screen: modes.active_alternate_screen,
+        application_cursor_keys: modes.application_cursor_keys,
+        alternate_scroll: modes.alternate_scroll,
+        mouse_tracking: modes.mouse_tracking,
+        mouse_tracking_mode: mouse_tracking_mode_name(modes.mouse_tracking_mode).to_string(),
+        mouse_report_format: mouse_report_format_name(modes.mouse_report_format).to_string(),
+        mouse_sgr: modes.mouse_sgr,
+        mouse_sgr_pixels: modes.mouse_sgr_pixels,
     }
 }
 
@@ -559,6 +647,32 @@ fn cursor_style_name(style: TerminalCursorStyle) -> &'static str {
         TerminalCursorStyle::Block => "block",
         TerminalCursorStyle::Underline => "underline",
         TerminalCursorStyle::BlockHollow => "block_hollow",
+    }
+}
+
+fn viewport_kind_name(kind: TerminalViewportKind) -> &'static str {
+    match kind {
+        TerminalViewportKind::LiveNormal => "live_normal",
+        TerminalViewportKind::LiveAlternate => "live_alternate",
+        TerminalViewportKind::NormalScrollback => "normal_scrollback",
+    }
+}
+
+fn mouse_tracking_mode_name(mode: vt::MouseTrackingMode) -> &'static str {
+    match mode {
+        vt::MouseTrackingMode::None => "none",
+        vt::MouseTrackingMode::X10 => "x10",
+        vt::MouseTrackingMode::Normal => "normal",
+        vt::MouseTrackingMode::Button => "button",
+        vt::MouseTrackingMode::Any => "any",
+    }
+}
+
+fn mouse_report_format_name(format: vt::MouseReportFormat) -> &'static str {
+    match format {
+        vt::MouseReportFormat::Legacy => "legacy",
+        vt::MouseReportFormat::Sgr => "sgr",
+        vt::MouseReportFormat::SgrPixels => "sgr_pixels",
     }
 }
 

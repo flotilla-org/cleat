@@ -5,7 +5,7 @@ use std::{
 
 use uuid::Uuid;
 
-use crate::vt::VtEngineKind;
+use crate::vt::{TerminalColors, VtEngineKind};
 
 const SESSION_ROOT_DIR: &str = "cleat";
 
@@ -16,6 +16,7 @@ pub struct SessionMetadata {
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
     pub record: bool,
+    pub colors: TerminalColors,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +60,7 @@ impl RuntimeLayout {
         let id = id.unwrap_or_else(|| format!("session-{}", Uuid::new_v4()));
         let dir = self.root.join(&id);
         fs::create_dir_all(&dir).map_err(|err| format!("create session dir {}: {err}", dir.display()))?;
-        Ok(SessionMetadata { id, vt_engine, cwd, cmd, record: false })
+        Ok(SessionMetadata { id, vt_engine, cwd, cmd, record: false, colors: TerminalColors::default() })
     }
 
     pub fn remove_session(&self, id: &str) -> Result<(), String> {

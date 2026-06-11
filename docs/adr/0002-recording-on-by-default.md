@@ -16,7 +16,9 @@ scrollback above them is a convenience.
 The recording format is **asciinema** today, and the invariant going forward is that
 **asciinema export is always possible**. That decouples how recordings are stored
 from what consumers can read, so the on-disk format can evolve without touching
-anything downstream.
+anything downstream. The invariant is about *exportability*, not byte-for-byte
+player compatibility of the raw on-disk file — see the appended-cast timestamp
+caveat in the consequences.
 
 ## Considered options
 
@@ -60,3 +62,19 @@ anything downstream.
 - The on-disk recording format is free to change as long as asciinema export
   remains lossless; downstream consumers should depend on the export, not the
   storage format.
+- Recording is **fail-closed at session start**: a session created with recording
+  on whose recorder cannot be opened (full disk, permissions, path collision)
+  fails `spawn` rather than silently degrading to no recording. This is the
+  deliberate consequence of recording-first — a session that was supposed to have
+  a persistence floor must not start without one — but it is a user-visible
+  behaviour change: a transient I/O problem that previously degraded silently now
+  surfaces as a session-create failure. (Toggling recording on a *running* session
+  is independent and stays best-effort.)
+- Appended casts currently restart their timeline at the activation boundary: each
+  recreation reopens the cast and emits new events from `t=0`, so a multi-activation
+  file has **non-monotonic timestamps** and a naive player rewinds at each boundary.
+  This is an MVP limitation, not a violation of the export invariant — a faithful
+  asciinema export can re-base each activation's timeline. Making the raw on-disk
+  file itself monotonic (carry the prior activation's last timestamp as the new
+  base offset) is deferred follow-up work, naturally subsumed by front-truncation
+  and the custom codec.

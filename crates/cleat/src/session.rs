@@ -241,7 +241,15 @@ pub fn ensure_session_started(
             // than returning on the leftover file. The session directory and its
             // recording survive, so falling through to the create path recreates
             // the session from its prior output (see recreate::seed_engine_from_cast).
-            let _ = fs::remove_file(&socket_path);
+            //
+            // A removal failure other than "already gone" (e.g. a permissions
+            // problem) would otherwise surface downstream as an opaque socket-bind
+            // error (EADDRINUSE), so report the real cause here instead.
+            match fs::remove_file(&socket_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("remove stale session socket {}: {err}", socket_path.display())),
+            }
         }
     }
 

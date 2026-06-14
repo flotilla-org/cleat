@@ -72,19 +72,26 @@ is the enabler.
   2. **Engine-sourced image capture** ([#73](https://github.com/flotilla-org/cleat/issues/73))
      — capture image bytes at the engine boundary (pre-decode source payload where
      available, post-decode frame otherwise) at transmit time so shm/file/temp-file
-     sessions become replayable. This is a **correctness fix** and the prerequisite
-     for everything below.
+     sessions become replayable. Capture happens while the engine is processing the
+     transmit — before it ACKs receipt to the terminal, and therefore before the
+     sender deletes a temp file or reuses a shm segment. Winning that race is the
+     whole reason capture must sit at the engine boundary rather than re-reading the
+     medium later. This is a **correctness fix** and the prerequisite for everything
+     below.
   3. **Semantic compaction** ([#74](https://github.com/flotilla-org/cleat/issues/74))
      — drop superseded content at recognized safe points: output before a full-screen
      snapshot boundary (it is reconstructable from the snapshot) and image
      transmissions whose images are deleted or fully overdrawn.
-  4. **Target frame rate with age decay** — for image-heavy sessions, keep frames at
-     a target cadence that decays as history ages; recent history stays high
-     fidelity, old history goes sparse, and the *latest* frame is always exact.
-  5. **Adaptive video track** — recognize an image-dominated session and route its
-     frame strip to a real video encoder: cheap/fast codec while live, background
-     re-encode of cold segments to a higher-ratio codec, keyframe-sampled decode on
-     replay/seek.
+  4. **Target frame rate with age decay** *(not yet tracked; an issue is filed when
+     the rung is approached)* — for image-heavy sessions, keep frames at a target
+     cadence that decays as history ages; recent history stays high fidelity, old
+     history goes sparse, and the *latest* frame is always exact.
+  5. **Adaptive video track** *(not yet tracked; an issue is filed when the rung is
+     approached, and is where the "this is video" threshold and the
+     sidecar-vs-promotion container choice below are decided)* — recognize an
+     image-dominated session and route its frame strip to a real video encoder:
+     cheap/fast codec while live, background re-encode of cold segments to a
+     higher-ratio codec, keyframe-sampled decode on replay/seek.
 - **The current state stays exact; dropped history is lossy by construction.** This
   is the same trade ADR 0002 already blessed (scrollback above the current activation
   is best-effort). Compaction and decay must never degrade reconstruction of the
@@ -95,19 +102,33 @@ is the enabler.
   the terminal track. For decayed/compacted regions the export is necessarily lossy
   (it reflects the sampled frames that were kept), and for a video-tier track export
   means decoding frames back out — possible but not cheap. Exportability, not
-  byte-for-byte player fidelity of the raw store, is the invariant.
+  byte-for-byte player fidelity of the raw store, is the invariant. This refines, not
+  weakens, ADR 0002: its "asciinema export is always possible" is preserved in the
+  *capability* sense, but the cost profile changes — text export stays trivial, while
+  video-tier export shifts from a cheap transform to a potentially expensive,
+  user-triggered decode/re-encode. That cost shift is an accepted consequence.
 - **Container format.** asciicast stays the base container and the export lingua
   franca; it is append-only, trivial to write, and right for the text-dominated
   common case. The video tier uses a real media container, and that container is
   **Matroska (MKV), not MP4**: MKV is designed for an arbitrary number of
   synchronized timed tracks including non-AV data tracks, it is stream/append
   friendly, and the video track is exactly its purpose; MP4's box structure is
-  awkward for non-AV data and less append-friendly. Two shapes are viable and we keep
-  the choice open until step 5: a **sidecar** encoded video referenced by image-id +
-  timestamp from cast events (keeps the simple cast, adds a file the AV tooling
-  already understands — the recommended first form), or **promotion** of the whole
-  recording to a single MKV with a data track for terminal events once a session
-  crosses the "this is video" threshold.
+  awkward for non-AV data and less append-friendly. Two shapes are viable, and the
+  choice between them is **deliberately deferred to step 5** (it is not "either is
+  fine" — it is "not chosen yet"); **sidecar is the recommended first form**. The
+  options: a **sidecar** encoded video referenced by image-id + timestamp from cast
+  events (keeps the simple cast, adds a file the AV tooling already understands), or
+  **promotion** of the whole recording to a single MKV with a data track for terminal
+  events once a session crosses the "this is video" threshold.
+- **Storage pressure is a known operational concern.** Before compaction and decay
+  exist (rungs 3–4), and in the window between them firing, a video-rate session can
+  outrun available disk. Unlike the terminal recorder, which is fail-closed at
+  session *start* (ADR 0002), the **image track is best-effort and fails open**:
+  under storage pressure it degrades — drop frames, lower the target rate, or disable
+  the image track — rather than killing a live session over graphics it could run
+  without. This composes with the cooperative size-budget reaping in the control-plane
+  design; the exact policy is an implementation detail, noted here so it is not
+  mistaken for an oversight.
 - **History rewriting is shared machinery.** Compaction, decay, and re-encoding all
   rewrite a recording in place (replace a prefix with a snapshot, drop dead frames,
   transcode a cold segment). [#71](https://github.com/flotilla-org/cleat/issues/71)

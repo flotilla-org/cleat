@@ -14,5 +14,5 @@ version = "0.15.2"
 # libvt branches upstream, retire this fork and re-pin to ghostty-org/ghostty.
 [ghostty]
 repo = "https://github.com/rjwittams/ghostty.git"
-ref = "5ac386088664b2209c0e0f8fce161977d2b1d31c"
-build_step = "-Demit-lib-vt=true"
+ref = "4951a2b2b4b18e1d627550c26fb0018cd915afbd"
+build_step = "-Demit-lib-vt=true -Dsimd=true"

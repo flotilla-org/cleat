@@ -38,8 +38,20 @@ fn main() {
         LinkMode::Static => println!("cargo:rustc-link-lib=static={}", static_link_name()),
         LinkMode::Dynamic => println!("cargo:rustc-link-lib=dylib=ghostty-vt"),
     }
+    if cfg!(all(target_os = "windows", target_env = "msvc")) && install.link_mode == LinkMode::Dynamic {
+        link_msvc_runtime_libs();
+    }
     if install.link_mode == LinkMode::Dynamic && cfg!(any(target_os = "linux", target_os = "macos")) {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", install.lib_dir.display());
+    }
+}
+
+fn link_msvc_runtime_libs() {
+    // Windows uses Ghostty's import library, but enabling Ghostty SIMD pulls in
+    // UCRT/VCRuntime/C++ EH symbols that Rust's DLL link does not otherwise
+    // resolve reliably.
+    for lib in ["ucrt", "vcruntime", "msvcprt"] {
+        println!("cargo:rustc-link-arg=/defaultlib:{lib}");
     }
 }
 

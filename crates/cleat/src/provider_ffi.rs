@@ -3,7 +3,10 @@ use std::{
     path::PathBuf,
     ptr, slice,
     str::Utf8Error,
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -536,6 +539,7 @@ struct MockSession {
 
 struct InProcessSession {
     tx: mpsc::Sender<InProcessCommand>,
+    observation: Arc<ObservationMirror>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -562,12 +566,23 @@ struct ObservationState {
     dirty: DirtyState,
     dirty_rows: Vec<u16>,
     terminal_modes: Option<vt::TerminalModeState>,
+    mirror: Option<Arc<ObservationMirror>>,
 }
 
 impl ObservationState {
     fn new(rows: u16) -> Self {
-        let mut state =
-            Self { render_generation: 0, observed_generation: 0, dirty: DirtyState::Clean, dirty_rows: Vec::new(), terminal_modes: None };
+        Self::new_with_mirror(rows, None)
+    }
+
+    fn new_with_mirror(rows: u16, mirror: Option<Arc<ObservationMirror>>) -> Self {
+        let mut state = Self {
+            render_generation: 0,
+            observed_generation: 0,
+            dirty: DirtyState::Clean,
+            dirty_rows: Vec::new(),
+            terminal_modes: None,
+            mirror,
+        };
         state.mark_full(rows);
         state
     }
@@ -585,6 +600,7 @@ impl ObservationState {
         self.render_generation = self.render_generation.saturating_add(1);
         self.dirty = DirtyState::Full;
         self.dirty_rows.clear();
+        self.publish_mirror();
         was_clean
     }
 
@@ -600,6 +616,7 @@ impl ObservationState {
             }
             self.dirty_rows.sort_unstable();
         }
+        self.publish_mirror();
         was_clean
     }
 
@@ -610,6 +627,7 @@ impl ObservationState {
             self.dirty = DirtyState::Partial;
             self.dirty_rows.clear();
         }
+        self.publish_mirror();
         was_clean
     }
 
@@ -631,6 +649,7 @@ impl ObservationState {
             self.dirty = DirtyState::Clean;
             self.dirty_rows.clear();
         }
+        self.publish_mirror();
         true
     }
 
@@ -657,6 +676,61 @@ impl ObservationState {
         } else if update.dirty == DirtyState::Clean {
             update.dirty = dirty;
         }
+    }
+
+    fn publish_mirror(&self) {
+        if let Some(mirror) = &self.mirror {
+            mirror.store(self.render_generation, self.observed_generation, self.dirty);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ObservationMirror {
+    render_generation: AtomicU64,
+    observed_generation: AtomicU64,
+    dirty: AtomicU8,
+}
+
+impl ObservationMirror {
+    fn new() -> Self {
+        Self {
+            render_generation: AtomicU64::new(0),
+            observed_generation: AtomicU64::new(0),
+            dirty: AtomicU8::new(dirty_state_to_u8(DirtyState::Clean)),
+        }
+    }
+
+    fn store(&self, render_generation: u64, observed_generation: u64, dirty: DirtyState) {
+        self.dirty.store(dirty_state_to_u8(dirty), AtomicOrdering::SeqCst);
+        self.observed_generation.store(observed_generation, AtomicOrdering::SeqCst);
+        self.render_generation.store(render_generation, AtomicOrdering::SeqCst);
+    }
+
+    fn dirty(&self) -> DirtyState {
+        let render_generation = self.render_generation.load(AtomicOrdering::SeqCst);
+        let observed_generation = self.observed_generation.load(AtomicOrdering::SeqCst);
+        if render_generation > observed_generation {
+            dirty_state_from_u8(self.dirty.load(AtomicOrdering::SeqCst))
+        } else {
+            DirtyState::Clean
+        }
+    }
+}
+
+fn dirty_state_to_u8(dirty: DirtyState) -> u8 {
+    match dirty {
+        DirtyState::Clean => 0,
+        DirtyState::Partial => 1,
+        DirtyState::Full => 2,
+    }
+}
+
+fn dirty_state_from_u8(value: u8) -> DirtyState {
+    match value {
+        1 => DirtyState::Partial,
+        2 => DirtyState::Full,
+        _ => DirtyState::Clean,
     }
 }
 
@@ -733,9 +807,6 @@ enum InProcessCommand {
         callback: CleatImageResourceDataFn,
         user_data: usize,
         reply: mpsc::Sender<Result<bool, String>>,
-    },
-    Dirty {
-        reply: mpsc::Sender<DirtyState>,
     },
     MarkObserved {
         generation: u64,
@@ -1724,9 +1795,7 @@ pub unsafe extern "C" fn cleat_session_poll(session: *mut CleatSession) -> Cleat
     };
     match &mut session.backend {
         SessionBackend::Mock(mock) => mock.observation.dirty().into(),
-        SessionBackend::InProcess(in_process) => {
-            in_process_request(in_process, |reply| InProcessCommand::Dirty { reply }, DirtyState::Full).into()
-        }
+        SessionBackend::InProcess(in_process) => in_process.observation.dirty().into(),
         SessionBackend::Daemon(daemon) => daemon.observation.dirty().into(),
     }
 }
@@ -1741,9 +1810,7 @@ pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> Cl
     unsafe { session.as_ref() }
         .map(|session| match &session.backend {
             SessionBackend::Mock(mock) => mock.observation.dirty().into(),
-            SessionBackend::InProcess(in_process) => {
-                in_process_request(in_process, |reply| InProcessCommand::Dirty { reply }, DirtyState::Full).into()
-            }
+            SessionBackend::InProcess(in_process) => in_process.observation.dirty().into(),
             SessionBackend::Daemon(daemon) => daemon.observation.dirty().into(),
         })
         .unwrap_or(CleatDirtyState::Full)
@@ -2117,10 +2184,11 @@ fn in_process_actor_loop(
     mut runtime: SessionRuntime,
     wake: Arc<Mutex<WakeCallback>>,
     rows: u16,
+    mirror: Arc<ObservationMirror>,
     ready: mpsc::Sender<Result<(), String>>,
     rx: mpsc::Receiver<InProcessCommand>,
 ) {
-    let mut observation = ObservationState::new(rows);
+    let mut observation = ObservationState::new_with_mirror(rows, Some(mirror));
     let mut exited = false;
     let _ = ready.send(Ok(()));
     loop {
@@ -2212,10 +2280,6 @@ fn in_process_actor_handle_command(
                 None => Ok(false),
             };
             let _ = reply.send(result);
-        }
-        InProcessCommand::Dirty { reply } => {
-            sync_terminal_modes_and_wake(runtime, observation, wake);
-            let _ = reply.send(observation.dirty());
         }
         InProcessCommand::MarkObserved { generation, reply } => {
             let _ = reply.send(observation.mark_observed(generation));
@@ -2311,6 +2375,8 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let initial_geometry = TerminalGeometry::from_cell_size(cols, rows, desc.cell_width_px, desc.cell_height_px);
     let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(initial_geometry);
     let wake = provider.wake.clone();
+    let observation = Arc::new(ObservationMirror::new());
+    let actor_observation = observation.clone();
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
@@ -2322,14 +2388,14 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
             Ok(runtime)
         })();
         match result {
-            Ok(runtime) => in_process_actor_loop(runtime, wake, rows, ready_tx, rx),
+            Ok(runtime) => in_process_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx),
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
             }
         }
     });
     match ready_rx.recv().map_err(|_| "in-process session actor did not report startup".to_string())? {
-        Ok(()) => Ok(InProcessSession { tx, worker: Some(worker) }),
+        Ok(()) => Ok(InProcessSession { tx, observation, worker: Some(worker) }),
         Err(err) => {
             let _ = worker.join();
             Err(err)
@@ -3005,6 +3071,58 @@ mod tests {
 
             cleat_session_destroy(session);
             cleat_provider_close(provider);
+        }
+    }
+
+    #[test]
+    fn in_process_dirty_queries_do_not_wait_for_actor_replies() {
+        let (tx, _rx) = mpsc::channel::<InProcessCommand>();
+        let observation = Arc::new(ObservationMirror::new());
+        observation.store(1, 0, DirtyState::Full);
+        let session = Box::into_raw(Box::new(CleatSession {
+            backend: SessionBackend::InProcess(Box::new(InProcessSession { tx, observation, worker: None })),
+            geometry: TerminalGeometry::default(),
+            next_input_sequence: 1,
+            wake: Arc::new(Mutex::new(WakeCallback::default())),
+            last_snapshot: None,
+            last_render_update: None,
+        }));
+
+        let session_addr = session as usize;
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || unsafe {
+            let dirty = cleat_session_dirty(session_addr as *const CleatSession);
+            let poll = cleat_session_poll(session_addr as *mut CleatSession);
+            let _ = done_tx.send((dirty, poll));
+        });
+        let result = done_rx.recv_timeout(Duration::from_millis(100)).expect("dirty queries blocked waiting for actor replies");
+        assert_eq!(result, (CleatDirtyState::Full, CleatDirtyState::Full));
+
+        unsafe {
+            cleat_session_destroy(session);
+        }
+    }
+
+    #[test]
+    fn in_process_dirty_queries_read_clean_mirror_state() {
+        let (tx, _rx) = mpsc::channel::<InProcessCommand>();
+        let observation = Arc::new(ObservationMirror::new());
+        observation.store(1, 1, DirtyState::Full);
+        let session = Box::into_raw(Box::new(CleatSession {
+            backend: SessionBackend::InProcess(Box::new(InProcessSession { tx, observation, worker: None })),
+            geometry: TerminalGeometry::default(),
+            next_input_sequence: 1,
+            wake: Arc::new(Mutex::new(WakeCallback::default())),
+            last_snapshot: None,
+            last_render_update: None,
+        }));
+
+        unsafe {
+            let dirty = cleat_session_dirty(session);
+            let poll = cleat_session_poll(session);
+            assert_eq!((dirty, poll), (CleatDirtyState::Clean, CleatDirtyState::Clean));
+
+            cleat_session_destroy(session);
         }
     }
 

@@ -18,6 +18,14 @@ Where a session's VT engine currently runs. A property *of the session* that can
 change over its life — not a global mode of the client or provider.
 _Avoid_: mode, backend (the code-level term, not the domain concept).
 
+**Placement**:
+A client's requested hosting target or policy for a session, such as embedded,
+daemon, or a remote target. A placement request may be exact, or may allow Cleat
+to fall back to a different hosting when policy, capability, or availability
+requires it at Ensure Session time. Both the requested placement and the actual hosting are
+discoverable by clients.
+_Avoid_: backend, provider mode.
+
 **Id**:
 A session's single durable identity. Client-assignable at create (cleat
 generates a uuid only as a fallback) and **reused across recreations** — so it is
@@ -38,6 +46,18 @@ socket. Survives client restarts.
 A client resuming a session that already exists — the program is still running,
 so it is lossless and live. Distinct from recreation.
 _Avoid_: connect, open.
+
+**Ensure Session**:
+Making a durable session id usable for a client by attaching to the live session,
+recreating it from recording, or creating it fresh. Attach is one possible
+outcome; it is not the umbrella term for the whole operation.
+_Avoid_: ensure attached, attach-or-create.
+
+**Session Handle**:
+A client's live reference to a session returned by Ensure Session. Multiple
+clients may hold handles to the same session; the handle is not the session's
+identity and does not determine where the session is hosted.
+_Avoid_: session id, attach.
 
 **Recording**:
 The append-only log of a session's output (asciicast v3), optionally with VT

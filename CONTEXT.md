@@ -20,10 +20,10 @@ _Avoid_: mode, backend (the code-level term, not the domain concept).
 
 **Placement**:
 A client's requested hosting target or policy for a session, such as embedded,
-daemon, or a remote target. A placement request may be exact, or may allow Cleat
-to fall back to a different hosting when policy, capability, or availability
-requires it at Ensure Session time. Both the requested placement and the actual hosting are
-discoverable by clients.
+daemon, or a remote target. A placement request may be exact or advisory. When
+advisory, Cleat may fall back to a different hosting when policy, capability, or
+availability requires it at Ensure Session time. Both the requested placement
+and the actual hosting are discoverable by clients.
 _Avoid_: backend, provider mode.
 
 **Id**:

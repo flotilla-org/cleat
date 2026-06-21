@@ -730,7 +730,10 @@ fn dirty_state_from_u8(value: u8) -> DirtyState {
     match value {
         1 => DirtyState::Partial,
         2 => DirtyState::Full,
-        _ => DirtyState::Clean,
+        _ => {
+            debug_assert_eq!(value, 0, "unexpected DirtyState byte");
+            DirtyState::Clean
+        }
     }
 }
 
@@ -3121,6 +3124,29 @@ mod tests {
             let dirty = cleat_session_dirty(session);
             let poll = cleat_session_poll(session);
             assert_eq!((dirty, poll), (CleatDirtyState::Clean, CleatDirtyState::Clean));
+
+            cleat_session_destroy(session);
+        }
+    }
+
+    #[test]
+    fn in_process_dirty_queries_read_partial_mirror_state() {
+        let (tx, _rx) = mpsc::channel::<InProcessCommand>();
+        let observation = Arc::new(ObservationMirror::new());
+        observation.store(2, 1, DirtyState::Partial);
+        let session = Box::into_raw(Box::new(CleatSession {
+            backend: SessionBackend::InProcess(Box::new(InProcessSession { tx, observation, worker: None })),
+            geometry: TerminalGeometry::default(),
+            next_input_sequence: 1,
+            wake: Arc::new(Mutex::new(WakeCallback::default())),
+            last_snapshot: None,
+            last_render_update: None,
+        }));
+
+        unsafe {
+            let dirty = cleat_session_dirty(session);
+            let poll = cleat_session_poll(session);
+            assert_eq!((dirty, poll), (CleatDirtyState::Partial, CleatDirtyState::Partial));
 
             cleat_session_destroy(session);
         }

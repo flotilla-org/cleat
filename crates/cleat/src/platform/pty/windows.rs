@@ -45,7 +45,7 @@ pub struct PtyChild {
 impl PtyChild {
     pub fn spawn(session: &SessionMetadata) -> Result<Self, String> {
         let pipes = Pipes::new()?;
-        let conpty = create_pseudo_console(80, 24, pipes.input_read, pipes.output_write)?;
+        let conpty = create_pseudo_console(session.initial_size.cols, session.initial_size.rows, pipes.input_read, pipes.output_write)?;
         let process = spawn_with_conpty(&windows_shell_command(session), conpty, session.cwd.as_ref())?;
         unsafe {
             CloseHandle(pipes.input_read);
@@ -391,7 +391,10 @@ fn last_error(operation: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{quote_windows_arg, windows_shell_command};
-    use crate::{runtime::SessionMetadata, vt::VtEngineKind};
+    use crate::{
+        runtime::{SessionMetadata, TerminalSize},
+        vt::VtEngineKind,
+    };
 
     #[test]
     fn quotes_empty_argument() {
@@ -424,6 +427,7 @@ mod tests {
             cwd: None,
             cmd: Some("echo ready".into()),
             record: false,
+            initial_size: TerminalSize::default(),
             colors: crate::vt::TerminalColors::default(),
         };
 

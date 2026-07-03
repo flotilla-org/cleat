@@ -534,6 +534,7 @@ mod tests {
             cwd: None,
             cmd: Some("true".to_string()),
             record: true,
+            initial_size: crate::runtime::TerminalSize::default(),
             colors: crate::vt::TerminalColors::default(),
         };
 
@@ -573,6 +574,7 @@ mod tests {
             cwd: None,
             cmd: Some("sh -c 'printf RECREATE_MARKER; sleep 30'".to_string()),
             record: true,
+            initial_size: crate::runtime::TerminalSize::default(),
             colors,
         };
         let engine1 = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).expect("engine 1");

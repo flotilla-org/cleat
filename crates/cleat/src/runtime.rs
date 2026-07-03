@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    env, fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -8,6 +8,26 @@ use uuid::Uuid;
 use crate::vt::{TerminalColors, VtEngineKind};
 
 const SESSION_ROOT_DIR: &str = "cleat";
+pub const DEFAULT_TERMINAL_COLS: u16 = 80;
+pub const DEFAULT_TERMINAL_ROWS: u16 = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl Default for TerminalSize {
+    fn default() -> Self {
+        Self { cols: DEFAULT_TERMINAL_COLS, rows: DEFAULT_TERMINAL_ROWS }
+    }
+}
+
+impl fmt::Display for TerminalSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}", self.cols, self.rows)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetadata {
@@ -16,6 +36,7 @@ pub struct SessionMetadata {
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
     pub record: bool,
+    pub initial_size: TerminalSize,
     pub colors: TerminalColors,
 }
 
@@ -60,7 +81,15 @@ impl RuntimeLayout {
         let id = id.unwrap_or_else(|| format!("session-{}", Uuid::new_v4()));
         let dir = self.root.join(&id);
         fs::create_dir_all(&dir).map_err(|err| format!("create session dir {}: {err}", dir.display()))?;
-        Ok(SessionMetadata { id, vt_engine, cwd, cmd, record: false, colors: TerminalColors::default() })
+        Ok(SessionMetadata {
+            id,
+            vt_engine,
+            cwd,
+            cmd,
+            record: false,
+            initial_size: TerminalSize::default(),
+            colors: TerminalColors::default(),
+        })
     }
 
     pub fn remove_session(&self, id: &str) -> Result<(), String> {

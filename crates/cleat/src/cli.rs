@@ -5,7 +5,7 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::{
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
-    runtime::SessionMetadata,
+    runtime::{SessionMetadata, TerminalSize},
     server::{EndBound, FallbackReason, SessionService, StartBound},
     vt::{Rgb, TerminalColors, VtEngineKind},
 };
@@ -113,6 +113,8 @@ pub enum Command {
         id: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(long, value_name = "COLSxROWS", value_parser = parse_terminal_size, help = "Initial terminal size, e.g. 120x40")]
+        size: Option<TerminalSize>,
         #[arg(long, value_enum, help = crate::vt::VT_ENGINE_HELP)]
         vt: Option<VtEngineKind>,
         #[arg(long, help = "Working directory for the session")]
@@ -374,6 +376,8 @@ resolved through the live daemon socket. \n\
         cmd: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
+        #[arg(long, value_name = "COLSxROWS", value_parser = parse_terminal_size)]
+        size: Option<TerminalSize>,
         // Internal: the daemon spawner passes the already-resolved value as a
         // presence flag, so there is no default-on / env handling here.
         #[arg(long)]
@@ -457,14 +461,14 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Launch { id, json, vt, cwd, cmd, record } => {
+        Command::Launch { id, json, size, vt, cwd, cmd, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
             if !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
             }
-            let created = match service.create(id, vt, cwd, cmd, record.enabled()) {
+            let created = match service.create_with_size(id, vt, cwd, cmd, record.enabled(), size.unwrap_or_default()) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
@@ -684,13 +688,14 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
         }
-        Command::Serve { id, vt, cmd, cwd, record, color_foreground, color_background, color_cursor } => {
+        Command::Serve { id, vt, cmd, cwd, size, record, color_foreground, color_background, color_cursor } => {
             let session = SessionMetadata {
                 id,
                 vt_engine: vt,
                 cwd,
                 cmd,
                 record,
+                initial_size: size.unwrap_or_default(),
                 colors: TerminalColors {
                     default_foreground: color_foreground,
                     default_background: color_background,
@@ -908,6 +913,17 @@ fn parse_rgb(value: &str) -> Result<Rgb, String> {
     let g = u8::from_str_radix(&value[2..4], 16).map_err(|err| format!("parse green channel: {err}"))?;
     let b = u8::from_str_radix(&value[4..6], 16).map_err(|err| format!("parse blue channel: {err}"))?;
     Ok(Rgb { r, g, b })
+}
+
+fn parse_terminal_size(value: &str) -> Result<TerminalSize, String> {
+    let (cols, rows) =
+        value.split_once('x').or_else(|| value.split_once('X')).ok_or_else(|| "size must be formatted as COLSxROWS".to_string())?;
+    let cols = cols.parse::<u16>().map_err(|_| "columns must be a positive integer up to 65535".to_string())?;
+    let rows = rows.parse::<u16>().map_err(|_| "rows must be a positive integer up to 65535".to_string())?;
+    if cols == 0 || rows == 0 {
+        return Err("size dimensions must be greater than zero".to_string());
+    }
+    Ok(TerminalSize { cols, rows })
 }
 
 fn parse_repeat(value: &str) -> Result<usize, String> {

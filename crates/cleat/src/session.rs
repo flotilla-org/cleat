@@ -27,14 +27,12 @@ use crate::{
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::Frame,
-    runtime::{RuntimeLayout, SessionMetadata},
+    runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
     session_runtime::SessionRuntime,
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
 
 const FOREGROUND_NAME: &str = "foreground";
-const DEFAULT_TERMINAL_COLS: u16 = 80;
-const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DETACH_CLEANUP_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
@@ -44,6 +42,13 @@ const TERMINATE_SIGNAL: i32 = 15;
 #[derive(Debug)]
 pub struct ForegroundAttach {
     stream: Arc<Mutex<SessionStream>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionStartOptions {
+    pub record: bool,
+    pub initial_size: TerminalSize,
+    pub colors: vt::TerminalColors,
 }
 
 impl ForegroundAttach {
@@ -223,8 +228,7 @@ pub fn ensure_session_started(
     vt_engine: Option<VtEngineKind>,
     cwd: Option<PathBuf>,
     cmd: Option<String>,
-    record: bool,
-    colors: vt::TerminalColors,
+    options: SessionStartOptions,
 ) -> Result<SessionMetadata, String> {
     // If a named session directory already exists with a live socket, reuse it.
     if let Some(ref id_str) = id {
@@ -234,7 +238,15 @@ pub fn ensure_session_started(
                 // Daemon is running — return the id. The caller should use inspect()
                 // if it needs the session's actual config.
                 let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-                return Ok(SessionMetadata { id: id_str.clone(), vt_engine, cwd, cmd, record, colors });
+                return Ok(SessionMetadata {
+                    id: id_str.clone(),
+                    vt_engine,
+                    cwd,
+                    cmd,
+                    record: options.record,
+                    initial_size: options.initial_size,
+                    colors: options.colors,
+                });
             }
             // Stale socket from a crashed daemon. Remove it so the respawned daemon
             // binds cleanly and wait_for_socket waits for the new listener rather
@@ -257,8 +269,9 @@ pub fn ensure_session_started(
     let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
     vt_engine.ensure_available()?;
     let mut session = layout.create_session(id, vt_engine, cwd, cmd)?;
-    session.record = record;
-    session.colors = colors;
+    session.record = options.record;
+    session.initial_size = options.initial_size;
+    session.colors = options.colors;
 
     let socket_path = session_socket_path(layout.root(), &session.id);
     spawn_daemon_process(layout.root(), &session)?;
@@ -309,15 +322,15 @@ pub fn foreground_path(root: &Path, id: &str) -> PathBuf {
 fn default_vt_engine(session: &SessionMetadata) -> Result<Box<dyn VtEngine>, String> {
     #[cfg(test)]
     if session.vt_engine == VtEngineKind::Ghostty {
-        return Ok(Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)));
+        return Ok(Box::new(TestReplayProbeVtEngine::new(session.initial_size.cols, session.initial_size.rows)));
     }
 
     if std::env::var_os("CARGO_BIN_EXE_cleat").is_some()
         && std::env::var_os("CLEAT_TEST_VT_ENGINE").as_deref() == Some(std::ffi::OsStr::new("replay-probe"))
     {
-        return Ok(Box::new(TestReplayProbeVtEngine::new(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)));
+        return Ok(Box::new(TestReplayProbeVtEngine::new(session.initial_size.cols, session.initial_size.rows)));
     }
-    vt::make_vt_engine_with_colors(session.vt_engine, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS, session.colors)
+    vt::make_vt_engine_with_colors(session.vt_engine, session.initial_size.cols, session.initial_size.rows, session.colors)
 }
 
 #[derive(Debug)]
@@ -1125,7 +1138,7 @@ mod tests {
     };
     use crate::{
         http_uds::read_http_request_for_test,
-        runtime::{RuntimeLayout, SessionMetadata},
+        runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
         vt::{self, VtEngine},
     };
 
@@ -1226,10 +1239,11 @@ mod tests {
             cwd: None,
             cmd: None,
             record: false,
+            initial_size: TerminalSize::default(),
             colors: vt::TerminalColors::default(),
         };
         let engine = default_vt_engine(&session).expect("create default vt engine");
-        assert_eq!(engine.size(), (super::DEFAULT_TERMINAL_COLS, super::DEFAULT_TERMINAL_ROWS));
+        assert_eq!(engine.size(), (crate::runtime::DEFAULT_TERMINAL_COLS, crate::runtime::DEFAULT_TERMINAL_ROWS));
         #[cfg(feature = "ghostty-vt")]
         assert!(engine.supports_replay());
         #[cfg(not(feature = "ghostty-vt"))]
@@ -1248,9 +1262,11 @@ mod tests {
             cwd: None,
             cmd: None,
             record: false,
+            initial_size: TerminalSize { cols: 120, rows: 40 },
             colors: vt::TerminalColors::default(),
         };
         let mut engine = default_vt_engine(&session).expect("create default vt engine");
+        assert_eq!(engine.size(), (120, 40));
         record_pty_output(engine.as_mut(), b"hello").expect("feed output");
         let replay =
             apply_attach_state(engine.as_mut(), 132, 40, &vt::ClientCapabilities::conservative_fallback()).expect("apply attach state");

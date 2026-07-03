@@ -22,7 +22,7 @@ use cleat::{
         CleatProviderDesc, CleatSessionDesc, CLEAT_PROVIDER_ABI_VERSION, CLEAT_PROVIDER_BACKEND_DAEMON, CLEAT_PROVIDER_VT_PASSTHROUGH,
     },
     recording::{SessionRecorder, CAST_FILE_NAME},
-    runtime::RuntimeLayout,
+    runtime::{RuntimeLayout, TerminalSize},
     server::{EndBound, SessionService, StartBound},
     session::{daemon_pid_path, session_socket_path},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
@@ -1104,6 +1104,38 @@ fn inspect_returns_structured_session_state() {
     assert_eq!(result.terminal.cols, 80);
     assert_eq!(result.terminal.rows, 24);
     assert!(!result.recording.active);
+
+    service.kill(&info.id).expect("kill session");
+}
+
+#[test]
+fn create_with_size_sets_initial_terminal_geometry() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let info = service
+        .create_with_size(Some("sized".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false, TerminalSize {
+            cols: 120,
+            rows: 40,
+        })
+        .expect("create session");
+
+    let socket_path = session_socket_path(temp.path(), &info.id);
+    wait_for_socket(&socket_path);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        match service.inspect(&info.id) {
+            Ok(result) => break result,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => panic!("inspect sized session: {err}"),
+        }
+    };
+
+    assert_eq!(result.terminal.cols, 120);
+    assert_eq!(result.terminal.rows, 40);
 
     service.kill(&info.id).expect("kill session");
 }

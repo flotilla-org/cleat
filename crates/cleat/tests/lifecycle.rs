@@ -271,6 +271,21 @@ fn list_json_reports_existing_sessions() {
 }
 
 #[test]
+fn list_reports_watch_only_session_as_detached() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+    let _watch = http_watch_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback());
+
+    let listed = service.list().expect("list sessions");
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "alpha");
+    assert_eq!(listed[0].status, cleat::protocol::SessionStatus::Detached);
+}
+
+#[test]
 fn capture_rejects_passthrough_sessions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

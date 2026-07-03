@@ -151,7 +151,8 @@ impl SessionService {
             }
             match self.inspect(&id) {
                 Ok(result) => {
-                    let status = if result.attachments.is_empty() { SessionStatus::Detached } else { SessionStatus::Attached };
+                    let status =
+                        if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
                     sessions.push(SessionInfo {
                         id: result.session.id,
                         vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
@@ -596,6 +597,10 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         status,
         error: None,
     }
+}
+
+fn has_controller_attachment(attachments: &[crate::protocol::AttachmentInspect]) -> bool {
+    attachments.iter().any(|attachment| attachment.role == "controller")
 }
 
 fn signal_target_to_http(target: crate::protocol::SignalTarget) -> http_uds::SignalTargetRequest {

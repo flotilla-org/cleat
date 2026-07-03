@@ -62,6 +62,21 @@ fn http_body(response: &str) -> &str {
 }
 
 fn http_attach_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, capabilities: ClientCapabilities) -> UnixStream {
+    http_upgrade_stream(root, id, "attach", cols, rows, capabilities)
+}
+
+fn http_watch_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, capabilities: ClientCapabilities) -> UnixStream {
+    http_upgrade_stream(root, id, "watch", cols, rows, capabilities)
+}
+
+fn http_upgrade_stream(
+    root: &std::path::Path,
+    id: &str,
+    action: &str,
+    cols: u16,
+    rows: u16,
+    capabilities: ClientCapabilities,
+) -> UnixStream {
     let socket_path = session_socket_path(root, id);
     let mut stream = UnixStream::connect(&socket_path).expect("connect session socket");
     let color_level = match capabilities.color_level {
@@ -75,11 +90,11 @@ fn http_attach_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, ca
     );
     write!(
         stream,
-        "POST /sessions/{id}/attach HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n{}",
+        "POST /sessions/{id}/{action} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n{}",
         body.len(),
         body
     )
-    .expect("write attach request");
+    .expect("write upgrade request");
 
     let response = read_http_response_head(&mut stream);
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
@@ -94,6 +109,27 @@ fn read_http_response_head(stream: &mut UnixStream) -> String {
         bytes.push(byte[0]);
     }
     String::from_utf8(bytes).expect("response utf8")
+}
+
+fn collect_output_until(stream: &mut UnixStream, needle: &str, timeout: Duration) -> String {
+    stream.set_read_timeout(Some(Duration::from_millis(100))).expect("set read timeout");
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    while Instant::now() < deadline {
+        match Frame::read(stream) {
+            Ok(Frame::Output(bytes)) => {
+                output.extend_from_slice(&bytes);
+                let text = String::from_utf8_lossy(&output);
+                if text.contains(needle) {
+                    return text.into_owned();
+                }
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(err) => panic!("read output frame: {err}"),
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
 }
 
 struct EnvVarGuard {
@@ -232,6 +268,21 @@ fn list_json_reports_existing_sessions() {
     assert_eq!(listed[1].vt_engine, VtEngineKind::Passthrough);
     assert_eq!(listed[1].vt_engine_status, vt::vt_engine_status(VtEngineKind::Passthrough));
     assert_eq!(listed[1].functional_vt_available, vt::functional_vt_available());
+}
+
+#[test]
+fn list_reports_watch_only_session_as_detached() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+    let _watch = http_watch_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback());
+
+    let listed = service.list().expect("list sessions");
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "alpha");
+    assert_eq!(listed[0].status, cleat::protocol::SessionStatus::Detached);
 }
 
 #[test]
@@ -655,6 +706,25 @@ fn lifecycle_attach_init_capabilities_drive_replay_output_on_daemon_path() {
 }
 
 #[test]
+fn lifecycle_watch_gets_replay_without_resizing_session() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvVarGuard::set("CLEAT_TEST_VT_ENGINE", "replay-probe");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("create alpha");
+
+    let mut stream = http_watch_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::new(ColorLevel::Ansi256, true));
+
+    let replay = Frame::read(&mut stream).expect("read watch replay output");
+    assert_eq!(replay, Frame::Output(b"Ansi256:true".to_vec()));
+    let result = service.inspect("alpha").expect("inspect watched session");
+    assert_eq!(result.terminal.cols, 80);
+    assert_eq!(result.terminal.rows, 24);
+    assert_eq!(result.attachments.iter().map(|attachment| attachment.role.as_str()).collect::<Vec<_>>(), vec!["watcher"]);
+}
+
+#[test]
 fn send_keys_injects_input_into_running_session_pty() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
@@ -684,6 +754,34 @@ fn send_keys_injects_input_into_running_session_pty() {
         "send-keys output should reach the attached session, got {:?}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn watcher_receives_live_output_without_taking_control() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("cat".into()), false).expect("create alpha");
+
+    let mut controller = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::conservative_fallback());
+    let mut watcher = http_watch_stream(temp.path(), "alpha", 12, 7, ClientCapabilities::conservative_fallback());
+
+    let result = service.inspect("alpha").expect("inspect with watcher");
+    assert_eq!(result.terminal.cols, 100, "watcher geometry should not resize the session");
+    assert_eq!(result.terminal.rows, 30, "watcher geometry should not resize the session");
+    let roles = result.attachments.iter().map(|attachment| attachment.role.as_str()).collect::<Vec<_>>();
+    assert_eq!(roles, vec!["controller", "watcher"]);
+
+    Frame::Input(b"ignored-from-watcher\n".to_vec()).write(&mut watcher).expect("write watcher input");
+    std::thread::sleep(Duration::from_millis(100));
+    service.send_keys("alpha", b"watched-from-control\n").expect("send keys");
+
+    let controller_output = collect_output_until(&mut controller, "watched-from-control", Duration::from_secs(2));
+    let watcher_output = collect_output_until(&mut watcher, "watched-from-control", Duration::from_secs(2));
+
+    assert!(controller_output.contains("watched-from-control"), "controller output was {controller_output:?}");
+    assert!(watcher_output.contains("watched-from-control"), "watcher output was {watcher_output:?}");
+    assert!(!watcher_output.contains("ignored-from-watcher"), "watcher input should be ignored, got {watcher_output:?}");
 }
 
 #[test]

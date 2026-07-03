@@ -15,7 +15,10 @@ use crate::{
     },
     protocol::{SessionInfo, SessionStatus},
     runtime::{RuntimeLayout, TerminalSize},
-    session::{attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, ForegroundAttach, SessionStartOptions},
+    session::{
+        attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, watch_foreground, ForegroundAttach,
+        SessionStartOptions,
+    },
     vt::VtEngineKind,
 };
 
@@ -148,7 +151,8 @@ impl SessionService {
             }
             match self.inspect(&id) {
                 Ok(result) => {
-                    let status = if result.attachments.is_empty() { SessionStatus::Detached } else { SessionStatus::Attached };
+                    let status =
+                        if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
                     sessions.push(SessionInfo {
                         id: result.session.id,
                         vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
@@ -366,6 +370,13 @@ impl SessionService {
         };
         let attach = attach_foreground(&self.layout, &info.id)?;
         Ok((info, attach))
+    }
+
+    pub fn watch(&self, id: &str) -> Result<ForegroundAttach, String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        watch_foreground(&self.layout, id)
     }
 
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {
@@ -586,6 +597,10 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         status,
         error: None,
     }
+}
+
+fn has_controller_attachment(attachments: &[crate::protocol::AttachmentInspect]) -> bool {
+    attachments.iter().any(|attachment| attachment.role == "controller")
 }
 
 fn signal_target_to_http(target: crate::protocol::SignalTarget) -> http_uds::SignalTargetRequest {

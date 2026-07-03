@@ -281,6 +281,14 @@ pub fn ensure_session_started(
 }
 
 pub fn attach_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundAttach, String> {
+    connect_foreground_upgrade(layout, id, "attach")
+}
+
+pub fn watch_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundAttach, String> {
+    connect_foreground_upgrade(layout, id, "watch")
+}
+
+fn connect_foreground_upgrade(layout: &RuntimeLayout, id: &str, role: &str) -> Result<ForegroundAttach, String> {
     let socket_path = session_socket_path(layout.root(), id);
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
@@ -292,13 +300,13 @@ pub fn attach_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundA
             capabilities: attach_capabilities_to_http(attach_init_capabilities()),
         })
         .map_err(|err| format!("serialize attach request: {err}"))?;
-        http_uds::write_attach_upgrade_request(&mut stream, &format!("/sessions/{id}/attach"), &body)
-            .map_err(|err| format!("write attach upgrade request: {err}"))?;
-        let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read attach upgrade response: {err}"))?;
+        http_uds::write_attach_upgrade_request(&mut stream, &format!("/sessions/{id}/{role}"), &body)
+            .map_err(|err| format!("write {role} upgrade request: {err}"))?;
+        let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read {role} upgrade response: {err}"))?;
         match response.status {
             StatusCode::SWITCHING_PROTOCOLS => return Ok(ForegroundAttach { stream: Arc::new(Mutex::new(stream)) }),
             StatusCode::CONFLICT => {}
-            other => return Err(format!("unexpected attach response: {other}")),
+            other => return Err(format!("unexpected {role} response: {other}")),
         }
         if Instant::now() >= deadline {
             return Err(format!("session {id} already has a foreground client"));
@@ -442,6 +450,37 @@ fn write_http_wait_result(stream: &mut SessionStream, status: crate::protocol::W
     http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse { status: wait_status_to_http(status), elapsed_ms })
 }
 
+fn enqueue_output_chunk(
+    root: &Path,
+    id: &str,
+    runtime: &mut SessionRuntime,
+    active_client: &mut Option<ActiveClient>,
+    watchers: &mut Vec<ActiveClient>,
+    chunk: Vec<u8>,
+) {
+    let frame = Frame::Output(chunk);
+    if let Some(client) = active_client.as_mut() {
+        if client.enqueue_frame(&frame).is_err() {
+            let _ = fs::remove_file(foreground_path(root, id));
+            runtime.record_detach();
+            *active_client = None;
+        }
+    }
+    watchers.retain_mut(|watcher| watcher.enqueue_frame(&frame).is_ok());
+}
+
+fn drain_watcher_inputs(watchers: &mut Vec<ActiveClient>) {
+    let mut ignored = VecDeque::new();
+    watchers.retain_mut(|watcher| {
+        ignored.clear();
+        watcher.drain_input_frames(&mut ignored, Duration::ZERO).unwrap_or_default()
+    });
+}
+
+fn flush_watchers(watchers: &mut Vec<ActiveClient>) {
+    watchers.retain_mut(|watcher| watcher.flush_pending_output().unwrap_or(false));
+}
+
 #[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
     let id = &session.id;
@@ -458,6 +497,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
     let mut runtime = SessionRuntime::spawn(session_dir.clone(), session, default_vt_engine(session)?)?;
     let mut active_client: Option<ActiveClient> = None;
+    let mut watchers: Vec<ActiveClient> = Vec::new();
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
     let mut pending_expects: Vec<PendingExpect> = Vec::new();
@@ -497,6 +537,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     let mut http_state = HttpRequestState {
                         runtime: &mut runtime,
                         active_client: &mut active_client,
+                        watchers: &mut watchers,
                         had_foreground_client: &mut had_foreground_client,
                         pending_waits: &mut pending_waits,
                         pending_expects: &mut pending_expects,
@@ -509,6 +550,8 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 Err(err) => return Err(format!("accept client: {err}")),
             }
         }
+
+        drain_watcher_inputs(&mut watchers);
 
         if active_client.is_some() {
             let mut client_disconnected = false;
@@ -553,18 +596,12 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 active_client = None;
             }
         }
+        flush_watchers(&mut watchers);
 
         if poll_result.pty_readable {
             let output = runtime.read_available_output(active_client.is_some())?;
             for chunk in output.chunks {
-                if let Some(client) = active_client.as_mut() {
-                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
-                        let _ = fs::remove_file(foreground_path(root, id));
-                        runtime.record_detach();
-                        active_client = None;
-                        break;
-                    }
-                }
+                enqueue_output_chunk(root, id, &mut runtime, &mut active_client, &mut watchers, chunk);
             }
         }
 
@@ -643,14 +680,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         if let Some(exit_code) = runtime.exit_code_if_exited()? {
             let output = runtime.drain_output_after_exit(active_client.is_some())?;
             for chunk in output.chunks {
-                if let Some(client) = active_client.as_mut() {
-                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
-                        let _ = fs::remove_file(foreground_path(root, id));
-                        runtime.record_detach();
-                        active_client = None;
-                        break;
-                    }
-                }
+                enqueue_output_chunk(root, id, &mut runtime, &mut active_client, &mut watchers, chunk);
             }
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
@@ -664,6 +694,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             if let Some(client) = active_client.as_mut() {
                 let _ = client.flush_pending_output();
             }
+            flush_watchers(&mut watchers);
             break;
         }
     }
@@ -686,6 +717,7 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
 struct HttpRequestState<'a> {
     runtime: &'a mut SessionRuntime,
     active_client: &'a mut Option<ActiveClient>,
+    watchers: &'a mut Vec<ActiveClient>,
     had_foreground_client: &'a mut bool,
     pending_waits: &'a mut Vec<PendingWait>,
     pending_expects: &'a mut Vec<PendingExpect>,
@@ -711,12 +743,12 @@ fn handle_http_request(
         )
         .map_err(|err| format!("write HTTP response: {err}")),
         http_uds::Route::Sessions => {
-            let result = state.runtime.inspect(state.active_client.is_some());
+            let result = state.runtime.inspect(state.active_client.is_some(), state.watchers.len());
             http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions: vec![result] })
                 .map_err(|err| format!("write HTTP sessions response: {err}"))
         }
         http_uds::Route::SessionInspect { id } if id == daemon_id => {
-            let result = state.runtime.inspect(state.active_client.is_some());
+            let result = state.runtime.inspect(state.active_client.is_some(), state.watchers.len());
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
         }
         http_uds::Route::SessionDelete { id } if id == daemon_id => {
@@ -751,6 +783,24 @@ fn handle_http_request(
             *state.active_client = Some(client);
             *state.had_foreground_client = true;
             state.runtime.record_attach();
+            Ok(())
+        }
+        http_uds::Route::SessionWatch { id } if id == daemon_id => {
+            let body: http_uds::AttachRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP watch request: {err}"))?;
+            let capabilities = attach_capabilities_from_http(body.capabilities);
+            let replay = state.runtime.replay_payload(&capabilities)?;
+            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
+            let watch_stream = stream.try_clone().map_err(|err| format!("clone HTTP watch stream: {err}"))?;
+            #[cfg(unix)]
+            set_stream_nonblocking(&watch_stream, true).map_err(|err| format!("set HTTP watch stream nonblocking: {err}"))?;
+            let mut watcher = ActiveClient::new(watch_stream)?;
+            if let Some(payload) = replay {
+                if !payload.is_empty() {
+                    watcher.enqueue_frame(&Frame::Output(payload))?;
+                }
+            }
+            state.watchers.push(watcher);
             Ok(())
         }
         http_uds::Route::SessionDetach { id } if id == daemon_id => {
@@ -889,15 +939,8 @@ fn handle_http_request(
         }
         http_uds::Route::SessionSnapshot { id } if id == daemon_id => {
             let output = state.runtime.read_available_output(state.active_client.is_some())?;
-            if let Some(client) = state.active_client.as_mut() {
-                for chunk in output.chunks {
-                    if client.enqueue_frame(&Frame::Output(chunk)).is_err() {
-                        let _ = fs::remove_file(foreground_path(root, daemon_id));
-                        state.runtime.record_detach();
-                        *state.active_client = None;
-                        break;
-                    }
-                }
+            for chunk in output.chunks {
+                enqueue_output_chunk(root, daemon_id, state.runtime, state.active_client, state.watchers, chunk);
             }
             match state.runtime.snapshot(crate::provider::DirtyState::Full) {
                 Ok(snapshot) => http_uds::write_json(stream, StatusCode::OK, &http_uds::snapshot_response(snapshot))

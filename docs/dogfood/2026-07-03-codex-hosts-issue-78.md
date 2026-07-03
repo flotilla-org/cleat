@@ -70,6 +70,17 @@ Check off as confirmed/refuted; surprises go in the friction log.
   attempt to write an HTTP 500 onto an already-upgraded stream on enqueue error;
   `--size` on an already-running session id is silently ignored (reuse path).
 
+- **2026-07-04 (run live)** Codex TUI renders cleanly detached under the ghostty
+  engine at 200×50; recording active; human watching via `cleat watch` while the
+  driver supervises through the control plane. The multi-client shape works.
+- **2026-07-04 (run live)** `cleat send codex-78 "<task>"` left the text sitting
+  in codex's composer unsubmitted — the trailing Enter was swallowed (likely
+  codex's paste heuristic treating fast text+newline as one paste). A separate
+  `send-keys codex-78 Enter` submitted it. Driving modern TUI composers needs
+  either a delay between text and Enter or a paste-encoded send followed by a
+  distinct Enter; consider a `send --submit` that does text-as-paste + delayed
+  Enter.
+
 ## Issues spawned
 
 *(label: `dogfood`)*

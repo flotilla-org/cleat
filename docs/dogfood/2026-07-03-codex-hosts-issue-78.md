@@ -81,6 +81,19 @@ Check off as confirmed/refuted; surprises go in the friction log.
   distinct Enter; consider a `send --submit` that does text-as-paste + delayed
   Enter.
 
+- **2026-07-04 (run live, watcher report)** Watch initially "over drew" the
+  watcher's terminal: the watch handler sends the replay payload with no
+  clear+home first (the reattach path has `REATTACH_CLEAR_SEQUENCE`; watch skips
+  it), and the payload assumes a 200×50 canvas the watcher may not have. Cheap
+  scaffolding fix: always prepend clear+home for watchers. The real fix is the
+  packet-based watcher — a byte-tee paints someone else's escape stream into the
+  watcher's current screen state and can never own cursor/alt-screen/viewport
+  reconciliation. First concrete evidence for the Update Packet destination.
+- **2026-07-04 (run live, watcher report)** Prediction 1 counter-evidence: watch
+  is *not* perceptibly laggy while codex streams. The #78 staleness may be
+  conditional (controller-attach path? specific load shapes?) rather than
+  constant — matches the decision to instrument before fixing.
+
 ## Issues spawned
 
 *(label: `dogfood`)*

@@ -1576,7 +1576,7 @@ fn route_in_process_wheel_event_on_actor(
     }
     match runtime.scroll_viewport(ViewportCommand::DeltaRows(delta_rows)) {
         Ok(ViewportCommandOutcome::Moved) => {
-            let rows = runtime.inspect(false).terminal.rows;
+            let rows = runtime.inspect(false, 0).terminal.rows;
             mark_full_and_wake(observation, rows, wake);
             Ok(0)
         }
@@ -2231,7 +2231,7 @@ fn in_process_actor_handle_command(
         }
         InProcessCommand::SetCellSize { cell_width_px, cell_height_px, reply } => {
             let result = runtime.set_cell_size(cell_width_px, cell_height_px).map(|_| {
-                let rows = runtime.inspect(false).terminal.rows;
+                let rows = runtime.inspect(false, 0).terminal.rows;
                 mark_full_and_wake(observation, rows, wake);
             });
             let _ = reply.send(result);
@@ -2252,7 +2252,7 @@ fn in_process_actor_handle_command(
         InProcessCommand::ScrollViewport { command, reply } => {
             let result = runtime.scroll_viewport(command).inspect(|outcome| {
                 if *outcome == ViewportCommandOutcome::Moved {
-                    let rows = runtime.inspect(false).terminal.rows;
+                    let rows = runtime.inspect(false, 0).terminal.rows;
                     mark_full_and_wake(observation, rows, wake);
                 }
             });
@@ -2290,14 +2290,14 @@ fn in_process_actor_handle_command(
         InProcessCommand::ScrollbackExtent { reply } => {
             let extent = runtime.scrollback_extent().unwrap_or_else(|_| TerminalScrollbackExtent {
                 normal_scrollback_rows: 0,
-                live_rows: runtime.inspect(false).terminal.rows,
+                live_rows: runtime.inspect(false, 0).terminal.rows,
                 alternate_screen: false,
             });
             let _ = reply.send(extent);
         }
         InProcessCommand::ScrollbarState { reply } => {
             let scrollbar = runtime.scrollbar_state().unwrap_or_else(|_| {
-                TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, runtime.inspect(false).terminal.rows)
+                TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, runtime.inspect(false, 0).terminal.rows)
             });
             let _ = reply.send(scrollbar);
         }
@@ -2324,7 +2324,7 @@ fn in_process_actor_pump(
         Ok(PumpOutcome::Clean) => {}
         Ok(PumpOutcome::PartialUnknown) => mark_partial_unknown_and_wake(observation, wake),
         Ok(PumpOutcome::Full) | Err(_) => {
-            let rows = runtime.inspect(false).terminal.rows;
+            let rows = runtime.inspect(false, 0).terminal.rows;
             mark_full_and_wake(observation, rows, wake);
         }
     }

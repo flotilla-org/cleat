@@ -12,6 +12,7 @@ fn help_lists_expected_subcommands() {
     let subcommands: Vec<_> = command.get_subcommands().filter(|sub| !sub.is_hide_set()).map(|sub| sub.get_name().to_string()).collect();
     assert_eq!(subcommands, vec![
         "attach",
+        "watch",
         "launch",
         "list",
         "capture",
@@ -88,6 +89,12 @@ fn attach_command_parses_vt() {
         cmd: None,
         record: RecordFlags::default()
     });
+}
+
+#[test]
+fn watch_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "watch", "demo"]).expect("watch parses");
+    assert_eq!(cli.command, Command::Watch { id: "demo".into() });
 }
 
 #[test]

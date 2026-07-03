@@ -103,6 +103,13 @@ pub enum Command {
         #[command(flatten)]
         record: RecordFlags,
     },
+    /// Watch a session read-only
+    #[command(after_long_help = "Attaches as a read-only watcher. The session keeps its existing\n\
+                           controller, if any; watcher input and resize events are ignored.")]
+    Watch {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
     /// Create a new session
     #[command(
         alias = "create",
@@ -456,6 +463,16 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                     return ExecResult::Err(e);
                 }
             }
+            match guard.relay_stdio() {
+                Ok(()) => ExecResult::Ok(None),
+                Err(e) => ExecResult::Err(e),
+            }
+        }
+        Command::Watch { id } => {
+            let guard = match service.watch(&id) {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
             match guard.relay_stdio() {
                 Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),
@@ -879,6 +896,10 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
     }
     if let Some(ref cwd) = result.process.foreground_cwd {
         table.add_row(vec!["fg_cwd", &cwd.display().to_string()]);
+    }
+    if !result.attachments.is_empty() {
+        let attachments = result.attachments.iter().map(|attachment| attachment.role.as_str()).collect::<Vec<_>>().join(", ");
+        table.add_row(vec!["attachments", &attachments]);
     }
     table.add_row(vec!["recording", if result.recording.active { "active" } else { "off" }]);
     if !result.recording.markers.is_empty() {

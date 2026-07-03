@@ -15,7 +15,10 @@ use crate::{
     },
     protocol::{SessionInfo, SessionStatus},
     runtime::{RuntimeLayout, TerminalSize},
-    session::{attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, ForegroundAttach, SessionStartOptions},
+    session::{
+        attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, watch_foreground, ForegroundAttach,
+        SessionStartOptions,
+    },
     vt::VtEngineKind,
 };
 
@@ -366,6 +369,13 @@ impl SessionService {
         };
         let attach = attach_foreground(&self.layout, &info.id)?;
         Ok((info, attach))
+    }
+
+    pub fn watch(&self, id: &str) -> Result<ForegroundAttach, String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        watch_foreground(&self.layout, id)
     }
 
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {

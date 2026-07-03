@@ -262,9 +262,22 @@ impl SessionRuntime {
         self.pty_child.resize(cols, rows, width_px, height_px)
     }
 
-    pub(crate) fn inspect(&self, has_controller: bool) -> InspectResult {
+    pub(crate) fn replay_payload(&mut self, capabilities: &vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+        if self.vt_engine.supports_replay() {
+            self.vt_engine.replay_payload(capabilities)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn inspect(&self, has_controller: bool, watcher_count: usize) -> InspectResult {
         let (cols, rows) = self.vt_engine.size();
         let foreground_pgid = self.pty_child.foreground_pgid();
+        let mut attachments = Vec::new();
+        if has_controller {
+            attachments.push(crate::protocol::AttachmentInspect { role: "controller".to_string() });
+        }
+        attachments.extend((0..watcher_count).map(|_| crate::protocol::AttachmentInspect { role: "watcher".to_string() }));
 
         InspectResult {
             session: crate::protocol::SessionInspect {
@@ -283,7 +296,7 @@ impl SessionRuntime {
                 leader_cwd: self.pty_child.leader_cwd(),
                 foreground_cwd: self.pty_child.foreground_cwd(),
             },
-            attachments: if has_controller { vec![crate::protocol::AttachmentInspect { role: "controller".to_string() }] } else { vec![] },
+            attachments,
             recording: crate::protocol::RecordingInspect {
                 active: self.recorder.as_ref().is_some_and(|r| !r.is_paused()),
                 bytes_written: self.recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),

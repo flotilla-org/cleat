@@ -14,8 +14,8 @@ use crate::{
         ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
     protocol::{SessionInfo, SessionStatus},
-    runtime::RuntimeLayout,
-    session::{attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, ForegroundAttach},
+    runtime::{RuntimeLayout, TerminalSize},
+    session::{attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, ForegroundAttach, SessionStartOptions},
     vt::VtEngineKind,
 };
 
@@ -81,7 +81,23 @@ impl SessionService {
         cmd: Option<String>,
         record: bool,
     ) -> Result<SessionInfo, String> {
-        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, record, crate::vt::TerminalColors::default())?;
+        self.create_with_size(name, vt_engine, cwd, cmd, record, TerminalSize::default())
+    }
+
+    pub fn create_with_size(
+        &self,
+        name: Option<String>,
+        vt_engine: Option<VtEngineKind>,
+        cwd: Option<std::path::PathBuf>,
+        cmd: Option<String>,
+        record: bool,
+        initial_size: TerminalSize,
+    ) -> Result<SessionInfo, String> {
+        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions {
+            record,
+            initial_size,
+            colors: crate::vt::TerminalColors::default(),
+        })?;
         // If the daemon was already running, get real config via inspect.
         if let Ok(result) = self.inspect(&session.id) {
             return Ok(session_info_from_inspect(result, SessionStatus::Detached));
@@ -321,9 +337,17 @@ impl SessionService {
                 return Err(format!("session {id} has a stale daemon (cleaned up)"));
             }
             let vt_engine = vt_engine.unwrap_or_else(crate::vt::default_vt_engine_kind);
-            crate::runtime::SessionMetadata { id, vt_engine, cwd, cmd, record: false, colors: crate::vt::TerminalColors::default() }
+            crate::runtime::SessionMetadata {
+                id,
+                vt_engine,
+                cwd,
+                cmd,
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: crate::vt::TerminalColors::default(),
+            }
         } else {
-            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, false, crate::vt::TerminalColors::default())?
+            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions::default())?
         };
         // Get real config from the daemon before attaching (which takes the foreground slot).
         let info = if let Ok(result) = self.inspect(&session.id) {

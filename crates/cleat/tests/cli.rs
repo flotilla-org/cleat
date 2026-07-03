@@ -1,7 +1,7 @@
 use clap::{CommandFactory, Parser};
 use cleat::{
     cli::{self, execute, Cli, Command, ExecResult, RecordFlags},
-    runtime::RuntimeLayout,
+    runtime::{RuntimeLayout, TerminalSize},
     server::SessionService,
     vt::{self, Rgb, VtEngineKind},
 };
@@ -96,6 +96,7 @@ fn launch_command_parses() {
     assert_eq!(cli.command, Command::Launch {
         id: None,
         json: false,
+        size: None,
         vt: None,
         cwd: None,
         cmd: Some("bash".into()),
@@ -104,11 +105,31 @@ fn launch_command_parses() {
 }
 
 #[test]
+fn launch_command_parses_size() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--size", "120x40"]).expect("launch --size parses");
+    assert!(matches!(
+        cli.command,
+        Command::Launch {
+            id: Some(ref id),
+            size: Some(TerminalSize { cols: 120, rows: 40 }),
+            ..
+        } if id == "demo"
+    ));
+}
+
+#[test]
+fn launch_command_rejects_invalid_size() {
+    assert!(Cli::try_parse_from(["cleat", "launch", "demo", "--size", "120"]).is_err());
+    assert!(Cli::try_parse_from(["cleat", "launch", "demo", "--size", "0x40"]).is_err());
+}
+
+#[test]
 fn launch_command_parses_positional_name() {
     let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--cmd", "bash"]).expect("launch positional parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         json: false,
+        size: None,
         vt: None,
         cwd: None,
         cmd: Some("bash".into()),
@@ -122,6 +143,7 @@ fn launch_command_parses_json() {
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         json: true,
+        size: None,
         vt: None,
         cwd: None,
         cmd: None,
@@ -135,6 +157,7 @@ fn launch_command_parses_vt() {
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         json: false,
+        size: None,
         vt: Some(VtEngineKind::Ghostty),
         cwd: None,
         cmd: None,
@@ -148,6 +171,7 @@ fn create_alias_still_parses_as_launch() {
     assert_eq!(cli.command, Command::Launch {
         id: None,
         json: false,
+        size: None,
         vt: None,
         cwd: None,
         cmd: Some("bash".into()),
@@ -328,6 +352,8 @@ fn serve_parses_all_flags() {
         "bash",
         "--cwd",
         "/tmp",
+        "--size",
+        "132x43",
         "--record",
         "--color-foreground",
         "123456",
@@ -341,6 +367,7 @@ fn serve_parses_all_flags() {
         cli.command,
         Command::Serve {
             ref id,
+            size: Some(TerminalSize { cols: 132, rows: 43 }),
             record: true,
             color_foreground: Some(Rgb { r: 0x12, g: 0x34, b: 0x56 }),
             color_background: Some(Rgb { r: 0xab, g: 0xcd, b: 0xef }),

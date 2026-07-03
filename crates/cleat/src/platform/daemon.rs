@@ -22,6 +22,7 @@ pub fn spawn_daemon_process(root: &Path, session: &SessionMetadata) -> Result<()
     let exe = resolve_cleat_executable()?;
     let mut command = Command::new(exe);
     command.arg("--runtime-root").arg(root).arg("serve").arg("--id").arg(&session.id).arg("--vt").arg(session.vt_engine.as_str());
+    command.arg("--size").arg(session.initial_size.to_string());
     if let Some(cmd) = &session.cmd {
         command.arg("--cmd").arg(cmd);
     }

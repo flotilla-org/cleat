@@ -9,7 +9,7 @@ use nix::{
     errno::Errno,
     fcntl::{fcntl, FcntlArg, OFlag},
     poll::{poll, PollFd, PollFlags, PollTimeout},
-    pty::{forkpty, ForkptyResult},
+    pty::{forkpty, ForkptyResult, Winsize},
     sys::{
         signal::{killpg, Signal},
         wait::{waitpid, WaitPidFlag, WaitStatus},
@@ -32,8 +32,9 @@ pub struct PtyChild {
 
 impl PtyChild {
     pub fn spawn(session: &SessionMetadata) -> Result<Self, String> {
+        let winsize = Winsize { ws_row: session.initial_size.rows, ws_col: session.initial_size.cols, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: `forkpty` creates a child attached to a new PTY; parent receives the owned master fd.
-        let result = unsafe { forkpty(None, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
+        let result = unsafe { forkpty(&winsize, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
         match result {
             ForkptyResult::Parent { master, child } => Ok(Self { master_fd: master.into_raw_fd(), pid: child }),
             ForkptyResult::Child => {

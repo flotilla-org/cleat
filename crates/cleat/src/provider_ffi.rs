@@ -23,8 +23,8 @@ use crate::{
         TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalStyleColor, TerminalStyleColorTag,
         TerminalViewportKind, ViewportCommand, ViewportCommandOutcome, TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
     },
-    runtime::RuntimeLayout,
-    session::{ensure_session_started, session_socket_path},
+    runtime::{RuntimeLayout, TerminalSize},
+    session::{ensure_session_started, session_socket_path, SessionStartOptions},
     session_runtime::{PtyOutput, SessionRuntime},
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
@@ -2372,9 +2372,10 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let id = read_optional_utf8(desc.id, desc.id_len).map_err(|err| format!("id is not valid UTF-8: {err}"))?;
     let mut metadata = layout.create_session(id, vt_engine, cwd, cmd)?;
     metadata.record = desc.record;
-    let session_dir = layout.root().join(&metadata.id);
     let cols = desc.cols.max(1);
     let rows = desc.rows.max(1);
+    metadata.initial_size = TerminalSize { cols, rows };
+    let session_dir = layout.root().join(&metadata.id);
     let initial_geometry = TerminalGeometry::from_cell_size(cols, rows, desc.cell_width_px, desc.cell_height_px);
     let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(initial_geometry);
     let wake = provider.wake.clone();
@@ -2413,14 +2414,16 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
     let cwd = read_optional_utf8(desc.cwd, desc.cwd_len).map_err(|err| format!("cwd is not valid UTF-8: {err}"))?.map(PathBuf::from);
     let id = read_optional_utf8(desc.id, desc.id_len).map_err(|err| format!("id is not valid UTF-8: {err}"))?;
-    let metadata = ensure_session_started(&layout, id, Some(vt_engine), cwd, cmd, desc.record, colors)?;
-    let mut session = DaemonSession {
-        id: metadata.id,
-        runtime_root: provider.runtime_root.clone(),
-        rows: desc.rows.max(1),
-        observation: ObservationState::new(desc.rows.max(1)),
-    };
-    daemon_resize(&mut session, desc.cols.max(1), desc.rows.max(1))?;
+    let cols = desc.cols.max(1);
+    let rows = desc.rows.max(1);
+    let metadata = ensure_session_started(&layout, id, Some(vt_engine), cwd, cmd, SessionStartOptions {
+        record: desc.record,
+        initial_size: TerminalSize { cols, rows },
+        colors,
+    })?;
+    let mut session =
+        DaemonSession { id: metadata.id, runtime_root: provider.runtime_root.clone(), rows, observation: ObservationState::new(rows) };
+    daemon_resize(&mut session, cols, rows)?;
     Ok(session)
 }
 

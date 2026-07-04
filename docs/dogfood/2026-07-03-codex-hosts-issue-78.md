@@ -140,6 +140,20 @@ Check off as confirmed/refuted; surprises go in the friction log.
   lifecycle hole dogfooding exists to find: the run's most valuable artifact was
   destroyed by the run's final command.
 
+- **2026-07-04 (fleet phase)** Four codexes launched in parallel worktrees to fix
+  the run's own friction (#89 send --submit, #90 wait --screen-stable, #92 kill
+  preserves recordings, #93 test flake), ordered to de-sabotage first. Implementation
+  took 4-9 min each; every codex then self-shepherded its PR ($pr-shepherd) —
+  handling CI flake reruns, review pushback (tolerance defense on #95), and one
+  network-approval loop. All four merged (#94-#97) with zero rebase conflicts.
+  Biggest catch: #93's "flake" was a real **fork-safety bug** — exec_child
+  allocated after forkpty from a multithreaded parent (deadlock risk for embedded
+  hosts, not just tests); found because the deadline bump failed on its own PR's
+  CI. Retirement validated #96 in anger: all four recordings (85 MB) survived
+  kill. Remaining friction: monitors still need per-TUI prompt strings until
+  --screen-stable is in the driving binary; pr-shepherd.py re-flags addressed bot
+  comments (plugin-repo issue, not cleat).
+
 ## Issues spawned
 
 *(label: `dogfood`)*
@@ -149,4 +163,5 @@ Check off as confirmed/refuted; surprises go in the friction log.
 - [#88](https://github.com/flotilla-org/cleat/pull/88) — kqueue/epoll readiness (the run's output; #78 stays open)
 - [#89](https://github.com/flotilla-org/cleat/issues/89) — `send --submit` (composer swallows fast text+Enter)
 - [#90](https://github.com/flotilla-org/cleat/issues/90) — `wait --screen-stable` / `--at-prompt` (spinners defeat idle)
+- [#93](https://github.com/flotilla-org/cleat/issues/93) + fleet PRs [#94](https://github.com/flotilla-org/cleat/pull/94) [#95](https://github.com/flotilla-org/cleat/pull/95) [#96](https://github.com/flotilla-org/cleat/pull/96) [#97](https://github.com/flotilla-org/cleat/pull/97) — all merged 2026-07-04
 - [#92](https://github.com/flotilla-org/cleat/issues/92) — `kill` deletes active recordings (found at retirement; the run's recording is lost)

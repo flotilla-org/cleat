@@ -94,6 +94,16 @@ Check off as confirmed/refuted; surprises go in the friction log.
   conditional (controller-attach path? specific load shapes?) rather than
   constant — matches the decision to instrument before fixing.
 
+- **2026-07-04 (run live)** `wait --idle-time` is defeated by TUI spinners: codex
+  redraws its "Working (Nm Ns)" timer every second, so PTY output never goes
+  quiet and a 45 s idle monitor sat blind for 40 minutes *through an approval
+  prompt*. Also `inspect`'s `foreground_pgid != leader_pgid` signal is useless
+  for TUI agents (the TUI is always the foreground process). Workaround today:
+  `wait --text "Press enter to confirm" --idle-time 60` (OR semantics) to catch
+  approval prompts by text. Real need: a "screen stable" / semantic-prompt wait
+  condition -- the VT engine already has row-level dirty tracking and ghostty
+  exposes semantic prompt state per row, so both are buildable.
+
 ## Issues spawned
 
 *(label: `dogfood`)*

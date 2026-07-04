@@ -201,7 +201,8 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         let pid_path = daemon_pid_path(self.layout.root(), id);
-        if self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &()).is_ok() {
+        let socket_path = session_socket_path(self.layout.root(), id);
+        if socket_path.exists() && self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &()).is_ok() {
             if pid_path.exists() {
                 self.wait_for_session_shutdown(id);
             }
@@ -708,7 +709,14 @@ fn connect_session_socket(socket_path: &Path) -> Result<SessionStream, String> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{fs, os::unix::net::UnixListener, process::Command, sync::mpsc, thread, time::Duration};
+    use std::{
+        fs,
+        os::unix::net::UnixListener,
+        process::Command,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::SessionService;
     use crate::{
@@ -799,6 +807,21 @@ mod tests {
         reader.join().expect("join reader");
         assert!(request.starts_with("DELETE /sessions/alpha HTTP/1.1\r\n"), "{request}");
         assert!(!session_dir.exists(), "kill should remove the local session directory");
+    }
+
+    #[test]
+    fn kill_purge_preserved_recording_without_socket_returns_promptly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = temp.path().join("alpha");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::write(session_dir.join(crate::recording::CAST_FILE_NAME), b"{\"version\":3}\n").expect("write cast");
+
+        let started = Instant::now();
+        service.kill_with_purge("alpha", true).expect("purge preserved recording");
+
+        assert!(started.elapsed() < Duration::from_secs(1), "purge should not wait for a missing socket");
+        assert!(!session_dir.exists(), "purge should remove the preserved recording directory");
     }
 
     #[test]

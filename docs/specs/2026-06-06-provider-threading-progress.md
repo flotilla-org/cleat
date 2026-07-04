@@ -72,6 +72,37 @@ wake subscription. Until that exists, daemon-backed embeddings should treat wake
 as a local provider notification facility, not a complete cross-process event
 stream.
 
+### Daemon Progress And Servicing Split (direction)
+
+The in-process provider already separates progress from rendering via a per-session
+runtime actor. The daemon must reach the same invariant: **terminal progress is
+never blocked by client rendering or by control-plane servicing.** Today's daemon
+is a single event loop (`run_session_daemon`) where PTY read + VT feed, connection
+accept, control-request handling, and client output flushing all run on one thread.
+That fuses progress with servicing, so a slow control connection or an expensive
+`feed()` (e.g. image decode) delays delivery of up-to-date screen state to every
+client.
+
+The direction:
+
+- A dedicated **VT-feed owner** (thread/actor) owns PTY read, VT feed, and the
+  dirty generation. It is never blocked by connection or client I/O.
+- **Connection and control servicing move off** the feed path (thread-per-connection
+  or a non-blocking request state machine), so a client that dribbles a partial
+  request cannot stall feed. (The accepted-stream blocking read with a 100 ms
+  timeout in the current inline handler is exactly the stall to remove.)
+- The feed owner needs a **reliable readiness primitive on the PTY master**. `poll()`
+  on a PTY device is unreliable on macOS/Darwin; the owner should use the platform
+  edge/readiness mechanism (kqueue/epoll) rather than `poll()` so readability is not
+  capped at the idle tick. This is also the leading hypothesis for observed
+  "attach updates only after a long delay" latency and is tracked as its own bug.
+- A **dirty/wake subscription** crosses the socket so structured clients are pushed
+  updates (the generation model above, now cross-process) instead of polling. This
+  also serves multiple attached clients fanning in from one feed.
+
+This decouples the daemon's PTY host role from its client-facing role, which is the
+same separation the M:N hub direction relies on.
+
 ## Target Model
 
 The intended provider contract is:

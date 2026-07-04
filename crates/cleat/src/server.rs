@@ -1,11 +1,13 @@
 use std::{
     path::Path,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use http::{Method, StatusCode};
 use serde::de::DeserializeOwned;
+
+const EMPTY_SESSION_DIR_GRACE: Duration = Duration::from_secs(2);
 
 use crate::{
     http_uds,
@@ -138,7 +140,7 @@ impl SessionService {
             };
             let socket_path = session_socket_path(self.layout.root(), &id);
             if !socket_path.exists() {
-                if session_dir_is_empty(&path) {
+                if session_dir_is_stale_empty(&path, EMPTY_SESSION_DIR_GRACE) {
                     let _ = self.layout.remove_session(&id);
                 }
                 continue;
@@ -581,6 +583,17 @@ fn session_dir_is_empty(path: &Path) -> bool {
     std::fs::read_dir(path).map(|mut entries| entries.next().is_none()).unwrap_or(false)
 }
 
+fn session_dir_is_stale_empty(path: &Path, grace: Duration) -> bool {
+    if !session_dir_is_empty(path) {
+        return false;
+    }
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= grace)
+}
+
 fn session_dir_contains_only(path: &Path, expected: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
@@ -715,15 +728,17 @@ fn connect_session_socket(socket_path: &Path) -> Result<SessionStream, String> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
+        ffi::CString,
         fs,
-        os::unix::net::UnixListener,
+        os::unix::{ffi::OsStrExt, net::UnixListener},
+        path::Path,
         process::Command,
         sync::mpsc,
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use super::SessionService;
+    use super::{SessionService, EMPTY_SESSION_DIR_GRACE};
     use crate::{
         http_uds::read_http_request_for_test,
         protocol::{WaitCondition, WaitStatus},
@@ -1013,10 +1028,24 @@ mod tests {
 
         let session_dir = temp.path().join("empty-session");
         fs::create_dir_all(&session_dir).expect("create session dir");
+        set_mtime_ago(&session_dir, EMPTY_SESSION_DIR_GRACE + Duration::from_secs(1));
 
         let sessions = service.list().expect("list sessions");
         assert!(sessions.is_empty(), "empty session dir should not appear in list");
         assert!(!session_dir.exists(), "empty session dir should be cleaned up");
+    }
+
+    #[test]
+    fn list_preserves_young_empty_session_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+        let session_dir = temp.path().join("starting-empty-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let sessions = service.list().expect("list sessions");
+        assert!(sessions.is_empty(), "young empty session dir should not appear in list");
+        assert!(session_dir.exists(), "young empty session dir should be allowed to finish starting");
     }
 
     #[test]
@@ -1036,5 +1065,15 @@ mod tests {
         let sessions = service.list().expect("list sessions");
         assert!(sessions.is_empty(), "stale session should not appear in list");
         assert!(session_dir.exists(), "a recreatable session directory must survive the stale sweep");
+    }
+
+    fn set_mtime_ago(path: &Path, age: Duration) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time after epoch");
+        let target = now.checked_sub(age).expect("age before now");
+        let timeval = libc::timeval { tv_sec: target.as_secs() as libc::time_t, tv_usec: target.subsec_micros() as libc::suseconds_t };
+        let times = [timeval, timeval];
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("path without nul");
+        let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "set mtime for {}", path.display());
     }
 }

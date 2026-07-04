@@ -213,7 +213,13 @@ fn detach_command_parses() {
 #[test]
 fn kill_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "kill", "session-1"]).expect("kill parses");
-    assert_eq!(cli.command, Command::Kill { id: "session-1".into() });
+    assert_eq!(cli.command, Command::Kill { id: "session-1".into(), purge: false });
+}
+
+#[test]
+fn kill_purge_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "kill", "session-1", "--purge"]).expect("kill --purge parses");
+    assert_eq!(cli.command, Command::Kill { id: "session-1".into(), purge: true });
 }
 
 #[test]

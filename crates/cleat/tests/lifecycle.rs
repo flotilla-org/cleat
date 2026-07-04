@@ -575,6 +575,53 @@ fn kill_removes_session_directory() {
 }
 
 #[test]
+fn kill_preserves_session_directory_with_recording() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sh -c 'printf preserved; sleep 30'".into()), true)
+        .expect("create alpha");
+
+    let cast_path = temp.path().join("alpha").join(CAST_FILE_NAME);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !cast_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(cast_path.exists(), "recording should exist before kill");
+
+    let cli = Cli::try_parse_from(["cleat", "kill", "alpha"]).expect("parse kill");
+    cli::execute(cli, &service).expect("execute kill");
+
+    assert!(temp.path().join("alpha").exists(), "recording-bearing session directory should be preserved");
+    assert!(cast_path.exists(), "recording should survive kill");
+    assert!(!session_socket_path(temp.path(), "alpha").exists(), "socket should not survive kill");
+    assert!(!daemon_pid_path(temp.path(), "alpha").exists(), "pid file should not survive kill");
+}
+
+#[test]
+fn kill_purge_removes_session_directory_with_recording() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sh -c 'printf purged; sleep 30'".into()), true)
+        .expect("create alpha");
+
+    let cast_path = temp.path().join("alpha").join(CAST_FILE_NAME);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !cast_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(cast_path.exists(), "recording should exist before purge");
+
+    let cli = Cli::try_parse_from(["cleat", "kill", "alpha", "--purge"]).expect("parse kill --purge");
+    cli::execute(cli, &service).expect("execute kill --purge");
+
+    assert!(!temp.path().join("alpha").exists(), "purge should delete the recording-bearing session directory");
+}
+
+#[test]
 fn kill_missing_session_is_an_error() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

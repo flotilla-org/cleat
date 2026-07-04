@@ -615,6 +615,7 @@ fn wait_condition_to_http(condition: crate::protocol::WaitCondition) -> http_uds
     match condition {
         crate::protocol::WaitCondition::OutputIdle { quiet_ms } => http_uds::WaitConditionRequest::OutputIdle { quiet_ms },
         crate::protocol::WaitCondition::TextMatch { text } => http_uds::WaitConditionRequest::TextMatch { text },
+        crate::protocol::WaitCondition::ScreenStable { stable_ms } => http_uds::WaitConditionRequest::ScreenStable { stable_ms },
     }
 }
 
@@ -793,13 +794,20 @@ mod tests {
                 .expect("write response");
         });
 
-        let result = service.wait("alpha", vec![WaitCondition::OutputIdle { quiet_ms: 250 }], 5000).expect("wait");
+        let result = service
+            .wait("alpha", vec![WaitCondition::OutputIdle { quiet_ms: 250 }, WaitCondition::ScreenStable { stable_ms: 750 }], 5000)
+            .expect("wait");
         let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
 
         reader.join().expect("join reader");
         assert_eq!(result, (WaitStatus::Ready, 42));
         assert!(request.starts_with("POST /sessions/alpha/wait HTTP/1.1\r\n"), "{request}");
-        assert!(request.ends_with(r#"{"conditions":[{"kind":"output_idle","quiet_ms":250}],"timeout_ms":5000}"#), "{request}");
+        assert!(
+            request.ends_with(
+                r#"{"conditions":[{"kind":"output_idle","quiet_ms":250},{"kind":"screen_stable","stable_ms":750}],"timeout_ms":5000}"#
+            ),
+            "{request}"
+        );
     }
 
     #[test]

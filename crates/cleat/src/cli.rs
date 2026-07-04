@@ -311,8 +311,9 @@ resolved through the live daemon socket. \n\
     #[command(after_long_help = "Conditions (OR semantics — any match wins):\n\
                            \x20 --idle-time N  Wait until no PTY output for N seconds\n\
                            \x20 --text STR     Wait until STR appears on the VT screen\n\
+                           \x20 --screen-stable N  Wait until the rendered screen is stable for N\n\
                            \n\
-                           At least one of --idle-time or --text is required.\n\
+                           At least one condition is required.\n\
                            \n\
                            NOTE: --text matches against the current VT screen state. If the\n\
                            text is already visible when wait is called, it returns immediately.\n\
@@ -332,6 +333,9 @@ resolved through the live daemon socket. \n\
         idle_time: Option<std::time::Duration>,
         #[arg(long, help = "Wait until this text appears on screen")]
         text: Option<String>,
+        /// Wait until the rendered screen is stable for this duration (e.g., 500ms, 2s, or plain seconds).
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
+        screen_stable: Option<std::time::Duration>,
         #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
         timeout: f64,
         #[arg(long, help = "Output as JSON")]
@@ -701,7 +705,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
-        Command::Wait { id, idle_time, text, timeout, json } => execute_wait(service, id, idle_time, text, timeout, json),
+        Command::Wait { id, idle_time, text, screen_stable, timeout, json } => {
+            execute_wait(service, id, idle_time, text, screen_stable, timeout, json)
+        }
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
         }
@@ -732,13 +738,14 @@ fn execute_wait(
     id: String,
     idle_time: Option<std::time::Duration>,
     text: Option<String>,
+    screen_stable: Option<std::time::Duration>,
     timeout: f64,
     json: bool,
 ) -> ExecResult {
-    if idle_time.is_none() && text.is_none() {
+    if idle_time.is_none() && text.is_none() && screen_stable.is_none() {
         return ExecResult::Exit {
             code: 2,
-            message: Some("wait requires at least one of --idle-time or --text".to_string()),
+            message: Some("wait requires at least one of --idle-time, --text, or --screen-stable".to_string()),
             output: None,
         };
     }
@@ -757,6 +764,13 @@ fn execute_wait(
     }
     if let Some(pattern) = text {
         conditions.push(WaitCondition::TextMatch { text: pattern });
+    }
+    if let Some(dur) = screen_stable {
+        let secs = dur.as_secs_f64();
+        if !(0.0..=86_400.0).contains(&secs) {
+            return ExecResult::Exit { code: 2, message: Some(format!("invalid screen-stable: {secs} (max 86400)")), output: None };
+        }
+        conditions.push(WaitCondition::ScreenStable { stable_ms: (secs * 1000.0) as u64 });
     }
     let timeout_ms = (timeout * 1000.0) as u64;
 

@@ -38,6 +38,7 @@ const DETACH_CLEANUP_SEQUENCE: &[u8] =
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const TERMINATE_SIGNAL: i32 = 15;
+const SCREEN_STABLE_CHANGED_CELL_TOLERANCE: usize = 16;
 
 #[derive(Debug)]
 pub struct ForegroundAttach {
@@ -433,8 +434,62 @@ fn apply_attach_state(
 struct PendingWait {
     stream: SessionStream,
     conditions: Vec<crate::protocol::WaitCondition>,
+    screen_stable: Option<ScreenStableState>,
     timeout_ms: u64,
     registered_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ScreenStableFingerprint {
+    cols: u16,
+    rows: u16,
+    viewport_kind: crate::provider::TerminalViewportKind,
+    scrollback_offset_rows: u64,
+    cells: Vec<crate::provider::TerminalCell>,
+}
+
+impl ScreenStableFingerprint {
+    fn from_snapshot(snapshot: crate::provider::TerminalSnapshot) -> Self {
+        Self {
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            viewport_kind: snapshot.viewport_kind,
+            scrollback_offset_rows: snapshot.scrollback_offset_rows,
+            cells: snapshot.cells,
+        }
+    }
+
+    fn significant_change_from(&self, other: &Self) -> bool {
+        if self.cols != other.cols
+            || self.rows != other.rows
+            || self.viewport_kind != other.viewport_kind
+            || self.scrollback_offset_rows != other.scrollback_offset_rows
+            || self.cells.len() != other.cells.len()
+        {
+            return true;
+        }
+
+        self.cells.iter().zip(&other.cells).filter(|(left, right)| left != right).count() > SCREEN_STABLE_CHANGED_CELL_TOLERANCE
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScreenStableState {
+    fingerprint: ScreenStableFingerprint,
+    stable_since: Instant,
+}
+
+impl ScreenStableState {
+    fn new(fingerprint: ScreenStableFingerprint, stable_since: Instant) -> Self {
+        Self { fingerprint, stable_since }
+    }
+
+    fn observe(&mut self, fingerprint: ScreenStableFingerprint, observed_at: Instant) {
+        if self.fingerprint.significant_change_from(&fingerprint) {
+            self.fingerprint = fingerprint;
+            self.stable_since = observed_at;
+        }
+    }
 }
 
 struct PendingExpect {
@@ -609,6 +664,12 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
         // Evaluate pending waits on each loop tick.
         // Write errors are intentionally discarded — the client may have disconnected.
+        let screen_stable_fingerprint = if pending_waits.iter().any(|wait| wait.screen_stable.is_some()) {
+            runtime.snapshot(crate::provider::DirtyState::Full).ok().map(ScreenStableFingerprint::from_snapshot)
+        } else {
+            None
+        };
+        let now = Instant::now();
         pending_waits.retain_mut(|wait| {
             let elapsed = wait.registered_at.elapsed();
             let elapsed_ms = elapsed.as_millis() as u64;
@@ -617,6 +678,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             if elapsed_ms >= wait.timeout_ms {
                 let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
                 return false;
+            }
+
+            if let (Some(state), Some(fingerprint)) = (wait.screen_stable.as_mut(), screen_stable_fingerprint.as_ref()) {
+                state.observe(fingerprint.clone(), now);
             }
 
             // Check conditions (OR semantics — any match wins)
@@ -638,6 +703,15 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         if runtime.screen_contains(text.as_str()) {
                             let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
                             return false;
+                        }
+                    }
+                    crate::protocol::WaitCondition::ScreenStable { stable_ms } => {
+                        if let Some(state) = wait.screen_stable.as_ref() {
+                            let stable_duration_ms = state.stable_since.elapsed().as_millis() as u64;
+                            if stable_duration_ms >= *stable_ms {
+                                let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
+                                return false;
+                            }
                         }
                     }
                 }
@@ -961,6 +1035,8 @@ fn handle_http_request(
             }
 
             let has_text_match = conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::TextMatch { .. }));
+            let has_screen_stable =
+                conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::ScreenStable { .. }));
             if has_text_match {
                 if let Err(err) = state.runtime.validate_text_matching() {
                     http_uds::write_error(stream, StatusCode::CONFLICT, &format!("text matching not supported: {err}"))
@@ -968,6 +1044,19 @@ fn handle_http_request(
                     break 'wait Ok(());
                 }
             }
+            let registered_at = Instant::now();
+            let screen_stable = if has_screen_stable {
+                match state.runtime.snapshot(crate::provider::DirtyState::Full) {
+                    Ok(snapshot) => Some(ScreenStableState::new(ScreenStableFingerprint::from_snapshot(snapshot), registered_at)),
+                    Err(err) => {
+                        http_uds::write_error(stream, StatusCode::CONFLICT, &format!("screen stability not supported: {err}"))
+                            .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                        break 'wait Ok(());
+                    }
+                }
+            } else {
+                None
+            };
 
             if has_text_match {
                 for condition in &conditions {
@@ -993,8 +1082,9 @@ fn handle_http_request(
             state.pending_waits.push(PendingWait {
                 stream: pending_stream,
                 conditions,
+                screen_stable,
                 timeout_ms: body.timeout_ms,
-                registered_at: Instant::now(),
+                registered_at,
             });
             Ok(())
         }
@@ -1016,6 +1106,7 @@ fn wait_condition_from_http(condition: http_uds::WaitConditionRequest) -> crate:
     match condition {
         http_uds::WaitConditionRequest::OutputIdle { quiet_ms } => crate::protocol::WaitCondition::OutputIdle { quiet_ms },
         http_uds::WaitConditionRequest::TextMatch { text } => crate::protocol::WaitCondition::TextMatch { text },
+        http_uds::WaitConditionRequest::ScreenStable { stable_ms } => crate::protocol::WaitCondition::ScreenStable { stable_ms },
     }
 }
 
@@ -1173,11 +1264,14 @@ fn wait_for_socket(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     use super::{
         apply_attach_state, attach_foreground, attach_init_capabilities, default_vt_engine, record_pty_output, session_socket_path,
-        AttachCleanupGuard, TestReplayProbeVtEngine,
+        AttachCleanupGuard, ScreenStableFingerprint, ScreenStableState, TestReplayProbeVtEngine, SCREEN_STABLE_CHANGED_CELL_TOLERANCE,
     };
     use crate::{
         http_uds::read_http_request_for_test,
@@ -1324,6 +1418,61 @@ mod tests {
     #[test]
     fn lifecycle_attach_init_capabilities_use_conservative_terminal_assumptions() {
         assert_eq!(attach_init_capabilities(), vt::ClientCapabilities::conservative_fallback());
+    }
+
+    fn screen_stable_fingerprint_with_cells(cell_count: usize, changed_prefix: usize) -> ScreenStableFingerprint {
+        let cells = (0..cell_count)
+            .map(|index| crate::provider::TerminalCell {
+                graphemes: vec![if index < changed_prefix { 'x' as u32 } else { 'a' as u32 }],
+                ..crate::provider::TerminalCell::default()
+            })
+            .collect();
+        ScreenStableFingerprint {
+            cols: cell_count as u16,
+            rows: 1,
+            viewport_kind: crate::provider::TerminalViewportKind::LiveNormal,
+            scrollback_offset_rows: 0,
+            cells,
+        }
+    }
+
+    #[test]
+    fn screen_stable_tolerates_small_rendered_cell_churn() {
+        let baseline = screen_stable_fingerprint_with_cells(80, 0);
+        let spinner_tick = screen_stable_fingerprint_with_cells(80, SCREEN_STABLE_CHANGED_CELL_TOLERANCE);
+
+        assert!(!baseline.significant_change_from(&spinner_tick));
+    }
+
+    #[test]
+    fn screen_stable_resets_on_large_rendered_cell_change() {
+        let baseline = screen_stable_fingerprint_with_cells(80, 0);
+        let changed = screen_stable_fingerprint_with_cells(80, SCREEN_STABLE_CHANGED_CELL_TOLERANCE + 1);
+
+        assert!(baseline.significant_change_from(&changed));
+    }
+
+    #[test]
+    fn screen_stable_resets_on_geometry_change() {
+        let baseline = screen_stable_fingerprint_with_cells(80, 0);
+        let mut resized = baseline.clone();
+        resized.cols = 40;
+
+        assert!(baseline.significant_change_from(&resized));
+    }
+
+    #[test]
+    fn screen_stable_observe_only_resets_timestamp_for_significant_changes() {
+        let baseline = screen_stable_fingerprint_with_cells(80, 0);
+        let mut state = ScreenStableState::new(baseline, Instant::now());
+        let original_stable_since = state.stable_since;
+
+        state.observe(screen_stable_fingerprint_with_cells(80, 1), original_stable_since + Duration::from_millis(100));
+        assert_eq!(state.stable_since, original_stable_since);
+
+        let reset_at = original_stable_since + Duration::from_millis(200);
+        state.observe(screen_stable_fingerprint_with_cells(80, SCREEN_STABLE_CHANGED_CELL_TOLERANCE + 1), reset_at);
+        assert_eq!(state.stable_since, reset_at);
     }
 
     #[test]

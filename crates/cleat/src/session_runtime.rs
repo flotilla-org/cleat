@@ -564,7 +564,10 @@ mod tests {
     #[test]
     fn recreation_seeds_scrollback_from_prior_recording() {
         fn pump_until_screen_contains(rt: &mut SessionRuntime, needle: &str) {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // This wait is setup for a replay correctness check, not a latency
+            // assertion. Under parallel PTY-heavy test runs, the child can take
+            // several seconds to exec before it emits the marker.
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 rt.read_available_output(false).expect("read pty output");
                 if rt.screen_contains(needle) {

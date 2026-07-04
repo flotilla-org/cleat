@@ -212,13 +212,13 @@ fn poll_session_ready_epoll(
 
     let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).map_err(|err| format!("create daemon epoll: {err}"))?;
     epoll
-        .add(borrow_raw(listener.as_raw_fd()), EpollEvent::new(read_epoll_flags(), TOKEN_LISTENER))
+        .add(borrow_raw(listener.as_raw_fd()), EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_LISTENER))
         .map_err(|err| format!("register listener with epoll: {err}"))?;
     epoll
-        .add(borrow_raw(pty_child.master_fd()), EpollEvent::new(read_epoll_flags(), TOKEN_PTY))
+        .add(borrow_raw(pty_child.master_fd()), EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_PTY))
         .map_err(|err| format!("register pty with epoll: {err}"))?;
     if let Some(client) = client {
-        let mut flags = read_epoll_flags();
+        let mut flags = EpollFlags::EPOLLIN;
         if client_needs_write {
             flags |= EpollFlags::EPOLLOUT;
         }
@@ -240,22 +240,16 @@ fn poll_session_ready_epoll(
     for event in events.iter().take(event_count) {
         let flags = event.events();
         match event.data() {
-            TOKEN_LISTENER => result.listener_readable = flags.intersects(read_epoll_flags()),
-            TOKEN_PTY => result.pty_readable = flags.intersects(read_epoll_flags()),
+            TOKEN_LISTENER => result.listener_readable = flags.contains(EpollFlags::EPOLLIN),
+            TOKEN_PTY => result.pty_readable = flags.contains(EpollFlags::EPOLLIN),
             TOKEN_CLIENT => {
-                result.client_readable = flags.intersects(read_epoll_flags());
-                result.client_writable =
-                    client_needs_write && flags.intersects(EpollFlags::EPOLLOUT | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR);
+                result.client_readable = flags.contains(EpollFlags::EPOLLIN);
+                result.client_writable = client_needs_write && flags.contains(EpollFlags::EPOLLOUT);
             }
             _ => {}
         }
     }
     Ok(result)
-}
-
-#[cfg(target_os = "linux")]
-fn read_epoll_flags() -> EpollFlags {
-    EpollFlags::EPOLLIN | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

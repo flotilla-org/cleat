@@ -130,9 +130,10 @@ What the session advertises *to the PTY child* in answer to its capability queri
   **primary controller** (below); with no controller it falls back to the default.
 
 **Controller**:
-An attachment allowed to drive the session — its input reaches the PTY. A session
-may have more than one; interference between concurrent controllers is the
-controllers' own responsibility, not cleat's.
+An attachment allowed to drive the session — its input reaches the PTY. In the
+first cut a session has at most one controller (see Take control); concurrent
+co-controllers are a **deferred** extension, and when they arrive, interference
+between them is the controllers' own responsibility, not cleat's.
 
 **Watcher**:
 An attachment that consumes the Update Packet read-only. It renders the session
@@ -140,9 +141,14 @@ but its input does not reach the PTY. The basis for "you are not in control"
 indication.
 
 **Primary controller**:
-The first-attached controller. The query target for Passthrough capability policy.
-The primary is the *query target*, which is independent of which controller's input
-is currently reaching the PTY.
+The first controller to attach in an activation. The query target for Passthrough
+capability policy, independent of which attachment's input is currently reaching
+the PTY. The designation is **sticky**: it does not move when control is taken —
+the demoted attachment remains the query target as a watcher, because Passthrough
+exists to give the child coherent capability answers from *one* emulator across
+the session (launch in xterm, drive from a remote attachment, xterm still answers
+queries), not from whoever currently drives. Only if the primary's attachment
+detaches entirely does Passthrough fall back to the default (engine) policy.
 
 **Grid geometry** (what size the child sees):
 The PTY grid is one `(rows, cols)` the child lays out to. Who decides it:
@@ -162,12 +168,15 @@ shrink the grid the controller is driving.
 
 **Take control**:
 A watcher promoting itself to controller. In the first cut a session has at most
-one controller, so taking control is a **forced handoff**: the requester becomes
-controller and the previous controller is **demoted to watcher** (not detached),
-which it learns from its own control state. Concurrent co-controllers are a
-deferred extension; until then, interference is impossible because control is
-exclusive. Control state (own role, who holds control) rides the Update Packet
+one controller, so taking control is a **forced reassignment**: the requester
+becomes controller and the previous controller is **demoted to watcher** (not
+detached), which it learns from its own control state. Concurrent co-controllers
+are a deferred extension; until then, interference is impossible because control
+is exclusive. Control state (own role, who holds control) rides the Update Packet
 like any other frontend-relevant state — never a side-channel query.
+_Avoid_: handoff (reserved as Transfer's alias — moving a session's PTY between
+hostings; taking control reassigns a *role between attachments* on the same
+hosting).
 
 **Recording**:
 The append-only log of a session's output (asciicast v3), optionally with VT

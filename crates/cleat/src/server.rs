@@ -146,6 +146,7 @@ impl SessionService {
             if !daemon_pid_path(self.layout.root(), &id).exists()
                 && !crate::recreate::session_is_recreatable(&path)
                 && session_dir_contains_only(&path, &socket_path)
+                && session_socket_is_stale(&socket_path)
             {
                 let _ = self.layout.remove_session(&id);
                 continue;
@@ -597,6 +598,10 @@ fn session_dir_contains_only(path: &Path, expected: &Path) -> bool {
     count == 1
 }
 
+fn session_socket_is_stale(socket_path: &Path) -> bool {
+    try_connect_session_stream(socket_path).is_err()
+}
+
 /// Resolve start and end bounds into byte offsets against a cast file without
 /// going through the daemon. Marker-based bounds are rejected; the CLI is
 /// expected to prevent these combinations via clap's `conflicts_with = "path"`
@@ -967,12 +972,38 @@ mod tests {
         let session_dir = temp.path().join("socket-only");
         fs::create_dir_all(&session_dir).expect("create session dir");
         let socket_path = session_socket_path(temp.path(), "socket-only");
-        let listener = UnixListener::bind(&socket_path).expect("bind socket");
-        drop(listener);
+        fs::write(&socket_path, b"stale socket placeholder").expect("write stale socket placeholder");
 
         let sessions = service.list().expect("list sessions");
         assert!(sessions.is_empty(), "socket-only husk should not appear in list");
         assert!(!session_dir.exists(), "socket-only husk should be cleaned up");
+    }
+
+    #[test]
+    fn list_preserves_socket_only_session_when_socket_is_connectable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+        let session_dir = temp.path().join("starting-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let socket_path = session_socket_path(temp.path(), "starting-session");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let reader = thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
+
+        let sessions = service.list().expect("list sessions");
+        assert_eq!(sessions.len(), 1, "connectable no-pid socket should be treated as starting");
+        assert_eq!(sessions[0].id, "starting-session");
+        assert!(sessions[0].error.is_some(), "inspect failure should be reported while preserving the directory");
+        assert!(session_dir.exists(), "connectable no-pid socket should not be cleaned up as a husk");
+
+        reader.join().expect("join reader");
     }
 
     #[test]

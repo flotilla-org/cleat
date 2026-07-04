@@ -162,6 +162,7 @@ pub(crate) struct WaitRequest {
 pub(crate) enum WaitConditionRequest {
     OutputIdle { quiet_ms: u64 },
     TextMatch { text: String },
+    ScreenStable { stable_ms: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

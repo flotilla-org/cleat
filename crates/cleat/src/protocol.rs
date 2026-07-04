@@ -92,6 +92,7 @@ const TAG_ERROR: u8 = 9;
 pub enum WaitCondition {
     OutputIdle { quiet_ms: u64 },
     TextMatch { text: String },
+    ScreenStable { stable_ms: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

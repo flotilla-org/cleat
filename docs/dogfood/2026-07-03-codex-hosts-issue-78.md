@@ -131,6 +131,15 @@ Check off as confirmed/refuted; surprises go in the friction log.
   datapoint of the run: the full author->CI->review->merge-ready loop is
   workable with the agent hosted in a cleat session.
 
+- **2026-07-04 (retirement)** `cleat kill codex-78` **deleted the active
+  recording** — the daemon preserved the session dir (recorder present) but
+  `SessionService::kill` unconditionally `remove_session`s it afterwards. The
+  full record of the run is gone; filed as #92. Also found ~30 empty
+  `session-<uuid>` husks and a crashed session dir (stale socket, no pid file)
+  that `list` reports as an error forever. Painful but exactly the kind of
+  lifecycle hole dogfooding exists to find: the run's most valuable artifact was
+  destroyed by the run's final command.
+
 ## Issues spawned
 
 *(label: `dogfood`)*
@@ -140,3 +149,4 @@ Check off as confirmed/refuted; surprises go in the friction log.
 - [#88](https://github.com/flotilla-org/cleat/pull/88) — kqueue/epoll readiness (the run's output; #78 stays open)
 - [#89](https://github.com/flotilla-org/cleat/issues/89) — `send --submit` (composer swallows fast text+Enter)
 - [#90](https://github.com/flotilla-org/cleat/issues/90) — `wait --screen-stable` / `--at-prompt` (spinners defeat idle)
+- [#92](https://github.com/flotilla-org/cleat/issues/92) — `kill` deletes active recordings (found at retirement; the run's recording is lost)

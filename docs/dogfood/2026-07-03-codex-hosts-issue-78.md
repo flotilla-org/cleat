@@ -126,3 +126,5 @@ Check off as confirmed/refuted; surprises go in the friction log.
 - [#79](https://github.com/flotilla-org/cleat/issues/79) — `launch --size` (prep 1)
 - [#80](https://github.com/flotilla-org/cleat/issues/80) — `cleat watch` byte-tee MVP (prep 2)
 - [#88](https://github.com/flotilla-org/cleat/pull/88) — kqueue/epoll readiness (the run's output; #78 stays open)
+- [#89](https://github.com/flotilla-org/cleat/issues/89) — `send --submit` (composer swallows fast text+Enter)
+- [#90](https://github.com/flotilla-org/cleat/issues/90) — `wait --screen-stable` / `--at-prompt` (spinners defeat idle)

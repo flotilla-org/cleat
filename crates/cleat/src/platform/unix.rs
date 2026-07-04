@@ -153,7 +153,13 @@ fn poll_session_ready_kqueue(
 
     let mut events = [KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0); 4];
     let timeout = kqueue_timeout(timeout_ms);
-    let event_count = kqueue.kevent(&changes, &mut events, timeout).map_err(|err| format!("kqueue daemon fds: {err}"))?;
+    let event_count = loop {
+        match kqueue.kevent(&changes, &mut events, timeout) {
+            Ok(event_count) => break event_count,
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(format!("kqueue daemon fds: {err}")),
+        }
+    };
     let mut result = PollResult { listener_readable: false, client_readable: false, client_writable: false, pty_readable: false };
     for event in events.iter().take(event_count) {
         if event.flags().contains(EvFlags::EV_ERROR) {
@@ -223,7 +229,13 @@ fn poll_session_ready_epoll(
 
     let mut events = [EpollEvent::empty(); 3];
     let timeout = PollTimeout::try_from(timeout_ms).map_err(|err| format!("invalid epoll timeout: {err}"))?;
-    let event_count = epoll.wait(&mut events, timeout).map_err(|err| format!("epoll daemon fds: {err}"))?;
+    let event_count = loop {
+        match epoll.wait(&mut events, timeout) {
+            Ok(event_count) => break event_count,
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(format!("epoll daemon fds: {err}")),
+        }
+    };
     let mut result = PollResult { listener_readable: false, client_readable: false, client_writable: false, pty_readable: false };
     for event in events.iter().take(event_count) {
         let flags = event.events();
@@ -232,7 +244,8 @@ fn poll_session_ready_epoll(
             TOKEN_PTY => result.pty_readable = flags.intersects(read_epoll_flags()),
             TOKEN_CLIENT => {
                 result.client_readable = flags.intersects(read_epoll_flags());
-                result.client_writable = flags.intersects(EpollFlags::EPOLLOUT | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR);
+                result.client_writable =
+                    client_needs_write && flags.intersects(EpollFlags::EPOLLOUT | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR);
             }
             _ => {}
         }
@@ -474,7 +487,7 @@ mod tests {
             id: "pty-ready".to_string(),
             vt_engine: VtEngineKind::Passthrough,
             cwd: None,
-            cmd: Some("printf READY".to_string()),
+            cmd: Some("sleep 0.2; printf READY; sleep 0.2".to_string()),
             record: false,
             initial_size: TerminalSize::default(),
             colors: TerminalColors::default(),
@@ -486,9 +499,21 @@ mod tests {
         loop {
             let result = super::poll_session_ready(&listener, None, false, &pty_child, 100).expect("poll session ready");
             if result.pty_readable {
+                reap_pty_child(&pty_child, deadline);
                 return;
             }
             assert!(Instant::now() < deadline, "timed out waiting for PTY readiness");
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn reap_pty_child(pty_child: &super::PtyChild, deadline: Instant) {
+        loop {
+            if pty_child.exited().expect("check child exit").is_some() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for PTY child exit");
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }

@@ -646,6 +646,21 @@ fn wait_execute_rejects_no_conditions() {
 }
 
 #[test]
+fn wait_execute_rejects_screen_stable_above_maximum() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--screen-stable", "86401s"]).expect("parse");
+    let result = execute(cli, &service);
+    match result {
+        ExecResult::Exit { code: 2, message: Some(msg), .. } => {
+            assert!(msg.contains("invalid screen-stable"));
+            assert!(msg.contains("max 86400"));
+        }
+        other => panic!("screen-stable above maximum should exit 2, got: {other:?}"),
+    }
+}
+
+#[test]
 fn wait_idle_time_accepts_humantime_and_seconds() {
     // Both forms parse to the same Duration.
     let humantime_form = Cli::try_parse_from(["cleat", "wait", "x", "--idle-time", "500ms"]).expect("humantime parse");

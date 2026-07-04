@@ -106,6 +106,7 @@ Three layers cooperate during a session. Knowing which layer is authoritative fo
 | `record`, `mark` | recording | Mutates recording state |
 | `wait --idle-time` | daemon | PTY-output idle timer |
 | `wait --text` | VT engine | Consults the rendered screen grid |
+| `wait --screen-stable` | VT engine | Waits for the rendered screen grid to stop changing |
 
 ### Queries and capabilities
 

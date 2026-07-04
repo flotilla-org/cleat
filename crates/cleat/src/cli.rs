@@ -311,7 +311,7 @@ resolved through the live daemon socket. \n\
     #[command(after_long_help = "Conditions (OR semantics — any match wins):\n\
                            \x20 --idle-time N  Wait until no PTY output for N seconds\n\
                            \x20 --text STR     Wait until STR appears on the VT screen\n\
-                           \x20 --screen-stable N  Wait until the rendered screen is stable for N\n\
+                           \x20 --screen-stable N  Wait until the rendered screen is stable for N (e.g., 500ms, 2s)\n\
                            \n\
                            At least one condition is required.\n\
                            \n\

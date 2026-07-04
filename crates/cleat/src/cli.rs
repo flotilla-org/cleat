@@ -38,6 +38,8 @@ pub struct Cli {
     pub command: Command,
 }
 
+// Bracketed paste marks the paste/submit boundary explicitly; the delay only
+// gives the TUI a short turn to consume the completed paste before Enter.
 const SUBMIT_ENTER_DELAY: Duration = Duration::from_millis(100);
 
 /// Recording flags shared by the session-creating commands. Recording is on by
@@ -691,17 +693,16 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Command::Send { id, text, no_enter, submit, mark_before } => {
             if submit {
                 let marker_offset = if let Some(marker_name) = mark_before {
-                    match service.named_mark(&id, &marker_name) {
+                    match service.send_paste_with_mark(&id, &text, &marker_name) {
                         Ok(offset) => Some(offset),
                         Err(e) => return ExecResult::Err(e),
                     }
                 } else {
+                    if let Err(e) = service.send_input(&id, &http_uds::InputRequest::Paste { text }) {
+                        return ExecResult::Err(e);
+                    }
                     None
                 };
-
-                if let Err(e) = service.send_input(&id, &http_uds::InputRequest::Paste { text }) {
-                    return ExecResult::Err(e);
-                }
                 std::thread::sleep(SUBMIT_ENTER_DELAY);
                 if let Err(e) = service
                     .send_input(&id, &http_uds::InputRequest::Key { key: http_uds::KeyRequest::Named { key: http_uds::NamedKey::Enter } })

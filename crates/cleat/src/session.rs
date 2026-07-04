@@ -890,6 +890,14 @@ fn handle_http_request(
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP keys-with-mark response: {err}"))
         }
+        http_uds::Route::SessionPasteWithMark { id } if id == daemon_id => {
+            let body: http_uds::PasteWithMarkRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP paste-with-mark request: {err}"))?;
+            let bytes = state.runtime.encode_paste(body.text.as_bytes())?;
+            let offset = state.runtime.write_input_with_mark(&bytes, body.marker_name)?;
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
+                .map_err(|err| format!("write HTTP paste-with-mark response: {err}"))
+        }
         http_uds::Route::SessionRecord { id } if id == daemon_id => {
             let body: http_uds::RecordRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;

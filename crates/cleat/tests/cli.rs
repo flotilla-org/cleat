@@ -635,7 +635,7 @@ fn send_submit_with_mark_marks_before_paste_and_returns_offset() {
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind socket");
     let reader = std::thread::spawn(move || {
         let mut requests = Vec::new();
-        for index in 0..3 {
+        for index in 0..2 {
             use std::io::Write;
 
             let (mut stream, _) = listener.accept().expect("accept connection");
@@ -655,13 +655,11 @@ fn send_submit_with_mark_marks_before_paste_and_returns_offset() {
     assert_eq!(execute(cli, &service).expect("execute send --submit"), Some("42".to_string()));
 
     let requests = reader.join().expect("join reader");
-    assert_eq!(requests.len(), 3);
-    assert!(requests[0].starts_with("POST /sessions/alpha/mark HTTP/1.1\r\n"), "{}", requests[0]);
-    assert!(requests[0].ends_with(r#"{"name":"m1"}"#), "{}", requests[0]);
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST /sessions/alpha/paste-with-mark HTTP/1.1\r\n"), "{}", requests[0]);
+    assert!(requests[0].ends_with(r#"{"text":"hello","marker_name":"m1"}"#), "{}", requests[0]);
     assert!(requests[1].starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{}", requests[1]);
-    assert!(requests[1].ends_with(r#"{"kind":"paste","text":"hello"}"#), "{}", requests[1]);
-    assert!(requests[2].starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{}", requests[2]);
-    assert!(requests[2].ends_with(r#"{"kind":"key","key":{"kind":"named","key":"enter"}}"#), "{}", requests[2]);
+    assert!(requests[1].ends_with(r#"{"kind":"key","key":{"kind":"named","key":"enter"}}"#), "{}", requests[1]);
 }
 
 #[test]

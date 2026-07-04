@@ -5,6 +5,10 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(target_os = "linux")]
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
+#[cfg(target_os = "macos")]
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::{
     errno::Errno,
     fcntl::{fcntl, FcntlArg, OFlag},
@@ -105,6 +109,144 @@ pub struct PollResult {
 }
 
 pub fn poll_session_ready(
+    listener: &SessionListener,
+    client: Option<&SessionStream>,
+    client_needs_write: bool,
+    pty_child: &PtyChild,
+    timeout_ms: i32,
+) -> Result<PollResult, String> {
+    #[cfg(target_os = "macos")]
+    {
+        poll_session_ready_kqueue(listener, client, client_needs_write, pty_child, timeout_ms)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        poll_session_ready_epoll(listener, client, client_needs_write, pty_child, timeout_ms)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        poll_session_ready_poll(listener, client, client_needs_write, pty_child, timeout_ms)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn poll_session_ready_kqueue(
+    listener: &SessionListener,
+    client: Option<&SessionStream>,
+    client_needs_write: bool,
+    pty_child: &PtyChild,
+    timeout_ms: i32,
+) -> Result<PollResult, String> {
+    const TOKEN_LISTENER_READ: isize = 1;
+    const TOKEN_PTY_READ: isize = 2;
+    const TOKEN_CLIENT_READ: isize = 3;
+    const TOKEN_CLIENT_WRITE: isize = 4;
+
+    let kqueue = Kqueue::new().map_err(|err| format!("create daemon kqueue: {err}"))?;
+    let mut changes = vec![read_kevent(listener.as_raw_fd(), TOKEN_LISTENER_READ), read_kevent(pty_child.master_fd(), TOKEN_PTY_READ)];
+    if let Some(client) = client {
+        changes.push(read_kevent(client.as_raw_fd(), TOKEN_CLIENT_READ));
+        if client_needs_write {
+            changes.push(write_kevent(client.as_raw_fd(), TOKEN_CLIENT_WRITE));
+        }
+    }
+
+    let mut events = [KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0); 4];
+    let timeout = kqueue_timeout(timeout_ms);
+    let event_count = kqueue.kevent(&changes, &mut events, timeout).map_err(|err| format!("kqueue daemon fds: {err}"))?;
+    let mut result = PollResult { listener_readable: false, client_readable: false, client_writable: false, pty_readable: false };
+    for event in events.iter().take(event_count) {
+        if event.flags().contains(EvFlags::EV_ERROR) {
+            if event.data() != 0 {
+                return Err(format!("kqueue daemon fd registration: {}", Errno::from_raw(event.data() as i32)));
+            }
+            continue;
+        }
+        match event.udata() {
+            TOKEN_LISTENER_READ => result.listener_readable = true,
+            TOKEN_PTY_READ => result.pty_readable = true,
+            TOKEN_CLIENT_READ => result.client_readable = true,
+            TOKEN_CLIENT_WRITE => result.client_writable = true,
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(target_os = "macos")]
+fn read_kevent(fd: RawFd, token: isize) -> KEvent {
+    KEvent::new(fd as _, EventFilter::EVFILT_READ, EvFlags::EV_ADD, FilterFlag::empty(), 0, token)
+}
+
+#[cfg(target_os = "macos")]
+fn write_kevent(fd: RawFd, token: isize) -> KEvent {
+    KEvent::new(fd as _, EventFilter::EVFILT_WRITE, EvFlags::EV_ADD, FilterFlag::empty(), 0, token)
+}
+
+#[cfg(target_os = "macos")]
+fn kqueue_timeout(timeout_ms: i32) -> Option<libc::timespec> {
+    if timeout_ms < 0 {
+        None
+    } else {
+        Some(libc::timespec { tv_sec: (timeout_ms / 1000) as libc::time_t, tv_nsec: ((timeout_ms % 1000) * 1_000_000) as _ })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn poll_session_ready_epoll(
+    listener: &SessionListener,
+    client: Option<&SessionStream>,
+    client_needs_write: bool,
+    pty_child: &PtyChild,
+    timeout_ms: i32,
+) -> Result<PollResult, String> {
+    const TOKEN_LISTENER: u64 = 1;
+    const TOKEN_PTY: u64 = 2;
+    const TOKEN_CLIENT: u64 = 3;
+
+    let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).map_err(|err| format!("create daemon epoll: {err}"))?;
+    epoll
+        .add(borrow_raw(listener.as_raw_fd()), EpollEvent::new(read_epoll_flags(), TOKEN_LISTENER))
+        .map_err(|err| format!("register listener with epoll: {err}"))?;
+    epoll
+        .add(borrow_raw(pty_child.master_fd()), EpollEvent::new(read_epoll_flags(), TOKEN_PTY))
+        .map_err(|err| format!("register pty with epoll: {err}"))?;
+    if let Some(client) = client {
+        let mut flags = read_epoll_flags();
+        if client_needs_write {
+            flags |= EpollFlags::EPOLLOUT;
+        }
+        epoll
+            .add(borrow_raw(client.as_raw_fd()), EpollEvent::new(flags, TOKEN_CLIENT))
+            .map_err(|err| format!("register client with epoll: {err}"))?;
+    }
+
+    let mut events = [EpollEvent::empty(); 3];
+    let timeout = PollTimeout::try_from(timeout_ms).map_err(|err| format!("invalid epoll timeout: {err}"))?;
+    let event_count = epoll.wait(&mut events, timeout).map_err(|err| format!("epoll daemon fds: {err}"))?;
+    let mut result = PollResult { listener_readable: false, client_readable: false, client_writable: false, pty_readable: false };
+    for event in events.iter().take(event_count) {
+        let flags = event.events();
+        match event.data() {
+            TOKEN_LISTENER => result.listener_readable = flags.intersects(read_epoll_flags()),
+            TOKEN_PTY => result.pty_readable = flags.intersects(read_epoll_flags()),
+            TOKEN_CLIENT => {
+                result.client_readable = flags.intersects(read_epoll_flags());
+                result.client_writable = flags.intersects(EpollFlags::EPOLLOUT | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR);
+            }
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(target_os = "linux")]
+fn read_epoll_flags() -> EpollFlags {
+    EpollFlags::EPOLLIN | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn poll_session_ready_poll(
     listener: &SessionListener,
     client: Option<&SessionStream>,
     client_needs_write: bool,
@@ -251,10 +393,12 @@ fn child_exited(child_pid: Pid) -> Result<Option<WaitStatus>, String> {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn has_pollin(fd: &PollFd<'_>) -> bool {
     fd.revents().map(|flags| flags.contains(PollFlags::POLLIN)).unwrap_or(false)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn has_pollout(fd: &PollFd<'_>) -> bool {
     fd.revents().map(|flags| flags.contains(PollFlags::POLLOUT)).unwrap_or(false)
 }
@@ -294,7 +438,14 @@ fn resolve_cwd(_pid: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use nix::{sys::wait::WaitStatus, unistd::Pid};
+
+    use crate::{
+        runtime::{SessionMetadata, TerminalSize},
+        vt::{TerminalColors, VtEngineKind},
+    };
 
     #[test]
     fn exit_code_from_normal_exit() {
@@ -312,5 +463,32 @@ mod tests {
     fn exit_code_from_signal_is_128_plus_signal() {
         let status = WaitStatus::Signaled(Pid::from_raw(1), nix::sys::signal::Signal::SIGTERM, false);
         assert_eq!(super::exit_code_from_wait_status(&status), 128 + libc::SIGTERM);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn session_readiness_reports_pty_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let listener = super::SessionListener::bind(temp.path().join("socket")).expect("bind listener");
+        let session = SessionMetadata {
+            id: "pty-ready".to_string(),
+            vt_engine: VtEngineKind::Passthrough,
+            cwd: None,
+            cmd: Some("printf READY".to_string()),
+            record: false,
+            initial_size: TerminalSize::default(),
+            colors: TerminalColors::default(),
+        };
+        let pty_child = super::PtyChild::spawn(&session).expect("spawn pty child");
+        pty_child.set_nonblocking().expect("set pty nonblocking");
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            let result = super::poll_session_ready(&listener, None, false, &pty_child, 100).expect("poll session ready");
+            if result.pty_readable {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for PTY readiness");
+        }
     }
 }

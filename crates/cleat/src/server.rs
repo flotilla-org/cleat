@@ -356,6 +356,27 @@ impl SessionService {
         Ok(response.offset)
     }
 
+    pub(crate) fn send_input(&self, id: &str, input: &http_uds::InputRequest) -> Result<(), String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+
+        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/input"), input)
+    }
+
+    pub(crate) fn send_paste_with_mark(&self, id: &str, text: &str, marker_name: &str) -> Result<u64, String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+
+        let response: http_uds::MarkResponse =
+            self.http_json(id, Method::POST, &format!("/sessions/{id}/paste-with-mark"), &http_uds::PasteWithMarkRequest {
+                text: text.to_string(),
+                marker_name: marker_name.to_string(),
+            })?;
+        Ok(response.offset)
+    }
+
     pub fn attach(
         &self,
         name: Option<String>,
@@ -740,7 +761,7 @@ mod tests {
 
     use super::{SessionService, EMPTY_SESSION_DIR_GRACE};
     use crate::{
-        http_uds::read_http_request_for_test,
+        http_uds::{self, read_http_request_for_test},
         protocol::{WaitCondition, WaitStatus},
         runtime::RuntimeLayout,
         session::{daemon_pid_path, session_socket_path},
@@ -800,6 +821,65 @@ mod tests {
         reader.join().expect("join reader");
         assert!(request.starts_with("POST /sessions/alpha/keys HTTP/1.1\r\n"), "{request}");
         assert!(request.ends_with(r#"{"bytes":[104,101,108,108,111,13]}"#), "{request}");
+    }
+
+    #[test]
+    fn send_input_posts_http_request_to_session_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = temp.path().join("alpha");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let socket_path = session_socket_path(temp.path(), "alpha");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_http_request_for_test(&mut stream);
+            tx.send(request).expect("send request");
+            stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("write response");
+        });
+
+        service.send_input("alpha", &http_uds::InputRequest::Paste { text: "hello".to_string() }).expect("send input");
+        let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
+
+        reader.join().expect("join reader");
+        assert!(request.starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{request}");
+        assert!(request.ends_with(r#"{"kind":"paste","text":"hello"}"#), "{request}");
+    }
+
+    #[test]
+    fn send_paste_with_mark_posts_http_request_to_session_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = temp.path().join("alpha");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let socket_path = session_socket_path(temp.path(), "alpha");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_http_request_for_test(&mut stream);
+            tx.send(request).expect("send request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"offset\":42}",
+                )
+                .expect("write response");
+        });
+
+        let offset = service.send_paste_with_mark("alpha", "hello", "m1").expect("send paste with mark");
+        let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
+
+        reader.join().expect("join reader");
+        assert_eq!(offset, 42);
+        assert!(request.starts_with("POST /sessions/alpha/paste-with-mark HTTP/1.1\r\n"), "{request}");
+        assert!(request.ends_with(r#"{"text":"hello","marker_name":"m1"}"#), "{request}");
     }
 
     #[test]

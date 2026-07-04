@@ -340,6 +340,20 @@ fn session_daemon_accepts_http_control_requests_on_session_socket() {
     let mark_json: serde_json::Value = serde_json::from_str(http_body(&mark)).expect("mark json");
     assert!(mark_json["offset"].is_u64());
 
+    let paste_with_mark_body = r#"{"text":"structured paste","marker_name":"m2"}"#;
+    let paste_with_mark = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!(
+            "POST /sessions/alpha/paste-with-mark HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}",
+            paste_with_mark_body.len(),
+            paste_with_mark_body
+        ),
+    );
+    assert!(paste_with_mark.starts_with("HTTP/1.1 200 OK\r\n"), "{paste_with_mark}");
+    let paste_with_mark_json: serde_json::Value = serde_json::from_str(http_body(&paste_with_mark)).expect("paste-with-mark json");
+    assert!(paste_with_mark_json["offset"].is_u64());
+
     let input_text_body = r#"{"kind":"text","text":"structured input"}"#;
     let input_text = http_session_request(
         temp.path(),

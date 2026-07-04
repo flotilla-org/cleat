@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::{
+    http_uds,
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
     runtime::{SessionMetadata, TerminalSize},
@@ -36,6 +37,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
+
+// Bracketed paste marks the paste/submit boundary explicitly; the delay only
+// gives the TUI a short turn to consume the completed paste before Enter.
+const SUBMIT_ENTER_DELAY: Duration = Duration::from_millis(100);
 
 /// Recording flags shared by the session-creating commands. Recording is on by
 /// default; `--no-record` opts out, and `CLEAT_RECORD` sets a boolish baseline
@@ -289,6 +294,8 @@ resolved through the live daemon socket. \n\
     /// Send text to a session
     #[command(after_long_help = "Sends text as PTY input — the same as typing on a keyboard.\n\
                            By default, Enter is appended (disable with --no-enter).\n\
+                           Use --submit for TUI composers: it paste-encodes the\n\
+                           text, waits briefly, then sends Enter as a separate key.\n\
                            \n\
                            In interactive shells, the sent text will be echoed back in the\n\
                            terminal output before any command results appear. This means\n\
@@ -298,13 +305,20 @@ resolved through the live daemon socket. \n\
                            Recommended pattern for capturing command output:\n\
                            \x20 cleat send my-session 'make test' --mark-before m1\n\
                            \x20 cleat expect my-session --since-marker m1 --text 'pattern'\n\
-                           \x20 cleat transcript my-session --since-marker m1")]
+                           \x20 cleat transcript my-session --since-marker m1\n\
+                           \n\
+                           Manual TUI composer workaround:\n\
+                           \x20 cleat send my-session --no-enter '<prompt>'\n\
+                           \x20 sleep 2\n\
+                           \x20 cleat send-keys my-session Enter")]
     Send {
         id: String,
         #[arg(value_name = "TEXT", help = "Text to send")]
         text: String,
         #[arg(long, help = "Do not append Enter after the text")]
         no_enter: bool,
+        #[arg(long, conflicts_with = "no_enter", help = "Paste-encode text, then send Enter as a separate key after a short delay")]
+        submit: bool,
         #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
         mark_before: Option<String>,
     },
@@ -681,20 +695,42 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Send { id, text, no_enter, mark_before } => {
-            let mut bytes = text.into_bytes();
-            if !no_enter {
-                bytes.push(b'\r');
-            }
-            if let Some(marker_name) = mark_before {
-                match service.send_keys_with_mark(&id, &bytes, &marker_name) {
-                    Ok(offset) => ExecResult::Ok(Some(offset.to_string())),
-                    Err(e) => ExecResult::Err(e),
+        Command::Send { id, text, no_enter, submit, mark_before } => {
+            if submit {
+                let marker_offset = if let Some(marker_name) = mark_before {
+                    match service.send_paste_with_mark(&id, &text, &marker_name) {
+                        Ok(offset) => Some(offset),
+                        Err(e) => return ExecResult::Err(e),
+                    }
+                } else {
+                    if let Err(e) = service.send_input(&id, &http_uds::InputRequest::Paste { text }) {
+                        return ExecResult::Err(e);
+                    }
+                    None
+                };
+                std::thread::sleep(SUBMIT_ENTER_DELAY);
+                if let Err(e) = service
+                    .send_input(&id, &http_uds::InputRequest::Key { key: http_uds::KeyRequest::Named { key: http_uds::NamedKey::Enter } })
+                {
+                    return ExecResult::Err(e);
                 }
+
+                ExecResult::Ok(marker_offset.map(|offset| offset.to_string()))
             } else {
-                match service.send_keys(&id, &bytes) {
-                    Ok(()) => ExecResult::Ok(None),
-                    Err(e) => ExecResult::Err(e),
+                let mut bytes = text.into_bytes();
+                if !no_enter {
+                    bytes.push(b'\r');
+                }
+                if let Some(marker_name) = mark_before {
+                    match service.send_keys_with_mark(&id, &bytes, &marker_name) {
+                        Ok(offset) => ExecResult::Ok(Some(offset.to_string())),
+                        Err(e) => ExecResult::Err(e),
+                    }
+                } else {
+                    match service.send_keys(&id, &bytes) {
+                        Ok(()) => ExecResult::Ok(None),
+                        Err(e) => ExecResult::Err(e),
+                    }
                 }
             }
         }

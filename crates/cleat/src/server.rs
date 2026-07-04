@@ -16,8 +16,8 @@ use crate::{
     protocol::{SessionInfo, SessionStatus},
     runtime::{RuntimeLayout, TerminalSize},
     session::{
-        attach_foreground, ensure_session_started, run_session_daemon, session_socket_path, watch_foreground, ForegroundAttach,
-        SessionStartOptions,
+        attach_foreground, ensure_session_started, foreground_path, run_session_daemon, session_socket_path, watch_foreground,
+        ForegroundAttach, SessionStartOptions,
     },
     vt::VtEngineKind,
 };
@@ -138,6 +138,16 @@ impl SessionService {
             };
             let socket_path = session_socket_path(self.layout.root(), &id);
             if !socket_path.exists() {
+                if session_dir_is_empty(&path) {
+                    let _ = self.layout.remove_session(&id);
+                }
+                continue;
+            }
+            if !daemon_pid_path(self.layout.root(), &id).exists()
+                && !crate::recreate::session_is_recreatable(&path)
+                && session_dir_contains_only(&path, &socket_path)
+            {
+                let _ = self.layout.remove_session(&id);
                 continue;
             }
             if !is_session_daemon_alive(self.layout.root(), &id) {
@@ -183,25 +193,51 @@ impl SessionService {
     }
 
     pub fn kill(&self, id: &str) -> Result<(), String> {
+        self.kill_with_purge(id, false)
+    }
+
+    pub fn kill_with_purge(&self, id: &str, purge: bool) -> Result<(), String> {
         if !self.layout.root().join(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let pid_path = daemon_pid_path(self.layout.root(), id);
         if self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &()).is_ok() {
             if pid_path.exists() {
-                for _ in 0..50 {
-                    if !self.layout.root().join(id).exists() || !pid_path.exists() || !is_session_daemon_alive(self.layout.root(), id) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                }
+                self.wait_for_session_shutdown(id);
             }
             if !self.layout.root().join(id).exists() {
                 return Ok(());
             }
         }
         terminate_session_daemon_if_expected(self.layout.root(), id);
-        self.layout.remove_session(id)
+        self.wait_for_session_shutdown(id);
+        if !self.layout.root().join(id).exists() {
+            return Ok(());
+        }
+        if purge || !crate::recreate::session_is_recreatable(&self.layout.root().join(id)) {
+            self.layout.remove_session(id)
+        } else {
+            self.remove_volatile_session_files(id);
+            Ok(())
+        }
+    }
+
+    fn wait_for_session_shutdown(&self, id: &str) {
+        for _ in 0..50 {
+            if !self.layout.root().join(id).exists()
+                || !daemon_pid_path(self.layout.root(), id).exists()
+                || !is_session_daemon_alive(self.layout.root(), id)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn remove_volatile_session_files(&self, id: &str) {
+        let _ = std::fs::remove_file(session_socket_path(self.layout.root(), id));
+        let _ = std::fs::remove_file(daemon_pid_path(self.layout.root(), id));
+        let _ = std::fs::remove_file(foreground_path(self.layout.root(), id));
     }
 
     pub fn detach(&self, id: &str) -> Result<(), String> {
@@ -539,6 +575,27 @@ impl SessionService {
     }
 }
 
+fn session_dir_is_empty(path: &Path) -> bool {
+    std::fs::read_dir(path).map(|mut entries| entries.next().is_none()).unwrap_or(false)
+}
+
+fn session_dir_contains_only(path: &Path, expected: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    let mut count = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        count += 1;
+        if entry.path() != expected {
+            return false;
+        }
+    }
+    count == 1
+}
+
 /// Resolve start and end bounds into byte offsets against a cast file without
 /// going through the daemon. Marker-based bounds are rejected; the CLI is
 /// expected to prevent these combinations via clap's `conflicts_with = "path"`
@@ -851,7 +908,7 @@ mod tests {
                 drop(stream);
             }
         });
-        // No PID file means is_session_daemon_alive returns true (assumes starting up).
+        fs::write(daemon_pid_path(temp.path(), "broken-session"), std::process::id().to_string()).expect("write pid");
 
         let sessions = service.list().expect("list sessions");
         assert_eq!(sessions.len(), 1, "broken session should appear in list");
@@ -877,6 +934,35 @@ mod tests {
         let sessions = service.list().expect("list sessions");
         assert!(sessions.is_empty(), "stale session should not appear in list");
         assert!(!session_dir.exists(), "stale session directory should be cleaned up");
+    }
+
+    #[test]
+    fn list_cleans_up_socket_only_session_without_pid_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+        let session_dir = temp.path().join("socket-only");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let socket_path = session_socket_path(temp.path(), "socket-only");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        drop(listener);
+
+        let sessions = service.list().expect("list sessions");
+        assert!(sessions.is_empty(), "socket-only husk should not appear in list");
+        assert!(!session_dir.exists(), "socket-only husk should be cleaned up");
+    }
+
+    #[test]
+    fn list_cleans_up_empty_session_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+
+        let session_dir = temp.path().join("empty-session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let sessions = service.list().expect("list sessions");
+        assert!(sessions.is_empty(), "empty session dir should not appear in list");
+        assert!(!session_dir.exists(), "empty session dir should be cleaned up");
     }
 
     #[test]

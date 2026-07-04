@@ -229,7 +229,12 @@ resolved through the live daemon socket. \n\
     /// Detach from a session
     Detach { id: String },
     /// Terminate a session
-    Kill { id: String },
+    Kill {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long, help = "Delete any preserved recording for the session")]
+        purge: bool,
+    },
     /// Send key sequences using tmux-style names
     #[command(
         after_long_help = "Key names: Enter, Escape (Esc), Tab, BSpace, Space,\n           Up, Down, Left, Right, Home, End,\n           PgUp (PageUp), PgDn (PageDown),\n           IC (Insert), DC (Delete),\n           F1-F12, BTab (Shift-Tab)\n\nModifiers:  C-x (Ctrl), M-x (Meta/Alt), S-x (Shift)\n            ^x  (Ctrl, alternative syntax)\n\nExamples:   cleat send-keys myapp Enter\n            cleat send-keys myapp C-c\n            cleat send-keys myapp -l 'literal text'\n            cleat send-keys myapp -H 1b5b41"
@@ -613,7 +618,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
-        Command::Kill { id } => match service.kill(&id) {
+        Command::Kill { id, purge } => match service.kill_with_purge(&id, purge) {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },

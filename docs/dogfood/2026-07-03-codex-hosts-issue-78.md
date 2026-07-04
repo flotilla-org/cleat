@@ -104,9 +104,25 @@ Check off as confirmed/refuted; surprises go in the friction log.
   condition -- the VT engine already has row-level dirty tracking and ghostty
   exposes semantic prompt state per row, so both are buildable.
 
+- **2026-07-04 (run complete)** Codex finished #78: instrumented first as asked,
+  **could not reproduce a Darwin poll() miss** (burst, paced, and
+  watcher-attached workloads) — prediction/hypothesis 1 unconfirmed. Landed the
+  kqueue/epoll readiness primitive anyway (the split needs it) as PR #88, honest
+  commit message, all four validation gates green on macOS. #78 stays open; the
+  staleness may live in the attach path or a load shape not reproduced.
+- **2026-07-04 (run complete)** Driving-codex friction summary: composer swallows
+  fast text+Enter (use send --no-enter, pause, send-keys Enter); TUI spinner
+  defeats wait --idle-time (use wait --text on the approval-prompt string, OR'd
+  with idle); worktrees don't share .tools so agents try to rebuild ghostty
+  (point CLEAT_GHOSTTY_PREFIX at the main checkout); codex sandbox blocks UDS
+  binds in tests (needs an unsandboxed approval). All workable today; the first
+  two argue for a send --submit flag and a screen-stable/semantic-prompt wait
+  condition.
+
 ## Issues spawned
 
 *(label: `dogfood`)*
 
 - [#79](https://github.com/flotilla-org/cleat/issues/79) — `launch --size` (prep 1)
 - [#80](https://github.com/flotilla-org/cleat/issues/80) — `cleat watch` byte-tee MVP (prep 2)
+- [#88](https://github.com/flotilla-org/cleat/pull/88) — kqueue/epoll readiness (the run's output; #78 stays open)

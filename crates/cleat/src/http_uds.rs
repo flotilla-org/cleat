@@ -31,6 +31,7 @@ pub(crate) enum Route {
     SessionExpect { id: String },
     SessionInspect { id: String },
     SessionInput { id: String },
+    SessionPasteWithMark { id: String },
     SessionKeys { id: String },
     SessionKeysWithMark { id: String },
     SessionMark { id: String },
@@ -109,6 +110,12 @@ pub(crate) struct KeysWithMarkRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PasteWithMarkRequest {
+    pub text: String,
+    pub marker_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ResizeRequest {
     pub cols: u16,
     pub rows: u16,
@@ -155,6 +162,7 @@ pub(crate) struct WaitRequest {
 pub(crate) enum WaitConditionRequest {
     OutputIdle { quiet_ms: u64 },
     TextMatch { text: String },
+    ScreenStable { stable_ms: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +481,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::POST, Some("detach"), None) => Route::SessionDetach { id: id.to_string() },
                 (&Method::POST, Some("expect"), None) => Route::SessionExpect { id: id.to_string() },
                 (&Method::POST, Some("input"), None) => Route::SessionInput { id: id.to_string() },
+                (&Method::POST, Some("paste-with-mark"), None) => Route::SessionPasteWithMark { id: id.to_string() },
                 (&Method::POST, Some("keys"), None) => Route::SessionKeys { id: id.to_string() },
                 (&Method::POST, Some("keys-with-mark"), None) => Route::SessionKeysWithMark { id: id.to_string() },
                 (&Method::POST, Some("mark"), None) => Route::SessionMark { id: id.to_string() },
@@ -713,6 +722,7 @@ mod tests {
             ("POST", "/sessions/alpha/detach", Route::SessionDetach { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/expect", Route::SessionExpect { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/input", Route::SessionInput { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/paste-with-mark", Route::SessionPasteWithMark { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/keys", Route::SessionKeys { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/keys-with-mark", Route::SessionKeysWithMark { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/mark", Route::SessionMark { id: "alpha".to_string() }),

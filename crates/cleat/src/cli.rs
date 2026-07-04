@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::{
+    http_uds,
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
     runtime::{SessionMetadata, TerminalSize},
@@ -36,6 +37,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
+
+// Bracketed paste marks the paste/submit boundary explicitly; the delay only
+// gives the TUI a short turn to consume the completed paste before Enter.
+const SUBMIT_ENTER_DELAY: Duration = Duration::from_millis(100);
 
 /// Recording flags shared by the session-creating commands. Recording is on by
 /// default; `--no-record` opts out, and `CLEAT_RECORD` sets a boolish baseline
@@ -229,7 +234,12 @@ resolved through the live daemon socket. \n\
     /// Detach from a session
     Detach { id: String },
     /// Terminate a session
-    Kill { id: String },
+    Kill {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long, help = "Delete any preserved recording for the session")]
+        purge: bool,
+    },
     /// Send key sequences using tmux-style names
     #[command(
         after_long_help = "Key names: Enter, Escape (Esc), Tab, BSpace, Space,\n           Up, Down, Left, Right, Home, End,\n           PgUp (PageUp), PgDn (PageDown),\n           IC (Insert), DC (Delete),\n           F1-F12, BTab (Shift-Tab)\n\nModifiers:  C-x (Ctrl), M-x (Meta/Alt), S-x (Shift)\n            ^x  (Ctrl, alternative syntax)\n\nExamples:   cleat send-keys myapp Enter\n            cleat send-keys myapp C-c\n            cleat send-keys myapp -l 'literal text'\n            cleat send-keys myapp -H 1b5b41"
@@ -284,6 +294,8 @@ resolved through the live daemon socket. \n\
     /// Send text to a session
     #[command(after_long_help = "Sends text as PTY input — the same as typing on a keyboard.\n\
                            By default, Enter is appended (disable with --no-enter).\n\
+                           Use --submit for TUI composers: it paste-encodes the\n\
+                           text, waits briefly, then sends Enter as a separate key.\n\
                            \n\
                            In interactive shells, the sent text will be echoed back in the\n\
                            terminal output before any command results appear. This means\n\
@@ -293,13 +305,20 @@ resolved through the live daemon socket. \n\
                            Recommended pattern for capturing command output:\n\
                            \x20 cleat send my-session 'make test' --mark-before m1\n\
                            \x20 cleat expect my-session --since-marker m1 --text 'pattern'\n\
-                           \x20 cleat transcript my-session --since-marker m1")]
+                           \x20 cleat transcript my-session --since-marker m1\n\
+                           \n\
+                           Manual TUI composer workaround:\n\
+                           \x20 cleat send my-session --no-enter '<prompt>'\n\
+                           \x20 sleep 2\n\
+                           \x20 cleat send-keys my-session Enter")]
     Send {
         id: String,
         #[arg(value_name = "TEXT", help = "Text to send")]
         text: String,
         #[arg(long, help = "Do not append Enter after the text")]
         no_enter: bool,
+        #[arg(long, conflicts_with = "no_enter", help = "Paste-encode text, then send Enter as a separate key after a short delay")]
+        submit: bool,
         #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
         mark_before: Option<String>,
     },
@@ -311,8 +330,9 @@ resolved through the live daemon socket. \n\
     #[command(after_long_help = "Conditions (OR semantics — any match wins):\n\
                            \x20 --idle-time N  Wait until no PTY output for N seconds\n\
                            \x20 --text STR     Wait until STR appears on the VT screen\n\
+                           \x20 --screen-stable N  Wait until the rendered screen is stable for N (e.g., 500ms, 2s)\n\
                            \n\
-                           At least one of --idle-time or --text is required.\n\
+                           At least one condition is required.\n\
                            \n\
                            NOTE: --text matches against the current VT screen state. If the\n\
                            text is already visible when wait is called, it returns immediately.\n\
@@ -332,6 +352,9 @@ resolved through the live daemon socket. \n\
         idle_time: Option<std::time::Duration>,
         #[arg(long, help = "Wait until this text appears on screen")]
         text: Option<String>,
+        /// Wait until the rendered screen is stable for this duration (e.g., 500ms, 2s, or plain seconds).
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
+        screen_stable: Option<std::time::Duration>,
         #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
         timeout: f64,
         #[arg(long, help = "Output as JSON")]
@@ -613,7 +636,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
-        Command::Kill { id } => match service.kill(&id) {
+        Command::Kill { id, purge } => match service.kill_with_purge(&id, purge) {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
@@ -676,20 +699,42 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Send { id, text, no_enter, mark_before } => {
-            let mut bytes = text.into_bytes();
-            if !no_enter {
-                bytes.push(b'\r');
-            }
-            if let Some(marker_name) = mark_before {
-                match service.send_keys_with_mark(&id, &bytes, &marker_name) {
-                    Ok(offset) => ExecResult::Ok(Some(offset.to_string())),
-                    Err(e) => ExecResult::Err(e),
+        Command::Send { id, text, no_enter, submit, mark_before } => {
+            if submit {
+                let marker_offset = if let Some(marker_name) = mark_before {
+                    match service.send_paste_with_mark(&id, &text, &marker_name) {
+                        Ok(offset) => Some(offset),
+                        Err(e) => return ExecResult::Err(e),
+                    }
+                } else {
+                    if let Err(e) = service.send_input(&id, &http_uds::InputRequest::Paste { text }) {
+                        return ExecResult::Err(e);
+                    }
+                    None
+                };
+                std::thread::sleep(SUBMIT_ENTER_DELAY);
+                if let Err(e) = service
+                    .send_input(&id, &http_uds::InputRequest::Key { key: http_uds::KeyRequest::Named { key: http_uds::NamedKey::Enter } })
+                {
+                    return ExecResult::Err(e);
                 }
+
+                ExecResult::Ok(marker_offset.map(|offset| offset.to_string()))
             } else {
-                match service.send_keys(&id, &bytes) {
-                    Ok(()) => ExecResult::Ok(None),
-                    Err(e) => ExecResult::Err(e),
+                let mut bytes = text.into_bytes();
+                if !no_enter {
+                    bytes.push(b'\r');
+                }
+                if let Some(marker_name) = mark_before {
+                    match service.send_keys_with_mark(&id, &bytes, &marker_name) {
+                        Ok(offset) => ExecResult::Ok(Some(offset.to_string())),
+                        Err(e) => ExecResult::Err(e),
+                    }
+                } else {
+                    match service.send_keys(&id, &bytes) {
+                        Ok(()) => ExecResult::Ok(None),
+                        Err(e) => ExecResult::Err(e),
+                    }
                 }
             }
         }
@@ -701,7 +746,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
-        Command::Wait { id, idle_time, text, timeout, json } => execute_wait(service, id, idle_time, text, timeout, json),
+        Command::Wait { id, idle_time, text, screen_stable, timeout, json } => {
+            execute_wait(service, id, idle_time, text, screen_stable, timeout, json)
+        }
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
         }
@@ -732,13 +779,14 @@ fn execute_wait(
     id: String,
     idle_time: Option<std::time::Duration>,
     text: Option<String>,
+    screen_stable: Option<std::time::Duration>,
     timeout: f64,
     json: bool,
 ) -> ExecResult {
-    if idle_time.is_none() && text.is_none() {
+    if idle_time.is_none() && text.is_none() && screen_stable.is_none() {
         return ExecResult::Exit {
             code: 2,
-            message: Some("wait requires at least one of --idle-time or --text".to_string()),
+            message: Some("wait requires at least one of --idle-time, --text, or --screen-stable".to_string()),
             output: None,
         };
     }
@@ -757,6 +805,13 @@ fn execute_wait(
     }
     if let Some(pattern) = text {
         conditions.push(WaitCondition::TextMatch { text: pattern });
+    }
+    if let Some(dur) = screen_stable {
+        let secs = dur.as_secs_f64();
+        if !(0.0..=86_400.0).contains(&secs) {
+            return ExecResult::Exit { code: 2, message: Some(format!("invalid screen-stable: {secs} (max 86400)")), output: None };
+        }
+        conditions.push(WaitCondition::ScreenStable { stable_ms: (secs * 1000.0) as u64 });
     }
     let timeout_ms = (timeout * 1000.0) as u64;
 

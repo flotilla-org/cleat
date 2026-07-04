@@ -340,6 +340,20 @@ fn session_daemon_accepts_http_control_requests_on_session_socket() {
     let mark_json: serde_json::Value = serde_json::from_str(http_body(&mark)).expect("mark json");
     assert!(mark_json["offset"].is_u64());
 
+    let paste_with_mark_body = r#"{"text":"structured paste","marker_name":"m2"}"#;
+    let paste_with_mark = http_session_request(
+        temp.path(),
+        "alpha",
+        &format!(
+            "POST /sessions/alpha/paste-with-mark HTTP/1.1\r\nHost: cleat\r\nContent-Length: {}\r\n\r\n{}",
+            paste_with_mark_body.len(),
+            paste_with_mark_body
+        ),
+    );
+    assert!(paste_with_mark.starts_with("HTTP/1.1 200 OK\r\n"), "{paste_with_mark}");
+    let paste_with_mark_json: serde_json::Value = serde_json::from_str(http_body(&paste_with_mark)).expect("paste-with-mark json");
+    assert!(paste_with_mark_json["offset"].is_u64());
+
     let input_text_body = r#"{"kind":"text","text":"structured input"}"#;
     let input_text = http_session_request(
         temp.path(),
@@ -572,6 +586,53 @@ fn kill_removes_session_directory() {
 
     assert_eq!(output, None);
     assert!(!temp.path().join("alpha").exists());
+}
+
+#[test]
+fn kill_preserves_session_directory_with_recording() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sh -c 'printf preserved; sleep 30'".into()), true)
+        .expect("create alpha");
+
+    let cast_path = temp.path().join("alpha").join(CAST_FILE_NAME);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !cast_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(cast_path.exists(), "recording should exist before kill");
+
+    let cli = Cli::try_parse_from(["cleat", "kill", "alpha"]).expect("parse kill");
+    cli::execute(cli, &service).expect("execute kill");
+
+    assert!(temp.path().join("alpha").exists(), "recording-bearing session directory should be preserved");
+    assert!(cast_path.exists(), "recording should survive kill");
+    assert!(!session_socket_path(temp.path(), "alpha").exists(), "socket should not survive kill");
+    assert!(!daemon_pid_path(temp.path(), "alpha").exists(), "pid file should not survive kill");
+}
+
+#[test]
+fn kill_purge_removes_session_directory_with_recording() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sh -c 'printf purged; sleep 30'".into()), true)
+        .expect("create alpha");
+
+    let cast_path = temp.path().join("alpha").join(CAST_FILE_NAME);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !cast_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(cast_path.exists(), "recording should exist before purge");
+
+    let cli = Cli::try_parse_from(["cleat", "kill", "alpha", "--purge"]).expect("parse kill --purge");
+    cli::execute(cli, &service).expect("execute kill --purge");
+
+    assert!(!temp.path().join("alpha").exists(), "purge should delete the recording-bearing session directory");
 }
 
 #[test]

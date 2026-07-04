@@ -3,6 +3,7 @@ use cleat::{
     cli::{self, execute, Cli, Command, ExecResult, RecordFlags},
     runtime::{RuntimeLayout, TerminalSize},
     server::SessionService,
+    session::session_socket_path,
     vt::{self, Rgb, VtEngineKind},
 };
 
@@ -213,7 +214,13 @@ fn detach_command_parses() {
 #[test]
 fn kill_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "kill", "session-1"]).expect("kill parses");
-    assert_eq!(cli.command, Command::Kill { id: "session-1".into() });
+    assert_eq!(cli.command, Command::Kill { id: "session-1".into(), purge: false });
+}
+
+#[test]
+fn kill_purge_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "kill", "session-1", "--purge"]).expect("kill --purge parses");
+    assert_eq!(cli.command, Command::Kill { id: "session-1".into(), purge: true });
 }
 
 #[test]
@@ -565,13 +572,100 @@ fn transcript_end_bounds_are_mutually_exclusive() {
 #[test]
 fn send_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "send", "demo", "echo hello"]).expect("send parses");
-    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "echo hello".into(), no_enter: false, mark_before: None });
+    assert_eq!(cli.command, Command::Send {
+        id: "demo".into(),
+        text: "echo hello".into(),
+        no_enter: false,
+        submit: false,
+        mark_before: None
+    });
 }
 
 #[test]
 fn send_command_parses_no_enter() {
     let cli = Cli::try_parse_from(["cleat", "send", "--no-enter", "demo", "partial"]).expect("send --no-enter parses");
-    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true, mark_before: None });
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true, submit: false, mark_before: None });
+}
+
+#[test]
+fn send_command_parses_submit() {
+    let cli = Cli::try_parse_from(["cleat", "send", "--submit", "demo", "prompt"]).expect("send --submit parses");
+    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "prompt".into(), no_enter: false, submit: true, mark_before: None });
+}
+
+#[test]
+fn send_command_rejects_submit_with_no_enter() {
+    assert!(Cli::try_parse_from(["cleat", "send", "--submit", "--no-enter", "demo", "prompt"]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn send_submit_posts_paste_then_enter_input_requests() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    std::fs::create_dir_all(temp.path().join("alpha")).expect("create session dir");
+
+    let socket_path = session_socket_path(temp.path(), "alpha");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind socket");
+    let reader = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            requests.push(read_http_request_for_cli_test(&mut stream));
+            stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("write response");
+        }
+        requests
+    });
+
+    let cli = Cli::try_parse_from(["cleat", "send", "--submit", "alpha", "hello"]).expect("parse send --submit");
+    assert_eq!(execute(cli, &service).expect("execute send --submit"), None);
+
+    let requests = reader.join().expect("join reader");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{}", requests[0]);
+    assert!(requests[0].ends_with(r#"{"kind":"paste","text":"hello"}"#), "{}", requests[0]);
+    assert!(requests[1].starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{}", requests[1]);
+    assert!(requests[1].ends_with(r#"{"kind":"key","key":{"kind":"named","key":"enter"}}"#), "{}", requests[1]);
+}
+
+#[cfg(unix)]
+#[test]
+fn send_submit_with_mark_marks_before_paste_and_returns_offset() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    std::fs::create_dir_all(temp.path().join("alpha")).expect("create session dir");
+
+    let socket_path = session_socket_path(temp.path(), "alpha");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind socket");
+    let reader = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            requests.push(read_http_request_for_cli_test(&mut stream));
+            if index == 0 {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"offset\":42}")
+                    .expect("write mark response");
+            } else {
+                stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("write response");
+            }
+        }
+        requests
+    });
+
+    let cli = Cli::try_parse_from(["cleat", "send", "--submit", "--mark-before", "m1", "alpha", "hello"]).expect("parse send --submit");
+    assert_eq!(execute(cli, &service).expect("execute send --submit"), Some("42".to_string()));
+
+    let requests = reader.join().expect("join reader");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST /sessions/alpha/paste-with-mark HTTP/1.1\r\n"), "{}", requests[0]);
+    assert!(requests[0].ends_with(r#"{"text":"hello","marker_name":"m1"}"#), "{}", requests[0]);
+    assert!(requests[1].starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{}", requests[1]);
+    assert!(requests[1].ends_with(r#"{"kind":"key","key":{"kind":"named","key":"enter"}}"#), "{}", requests[1]);
 }
 
 #[test]
@@ -607,10 +701,21 @@ fn wait_text_parses() {
 }
 
 #[test]
+fn wait_screen_stable_parses() {
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--screen-stable", "750ms"]).expect("parse");
+    assert!(matches!(
+        cli.command,
+        Command::Wait { screen_stable: Some(t), idle_time: None, text: None, .. } if t == std::time::Duration::from_millis(750)
+    ));
+}
+
+#[test]
 fn wait_combined_parses() {
-    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "1.0", "--text", "ready", "--timeout", "10"]).expect("parse");
+    let cli =
+        Cli::try_parse_from(["cleat", "wait", "sess", "--idle-time", "1.0", "--text", "ready", "--screen-stable", "2s", "--timeout", "10"])
+            .expect("parse");
     assert!(
-        matches!(cli.command, Command::Wait { idle_time: Some(_), text: Some(_), timeout, .. } if (timeout - 10.0).abs() < f64::EPSILON)
+        matches!(cli.command, Command::Wait { idle_time: Some(_), text: Some(_), screen_stable: Some(_), timeout, .. } if (timeout - 10.0).abs() < f64::EPSILON)
     );
 }
 
@@ -628,9 +733,24 @@ fn wait_execute_rejects_no_conditions() {
     let result = execute(cli, &service);
     match result {
         ExecResult::Exit { code: 2, message: Some(msg), .. } => {
-            assert!(msg.contains("at least one of --idle-time or --text"));
+            assert!(msg.contains("at least one of --idle-time, --text, or --screen-stable"));
         }
         other => panic!("wait without conditions should exit 2, got: {other:?}"),
+    }
+}
+
+#[test]
+fn wait_execute_rejects_screen_stable_above_maximum() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--screen-stable", "86401s"]).expect("parse");
+    let result = execute(cli, &service);
+    match result {
+        ExecResult::Exit { code: 2, message: Some(msg), .. } => {
+            assert!(msg.contains("invalid screen-stable"));
+            assert!(msg.contains("max 86400"));
+        }
+        other => panic!("screen-stable above maximum should exit 2, got: {other:?}"),
     }
 }
 
@@ -698,7 +818,13 @@ fn expect_json_flag_parses() {
 #[test]
 fn send_mark_before_parses() {
     let cli = Cli::try_parse_from(["cleat", "send", "--mark-before", "m1", "sess", "echo hi"]).expect("parse");
-    assert_eq!(cli.command, Command::Send { id: "sess".into(), text: "echo hi".into(), no_enter: false, mark_before: Some("m1".into()) });
+    assert_eq!(cli.command, Command::Send {
+        id: "sess".into(),
+        text: "echo hi".into(),
+        no_enter: false,
+        submit: false,
+        mark_before: Some("m1".into())
+    });
 }
 
 #[test]
@@ -777,4 +903,34 @@ fn replay_humantime_max_idle_parses() {
         }
         other => panic!("expected Replay, got {other:?}"),
     }
+}
+
+#[cfg(unix)]
+fn read_http_request_for_cli_test(stream: &mut impl std::io::Read) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        let mut buf = [0; 1024];
+        let n = stream.read(&mut buf).expect("read request");
+        assert_ne!(n, 0, "connection closed before request completed");
+        bytes.extend_from_slice(&buf[..n]);
+        if http_request_complete_for_cli_test(&bytes) {
+            return String::from_utf8(bytes).expect("request utf8");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn http_request_complete_for_cli_test(bytes: &[u8]) -> bool {
+    let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let header = String::from_utf8_lossy(&bytes[..header_end + 4]);
+    let content_length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("content length"))
+        })
+        .unwrap_or(0);
+    bytes.len() >= header_end + 4 + content_length
 }

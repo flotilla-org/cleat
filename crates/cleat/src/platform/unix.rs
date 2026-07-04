@@ -1,8 +1,12 @@
 use std::{
-    ffi::CString,
+    env,
+    ffi::{CString, OsStr, OsString},
     io,
-    os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd},
-    path::PathBuf,
+    os::{
+        fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
+    path::{Path, PathBuf},
 };
 
 #[cfg(target_os = "linux")]
@@ -18,7 +22,7 @@ use nix::{
         signal::{killpg, Signal},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{chdir, execvp, read as nix_read, tcgetpgrp, write as nix_write, Pid},
+    unistd::{read as nix_read, tcgetpgrp, write as nix_write, Pid},
 };
 
 use crate::{
@@ -36,13 +40,14 @@ pub struct PtyChild {
 
 impl PtyChild {
     pub fn spawn(session: &SessionMetadata) -> Result<Self, String> {
+        let exec_spec = ChildExecSpec::new(session)?;
         let winsize = Winsize { ws_row: session.initial_size.rows, ws_col: session.initial_size.cols, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: `forkpty` creates a child attached to a new PTY; parent receives the owned master fd.
         let result = unsafe { forkpty(&winsize, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
         match result {
             ForkptyResult::Parent { master, child } => Ok(Self { master_fd: master.into_raw_fd(), pid: child }),
             ForkptyResult::Child => {
-                exec_child_or_exit(session);
+                exec_child_or_exit(&exec_spec);
             }
         }
     }
@@ -305,34 +310,96 @@ pub fn listener_fd(listener: &std::os::unix::net::UnixListener) -> RawFd {
     listener.as_raw_fd()
 }
 
-fn exec_child_or_exit(session: &SessionMetadata) -> ! {
-    if let Err(err) = exec_child(session) {
-        eprintln!("{err}");
-    }
-    std::process::exit(127);
+struct ChildExecSpec {
+    program: CString,
+    _argv: Vec<CString>,
+    _envp: Vec<CString>,
+    cwd: Option<CString>,
+    argv_ptrs: Vec<*const libc::c_char>,
+    envp_ptrs: Vec<*const libc::c_char>,
 }
 
-fn exec_child(session: &SessionMetadata) -> Result<(), String> {
-    if let Some(cwd) = &session.cwd {
-        let _ = chdir(cwd);
+impl ChildExecSpec {
+    fn new(session: &SessionMetadata) -> Result<Self, String> {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+        let program = cstring_from_os(resolve_shell_program(&shell).as_os_str(), "shell path contains interior nul")?;
+        let mut argv = vec![cstring_from_os(&shell, "shell contains interior nul")?];
+        if let Some(cmd) = &session.cmd {
+            argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
+            argv.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
+        }
+        let envp = filtered_envp_from(env::vars_os())?;
+        let cwd = session.cwd.as_ref().map(|cwd| cstring_from_os(cwd.as_os_str(), "cwd contains interior nul")).transpose()?;
+        let argv_ptrs = null_terminated_ptrs(&argv);
+        let envp_ptrs = null_terminated_ptrs(&envp);
+        Ok(Self { program, _argv: argv, _envp: envp, cwd, argv_ptrs, envp_ptrs })
     }
-    for key in STRIP_ENV_VARS {
-        // SAFETY: child process is single-threaded here, before exec, so environment mutation is safe.
-        unsafe {
-            std::env::remove_var(key);
+}
+
+fn exec_child_or_exit(spec: &ChildExecSpec) -> ! {
+    // The process may have been forked from a multithreaded parent. Keep this
+    // path async-signal-safe: raw chdir/execve/write/_exit only.
+    unsafe {
+        if let Some(cwd) = &spec.cwd {
+            let _ = libc::chdir(cwd.as_ptr());
+        }
+        libc::execve(spec.program.as_ptr(), spec.argv_ptrs.as_ptr(), spec.envp_ptrs.as_ptr());
+        static EXEC_FAILED: &[u8] = b"cleat: execve failed\n";
+        let _ = libc::write(libc::STDERR_FILENO, EXEC_FAILED.as_ptr().cast(), EXEC_FAILED.len());
+        libc::_exit(127);
+    }
+}
+
+fn resolve_shell_program(shell: &OsStr) -> PathBuf {
+    if shell.as_bytes().contains(&b'/') {
+        return PathBuf::from(shell);
+    }
+
+    let path = env::var_os("PATH").unwrap_or_else(|| OsString::from("/bin:/usr/bin"));
+    for mut dir in env::split_paths(&path) {
+        dir.push(shell);
+        if is_executable_file(&dir) {
+            return dir;
         }
     }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let shell_c = CString::new(shell.clone()).map_err(|_| "shell contains interior nul".to_string())?;
-    let mut args = vec![shell_c.clone()];
-    if let Some(cmd) = &session.cmd {
-        args.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
-        args.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
+    PathBuf::from(shell)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
     }
-    match execvp(&shell_c, &args) {
-        Ok(_) => unreachable!("execvp only returns on error"),
-        Err(err) => Err(format!("execvp {shell}: {err}")),
+    let Ok(path_c) = cstring_from_os(path.as_os_str(), "path contains interior nul") else {
+        return false;
+    };
+    // SAFETY: access reads a valid nul-terminated path prepared in this process.
+    unsafe { libc::access(path_c.as_ptr(), libc::X_OK) == 0 }
+}
+
+fn filtered_envp_from(env: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Vec<CString>, String> {
+    let mut envp = Vec::new();
+    for (key, value) in env {
+        if STRIP_ENV_VARS.iter().any(|strip| key == OsStr::new(strip)) {
+            continue;
+        }
+        let mut entry = Vec::with_capacity(key.as_bytes().len() + 1 + value.as_bytes().len());
+        entry.extend_from_slice(key.as_bytes());
+        entry.push(b'=');
+        entry.extend_from_slice(value.as_bytes());
+        envp.push(CString::new(entry).map_err(|_| "environment contains interior nul".to_string())?);
     }
+    Ok(envp)
+}
+
+fn cstring_from_os(value: &OsStr, error: &str) -> Result<CString, String> {
+    CString::new(value.as_bytes()).map_err(|_| error.to_string())
+}
+
+fn null_terminated_ptrs(values: &[CString]) -> Vec<*const libc::c_char> {
+    let mut ptrs = Vec::with_capacity(values.len() + 1);
+    ptrs.extend(values.iter().map(|value| value.as_ptr()));
+    ptrs.push(std::ptr::null());
+    ptrs
 }
 
 fn borrow_raw<'fd>(fd: RawFd) -> BorrowedFd<'fd> {
@@ -445,7 +512,10 @@ fn resolve_cwd(_pid: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        ffi::OsString,
+        time::{Duration, Instant},
+    };
 
     use nix::{sys::wait::WaitStatus, unistd::Pid};
 
@@ -470,6 +540,25 @@ mod tests {
     fn exit_code_from_signal_is_128_plus_signal() {
         let status = WaitStatus::Signaled(Pid::from_raw(1), nix::sys::signal::Signal::SIGTERM, false);
         assert_eq!(super::exit_code_from_wait_status(&status), 128 + libc::SIGTERM);
+    }
+
+    #[test]
+    fn child_exec_env_filters_ssh_connection_variables_before_fork() {
+        let envp = super::filtered_envp_from([
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("SSH_TTY"), OsString::from("/dev/ttys001")),
+            (OsString::from("SSH_CONNECTION"), OsString::from("client server")),
+            (OsString::from("SSH_CLIENT"), OsString::from("client")),
+            (OsString::from("CLEAT_KEEP"), OsString::from("1")),
+        ])
+        .expect("filtered envp");
+        let entries: Vec<_> = envp.iter().map(|entry| entry.to_str().expect("utf8 env")).collect();
+
+        assert!(entries.contains(&"PATH=/bin"));
+        assert!(entries.contains(&"CLEAT_KEEP=1"));
+        assert!(!entries.iter().any(|entry| entry.starts_with("SSH_TTY=")));
+        assert!(!entries.iter().any(|entry| entry.starts_with("SSH_CONNECTION=")));
+        assert!(!entries.iter().any(|entry| entry.starts_with("SSH_CLIENT=")));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

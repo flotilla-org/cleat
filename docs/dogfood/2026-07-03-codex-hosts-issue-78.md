@@ -119,6 +119,18 @@ Check off as confirmed/refuted; surprises go in the friction log.
   two argue for a send --submit flag and a screen-stable/semantic-prompt wait
   condition.
 
+- **2026-07-04 (shepherding phase)** Codex shepherded its own PR #88 from inside
+  the cleat session ($pr-shepherd): investigated Linux CI failures it could not
+  reproduce locally and fixed **three real epoll bugs** (EINTR from SIGCHLD
+  interrupting epoll_wait, HUP/ERR misreported as PTY read readiness, client
+  writability semantics), de-flaked its own regression test, rode out an
+  unrelated Ghostty VT flake with a rerun, and reported merge-readiness without
+  merging. The review-loop pattern (bot review -> fix -> re-verify) also worked
+  on the docs PR #87: three real CONTEXT.md ambiguities found and resolved, with
+  one reviewer inference correctly pushed back on (sticky primary). Strongest
+  datapoint of the run: the full author->CI->review->merge-ready loop is
+  workable with the agent hosted in a cleat session.
+
 ## Issues spawned
 
 *(label: `dogfood`)*

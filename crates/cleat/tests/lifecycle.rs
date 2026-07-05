@@ -642,6 +642,7 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
 
     let mut stream = http_packet_stream(temp.path(), "alpha");
     stream.set_read_timeout(Some(Duration::from_secs(2))).expect("set read timeout");
@@ -654,11 +655,32 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
     assert_eq!(hello_frame.decode::<ControlHello>().expect("decode hello").version, PROTOCOL_VERSION);
     assert_eq!(directory_frame.channel, CHANNEL_CONTROL);
     assert_eq!(directory_frame.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
-    assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![cleat::packet::DirectoryEntry {
-        session_id: "alpha".to_string(),
-        cols: 80,
-        rows: 24
-    }]);
+    assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![
+        cleat::packet::DirectoryEntry { session_id: "alpha".to_string(), cols: 80, rows: 24 },
+        cleat::packet::DirectoryEntry { session_id: "beta".to_string(), cols: 80, rows: 24 },
+    ]);
+}
+
+#[test]
+fn contained_session_panic_does_not_stop_sibling_session() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _panic = EnvVarGuard::set("CLEAT_TEST_PANIC_SESSION_TICK", "alpha");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while service.inspect("alpha").is_ok() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(service.inspect("alpha").is_err(), "faulted session should be removed");
+    assert_eq!(service.inspect("beta").expect("sibling session should remain hosted").session.id, "beta");
+    let listed = service.list().expect("list after contained panic");
+    assert_eq!(listed.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+    service.kill("beta").expect("kill sibling session");
 }
 
 #[cfg(feature = "ghostty-vt")]

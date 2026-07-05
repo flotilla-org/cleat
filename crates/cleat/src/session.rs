@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     io::{self, Read, Write},
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -605,6 +606,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     let mut sessions = HashMap::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
     let mut exited_session: Option<(String, bool)> = None;
+    let mut faulted_session: Option<String> = None;
     let mut idle_since = Some(Instant::now());
 
     loop {
@@ -667,19 +669,45 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             let Some(hosted) = sessions.get_mut(&session_id) else {
                 continue;
             };
-            did_work |= service_hosted_session(&layout, &session_id, hosted, &mut packet_clients)?;
-            if hosted.actor.exit_code()?.is_some() {
-                let should_keep_session_dir = finish_exited_session(&layout, &session_id, hosted, &mut packet_clients)?;
-                exited_session = Some((session_id, should_keep_session_dir));
-                break;
+            let service_result = contain_session_unwind(&session_id, || -> Result<(bool, Option<bool>), String> {
+                maybe_panic_for_containment_test(&session_id);
+                let session_did_work = service_hosted_session(&layout, &session_id, hosted, &mut packet_clients)?;
+                let should_keep_session_dir = if hosted.actor.exit_code()?.is_some() {
+                    Some(finish_exited_session(&layout, &session_id, hosted, &mut packet_clients)?)
+                } else {
+                    None
+                };
+                Ok((session_did_work, should_keep_session_dir))
+            })?;
+            match service_result {
+                Some((session_did_work, Some(should_keep_session_dir))) => {
+                    did_work |= session_did_work;
+                    exited_session = Some((session_id, should_keep_session_dir));
+                    break;
+                }
+                Some((session_did_work, None)) => {
+                    did_work |= session_did_work;
+                }
+                None => {
+                    did_work = true;
+                    faulted_session = Some(session_id);
+                    break;
+                }
             }
         }
 
         flush_packet_clients(&mut packet_clients);
 
+        if let Some(session_id) = faulted_session.take() {
+            cleanup_exited_session(&layout, &session_id, true);
+            sessions.remove(&session_id);
+            remove_packet_channels_for_session(&session_id, &mut packet_clients);
+        }
+
         if let Some((session_id, should_keep_session_dir)) = exited_session.take() {
             cleanup_exited_session(&layout, &session_id, should_keep_session_dir);
             sessions.remove(&session_id);
+            remove_packet_channels_for_session(&session_id, &mut packet_clients);
         }
 
         if sessions.is_empty() {
@@ -699,6 +727,45 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(layout.daemon_pid_path());
     Ok(())
+}
+
+fn contain_session_unwind<T, F>(id: &str, action: F) -> Result<Option<T>, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    match panic::catch_unwind(AssertUnwindSafe(action)) {
+        Ok(result) => result.map(Some),
+        Err(payload) => {
+            eprintln!("contained panic while servicing session {id}: {}", panic_payload_message(payload.as_ref()));
+            Ok(None)
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn remove_packet_channels_for_session(session_id: &str, packet_clients: &mut [PacketClient]) {
+    for client in packet_clients {
+        client.channels.retain(|_, channel| channel.session_id != session_id);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_panic_for_containment_test(_session_id: &str) {}
+
+#[cfg(debug_assertions)]
+fn maybe_panic_for_containment_test(session_id: &str) {
+    if std::env::var("CLEAT_TEST_PANIC_SESSION_TICK").as_deref() == Ok(session_id) {
+        panic!("test-requested panic for session {session_id}");
+    }
 }
 
 fn cleanup_exited_session(layout: &RuntimeLayout, id: &str, should_keep_session_dir: bool) {

@@ -580,6 +580,7 @@ mod tests {
             vt_engine: VtEngineKind::Passthrough,
             cwd: None,
             cmd: Some("sleep 0.2; printf READY; sleep 0.2".to_string()),
+            tags: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
             colors: TerminalColors::default(),

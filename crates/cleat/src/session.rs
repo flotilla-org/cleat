@@ -56,11 +56,12 @@ pub struct ForegroundAttach {
     stream: Arc<Mutex<SessionStream>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionStartOptions {
     pub record: bool,
     pub initial_size: TerminalSize,
     pub colors: vt::TerminalColors,
+    pub tags: Vec<String>,
 }
 
 impl ForegroundAttach {
@@ -250,6 +251,8 @@ pub fn ensure_session_started(
     session.record = options.record;
     session.initial_size = options.initial_size;
     session.colors = options.colors;
+    session.tags = options.tags;
+    crate::runtime::normalize_tags(&mut session.tags);
 
     ensure_daemon_started(layout)?;
     let mut stream = connect_session_stream(&layout.socket_path())?;
@@ -1053,6 +1056,7 @@ fn handle_http_request(
                 let inspect = hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?;
                 directory_entries.push(DirectoryEntry {
                     session_id: inspect.session.id,
+                    tags: inspect.session.tags,
                     cols: inspect.terminal.cols,
                     rows: inspect.terminal.rows,
                 });
@@ -1257,6 +1261,16 @@ fn handle_http_request(
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;
             hosted.actor.set_recording(body.enable)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP record response: {err}"))
+        }
+        http_uds::Route::SessionTags { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
+            let body: http_uds::TagRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP tag request: {err}"))?;
+            let tags = hosted.actor.update_tags(body.add, body.remove)?;
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::TagResponse { tags })
+                .map_err(|err| format!("write HTTP tag response: {err}"))
         }
         http_uds::Route::SessionMark { id } => {
             let Some(hosted) = state.sessions.get(&id) else {
@@ -2083,6 +2097,7 @@ mod tests {
             vt_engine: vt::default_vt_engine_kind(),
             cwd: None,
             cmd: None,
+            tags: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
             colors: vt::TerminalColors::default(),
@@ -2106,6 +2121,7 @@ mod tests {
             vt_engine: vt::default_vt_engine_kind(),
             cwd: None,
             cmd: None,
+            tags: Vec::new(),
             record: false,
             initial_size: TerminalSize { cols: 120, rows: 40 },
             colors: vt::TerminalColors::default(),

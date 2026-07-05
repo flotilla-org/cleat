@@ -99,11 +99,23 @@ impl SessionService {
         record: bool,
         initial_size: TerminalSize,
     ) -> Result<SessionInfo, String> {
-        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions {
+        self.create_with_options(name, vt_engine, cwd, cmd, SessionStartOptions {
             record,
             initial_size,
             colors: crate::vt::TerminalColors::default(),
-        })?;
+            tags: Vec::new(),
+        })
+    }
+
+    pub fn create_with_options(
+        &self,
+        name: Option<String>,
+        vt_engine: Option<VtEngineKind>,
+        cwd: Option<std::path::PathBuf>,
+        cmd: Option<String>,
+        options: SessionStartOptions,
+    ) -> Result<SessionInfo, String> {
+        let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, options)?;
         // If the daemon was already running, get real config via inspect.
         if let Ok(result) = self.inspect(&session.id) {
             return Ok(session_info_from_inspect(result, SessionStatus::Detached));
@@ -115,6 +127,7 @@ impl SessionService {
             functional_vt_available: crate::vt::functional_vt_available(),
             cwd: session.cwd,
             cmd: session.cmd,
+            tags: session.tags,
             status: SessionStatus::Detached,
             error: None,
         })
@@ -158,6 +171,7 @@ impl SessionService {
                             functional_vt_available: result.session.functional_vt_available,
                             cwd: result.session.cwd,
                             cmd: result.session.cmd,
+                            tags: result.session.tags,
                             status,
                             error: None,
                         });
@@ -369,6 +383,7 @@ impl SessionService {
                 record: false,
                 initial_size: TerminalSize::default(),
                 colors: crate::vt::TerminalColors::default(),
+                tags: Vec::new(),
             }
         } else {
             ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions::default())?
@@ -384,6 +399,7 @@ impl SessionService {
                 functional_vt_available: crate::vt::functional_vt_available(),
                 cwd: session.cwd,
                 cmd: session.cmd,
+                tags: session.tags,
                 status: SessionStatus::Attached,
                 error: None,
             }
@@ -442,6 +458,15 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         self.http_json(id, Method::GET, &format!("/sessions/{id}"), &())
+    }
+
+    pub fn update_tags(&self, id: &str, add: Vec<String>, remove: Vec<String>) -> Result<Vec<String>, String> {
+        if !self.layout.session_dir(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let response: http_uds::TagResponse =
+            self.http_json(id, Method::POST, &format!("/sessions/{id}/tags"), &http_uds::TagRequest { add, remove })?;
+        Ok(response.tags)
     }
 
     pub fn signal(&self, id: &str, signal: i32, target: crate::protocol::SignalTarget) -> Result<(), String> {
@@ -630,6 +655,7 @@ fn list_preserved_sessions_with_error(layout: &RuntimeLayout, err: String) -> Re
             functional_vt_available: false,
             cwd: None,
             cmd: None,
+            tags: Vec::new(),
             status: SessionStatus::Detached,
             error: Some(err.clone()),
         });
@@ -692,6 +718,7 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         functional_vt_available: result.session.functional_vt_available,
         cwd: result.session.cwd,
         cmd: result.session.cmd,
+        tags: result.session.tags,
         status,
         error: None,
     }

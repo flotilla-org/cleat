@@ -15,6 +15,8 @@ pub struct SessionInfo {
     pub functional_vt_available: bool,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub status: SessionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -46,6 +48,8 @@ pub struct SessionInspect {
     pub functional_vt_available: bool,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

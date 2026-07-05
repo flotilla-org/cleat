@@ -48,6 +48,8 @@ pub struct DirectoryDelta {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub session_id: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub cols: u16,
     pub rows: u16,
 }
@@ -239,7 +241,9 @@ mod tests {
     #[test]
     fn buffer_reader_skips_unknown_message_payload_by_length() {
         let unknown = PacketFrame { channel: CHANNEL_CONTROL, msg_type: 250, payload: vec![1, 2, 3, 4] };
-        let directory = DirectorySnapshot { sessions: vec![DirectoryEntry { session_id: "alpha".to_string(), cols: 80, rows: 24 }] };
+        let directory = DirectorySnapshot {
+            sessions: vec![DirectoryEntry { session_id: "alpha".to_string(), tags: vec!["role=impl".to_string()], cols: 80, rows: 24 }],
+        };
         let known = PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory).expect("encode directory");
         let mut bytes = Vec::new();
         unknown.write(&mut bytes).expect("write unknown");

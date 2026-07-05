@@ -368,6 +368,49 @@ fn list_json_reports_existing_sessions() {
 }
 
 #[test]
+fn list_and_inspect_report_opaque_tags() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create_with_options(
+            Some("alpha".into()),
+            Some(VtEngineKind::Passthrough),
+            None,
+            Some("zsh".into()),
+            cleat::session::SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags: vec!["task=99".into(), "role=impl".into(), "role=impl".into()],
+            },
+        )
+        .expect("create alpha");
+    let cli = Cli::try_parse_from(["cleat", "list"]).expect("parse list");
+
+    let output = cli::execute(cli, &service).expect("execute list").expect("list output");
+    let listed = service.inspect("alpha").expect("inspect alpha");
+
+    assert!(output.contains("tags=role=impl,task=99"), "{output}");
+    assert_eq!(listed.session.tags, vec!["role=impl", "task=99"]);
+}
+
+#[test]
+fn tag_command_adds_and_removes_opaque_tags() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+    let cli = Cli::try_parse_from(["cleat", "tag", "alpha", "+role=impl", "+task=99", "-role=impl"]).expect("parse tag");
+
+    let output = cli::execute(cli, &service).expect("execute tag").expect("tag output");
+    let inspect = service.inspect("alpha").expect("inspect alpha");
+
+    assert_eq!(output, "task=99");
+    assert_eq!(inspect.session.tags, vec!["task=99"]);
+}
+
+#[test]
 fn list_reports_watch_only_session_as_detached() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
@@ -656,8 +699,8 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
     assert_eq!(directory_frame.channel, CHANNEL_CONTROL);
     assert_eq!(directory_frame.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
     assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![
-        cleat::packet::DirectoryEntry { session_id: "alpha".to_string(), cols: 80, rows: 24 },
-        cleat::packet::DirectoryEntry { session_id: "beta".to_string(), cols: 80, rows: 24 },
+        cleat::packet::DirectoryEntry { session_id: "alpha".to_string(), tags: Vec::new(), cols: 80, rows: 24 },
+        cleat::packet::DirectoryEntry { session_id: "beta".to_string(), tags: Vec::new(), cols: 80, rows: 24 },
     ]);
 }
 

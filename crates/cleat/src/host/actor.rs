@@ -278,6 +278,7 @@ pub(crate) enum SessionCommand {
     PasteWithMark { text: Vec<u8>, marker_name: String, reply: mpsc::Sender<Result<u64, String>> },
     SetRecording { enable: bool, reply: mpsc::Sender<Result<(), String>> },
     Mark { name: Option<String>, reply: mpsc::Sender<Result<u64, String>> },
+    UpdateTags { add: Vec<String>, remove: Vec<String>, reply: mpsc::Sender<Result<Vec<String>, String>> },
     ResolveMarker { name: String, reply: mpsc::Sender<Result<Option<u64>, String>> },
     ResolveNextMarker { after: u64, reply: mpsc::Sender<Result<Option<u64>, String>> },
     DispatchSignal { signal: i32, target: SignalTarget, reply: mpsc::Sender<Result<(), String>> },
@@ -712,6 +713,10 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::Mark { name, reply })
     }
 
+    pub(crate) fn update_tags(&self, add: Vec<String>, remove: Vec<String>) -> Result<Vec<String>, String> {
+        self.request_result(|reply| SessionCommand::UpdateTags { add, remove, reply })
+    }
+
     pub(crate) fn resolve_marker(&self, name: String) -> Result<Option<u64>, String> {
         self.request_result(|reply| SessionCommand::ResolveMarker { name, reply })
     }
@@ -1023,6 +1028,9 @@ fn session_actor_handle_command(
         }
         SessionCommand::Mark { name, reply } => {
             let _ = reply.send(runtime.mark(name));
+        }
+        SessionCommand::UpdateTags { add, remove, reply } => {
+            let _ = reply.send(Ok(runtime.update_tags(add, remove)));
         }
         SessionCommand::ResolveMarker { name, reply } => {
             let _ = reply.send(Ok(runtime.resolve_marker(&name)));

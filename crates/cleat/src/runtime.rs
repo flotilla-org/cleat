@@ -37,6 +37,8 @@ pub struct SessionMetadata {
     pub vt_engine: VtEngineKind,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub record: bool,
     pub initial_size: TerminalSize,
     pub colors: TerminalColors,
@@ -128,7 +130,16 @@ impl RuntimeLayout {
     }
 
     pub fn session_metadata(&self, id: String, vt_engine: VtEngineKind, cwd: Option<PathBuf>, cmd: Option<String>) -> SessionMetadata {
-        SessionMetadata { id, vt_engine, cwd, cmd, record: false, initial_size: TerminalSize::default(), colors: TerminalColors::default() }
+        SessionMetadata {
+            id,
+            vt_engine,
+            cwd,
+            cmd,
+            tags: Vec::new(),
+            record: false,
+            initial_size: TerminalSize::default(),
+            colors: TerminalColors::default(),
+        }
     }
 
     pub fn remove_session(&self, id: &str) -> Result<(), String> {
@@ -152,6 +163,11 @@ pub fn validate_runtime_name(name: &str) -> Result<(), String> {
     } else {
         Err(format!("invalid filesystem-safe name: {name}"))
     }
+}
+
+pub fn normalize_tags(tags: &mut Vec<String>) {
+    tags.sort();
+    tags.dedup();
 }
 
 fn discover_runtime_root(

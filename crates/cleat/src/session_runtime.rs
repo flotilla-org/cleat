@@ -15,7 +15,7 @@ use crate::{
         ViewportCommandOutcome,
     },
     recording::SessionRecorder,
-    runtime::SessionMetadata,
+    runtime::{normalize_tags, SessionMetadata},
     vt::{self, TerminalModeState, VtEngine},
 };
 
@@ -282,6 +282,7 @@ impl SessionRuntime {
                 functional_vt_available: crate::vt::functional_vt_available(),
                 cwd: self.session.cwd.clone(),
                 cmd: self.session.cmd.clone(),
+                tags: self.session.tags.clone(),
             },
             terminal: crate::protocol::TerminalInspect { rows, cols },
             process: crate::protocol::ProcessInspect {
@@ -308,6 +309,17 @@ impl SessionRuntime {
         };
         self.record_custom_event('s', &serde_json::json!({"signal": signal, "target": target_str}).to_string());
         Ok(())
+    }
+
+    pub(crate) fn update_tags(&mut self, add: Vec<String>, remove: Vec<String>) -> Vec<String> {
+        for tag in add {
+            if !self.session.tags.contains(&tag) {
+                self.session.tags.push(tag);
+            }
+        }
+        self.session.tags.retain(|tag| !remove.contains(tag));
+        normalize_tags(&mut self.session.tags);
+        self.session.tags.clone()
     }
 
     pub(crate) fn mark(&mut self, name: Option<String>) -> Result<u64, String> {
@@ -540,6 +552,7 @@ mod tests {
             vt_engine: VtEngineKind::Passthrough,
             cwd: None,
             cmd: Some("true".to_string()),
+            tags: Vec::new(),
             record: true,
             initial_size: crate::runtime::TerminalSize::default(),
             colors: crate::vt::TerminalColors::default(),
@@ -583,6 +596,7 @@ mod tests {
             vt_engine: VtEngineKind::Ghostty,
             cwd: None,
             cmd: Some("sh -c 'printf RECREATE_MARKER; sleep 30'".to_string()),
+            tags: Vec::new(),
             record: true,
             initial_size: crate::runtime::TerminalSize::default(),
             colors,

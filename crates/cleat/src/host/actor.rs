@@ -4,7 +4,9 @@ use std::{
     io,
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering},
-        mpsc, Arc,
+        mpsc,
+        mpsc::{Receiver, SyncSender},
+        Arc,
     },
     thread,
 };
@@ -33,9 +35,22 @@ use crate::{
 };
 
 const POSIX_SIGTERM: i32 = 15;
+const RAW_OUTPUT_TAP_CHUNKS: usize = 64;
 
 pub(crate) type WakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 pub(crate) type ImageResourceDataCallback = Box<dyn FnMut(&[u8]) -> bool + Send>;
+
+#[allow(dead_code)]
+pub(crate) struct RawOutputTap {
+    rx: Receiver<Vec<u8>>,
+}
+
+impl RawOutputTap {
+    #[allow(dead_code)]
+    pub(crate) fn try_recv(&self) -> Result<Vec<u8>, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ObservationState {
@@ -250,6 +265,8 @@ pub(crate) enum SessionCommand {
     MarkObserved { generation: u64, reply: mpsc::Sender<bool> },
     ScrollbackExtent { reply: mpsc::Sender<TerminalScrollbackExtent> },
     ScrollbarState { reply: mpsc::Sender<TerminalScrollbarState> },
+    SetClientPresence { active: bool, reply: mpsc::Sender<()> },
+    SubscribeRawOutput { reply: mpsc::Sender<RawOutputTap> },
     Stop { terminate: bool },
 }
 
@@ -558,6 +575,19 @@ impl SessionActor {
         self.tx.send(make_command(reply)).map_err(|_| "session actor is not running".to_string())?;
         recv.recv().map_err(|_| "session actor did not reply".to_string())?
     }
+
+    pub(crate) fn set_client_presence(&self, active: bool) -> Result<(), String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::SetClientPresence { active, reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn subscribe_raw_output(&self) -> Result<RawOutputTap, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::SubscribeRawOutput { reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
 }
 
 impl Drop for SessionActor {
@@ -576,7 +606,12 @@ enum PumpOutcome {
     Full,
 }
 
-fn pump_session_runtime(runtime: &mut SessionRuntime, exited: &mut bool) -> Result<PumpOutcome, String> {
+struct PumpResult {
+    outcome: PumpOutcome,
+    chunks: Vec<Vec<u8>>,
+}
+
+fn pump_session_runtime(runtime: &mut SessionRuntime, exited: &mut bool, has_active_client: bool) -> Result<PumpResult, String> {
     let mut exited_now = false;
     if !*exited {
         if let Some(exit_code) = runtime.exit_code_if_exited()? {
@@ -586,19 +621,20 @@ fn pump_session_runtime(runtime: &mut SessionRuntime, exited: &mut bool) -> Resu
         }
     }
     let output = if exited_now {
-        runtime.drain_output_after_exit(false)?
+        runtime.drain_output_after_exit(has_active_client)?
     } else if *exited {
         PtyOutput { chunks: Vec::new() }
     } else {
-        runtime.read_available_output(false)?
+        runtime.read_available_output(has_active_client)?
     };
-    if exited_now {
-        Ok(PumpOutcome::Full)
+    let outcome = if exited_now {
+        PumpOutcome::Full
     } else if !output.chunks.is_empty() {
-        Ok(PumpOutcome::PartialUnknown)
+        PumpOutcome::PartialUnknown
     } else {
-        Ok(PumpOutcome::Clean)
-    }
+        PumpOutcome::Clean
+    };
+    Ok(PumpResult { outcome, chunks: output.chunks })
 }
 
 fn mark_full_and_wake(observation: &mut ObservationState, rows: u16, wake: &WakeCallback) {
@@ -632,6 +668,8 @@ fn session_actor_loop(
 ) {
     let mut observation = ObservationState::new_with_mirror(rows, Some(mirror));
     let mut exited = false;
+    let mut has_active_client = false;
+    let mut raw_output_taps = Vec::new();
     let _ = ready.send(Ok(()));
     #[cfg(unix)]
     loop {
@@ -644,24 +682,33 @@ fn session_actor_loop(
         };
         if readiness.command_readable {
             command_wake.drain();
-            if drain_session_commands(&rx, &mut runtime, &mut observation, &mut exited, &wake) {
+            if drain_session_commands(&rx, &mut runtime, &mut observation, &mut exited, &mut has_active_client, &mut raw_output_taps, &wake)
+            {
                 break;
             }
         }
         if readiness.pty_readable {
-            session_actor_pump(&mut runtime, &mut observation, &mut exited, &wake);
+            session_actor_pump(&mut runtime, &mut observation, &mut exited, has_active_client, &mut raw_output_taps, &wake);
         }
     }
     #[cfg(not(unix))]
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(10)) {
             Ok(command) => {
-                if session_actor_handle_command(command, &mut runtime, &mut observation, &mut exited, &wake) {
+                if session_actor_handle_command(
+                    command,
+                    &mut runtime,
+                    &mut observation,
+                    &mut exited,
+                    &mut has_active_client,
+                    &mut raw_output_taps,
+                    &wake,
+                ) {
                     break;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                session_actor_pump(&mut runtime, &mut observation, &mut exited, &wake);
+                session_actor_pump(&mut runtime, &mut observation, &mut exited, has_active_client, &mut raw_output_taps, &wake);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
@@ -676,12 +723,14 @@ fn drain_session_commands(
     runtime: &mut SessionRuntime,
     observation: &mut ObservationState,
     exited: &mut bool,
+    has_active_client: &mut bool,
+    raw_output_taps: &mut Vec<SyncSender<Vec<u8>>>,
     wake: &WakeCallback,
 ) -> bool {
     loop {
         match rx.try_recv() {
             Ok(command) => {
-                if session_actor_handle_command(command, runtime, observation, exited, wake) {
+                if session_actor_handle_command(command, runtime, observation, exited, has_active_client, raw_output_taps, wake) {
                     return true;
                 }
             }
@@ -699,6 +748,8 @@ fn session_actor_handle_command(
     runtime: &mut SessionRuntime,
     observation: &mut ObservationState,
     exited: &mut bool,
+    has_active_client: &mut bool,
+    raw_output_taps: &mut Vec<SyncSender<Vec<u8>>>,
     wake: &WakeCallback,
 ) -> bool {
     let mut stop = false;
@@ -777,6 +828,15 @@ fn session_actor_handle_command(
             });
             let _ = reply.send(scrollbar);
         }
+        SessionCommand::SetClientPresence { active, reply } => {
+            *has_active_client = active;
+            let _ = reply.send(());
+        }
+        SessionCommand::SubscribeRawOutput { reply } => {
+            let (tx, rx) = mpsc::sync_channel(RAW_OUTPUT_TAP_CHUNKS);
+            raw_output_taps.push(tx);
+            let _ = reply.send(RawOutputTap { rx });
+        }
         SessionCommand::Stop { terminate } => {
             if terminate && !*exited {
                 let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
@@ -785,21 +845,51 @@ fn session_actor_handle_command(
         }
     }
     if !stop {
-        session_actor_pump(runtime, observation, exited, wake);
+        session_actor_pump(runtime, observation, exited, *has_active_client, raw_output_taps, wake);
     }
     stop
 }
 
-fn session_actor_pump(runtime: &mut SessionRuntime, observation: &mut ObservationState, exited: &mut bool, wake: &WakeCallback) {
-    match pump_session_runtime(runtime, exited) {
-        Ok(PumpOutcome::Clean) => {}
-        Ok(PumpOutcome::PartialUnknown) => mark_partial_unknown_and_wake(observation, wake),
-        Ok(PumpOutcome::Full) | Err(_) => {
+fn session_actor_pump(
+    runtime: &mut SessionRuntime,
+    observation: &mut ObservationState,
+    exited: &mut bool,
+    has_active_client: bool,
+    raw_output_taps: &mut Vec<SyncSender<Vec<u8>>>,
+    wake: &WakeCallback,
+) {
+    match pump_session_runtime(runtime, exited, has_active_client) {
+        Ok(result) => {
+            publish_raw_output(raw_output_taps, &result.chunks);
+            match result.outcome {
+                PumpOutcome::Clean => {}
+                PumpOutcome::PartialUnknown => mark_partial_unknown_and_wake(observation, wake),
+                PumpOutcome::Full => {
+                    let rows = runtime.inspect(false, 0).terminal.rows;
+                    mark_full_and_wake(observation, rows, wake);
+                }
+            }
+        }
+        Err(_) => {
             let rows = runtime.inspect(false, 0).terminal.rows;
             mark_full_and_wake(observation, rows, wake);
         }
     }
     sync_terminal_modes_and_wake(runtime, observation, wake);
+}
+
+fn publish_raw_output(taps: &mut Vec<SyncSender<Vec<u8>>>, chunks: &[Vec<u8>]) {
+    if chunks.is_empty() || taps.is_empty() {
+        return;
+    }
+    taps.retain(|tap| {
+        for chunk in chunks {
+            if tap.try_send(chunk.clone()).is_err() {
+                return false;
+            }
+        }
+        true
+    });
 }
 
 fn route_paste_on_actor(runtime: &mut SessionRuntime, text: &[u8]) -> Result<usize, String> {

@@ -6,60 +6,28 @@ use std::{
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-use crate::{
-    platform::process,
-    runtime::SessionMetadata,
-    vt::{Rgb, TerminalColors},
-};
+use crate::platform::process;
 
 const PID_NAME: &str = "daemon.pid";
 
-pub fn daemon_pid_path(root: &Path, id: &str) -> PathBuf {
-    root.join(id).join(PID_NAME)
+pub fn daemon_pid_path(root: &Path, daemon_name: &str) -> PathBuf {
+    root.join(daemon_name).join(PID_NAME)
 }
 
-pub fn spawn_daemon_process(root: &Path, session: &SessionMetadata) -> Result<(), String> {
+pub fn spawn_daemon_process(root: &Path, daemon_name: &str) -> Result<(), String> {
     let exe = resolve_cleat_executable()?;
     let mut command = Command::new(exe);
-    command.arg("--runtime-root").arg(root).arg("serve").arg("--id").arg(&session.id).arg("--vt").arg(session.vt_engine.as_str());
-    command.arg("--size").arg(session.initial_size.to_string());
-    if let Some(cmd) = &session.cmd {
-        command.arg("--cmd").arg(cmd);
-    }
-    if let Some(cwd) = &session.cwd {
-        command.arg("--cwd").arg(cwd);
-    }
-    if session.record {
-        command.arg("--record");
-    }
-    add_color_args(&mut command, session.colors);
+    command.arg("--runtime-root").arg(root).arg("--server").arg(daemon_name).arg("serve");
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    let child = command.spawn().map_err(|err| format!("spawn session daemon for {}: {err}", session.id))?;
-    fs::write(daemon_pid_path(root, &session.id), child.id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
+    command.spawn().map_err(|err| format!("spawn daemon {daemon_name}: {err}"))?;
     Ok(())
-}
-
-fn add_color_args(command: &mut Command, colors: TerminalColors) {
-    if let Some(color) = colors.default_foreground {
-        command.arg("--color-foreground").arg(format_rgb_arg(color));
-    }
-    if let Some(color) = colors.default_background {
-        command.arg("--color-background").arg(format_rgb_arg(color));
-    }
-    if let Some(color) = colors.default_cursor {
-        command.arg("--color-cursor").arg(format_rgb_arg(color));
-    }
-}
-
-fn format_rgb_arg(color: Rgb) -> String {
-    format!("{:02x}{:02x}{:02x}", color.r, color.g, color.b)
 }
 
 /// Returns true if the daemon is alive, or if no PID file exists yet because
 /// the daemon may still be starting. Returns false only for a definitive stale
 /// PID file.
-pub fn is_session_daemon_alive(root: &Path, id: &str) -> bool {
-    let pid_path = daemon_pid_path(root, id);
+pub fn is_session_daemon_alive(root: &Path, daemon_name: &str) -> bool {
+    let pid_path = daemon_pid_path(root, daemon_name);
     let Ok(contents) = fs::read_to_string(&pid_path) else {
         return true;
     };
@@ -69,8 +37,8 @@ pub fn is_session_daemon_alive(root: &Path, id: &str) -> bool {
     is_expected_cleat_process(pid)
 }
 
-pub fn terminate_session_daemon_if_expected(root: &Path, id: &str) {
-    let pid_path = daemon_pid_path(root, id);
+pub fn terminate_session_daemon_if_expected(root: &Path, daemon_name: &str) {
+    let pid_path = daemon_pid_path(root, daemon_name);
     let Ok(Some(pid)) = fs::read_to_string(&pid_path).map(|value| value.trim().parse::<i32>().ok()) else {
         return;
     };

@@ -8,7 +8,8 @@ use cleat::{
 };
 
 fn setup_session_with_cast(root: &std::path::Path, id: &str, events: &[Event]) {
-    let session_dir = root.join(id);
+    let layout = RuntimeLayout::new(root.to_path_buf());
+    let session_dir = layout.session_dir(id);
     std::fs::create_dir_all(&session_dir).unwrap();
     let path = session_dir.join(CAST_FILE_NAME);
     let mut f = std::fs::File::create(&path).unwrap();
@@ -63,7 +64,8 @@ fn capture_slice_text_returns_empty_at_eof() {
     let events = vec![Event { time: Duration::from_millis(100), code: EventCode::Output, data: "done".into() }];
     setup_session_with_cast(temp.path(), "sess", &events);
 
-    let file_size = std::fs::metadata(temp.path().join("sess").join(CAST_FILE_NAME)).unwrap().len();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let file_size = std::fs::metadata(layout.session_dir("sess").join(CAST_FILE_NAME)).unwrap().len();
     let (result, _outcome) = service.capture_slice_text("sess", StartBound::Offset(file_size), EndBound::EndOfRecording).unwrap();
     assert!(result.is_empty());
 }
@@ -74,7 +76,8 @@ fn capture_slice_errors_when_no_recording() {
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
 
     // Create session dir but no .cast file
-    std::fs::create_dir_all(temp.path().join("no-rec")).unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    std::fs::create_dir_all(layout.session_dir("no-rec")).unwrap();
 
     let err = service.capture_slice_text("no-rec", StartBound::Offset(0), EndBound::EndOfRecording).unwrap_err();
     assert!(err.contains("no recording"), "error should mention missing recording: {err}");
@@ -95,7 +98,8 @@ fn capture_slice_text_returns_bytes_through_eof_with_start_at_zero() {
     assert_eq!(text, "hello world");
     assert_eq!(outcome.end_status, None);
     assert_eq!(outcome.start_offset, 0);
-    let file_size = std::fs::metadata(temp.path().join("sess").join(CAST_FILE_NAME)).unwrap().len();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let file_size = std::fs::metadata(layout.session_dir("sess").join(CAST_FILE_NAME)).unwrap().len();
     assert_eq!(outcome.end_offset, file_size);
 }
 

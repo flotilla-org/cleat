@@ -261,7 +261,7 @@ fn create_makes_session_directory_and_returns_metadata() {
 
     let output = cli::execute(cli, &service).expect("execute create").expect("create output");
     assert_eq!(output, "alpha");
-    assert!(temp.path().join("alpha").exists());
+    assert!(service.session_dir("alpha").exists());
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -607,7 +607,9 @@ fn create_respawns_over_a_stale_crashed_daemon() {
     // Hand-build the husk a crashed recording daemon leaves behind: a session dir
     // with a real recording, a leftover socket file with no listener, and a PID
     // file pointing at a process that is not a live cleat.
-    let dir = root.join(id);
+    let layout = RuntimeLayout::new(root.to_path_buf());
+    layout.ensure_daemon_dirs().expect("create daemon dirs");
+    let dir = layout.session_dir(id);
     std::fs::create_dir_all(&dir).expect("create session dir");
     let mut recorder = SessionRecorder::new(&dir, 80, 24, "passthrough").expect("recorder");
     recorder.output(b"prior activation output\r\n", Duration::from_millis(1));
@@ -640,6 +642,7 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
 
     let mut stream = http_packet_stream(temp.path(), "alpha");
     stream.set_read_timeout(Some(Duration::from_secs(2))).expect("set read timeout");
@@ -652,11 +655,32 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
     assert_eq!(hello_frame.decode::<ControlHello>().expect("decode hello").version, PROTOCOL_VERSION);
     assert_eq!(directory_frame.channel, CHANNEL_CONTROL);
     assert_eq!(directory_frame.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
-    assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![cleat::packet::DirectoryEntry {
-        session_id: "alpha".to_string(),
-        cols: 80,
-        rows: 24
-    }]);
+    assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![
+        cleat::packet::DirectoryEntry { session_id: "alpha".to_string(), cols: 80, rows: 24 },
+        cleat::packet::DirectoryEntry { session_id: "beta".to_string(), cols: 80, rows: 24 },
+    ]);
+}
+
+#[test]
+fn contained_session_panic_does_not_stop_sibling_session() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _panic = EnvVarGuard::set("CLEAT_TEST_PANIC_SESSION_TICK", "alpha");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while service.inspect("alpha").is_ok() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(service.inspect("alpha").is_err(), "faulted session should be removed");
+    assert_eq!(service.inspect("beta").expect("sibling session should remain hosted").session.id, "beta");
+    let listed = service.list().expect("list after contained panic");
+    assert_eq!(listed.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+    service.kill("beta").expect("kill sibling session");
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -899,7 +923,7 @@ fn kill_removes_session_directory() {
     let output = cli::execute(cli, &service).expect("execute kill");
 
     assert_eq!(output, None);
-    assert!(!temp.path().join("alpha").exists());
+    assert!(!service.session_dir("alpha").exists());
 }
 
 #[test]
@@ -911,7 +935,7 @@ fn kill_preserves_session_directory_with_recording() {
         .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sh -c 'printf preserved; sleep 30'".into()), true)
         .expect("create alpha");
 
-    let cast_path = temp.path().join("alpha").join(CAST_FILE_NAME);
+    let cast_path = service.session_dir("alpha").join(CAST_FILE_NAME);
     let deadline = Instant::now() + Duration::from_secs(2);
     while !cast_path.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -921,10 +945,10 @@ fn kill_preserves_session_directory_with_recording() {
     let cli = Cli::try_parse_from(["cleat", "kill", "alpha"]).expect("parse kill");
     cli::execute(cli, &service).expect("execute kill");
 
-    assert!(temp.path().join("alpha").exists(), "recording-bearing session directory should be preserved");
+    assert!(service.session_dir("alpha").exists(), "recording-bearing session directory should be preserved");
     assert!(cast_path.exists(), "recording should survive kill");
-    assert!(!session_socket_path(temp.path(), "alpha").exists(), "socket should not survive kill");
-    assert!(!daemon_pid_path(temp.path(), "alpha").exists(), "pid file should not survive kill");
+    assert!(session_socket_path(temp.path(), "alpha").exists(), "daemon socket should linger after session-scoped kill");
+    assert!(daemon_pid_path(temp.path(), "alpha").exists(), "daemon pid should linger after session-scoped kill");
 }
 
 #[test]
@@ -936,7 +960,7 @@ fn kill_purge_removes_session_directory_with_recording() {
         .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sh -c 'printf purged; sleep 30'".into()), true)
         .expect("create alpha");
 
-    let cast_path = temp.path().join("alpha").join(CAST_FILE_NAME);
+    let cast_path = service.session_dir("alpha").join(CAST_FILE_NAME);
     let deadline = Instant::now() + Duration::from_secs(2);
     while !cast_path.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -946,7 +970,7 @@ fn kill_purge_removes_session_directory_with_recording() {
     let cli = Cli::try_parse_from(["cleat", "kill", "alpha", "--purge"]).expect("parse kill --purge");
     cli::execute(cli, &service).expect("execute kill --purge");
 
-    assert!(!temp.path().join("alpha").exists(), "purge should delete the recording-bearing session directory");
+    assert!(!service.session_dir("alpha").exists(), "purge should delete the recording-bearing session directory");
 }
 
 #[test]
@@ -1054,7 +1078,7 @@ fn http_detach_records_only_real_foreground_transition() {
     assert!(second_detach.starts_with("HTTP/1.1 204 No Content\r\n"), "{second_detach}");
     drop(attach_stream);
 
-    let cast_path = temp.path().join("alpha").join(cleat::recording::CAST_FILE_NAME);
+    let cast_path = service.session_dir("alpha").join(cleat::recording::CAST_FILE_NAME);
     let events = cleat::cast_reader::read_all_events_since(&cast_path, 0).expect("read cast events");
     let attach_count = events.iter().filter(|event| matches!(event.code, cleat::asciicast::EventCode::Custom('a'))).count();
     let detach_count = events.iter().filter(|event| matches!(event.code, cleat::asciicast::EventCode::Custom('d'))).count();
@@ -1528,7 +1552,7 @@ fn cleat_detach_exits_foreground_client_and_keeps_session_alive() {
     }
 
     assert!(!foreground_path(temp.path(), "alpha").exists(), "detach should clear the foreground marker");
-    assert!(temp.path().join("alpha").exists(), "detach should leave the session directory intact");
+    assert!(service.session_dir("alpha").exists(), "detach should leave the session directory intact");
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -1581,7 +1605,7 @@ fn cleat_attach_exits_on_sigterm_and_keeps_session_alive() {
     }
 
     assert!(!foreground_path(temp.path(), "alpha").exists(), "signal exit should clear the foreground marker");
-    assert!(temp.path().join("alpha").exists(), "signal exit should leave the session directory intact");
+    assert!(service.session_dir("alpha").exists(), "signal exit should leave the session directory intact");
 }
 
 #[test]
@@ -1677,12 +1701,13 @@ fn signal_term_to_leader_terminates_session() {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if !socket_path.exists() {
+        if service.inspect(&info.id).is_err() {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!socket_path.exists(), "socket should be gone after SIGTERM to leader");
+    assert!(service.inspect(&info.id).is_err(), "session should be gone after SIGTERM to leader");
+    assert!(socket_path.exists(), "daemon socket should linger after session exit");
 }
 
 #[test]
@@ -1692,13 +1717,19 @@ fn short_lived_session_reaps_its_directory_after_child_exit() {
     let service = service_for(temp.path());
     service.create(Some("alpha".into()), None, None, Some("printf done; sleep 0.1".into()), false).expect("create alpha");
 
-    let session_dir = temp.path().join("alpha");
+    let session_dir = service.session_dir("alpha");
     let deadline = Instant::now() + Duration::from_secs(2);
     while session_dir.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
 
     assert!(!session_dir.exists(), "session directory should be reaped after child exit");
+
+    let beta = service
+        .create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create second session via lingering daemon");
+    assert_eq!(beta.id, "beta");
+    service.kill("beta").expect("kill second session");
 }
 
 #[test]
@@ -1949,7 +1980,7 @@ fn replay_with_session_and_markers_while_daemon_alive() {
     // Resolve range via the live daemon (socket-backed marker lookup), then
     // play into a buffer so we can assert the actual bytes rather than just
     // ExecResult::Ok.
-    let cast_path = service.layout_root().join("alpha").join(cleat::recording::CAST_FILE_NAME);
+    let cast_path = service.session_dir("alpha").join(cleat::recording::CAST_FILE_NAME);
     let (so, eo, _status) = service
         .resolve_slice_range(
             "alpha",

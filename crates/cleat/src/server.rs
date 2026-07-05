@@ -2,26 +2,18 @@ use std::{
     io::Write,
     path::Path,
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use http::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
-const EMPTY_SESSION_DIR_GRACE: Duration = Duration::from_secs(2);
-
 use crate::{
     http_uds,
-    platform::{
-        daemon::{daemon_pid_path, is_session_daemon_alive, terminate_session_daemon_if_expected},
-        ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
-    },
+    platform::ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     protocol::{SessionInfo, SessionStatus},
     runtime::{RuntimeLayout, TerminalSize},
-    session::{
-        attach_foreground, ensure_session_started, foreground_path, run_session_daemon, session_socket_path, watch_foreground,
-        ForegroundAttach, SessionStartOptions,
-    },
+    session::{attach_foreground, ensure_session_started, run_session_daemon, watch_foreground, ForegroundAttach, SessionStartOptions},
     vt::VtEngineKind,
 };
 
@@ -75,8 +67,16 @@ impl SessionService {
         Self::new(RuntimeLayout::discover())
     }
 
+    pub fn with_daemon(&self, daemon_name: String) -> Result<Self, String> {
+        Ok(Self::new(self.layout.clone().with_daemon(daemon_name)?))
+    }
+
     pub fn layout_root(&self) -> &std::path::Path {
         self.layout.root()
+    }
+
+    pub fn session_dir(&self, id: &str) -> std::path::PathBuf {
+        self.layout.session_dir(id)
     }
 
     pub fn create(
@@ -135,60 +135,36 @@ impl SessionService {
             if !path.is_dir() {
                 continue;
             }
-            let id = match path.file_name().and_then(|n| n.to_str()) {
+            let daemon_name = match path.file_name().and_then(|n| n.to_str()) {
                 Some(name) => name.to_string(),
                 None => continue,
             };
-            let socket_path = session_socket_path(self.layout.root(), &id);
-            if !socket_path.exists() {
-                if session_dir_is_stale_empty(&path, EMPTY_SESSION_DIR_GRACE) {
-                    let _ = self.layout.remove_session(&id);
-                }
+            if !path.join("sessions").is_dir() {
                 continue;
             }
-            if !daemon_pid_path(self.layout.root(), &id).exists()
-                && !crate::recreate::session_is_recreatable(&path)
-                && session_dir_contains_only(&path, &socket_path)
-                && session_socket_is_stale(&socket_path)
-            {
-                let _ = self.layout.remove_session(&id);
+            let daemon_service = self.with_daemon(daemon_name)?;
+            if !daemon_service.layout.socket_path().exists() || session_socket_is_stale(&daemon_service.layout.socket_path()) {
                 continue;
             }
-            if !is_session_daemon_alive(self.layout.root(), &id) {
-                // Stale daemon. Only garbage-collect it if there is nothing to
-                // recreate from; a crashed session with a recording survives so a
-                // later create/attach can respawn it from its prior output.
-                if !crate::recreate::session_is_recreatable(&path) {
-                    let _ = self.layout.remove_session(&id);
-                }
-                continue;
-            }
-            match self.inspect(&id) {
+            match daemon_service.http_json_daemon::<_, http_uds::SessionListResponse>(Method::GET, "/sessions", &()) {
                 Ok(result) => {
-                    let status =
-                        if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
-                    sessions.push(SessionInfo {
-                        id: result.session.id,
-                        vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
-                        vt_engine_status: result.session.vt_engine_status,
-                        functional_vt_available: result.session.functional_vt_available,
-                        cwd: result.session.cwd,
-                        cmd: result.session.cmd,
-                        status,
-                        error: None,
-                    });
+                    for result in result.sessions {
+                        let status =
+                            if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
+                        sessions.push(SessionInfo {
+                            id: result.session.id,
+                            vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+                            vt_engine_status: result.session.vt_engine_status,
+                            functional_vt_available: result.session.functional_vt_available,
+                            cwd: result.session.cwd,
+                            cmd: result.session.cmd,
+                            status,
+                            error: None,
+                        });
+                    }
                 }
                 Err(err) => {
-                    sessions.push(SessionInfo {
-                        id,
-                        vt_engine: crate::vt::default_vt_engine_kind(),
-                        vt_engine_status: String::new(),
-                        functional_vt_available: false,
-                        cwd: None,
-                        cmd: None,
-                        status: SessionStatus::Detached,
-                        error: Some(err),
-                    });
+                    sessions.extend(list_preserved_sessions_with_error(&daemon_service.layout, err)?);
                 }
             }
         }
@@ -201,25 +177,16 @@ impl SessionService {
     }
 
     pub fn kill_with_purge(&self, id: &str, purge: bool) -> Result<(), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let pid_path = daemon_pid_path(self.layout.root(), id);
-        let socket_path = session_socket_path(self.layout.root(), id);
-        if socket_path.exists() && self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &()).is_ok() {
-            if pid_path.exists() {
-                self.wait_for_session_shutdown(id);
-            }
-            if !self.layout.root().join(id).exists() {
+        if self.layout.socket_path().exists() && self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &()).is_ok() {
+            self.wait_for_session_shutdown(id);
+            if !self.layout.session_dir(id).exists() {
                 return Ok(());
             }
         }
-        terminate_session_daemon_if_expected(self.layout.root(), id);
-        self.wait_for_session_shutdown(id);
-        if !self.layout.root().join(id).exists() {
-            return Ok(());
-        }
-        if purge || !crate::recreate::session_is_recreatable(&self.layout.root().join(id)) {
+        if purge || !crate::recreate::session_is_recreatable(&self.layout.session_dir(id)) {
             self.layout.remove_session(id)
         } else {
             self.remove_volatile_session_files(id);
@@ -229,10 +196,7 @@ impl SessionService {
 
     fn wait_for_session_shutdown(&self, id: &str) {
         for _ in 0..50 {
-            if !self.layout.root().join(id).exists()
-                || !daemon_pid_path(self.layout.root(), id).exists()
-                || !is_session_daemon_alive(self.layout.root(), id)
-            {
+            if !self.layout.session_dir(id).exists() || self.inspect(id).is_err() {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
@@ -240,13 +204,11 @@ impl SessionService {
     }
 
     fn remove_volatile_session_files(&self, id: &str) {
-        let _ = std::fs::remove_file(session_socket_path(self.layout.root(), id));
-        let _ = std::fs::remove_file(daemon_pid_path(self.layout.root(), id));
-        let _ = std::fs::remove_file(foreground_path(self.layout.root(), id));
+        let _ = std::fs::remove_file(self.layout.foreground_path(id));
     }
 
     pub fn detach(&self, id: &str) -> Result<(), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
@@ -254,7 +216,7 @@ impl SessionService {
     }
 
     pub fn capture(&self, id: &str) -> Result<String, String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
@@ -325,7 +287,7 @@ impl SessionService {
     }
 
     fn capture_slice_inner(&self, id: &str, start: StartBound, end: EndBound) -> Result<(String, SliceOutcome), String> {
-        let cast_path = self.layout.root().join(id).join(crate::recording::CAST_FILE_NAME);
+        let cast_path = self.layout.session_dir(id).join(crate::recording::CAST_FILE_NAME);
         if !cast_path.exists() {
             return Err(format!("no recording for session {id}"));
         }
@@ -338,7 +300,7 @@ impl SessionService {
     }
 
     pub fn send_keys(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
@@ -346,7 +308,7 @@ impl SessionService {
     }
 
     pub fn send_keys_with_mark(&self, id: &str, bytes: &[u8], marker_name: &str) -> Result<u64, String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let response: http_uds::MarkResponse =
@@ -358,7 +320,7 @@ impl SessionService {
     }
 
     pub(crate) fn send_input(&self, id: &str, input: &http_uds::InputRequest) -> Result<(), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
@@ -366,7 +328,7 @@ impl SessionService {
     }
 
     pub(crate) fn send_paste_with_mark(&self, id: &str, text: &str, marker_name: &str) -> Result<u64, String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
@@ -388,15 +350,11 @@ impl SessionService {
     ) -> Result<(SessionInfo, ForegroundAttach), String> {
         let session = if no_create {
             let id = name.ok_or_else(|| "attach --no-create requires a session id".to_string())?;
-            let socket_path = session_socket_path(self.layout.root(), &id);
-            if !socket_path.exists() {
+            if !self.layout.session_dir(&id).exists() {
                 return Err(format!("missing session {id}"));
             }
-            if !is_session_daemon_alive(self.layout.root(), &id) {
-                // The daemon crashed. --no-create forbids respawning, so report it
-                // as stale. Preserve a recoverable recording (a later attach without
-                // --no-create recreates from it); only remove a non-recreatable husk.
-                if crate::recreate::session_is_recreatable(&self.layout.root().join(&id)) {
+            if self.inspect(&id).is_err() {
+                if crate::recreate::session_is_recreatable(&self.layout.session_dir(&id)) {
                     return Err(format!("session {id} has a stale daemon (use attach without --no-create to recreate)"));
                 }
                 let _ = self.layout.remove_session(&id);
@@ -435,7 +393,7 @@ impl SessionService {
     }
 
     pub fn watch(&self, id: &str) -> Result<ForegroundAttach, String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         watch_foreground(&self.layout, id)
@@ -445,11 +403,11 @@ impl SessionService {
         &self,
         id: &str,
     ) -> Result<(crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
 
-        let socket_path = session_socket_path(self.layout.root(), id);
+        let socket_path = self.layout.socket_path();
         let mut stream = connect_session_socket(&socket_path)?;
         write!(
             stream,
@@ -480,14 +438,14 @@ impl SessionService {
     }
 
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         self.http_json(id, Method::GET, &format!("/sessions/{id}"), &())
     }
 
     pub fn signal(&self, id: &str, signal: i32, target: crate::protocol::SignalTarget) -> Result<(), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         self.http_no_content(id, Method::POST, &format!("/sessions/{id}/signal"), &http_uds::SignalRequest {
@@ -505,7 +463,7 @@ impl SessionService {
     }
 
     fn mark_impl(&self, id: &str, name: Option<&str>) -> Result<u64, String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let response: http_uds::MarkResponse =
@@ -514,7 +472,7 @@ impl SessionService {
     }
 
     pub fn resolve_marker(&self, id: &str, name: &str) -> Result<u64, String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let response: http_uds::MarkResponse =
@@ -525,7 +483,7 @@ impl SessionService {
     }
 
     pub fn resolve_next_marker_after(&self, id: &str, after: u64) -> Result<Option<u64>, String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let response: http_uds::ResolveNextMarkerResponse =
@@ -536,7 +494,7 @@ impl SessionService {
     }
 
     pub fn record(&self, id: &str, enable: bool) -> Result<(), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         self.http_no_content(id, Method::POST, &format!("/sessions/{id}/record"), &http_uds::RecordRequest { enable })
@@ -548,7 +506,7 @@ impl SessionService {
         conditions: Vec<crate::protocol::WaitCondition>,
         timeout_ms: u64,
     ) -> Result<(crate::protocol::WaitStatus, u64), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let conditions = conditions.into_iter().map(wait_condition_to_http).collect();
@@ -563,7 +521,7 @@ impl SessionService {
     }
 
     pub fn expect(&self, id: &str, text: &str, since_offset: u64, timeout_ms: u64) -> Result<(crate::protocol::WaitStatus, u64), String> {
-        if !self.layout.root().join(id).exists() {
+        if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
         let response: http_uds::WaitResultResponse = self.http_json_with_read_timeout(
@@ -576,8 +534,8 @@ impl SessionService {
         Ok((wait_status_from_http(response.status), response.elapsed_ms))
     }
 
-    pub fn serve(&self, session: &crate::runtime::SessionMetadata) -> Result<(), String> {
-        run_session_daemon(self.layout.root(), session)
+    pub fn serve(&self) -> Result<(), String> {
+        run_session_daemon(self.layout.root(), self.layout.daemon_name())
     }
 
     fn http_json<T: serde::Serialize, R: DeserializeOwned>(&self, id: &str, method: Method, path: &str, body: &T) -> Result<R, String> {
@@ -616,15 +574,23 @@ impl SessionService {
         self.http_request_with_read_timeout(id, method, path, body, None)
     }
 
+    fn http_json_daemon<T: serde::Serialize, R: DeserializeOwned>(&self, method: Method, path: &str, body: &T) -> Result<R, String> {
+        let response = self.http_request_with_read_timeout("", method, path, body, None)?;
+        if response.status != StatusCode::OK {
+            return Err(http_error_message(response));
+        }
+        serde_json::from_slice(&response.body).map_err(|err| format!("parse HTTP response: {err}"))
+    }
+
     fn http_request_with_read_timeout<T: serde::Serialize>(
         &self,
-        id: &str,
+        _id: &str,
         method: Method,
         path: &str,
         body: &T,
         read_timeout: Option<Duration>,
     ) -> Result<http_uds::HttpResponse, String> {
-        let socket_path = session_socket_path(self.layout.root(), id);
+        let socket_path = self.layout.socket_path();
         let mut stream = connect_session_socket(&socket_path)?;
         if let Some(timeout) = read_timeout {
             set_stream_read_timeout(&stream, Some(timeout))?;
@@ -639,40 +605,36 @@ impl SessionService {
     }
 }
 
-fn session_dir_is_empty(path: &Path) -> bool {
-    std::fs::read_dir(path).map(|mut entries| entries.next().is_none()).unwrap_or(false)
-}
-
-fn session_dir_is_stale_empty(path: &Path, grace: Duration) -> bool {
-    if !session_dir_is_empty(path) {
-        return false;
-    }
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age >= grace)
-}
-
-fn session_dir_contains_only(path: &Path, expected: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-    let mut count = 0;
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        count += 1;
-        if entry.path() != expected {
-            return false;
-        }
-    }
-    count == 1
-}
-
 fn session_socket_is_stale(socket_path: &Path) -> bool {
     try_connect_session_stream(socket_path).is_err()
+}
+
+fn list_preserved_sessions_with_error(layout: &RuntimeLayout, err: String) -> Result<Vec<SessionInfo>, String> {
+    let mut sessions = Vec::new();
+    let entries = std::fs::read_dir(layout.sessions_dir()).map_err(|read_err| {
+        format!("read daemon sessions directory {} after inspect failure ({err}): {read_err}", layout.sessions_dir().display())
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|read_err| format!("read daemon session entry: {read_err}"))?;
+        let path = entry.path();
+        if !path.is_dir() || !crate::recreate::session_is_recreatable(&path) {
+            continue;
+        }
+        let Some(id) = path.file_name().and_then(|name| name.to_str()).map(str::to_string) else {
+            continue;
+        };
+        sessions.push(SessionInfo {
+            id,
+            vt_engine: crate::vt::default_vt_engine_kind(),
+            vt_engine_status: String::new(),
+            functional_vt_available: false,
+            cwd: None,
+            cmd: None,
+            status: SessionStatus::Detached,
+            error: Some(err.clone()),
+        });
+    }
+    Ok(sessions)
 }
 
 /// Resolve start and end bounds into byte offsets against a cast file without
@@ -789,17 +751,16 @@ fn connect_session_socket(socket_path: &Path) -> Result<SessionStream, String> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
-        ffi::CString,
         fs,
-        os::unix::{ffi::OsStrExt, net::UnixListener},
+        os::unix::net::UnixListener,
         path::Path,
         process::Command,
         sync::mpsc,
         thread,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant},
     };
 
-    use super::{SessionService, EMPTY_SESSION_DIR_GRACE};
+    use super::SessionService;
     use crate::{
         http_uds::{self, read_http_request_for_test},
         protocol::{WaitCondition, WaitStatus},
@@ -807,12 +768,19 @@ mod tests {
         session::{daemon_pid_path, session_socket_path},
     };
 
+    fn create_test_session_dir(root: &Path, id: &str) -> std::path::PathBuf {
+        let layout = RuntimeLayout::new(root.to_path_buf());
+        layout.ensure_daemon_dirs().expect("create daemon dirs");
+        let session_dir = layout.session_dir(id);
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        session_dir
+    }
+
     #[test]
     fn kill_does_not_signal_unrelated_process_from_stale_pid_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let _session_dir = create_test_session_dir(temp.path(), "alpha");
 
         let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
         fs::write(daemon_pid_path(temp.path(), "alpha"), child.id().to_string()).expect("write pid");
@@ -840,8 +808,7 @@ mod tests {
     fn send_keys_posts_http_request_to_session_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let _session_dir = create_test_session_dir(temp.path(), "alpha");
 
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
@@ -867,8 +834,7 @@ mod tests {
     fn send_input_posts_http_request_to_session_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let _session_dir = create_test_session_dir(temp.path(), "alpha");
 
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
@@ -894,8 +860,7 @@ mod tests {
     fn send_paste_with_mark_posts_http_request_to_session_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let _session_dir = create_test_session_dir(temp.path(), "alpha");
 
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
@@ -926,8 +891,7 @@ mod tests {
     fn kill_deletes_session_over_http_when_socket_is_available() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let session_dir = create_test_session_dir(temp.path(), "alpha");
 
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
@@ -953,8 +917,7 @@ mod tests {
     fn kill_purge_preserved_recording_without_socket_returns_promptly() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let session_dir = create_test_session_dir(temp.path(), "alpha");
         fs::write(session_dir.join(crate::recording::CAST_FILE_NAME), b"{\"version\":3}\n").expect("write cast");
 
         let started = Instant::now();
@@ -968,8 +931,7 @@ mod tests {
     fn detach_posts_http_request_to_session_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let _session_dir = create_test_session_dir(temp.path(), "alpha");
 
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
@@ -994,8 +956,7 @@ mod tests {
     fn wait_posts_http_request_to_session_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let _session_dir = create_test_session_dir(temp.path(), "alpha");
 
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
@@ -1033,8 +994,7 @@ mod tests {
     fn expect_posts_http_request_to_session_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-        let session_dir = temp.path().join("alpha");
-        fs::create_dir_all(&session_dir).expect("create session dir");
+        let _session_dir = create_test_session_dir(temp.path(), "alpha");
 
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
@@ -1059,148 +1019,5 @@ mod tests {
         assert_eq!(result, (WaitStatus::Timeout, 500));
         assert!(request.starts_with("POST /sessions/alpha/expect HTTP/1.1\r\n"), "{request}");
         assert!(request.ends_with(r#"{"text":"DONE","since_offset":123,"timeout_ms":500}"#), "{request}");
-    }
-
-    #[test]
-    fn list_includes_sessions_with_inspect_failure() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-
-        // Create a session directory with a live socket that accepts but immediately closes
-        // the connection, simulating a daemon that doesn't respond to inspect.
-        let session_dir = temp.path().join("broken-session");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-        let socket_path = session_socket_path(temp.path(), "broken-session");
-        let listener = UnixListener::bind(&socket_path).expect("bind socket");
-        // Spawn a thread that accepts and immediately drops connections (simulates broken daemon).
-        thread::spawn(move || {
-            while let Ok((stream, _)) = listener.accept() {
-                drop(stream);
-            }
-        });
-        fs::write(daemon_pid_path(temp.path(), "broken-session"), std::process::id().to_string()).expect("write pid");
-
-        let sessions = service.list().expect("list sessions");
-        assert_eq!(sessions.len(), 1, "broken session should appear in list");
-        assert_eq!(sessions[0].id, "broken-session");
-        assert!(sessions[0].error.is_some(), "should have error field set");
-    }
-
-    #[test]
-    fn list_skips_and_cleans_up_stale_sessions() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-
-        // Create a session directory with a socket file and a PID file pointing to a dead process.
-        let session_dir = temp.path().join("stale-session");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-        let socket_path = session_socket_path(temp.path(), "stale-session");
-        // Create a socket file that nobody is listening on, then drop the listener.
-        let listener = UnixListener::bind(&socket_path).expect("bind socket");
-        drop(listener);
-        // Write a PID that doesn't exist.
-        fs::write(daemon_pid_path(temp.path(), "stale-session"), "999999999").expect("write pid");
-
-        let sessions = service.list().expect("list sessions");
-        assert!(sessions.is_empty(), "stale session should not appear in list");
-        assert!(!session_dir.exists(), "stale session directory should be cleaned up");
-    }
-
-    #[test]
-    fn list_cleans_up_socket_only_session_without_pid_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-
-        let session_dir = temp.path().join("socket-only");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-        let socket_path = session_socket_path(temp.path(), "socket-only");
-        fs::write(&socket_path, b"stale socket placeholder").expect("write stale socket placeholder");
-
-        let sessions = service.list().expect("list sessions");
-        assert!(sessions.is_empty(), "socket-only husk should not appear in list");
-        assert!(!session_dir.exists(), "socket-only husk should be cleaned up");
-    }
-
-    #[test]
-    fn list_preserves_socket_only_session_when_socket_is_connectable() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-
-        let session_dir = temp.path().join("starting-session");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-        let socket_path = session_socket_path(temp.path(), "starting-session");
-        let listener = UnixListener::bind(&socket_path).expect("bind socket");
-        let reader = thread::spawn(move || {
-            for _ in 0..2 {
-                let Ok((stream, _)) = listener.accept() else {
-                    break;
-                };
-                drop(stream);
-            }
-        });
-
-        let sessions = service.list().expect("list sessions");
-        assert_eq!(sessions.len(), 1, "connectable no-pid socket should be treated as starting");
-        assert_eq!(sessions[0].id, "starting-session");
-        assert!(sessions[0].error.is_some(), "inspect failure should be reported while preserving the directory");
-        assert!(session_dir.exists(), "connectable no-pid socket should not be cleaned up as a husk");
-
-        reader.join().expect("join reader");
-    }
-
-    #[test]
-    fn list_cleans_up_empty_session_directory() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-
-        let session_dir = temp.path().join("empty-session");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-        set_mtime_ago(&session_dir, EMPTY_SESSION_DIR_GRACE + Duration::from_secs(1));
-
-        let sessions = service.list().expect("list sessions");
-        assert!(sessions.is_empty(), "empty session dir should not appear in list");
-        assert!(!session_dir.exists(), "empty session dir should be cleaned up");
-    }
-
-    #[test]
-    fn list_preserves_young_empty_session_directory() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-
-        let session_dir = temp.path().join("starting-empty-session");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-
-        let sessions = service.list().expect("list sessions");
-        assert!(sessions.is_empty(), "young empty session dir should not appear in list");
-        assert!(session_dir.exists(), "young empty session dir should be allowed to finish starting");
-    }
-
-    #[test]
-    fn list_preserves_stale_sessions_that_have_a_recording() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-
-        // A crashed daemon: stale socket + dead PID, but a recording survives.
-        let session_dir = temp.path().join("crashed-session");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-        let socket_path = session_socket_path(temp.path(), "crashed-session");
-        let listener = UnixListener::bind(&socket_path).expect("bind socket");
-        drop(listener);
-        fs::write(daemon_pid_path(temp.path(), "crashed-session"), "999999999").expect("write pid");
-        fs::write(session_dir.join(crate::recording::CAST_FILE_NAME), b"{\"version\":3}\n").expect("write cast");
-
-        let sessions = service.list().expect("list sessions");
-        assert!(sessions.is_empty(), "stale session should not appear in list");
-        assert!(session_dir.exists(), "a recreatable session directory must survive the stale sweep");
-    }
-
-    fn set_mtime_ago(path: &Path, age: Duration) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time after epoch");
-        let target = now.checked_sub(age).expect("age before now");
-        let timeval = libc::timeval { tv_sec: target.as_secs() as libc::time_t, tv_usec: target.subsec_micros() as libc::suseconds_t };
-        let times = [timeval, timeval];
-        let c_path = CString::new(path.as_os_str().as_bytes()).expect("path without nul");
-        let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
-        assert_eq!(rc, 0, "set mtime for {}", path.display());
     }
 }

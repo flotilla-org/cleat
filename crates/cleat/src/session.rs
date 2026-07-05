@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -37,6 +37,7 @@ const DETACH_CLEANUP_SEQUENCE: &[u8] =
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SESSION_DAEMON_SERVICING_TICK: Duration = Duration::from_millis(10);
+const SESSION_HTTP_HANDSHAKE_DEADLINE: Duration = Duration::from_millis(250);
 const TERMINATE_SIGNAL: i32 = 15;
 const SCREEN_STABLE_CHANGED_CELL_TOLERANCE: usize = 16;
 
@@ -595,21 +596,34 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     #[cfg(unix)]
                     {
                         set_stream_nonblocking(&stream, false).map_err(|err| format!("set accepted stream blocking: {err}"))?;
-                        let _ = set_stream_read_timeout(&stream, Some(Duration::from_millis(100)));
                     }
                     #[cfg(windows)]
                     {
                         set_stream_nonblocking(&stream, true).map_err(|err| format!("set accepted stream nonblocking: {err}"))?;
                     }
-                    let mut prefix = [0; 5];
-                    if let Err(err) = stream.read_exact(&mut prefix) {
-                        let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
-                        continue;
-                    }
-                    if !http_uds::looks_like_http_prefix(&prefix) {
-                        let _ = Frame::Error("session daemon requires HTTP requests".to_string()).write(&mut stream);
-                        continue;
-                    }
+                    let request = {
+                        let mut reader = HttpHandshakeReader::new(&mut stream, SESSION_HTTP_HANDSHAKE_DEADLINE);
+                        let mut prefix = [0; 5];
+                        if let Err(err) = reader.read_exact(&mut prefix) {
+                            let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
+                            continue;
+                        }
+                        if !http_uds::looks_like_http_prefix(&prefix) {
+                            let _ = Frame::Error("session daemon requires HTTP requests".to_string()).write(&mut stream);
+                            continue;
+                        }
+                        match http_uds::read_request_with_prefix(&mut reader, &prefix) {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let _ = http_uds::write_error(
+                                    &mut stream,
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    &format!("read HTTP request: {err}"),
+                                );
+                                continue;
+                            }
+                        }
+                    };
 
                     let mut http_state = HttpRequestState {
                         actor: &actor,
@@ -619,7 +633,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         pending_waits: &mut pending_waits,
                         pending_expects: &mut pending_expects,
                     };
-                    if let Err(err) = handle_http_request(root, id, &mut stream, &prefix, &mut http_state) {
+                    if let Err(err) = handle_http_request(root, id, &mut stream, request, &mut http_state) {
                         let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                     }
                 }
@@ -814,14 +828,42 @@ struct HttpRequestState<'a> {
     pending_expects: &'a mut Vec<PendingExpect>,
 }
 
+struct HttpHandshakeReader<'a> {
+    stream: &'a mut SessionStream,
+    deadline: Instant,
+}
+
+impl<'a> HttpHandshakeReader<'a> {
+    fn new(stream: &'a mut SessionStream, budget: Duration) -> Self {
+        Self { stream, deadline: Instant::now() + budget }
+    }
+
+    fn remaining_budget(&self) -> io::Result<Duration> {
+        let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP request handshake deadline exceeded"));
+        };
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP request handshake deadline exceeded"));
+        }
+        Ok(remaining)
+    }
+}
+
+impl Read for HttpHandshakeReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.remaining_budget()?;
+        set_stream_read_timeout(self.stream, Some(remaining)).map_err(io::Error::other)?;
+        self.stream.read(buf)
+    }
+}
+
 fn handle_http_request(
     root: &Path,
     daemon_id: &str,
     stream: &mut SessionStream,
-    prefix: &[u8],
+    request: http_uds::HttpRequest,
     state: &mut HttpRequestState<'_>,
 ) -> Result<(), String> {
-    let request = http_uds::read_request_with_prefix(stream, prefix).map_err(|err| format!("read HTTP request: {err}"))?;
     match http_uds::route(&request) {
         http_uds::Route::Root | http_uds::Route::Health => http_uds::write_json(
             stream,

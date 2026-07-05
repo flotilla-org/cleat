@@ -1,10 +1,24 @@
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::{
+    io,
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering},
         mpsc, Arc,
     },
     thread,
-    time::Duration,
+};
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+#[cfg(target_os = "linux")]
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
+#[cfg(target_os = "macos")]
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+#[cfg(unix)]
+use nix::{
+    errno::Errno,
+    fcntl::{fcntl, FcntlArg, OFlag},
 };
 
 use crate::{
@@ -240,9 +254,243 @@ pub(crate) enum SessionCommand {
 }
 
 pub(crate) struct SessionActor {
-    tx: mpsc::Sender<SessionCommand>,
+    tx: CommandSender,
     observation: Arc<ObservationMirror>,
     worker: Option<thread::JoinHandle<()>>,
+}
+
+struct CommandSender {
+    tx: mpsc::Sender<SessionCommand>,
+    #[cfg(unix)]
+    wake: CommandWakeWriter,
+}
+
+impl CommandSender {
+    #[cfg(unix)]
+    fn new(tx: mpsc::Sender<SessionCommand>, wake: CommandWakeWriter) -> Self {
+        Self { tx, wake }
+    }
+
+    #[cfg(not(unix))]
+    fn new(tx: mpsc::Sender<SessionCommand>) -> Self {
+        Self { tx }
+    }
+
+    #[cfg(test)]
+    fn inert(tx: mpsc::Sender<SessionCommand>) -> Self {
+        Self {
+            tx,
+            #[cfg(unix)]
+            wake: CommandWakeWriter::noop(),
+        }
+    }
+
+    fn send(&self, command: SessionCommand) -> Result<(), mpsc::SendError<SessionCommand>> {
+        self.tx.send(command)?;
+        #[cfg(unix)]
+        self.wake.wake();
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct CommandWakeWriter {
+    fd: Option<Arc<OwnedFd>>,
+}
+
+#[cfg(unix)]
+impl CommandWakeWriter {
+    fn new(fd: OwnedFd) -> Self {
+        Self { fd: Some(Arc::new(fd)) }
+    }
+
+    #[cfg(test)]
+    fn noop() -> Self {
+        Self { fd: None }
+    }
+
+    fn wake(&self) {
+        let Some(fd) = &self.fd else {
+            return;
+        };
+        let byte = [1u8];
+        loop {
+            let written = unsafe { libc::write(fd.as_raw_fd(), byte.as_ptr().cast(), byte.len()) };
+            if written >= 0 {
+                return;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+struct CommandWakeReader {
+    fd: OwnedFd,
+}
+
+#[cfg(unix)]
+impl CommandWakeReader {
+    fn drain(&self) {
+        let mut buf = [0u8; 64];
+        loop {
+            let read = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if read > 0 {
+                continue;
+            }
+            if read == 0 {
+                return;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+fn command_wake_pair() -> Result<(CommandWakeReader, CommandWakeWriter), String> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(format!("create actor command wake pipe: {}", io::Error::last_os_error()));
+    }
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    set_fd_nonblocking(read.as_raw_fd()).map_err(|err| format!("set actor command wake read nonblocking: {err}"))?;
+    set_fd_nonblocking(write.as_raw_fd()).map_err(|err| format!("set actor command wake write nonblocking: {err}"))?;
+    Ok((CommandWakeReader { fd: read }, CommandWakeWriter::new(write)))
+}
+
+#[cfg(unix)]
+fn set_fd_nonblocking(fd: RawFd) -> Result<(), Errno> {
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ActorReadiness {
+    pty_readable: bool,
+    command_readable: bool,
+}
+
+#[cfg(unix)]
+fn wait_actor_ready(pty_child: &PtyChild, command_fd: RawFd) -> Result<ActorReadiness, String> {
+    #[cfg(target_os = "macos")]
+    {
+        wait_actor_ready_kqueue(pty_child.master_fd(), command_fd)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        wait_actor_ready_epoll(pty_child.master_fd(), command_fd)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        wait_actor_ready_poll(pty_child.master_fd(), command_fd)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_actor_ready_kqueue(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadiness, String> {
+    const TOKEN_PTY: isize = 1;
+    const TOKEN_COMMAND: isize = 2;
+
+    let kqueue = Kqueue::new().map_err(|err| format!("create actor kqueue: {err}"))?;
+    let changes = [
+        KEvent::new(pty_fd as _, EventFilter::EVFILT_READ, EvFlags::EV_ADD, FilterFlag::empty(), 0, TOKEN_PTY),
+        KEvent::new(command_fd as _, EventFilter::EVFILT_READ, EvFlags::EV_ADD, FilterFlag::empty(), 0, TOKEN_COMMAND),
+    ];
+    let mut events = [KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0); 2];
+    let event_count = loop {
+        match kqueue.kevent(&changes, &mut events, None) {
+            Ok(event_count) => break event_count,
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(format!("kqueue actor fds: {err}")),
+        }
+    };
+
+    let mut readiness = ActorReadiness::default();
+    for event in events.iter().take(event_count) {
+        if event.flags().contains(EvFlags::EV_ERROR) {
+            if event.data() != 0 {
+                return Err(format!("kqueue actor fd registration: {}", Errno::from_raw(event.data() as i32)));
+            }
+            continue;
+        }
+        match event.udata() {
+            TOKEN_PTY => readiness.pty_readable = true,
+            TOKEN_COMMAND => readiness.command_readable = true,
+            _ => {}
+        }
+    }
+    Ok(readiness)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadiness, String> {
+    const TOKEN_PTY: u64 = 1;
+    const TOKEN_COMMAND: u64 = 2;
+
+    let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).map_err(|err| format!("create actor epoll: {err}"))?;
+    epoll
+        .add(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_fd) }, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_PTY))
+        .map_err(|err| format!("register pty with actor epoll: {err}"))?;
+    epoll
+        .add(unsafe { std::os::fd::BorrowedFd::borrow_raw(command_fd) }, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_COMMAND))
+        .map_err(|err| format!("register command wake with actor epoll: {err}"))?;
+
+    let mut events = [EpollEvent::empty(); 2];
+    let event_count = loop {
+        match epoll.wait(&mut events, nix::poll::PollTimeout::NONE) {
+            Ok(event_count) => break event_count,
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(format!("epoll actor fds: {err}")),
+        }
+    };
+
+    let mut readiness = ActorReadiness::default();
+    for event in events.iter().take(event_count) {
+        if event.events().contains(EpollFlags::EPOLLIN) {
+            match event.data() {
+                TOKEN_PTY => readiness.pty_readable = true,
+                TOKEN_COMMAND => readiness.command_readable = true,
+                _ => {}
+            }
+        }
+    }
+    Ok(readiness)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn wait_actor_ready_poll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadiness, String> {
+    let mut fds = [
+        PollFd::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_fd) }, PollFlags::POLLIN),
+        PollFd::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(command_fd) }, PollFlags::POLLIN),
+    ];
+    loop {
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => break,
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(format!("poll actor fds: {err}")),
+        }
+    }
+    Ok(ActorReadiness {
+        pty_readable: fds[0].revents().unwrap_or_else(PollFlags::empty).contains(PollFlags::POLLIN),
+        command_readable: fds[1].revents().unwrap_or_else(PollFlags::empty).contains(PollFlags::POLLIN),
+    })
 }
 
 impl SessionActor {
@@ -254,13 +502,24 @@ impl SessionActor {
         let observation = Arc::new(ObservationMirror::new());
         let actor_observation = observation.clone();
         let (tx, rx) = mpsc::channel();
+        #[cfg(unix)]
+        let (command_wake_reader, command_wake_writer) = command_wake_pair()?;
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::spawn(move || match build_runtime() {
-            Ok(runtime) => session_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx),
+            Ok(runtime) => {
+                #[cfg(unix)]
+                session_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx, command_wake_reader);
+                #[cfg(not(unix))]
+                session_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx);
+            }
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
             }
         });
+        #[cfg(unix)]
+        let tx = CommandSender::new(tx, command_wake_writer);
+        #[cfg(not(unix))]
+        let tx = CommandSender::new(tx);
         match ready_rx.recv().map_err(|_| "session actor did not report startup".to_string())? {
             Ok(()) => Ok(Self { tx, observation, worker: Some(worker) }),
             Err(err) => {
@@ -276,7 +535,7 @@ impl SessionActor {
         observation: Arc<ObservationMirror>,
         worker: Option<thread::JoinHandle<()>>,
     ) -> Self {
-        Self { tx, observation, worker }
+        Self { tx: CommandSender::inert(tx), observation, worker }
     }
 
     pub(crate) fn observation(&self) -> &ObservationMirror {
@@ -369,12 +628,33 @@ fn session_actor_loop(
     mirror: Arc<ObservationMirror>,
     ready: mpsc::Sender<Result<(), String>>,
     rx: mpsc::Receiver<SessionCommand>,
+    #[cfg(unix)] command_wake: CommandWakeReader,
 ) {
     let mut observation = ObservationState::new_with_mirror(rows, Some(mirror));
     let mut exited = false;
     let _ = ready.send(Ok(()));
+    #[cfg(unix)]
     loop {
-        match rx.recv_timeout(Duration::from_millis(10)) {
+        let readiness = match wait_actor_ready(runtime.pty_child(), command_wake.raw_fd()) {
+            Ok(readiness) => readiness,
+            Err(_) => {
+                let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
+                break;
+            }
+        };
+        if readiness.command_readable {
+            command_wake.drain();
+            if drain_session_commands(&rx, &mut runtime, &mut observation, &mut exited, &wake) {
+                break;
+            }
+        }
+        if readiness.pty_readable {
+            session_actor_pump(&mut runtime, &mut observation, &mut exited, &wake);
+        }
+    }
+    #[cfg(not(unix))]
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(10)) {
             Ok(command) => {
                 if session_actor_handle_command(command, &mut runtime, &mut observation, &mut exited, &wake) {
                     break;
@@ -386,6 +666,29 @@ fn session_actor_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
                 break;
+            }
+        }
+    }
+}
+
+fn drain_session_commands(
+    rx: &mpsc::Receiver<SessionCommand>,
+    runtime: &mut SessionRuntime,
+    observation: &mut ObservationState,
+    exited: &mut bool,
+    wake: &WakeCallback,
+) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(command) => {
+                if session_actor_handle_command(command, runtime, observation, exited, wake) {
+                    return true;
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
+                return true;
             }
         }
     }
@@ -682,6 +985,3 @@ fn legacy_mouse_byte(value: u16) -> Option<u8> {
     let encoded = value.checked_add(32)?;
     u8::try_from(encoded).ok()
 }
-
-#[allow(dead_code)]
-fn _pty_child_anchor(_: &PtyChild) {}

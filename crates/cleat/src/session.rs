@@ -22,7 +22,7 @@ use crate::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
         ipc::{
             bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
-            set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
+            set_stream_nonblocking, set_stream_read_timeout, set_stream_write_timeout, shutdown_stream, SessionStream,
         },
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
@@ -38,6 +38,7 @@ const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SESSION_DAEMON_SERVICING_TICK: Duration = Duration::from_millis(10);
 const SESSION_HTTP_HANDSHAKE_DEADLINE: Duration = Duration::from_millis(250);
+const SESSION_HTTP_RESPONSE_WRITE_DEADLINE: Duration = Duration::from_millis(250);
 const TERMINATE_SIGNAL: i32 = 15;
 const SCREEN_STABLE_CHANGED_CELL_TOLERANCE: usize = 16;
 
@@ -530,10 +531,10 @@ fn drain_raw_output_tap(
     root: &Path,
     id: &str,
     actor: &SessionActor,
-    raw_output_tap: &RawOutputTap,
+    raw_output_tap: &mut RawOutputTap,
     active_client: &mut Option<ActiveClient>,
     watchers: &mut Vec<ActiveClient>,
-) -> bool {
+) -> Result<bool, String> {
     let mut drained = false;
     loop {
         match raw_output_tap.try_recv() {
@@ -541,7 +542,11 @@ fn drain_raw_output_tap(
                 drained = true;
                 enqueue_output_chunk(root, id, actor, active_client, watchers, chunk);
             }
-            Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected) => return drained,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(drained),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *raw_output_tap = actor.subscribe_raw_output()?;
+                return Ok(drained);
+            }
         }
     }
 }
@@ -577,7 +582,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
         crate::session_runtime::SessionRuntime::spawn(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?)
     })?;
-    let raw_output_tap = actor.subscribe_raw_output()?;
+    let mut raw_output_tap = actor.subscribe_raw_output()?;
     let mut active_client: Option<ActiveClient> = None;
     let mut watchers: Vec<ActiveClient> = Vec::new();
     let mut had_foreground_client = false;
@@ -601,6 +606,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     {
                         set_stream_nonblocking(&stream, true).map_err(|err| format!("set accepted stream nonblocking: {err}"))?;
                     }
+                    set_stream_write_timeout(&stream, Some(SESSION_HTTP_RESPONSE_WRITE_DEADLINE))?;
                     let request = {
                         let mut reader = HttpHandshakeReader::new(&mut stream, SESSION_HTTP_HANDSHAKE_DEADLINE);
                         let mut prefix = [0; 5];
@@ -642,7 +648,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
         }
 
-        did_work |= drain_raw_output_tap(root, id, &actor, &raw_output_tap, &mut active_client, &mut watchers);
+        did_work |= drain_raw_output_tap(root, id, &actor, &mut raw_output_tap, &mut active_client, &mut watchers)?;
         drain_watcher_inputs(&mut watchers);
 
         if active_client.is_some() {
@@ -782,7 +788,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         actor.flush_recording()?;
 
         if actor.exit_code()?.is_some() {
-            drain_raw_output_tap(root, id, &actor, &raw_output_tap, &mut active_client, &mut watchers);
+            drain_raw_output_tap(root, id, &actor, &mut raw_output_tap, &mut active_client, &mut watchers)?;
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
                 let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);

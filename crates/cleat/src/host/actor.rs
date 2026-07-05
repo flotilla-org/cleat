@@ -262,30 +262,30 @@ pub(crate) enum SessionCommand {
     RenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
     FullSnapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     ImageResourceData { image_id: u32, generation: u64, callback: ImageResourceDataCallback, reply: mpsc::Sender<Result<bool, String>> },
-    Inspect { has_controller: bool, watcher_count: usize, reply: mpsc::Sender<InspectResult> },
+    Inspect { has_controller: bool, watcher_count: usize, reply: mpsc::Sender<Result<InspectResult, String>> },
     ApplyAttachState { cols: u16, rows: u16, capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<Option<Vec<u8>>, String>> },
     ReplayPayload { capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<Option<Vec<u8>>, String>> },
     CaptureText { reply: mpsc::Sender<Result<String, String>> },
     ValidateTextMatching { reply: mpsc::Sender<Result<(), String>> },
-    ScreenContains { text: String, reply: mpsc::Sender<bool> },
-    LastPtyOutputAt { reply: mpsc::Sender<Option<Instant>> },
-    FlushRecording { reply: mpsc::Sender<()> },
-    RecordingActive { reply: mpsc::Sender<bool> },
-    RecordAttach { reply: mpsc::Sender<()> },
-    RecordDetach { reply: mpsc::Sender<()> },
+    ScreenContains { text: String, reply: mpsc::Sender<Result<bool, String>> },
+    LastPtyOutputAt { reply: mpsc::Sender<Result<Option<Instant>, String>> },
+    FlushRecording { reply: mpsc::Sender<Result<(), String>> },
+    RecordingActive { reply: mpsc::Sender<Result<bool, String>> },
+    RecordAttach { reply: mpsc::Sender<Result<(), String>> },
+    RecordDetach { reply: mpsc::Sender<Result<(), String>> },
     WriteInputWithMark { bytes: Vec<u8>, marker_name: String, reply: mpsc::Sender<Result<u64, String>> },
     PasteWithMark { text: Vec<u8>, marker_name: String, reply: mpsc::Sender<Result<u64, String>> },
     SetRecording { enable: bool, reply: mpsc::Sender<Result<(), String>> },
     Mark { name: Option<String>, reply: mpsc::Sender<Result<u64, String>> },
-    ResolveMarker { name: String, reply: mpsc::Sender<Option<u64>> },
-    ResolveNextMarker { after: u64, reply: mpsc::Sender<Option<u64>> },
+    ResolveMarker { name: String, reply: mpsc::Sender<Result<Option<u64>, String>> },
+    ResolveNextMarker { after: u64, reply: mpsc::Sender<Result<Option<u64>, String>> },
     DispatchSignal { signal: i32, target: SignalTarget, reply: mpsc::Sender<Result<(), String>> },
-    ExitCode { reply: mpsc::Sender<Option<i32>> },
-    ShouldKeepSessionDir { reply: mpsc::Sender<bool> },
+    ExitCode { reply: mpsc::Sender<Result<Option<i32>, String>> },
+    ShouldKeepSessionDir { reply: mpsc::Sender<Result<bool, String>> },
     MarkObserved { generation: u64, reply: mpsc::Sender<bool> },
     ScrollbackExtent { reply: mpsc::Sender<TerminalScrollbackExtent> },
     ScrollbarState { reply: mpsc::Sender<TerminalScrollbarState> },
-    SetClientPresence { active: bool, reply: mpsc::Sender<()> },
+    SetClientPresence { active: bool, reply: mpsc::Sender<Result<(), String>> },
     SubscribeRawOutput { reply: mpsc::Sender<RawOutputTap> },
     Stop { terminate: bool },
 }
@@ -482,11 +482,12 @@ fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadi
     const TOKEN_COMMAND: u64 = 2;
 
     let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).map_err(|err| format!("create actor epoll: {err}"))?;
+    let read_or_closed = EpollFlags::EPOLLIN | EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR;
     epoll
-        .add(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_fd) }, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_PTY))
+        .add(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_fd) }, EpollEvent::new(read_or_closed, TOKEN_PTY))
         .map_err(|err| format!("register pty with actor epoll: {err}"))?;
     epoll
-        .add(unsafe { std::os::fd::BorrowedFd::borrow_raw(command_fd) }, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_COMMAND))
+        .add(unsafe { std::os::fd::BorrowedFd::borrow_raw(command_fd) }, EpollEvent::new(read_or_closed, TOKEN_COMMAND))
         .map_err(|err| format!("register command wake with actor epoll: {err}"))?;
 
     let mut events = [EpollEvent::empty(); 2];
@@ -500,7 +501,7 @@ fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadi
 
     let mut readiness = ActorReadiness::default();
     for event in events.iter().take(event_count) {
-        if event.events().contains(EpollFlags::EPOLLIN) {
+        if event.events().intersects(read_or_closed) {
             match event.data() {
                 TOKEN_PTY => readiness.pty_readable = true,
                 TOKEN_COMMAND => readiness.command_readable = true,
@@ -514,8 +515,11 @@ fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadi
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn wait_actor_ready_poll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadiness, String> {
     let mut fds = [
-        PollFd::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_fd) }, PollFlags::POLLIN),
-        PollFd::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(command_fd) }, PollFlags::POLLIN),
+        PollFd::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_fd) }, PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR),
+        PollFd::new(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(command_fd) },
+            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+        ),
     ];
     loop {
         match poll(&mut fds, PollTimeout::NONE) {
@@ -524,9 +528,10 @@ fn wait_actor_ready_poll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadin
             Err(err) => return Err(format!("poll actor fds: {err}")),
         }
     }
+    let read_or_closed = PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR;
     Ok(ActorReadiness {
-        pty_readable: fds[0].revents().unwrap_or_else(PollFlags::empty).contains(PollFlags::POLLIN),
-        command_readable: fds[1].revents().unwrap_or_else(PollFlags::empty).contains(PollFlags::POLLIN),
+        pty_readable: fds[0].revents().unwrap_or_else(PollFlags::empty).intersects(read_or_closed),
+        command_readable: fds[1].revents().unwrap_or_else(PollFlags::empty).intersects(read_or_closed),
     })
 }
 
@@ -597,12 +602,9 @@ impl SessionActor {
     }
 
     pub(crate) fn set_client_presence(&self, active: bool) -> Result<(), String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::SetClientPresence { active, reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::SetClientPresence { active, reply })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn subscribe_raw_output(&self) -> Result<RawOutputTap, String> {
         let (reply, recv) = mpsc::channel();
         self.tx.send(SessionCommand::SubscribeRawOutput { reply }).map_err(|_| "session actor is not running".to_string())?;
@@ -610,11 +612,7 @@ impl SessionActor {
     }
 
     pub(crate) fn inspect(&self, has_controller: bool, watcher_count: usize) -> Result<InspectResult, String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx
-            .send(SessionCommand::Inspect { has_controller, watcher_count, reply })
-            .map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::Inspect { has_controller, watcher_count, reply })
     }
 
     pub(crate) fn apply_attach_state(&self, cols: u16, rows: u16, capabilities: vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
@@ -650,39 +648,27 @@ impl SessionActor {
     }
 
     pub(crate) fn screen_contains(&self, text: String) -> Result<bool, String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::ScreenContains { text, reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::ScreenContains { text, reply })
     }
 
     pub(crate) fn last_pty_output_at(&self) -> Result<Option<Instant>, String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::LastPtyOutputAt { reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::LastPtyOutputAt { reply })
     }
 
     pub(crate) fn flush_recording(&self) -> Result<(), String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::FlushRecording { reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::FlushRecording { reply })
     }
 
     pub(crate) fn recording_active(&self) -> Result<bool, String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::RecordingActive { reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::RecordingActive { reply })
     }
 
     pub(crate) fn record_attach(&self) -> Result<(), String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::RecordAttach { reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::RecordAttach { reply })
     }
 
     pub(crate) fn record_detach(&self) -> Result<(), String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::RecordDetach { reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::RecordDetach { reply })
     }
 
     pub(crate) fn write_input_with_mark(&self, bytes: Vec<u8>, marker_name: String) -> Result<u64, String> {
@@ -702,15 +688,11 @@ impl SessionActor {
     }
 
     pub(crate) fn resolve_marker(&self, name: String) -> Result<Option<u64>, String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::ResolveMarker { name, reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::ResolveMarker { name, reply })
     }
 
     pub(crate) fn resolve_next_marker_after(&self, after: u64) -> Result<Option<u64>, String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::ResolveNextMarker { after, reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::ResolveNextMarker { after, reply })
     }
 
     pub(crate) fn dispatch_signal(&self, signal: i32, target: SignalTarget) -> Result<(), String> {
@@ -718,15 +700,11 @@ impl SessionActor {
     }
 
     pub(crate) fn exit_code(&self) -> Result<Option<i32>, String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::ExitCode { reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::ExitCode { reply })
     }
 
     pub(crate) fn should_keep_session_dir(&self) -> Result<bool, String> {
-        let (reply, recv) = mpsc::channel();
-        self.tx.send(SessionCommand::ShouldKeepSessionDir { reply }).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())
+        self.request_result(|reply| SessionCommand::ShouldKeepSessionDir { reply })
     }
 }
 
@@ -950,6 +928,7 @@ fn session_actor_handle_command(
             let _ = reply.send(result);
         }
         SessionCommand::FullSnapshot { reply } => {
+            session_actor_pump(runtime, state, wake);
             let _ = reply.send(runtime.snapshot(DirtyState::Full));
         }
         SessionCommand::ImageResourceData { image_id, generation, mut callback, reply } => {
@@ -957,7 +936,7 @@ fn session_actor_handle_command(
             let _ = reply.send(result);
         }
         SessionCommand::Inspect { has_controller, watcher_count, reply } => {
-            let _ = reply.send(runtime.inspect(has_controller, watcher_count));
+            let _ = reply.send(Ok(runtime.inspect(has_controller, watcher_count)));
         }
         SessionCommand::ApplyAttachState { cols, rows, capabilities, reply } => {
             let cols = cols.max(1);
@@ -977,25 +956,25 @@ fn session_actor_handle_command(
             let _ = reply.send(runtime.validate_text_matching());
         }
         SessionCommand::ScreenContains { text, reply } => {
-            let _ = reply.send(runtime.screen_contains(&text));
+            let _ = reply.send(Ok(runtime.screen_contains(&text)));
         }
         SessionCommand::LastPtyOutputAt { reply } => {
-            let _ = reply.send(runtime.last_pty_output_at());
+            let _ = reply.send(Ok(runtime.last_pty_output_at()));
         }
         SessionCommand::FlushRecording { reply } => {
             runtime.flush_recording();
-            let _ = reply.send(());
+            let _ = reply.send(Ok(()));
         }
         SessionCommand::RecordingActive { reply } => {
-            let _ = reply.send(runtime.recording_active());
+            let _ = reply.send(Ok(runtime.recording_active()));
         }
         SessionCommand::RecordAttach { reply } => {
             runtime.record_attach();
-            let _ = reply.send(());
+            let _ = reply.send(Ok(()));
         }
         SessionCommand::RecordDetach { reply } => {
             runtime.record_detach();
-            let _ = reply.send(());
+            let _ = reply.send(Ok(()));
         }
         SessionCommand::WriteInputWithMark { bytes, marker_name, reply } => {
             let _ = reply.send(runtime.write_input_with_mark(&bytes, marker_name));
@@ -1011,19 +990,19 @@ fn session_actor_handle_command(
             let _ = reply.send(runtime.mark(name));
         }
         SessionCommand::ResolveMarker { name, reply } => {
-            let _ = reply.send(runtime.resolve_marker(&name));
+            let _ = reply.send(Ok(runtime.resolve_marker(&name)));
         }
         SessionCommand::ResolveNextMarker { after, reply } => {
-            let _ = reply.send(runtime.resolve_next_marker_after(after));
+            let _ = reply.send(Ok(runtime.resolve_next_marker_after(after)));
         }
         SessionCommand::DispatchSignal { signal, target, reply } => {
             let _ = reply.send(runtime.dispatch_signal(signal, target));
         }
         SessionCommand::ExitCode { reply } => {
-            let _ = reply.send(state.exit_code);
+            let _ = reply.send(Ok(state.exit_code));
         }
         SessionCommand::ShouldKeepSessionDir { reply } => {
-            let _ = reply.send(runtime.should_keep_session_dir());
+            let _ = reply.send(Ok(runtime.should_keep_session_dir()));
         }
         SessionCommand::MarkObserved { generation, reply } => {
             let _ = reply.send(state.observation.mark_observed(generation));
@@ -1044,7 +1023,7 @@ fn session_actor_handle_command(
         }
         SessionCommand::SetClientPresence { active, reply } => {
             state.has_active_client = active;
-            let _ = reply.send(());
+            let _ = reply.send(Ok(()));
         }
         SessionCommand::SubscribeRawOutput { reply } => {
             let (tx, rx) = mpsc::sync_channel(RAW_OUTPUT_TAP_CHUNKS);

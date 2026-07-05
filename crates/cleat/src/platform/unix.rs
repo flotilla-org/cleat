@@ -32,6 +32,7 @@ use crate::{
 };
 
 const STRIP_ENV_VARS: &[&str] = &["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"];
+const PTY_WRITE_READY_TIMEOUT_MS: i32 = 250;
 
 pub struct PtyChild {
     master_fd: RawFd,
@@ -422,6 +423,7 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> Result<usize, io::Error> {
 fn write_fd_all(fd: RawFd, mut bytes: &[u8]) -> Result<(), String> {
     while !bytes.is_empty() {
         match nix_write(borrow_raw(fd), bytes) {
+            Ok(0) => return Err("write pty input: wrote zero bytes".to_string()),
             Ok(written) => bytes = &bytes[written..],
             Err(err) => {
                 let err = io::Error::from(err);
@@ -438,8 +440,15 @@ fn write_fd_all(fd: RawFd, mut bytes: &[u8]) -> Result<(), String> {
 
 fn wait_for_writable(fd: RawFd) -> Result<(), String> {
     let mut fds = [PollFd::new(borrow_raw(fd), PollFlags::POLLOUT)];
-    poll(&mut fds, PollTimeout::NONE).map_err(|err| format!("poll writable pty fd: {err}"))?;
-    Ok(())
+    let timeout = PollTimeout::try_from(PTY_WRITE_READY_TIMEOUT_MS).map_err(|err| format!("invalid pty write timeout: {err}"))?;
+    loop {
+        match poll(&mut fds, timeout) {
+            Ok(0) => return Err("timed out waiting for pty to become writable".to_string()),
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(format!("poll writable pty fd: {err}")),
+        }
+    }
 }
 
 fn resize_pty(fd: RawFd, cols: u16, rows: u16, width_px: u32, height_px: u32) -> Result<(), String> {

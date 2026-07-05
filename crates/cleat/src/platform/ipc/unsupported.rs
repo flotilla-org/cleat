@@ -56,6 +56,10 @@ pub fn set_stream_read_timeout(_stream: &SessionStream, _timeout: Option<Duratio
     Err("session IPC stream is only supported on Unix".to_string())
 }
 
+pub fn set_stream_write_timeout(_stream: &SessionStream, _timeout: Option<Duration>) -> Result<(), String> {
+    Err("session IPC stream is only supported on Unix".to_string())
+}
+
 pub fn shutdown_stream(_stream: &SessionStream) {}
 
 fn unsupported_io() -> io::Error {

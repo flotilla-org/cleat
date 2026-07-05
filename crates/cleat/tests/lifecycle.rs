@@ -783,6 +783,47 @@ fn packet_concurrent_channels_receive_same_dirty_generation() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn packet_lagging_channel_receives_cached_generation_after_session_goes_clean() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let mut fast_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut fast_stream).expect("read fast hello");
+    let _directory = PacketFrame::read(&mut fast_stream).expect("read fast directory");
+    packet_open_channel(&mut fast_stream, 1, "alpha");
+    let fast_initial = read_packet_render(&mut fast_stream, 1, Duration::from_secs(2));
+    packet_ack(&mut fast_stream, 1, fast_initial.render_generation);
+
+    let mut slow_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut slow_stream).expect("read slow hello");
+    let _directory = PacketFrame::read(&mut slow_stream).expect("read slow directory");
+    packet_open_channel(&mut slow_stream, 1, "alpha");
+    let slow_initial = read_packet_render(&mut slow_stream, 1, Duration::from_secs(2));
+
+    std::thread::sleep(Duration::from_millis(500));
+    packet_input(&mut fast_stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "y".to_string() }));
+    let fast_update = loop {
+        let update = read_packet_render(&mut fast_stream, 1, Duration::from_secs(2));
+        if !update.ops.is_empty() {
+            break update;
+        }
+        packet_ack(&mut fast_stream, 1, update.render_generation);
+    };
+    packet_ack(&mut fast_stream, 1, fast_update.render_generation);
+
+    packet_ack(&mut slow_stream, 1, slow_initial.render_generation);
+    let slow_update = read_packet_render(&mut slow_stream, 1, Duration::from_secs(2));
+
+    assert_eq!(slow_update.render_generation, fast_update.render_generation);
+    assert!(!slow_update.ops.is_empty(), "lagging viewer should receive cached row content after fast ack");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn packets_command_prints_render_summaries() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

@@ -1450,7 +1450,12 @@ fn push_due_packet_renders(
     }
 
     if actor.observation().dirty() != DirtyState::Clean {
-        render_cache.store(actor.render_update()?);
+        let update = if has_packet_channel_lagging_cached_generation(packet_clients, render_cache) {
+            actor.full_render_update()?
+        } else {
+            actor.render_update()?
+        };
+        render_cache.store(update);
     }
 
     let Some(latest_generation) = render_cache.latest_generation() else {
@@ -1480,6 +1485,13 @@ fn push_due_packet_renders(
         }
     }
     Ok(())
+}
+
+fn has_packet_channel_lagging_cached_generation(packet_clients: &[PacketClient], render_cache: &PacketRenderCache) -> bool {
+    let Some(latest_generation) = render_cache.latest_generation() else {
+        return false;
+    };
+    packet_clients.iter().flat_map(|client| client.channels.values()).any(|session| session.last_sent_generation < latest_generation)
 }
 
 fn route_packet_input_event(actor: &SessionActor, event: TerminalInputEvent) -> Result<(), String> {

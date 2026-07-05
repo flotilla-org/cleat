@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 use crate::vt::{self, ScreenGrid};
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
     pub struct ProviderFeatures: u32 {
         const CELL_SNAPSHOTS = 1 << 0;
         const DAMAGE_ROWS = 1 << 1;
@@ -12,7 +14,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DirtyState {
     #[default]
     Clean,
@@ -20,7 +22,7 @@ pub enum DirtyState {
     Full,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSnapshot {
     pub cols: u16,
     pub rows: u16,
@@ -56,7 +58,7 @@ impl TerminalSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalRenderUpdateOpKind {
     #[default]
     FullVisibleReplace,
@@ -64,7 +66,7 @@ pub enum TerminalRenderUpdateOpKind {
     ScrollCopy,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalRenderUpdateOp {
     pub kind: TerminalRenderUpdateOpKind,
     pub first_row: u16,
@@ -75,7 +77,7 @@ pub struct TerminalRenderUpdateOp {
     pub dst_row: u16,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalRenderRow {
     pub row: u16,
     pub col_count: u16,
@@ -90,13 +92,13 @@ pub struct TerminalRenderRow {
     pub dirty: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalRenderCell {
     pub graphemes: Vec<u32>,
     pub style: TerminalRenderStyle,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalRenderStyle {
     pub flags: TerminalCellFlags,
     pub width: TerminalCellWidth,
@@ -116,14 +118,14 @@ pub struct TerminalRenderStyle {
     pub style_id: u16,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalStyleColor {
     pub tag: TerminalStyleColorTag,
     pub palette_index: u8,
     pub rgb: Option<TerminalRgb>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalStyleColorTag {
     #[default]
     None,
@@ -131,7 +133,7 @@ pub enum TerminalStyleColorTag {
     Rgb,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalRenderUpdate {
     pub cols: u16,
     pub rows: u16,
@@ -148,7 +150,7 @@ pub struct TerminalRenderUpdate {
     pub image_placements: Vec<TerminalImagePlacement>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalImageResource {
     pub image_id: u32,
     pub generation: u64,
@@ -161,7 +163,7 @@ pub struct TerminalImageResource {
 
 pub const TERMINAL_IMAGE_PLACEMENT_VIRTUAL: u32 = 1 << 0;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalImagePlacement {
     pub image_id: u32,
     pub generation: u64,
@@ -308,7 +310,7 @@ impl TerminalStyleColor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalViewportKind {
     #[default]
     LiveNormal,
@@ -316,14 +318,14 @@ pub enum TerminalViewportKind {
     NormalScrollback,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalScrollbackExtent {
     pub normal_scrollback_rows: u64,
     pub live_rows: u16,
     pub alternate_screen: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalScrollbarState {
     pub viewport_kind: TerminalViewportKind,
     pub total_rows: u64,
@@ -344,21 +346,21 @@ impl TerminalScrollbarState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ViewportCommand {
     Top,
     Bottom,
     DeltaRows(i64),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ViewportCommandOutcome {
     Moved,
     NoOp,
     Unsupported,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalGeometry {
     pub cell_width_px: f32,
     pub cell_height_px: f32,
@@ -410,7 +412,7 @@ fn finite_or_zero(value: f32) -> f32 {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalCell {
     pub graphemes: Vec<u32>,
     pub fg: TerminalRgb,
@@ -441,7 +443,7 @@ impl TerminalCell {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalRgb {
     pub r: u8,
     pub g: u8,
@@ -455,7 +457,7 @@ impl TerminalRgb {
 }
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
     pub struct TerminalCellFlags: u32 {
         const BOLD = 1 << 0;
         const ITALIC = 1 << 1;
@@ -503,7 +505,7 @@ impl TerminalCellFlags {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalCellWidth {
     #[default]
     Narrow,
@@ -523,7 +525,7 @@ impl TerminalCellWidth {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalCursor {
     pub col: u16,
     pub row: u16,
@@ -546,7 +548,7 @@ impl TerminalCursor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalCursorStyle {
     Bar,
     #[default]
@@ -566,7 +568,7 @@ impl TerminalCursorStyle {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TerminalInputEvent {
     Key(TerminalKeyEvent),
     Text(TerminalTextEvent),
@@ -577,7 +579,7 @@ pub enum TerminalInputEvent {
     RawBytes(Vec<u8>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalKeyEvent {
     pub key: TerminalKey,
     pub modifiers: TerminalModifiers,
@@ -587,7 +589,7 @@ pub struct TerminalKeyEvent {
     pub platform_keycode: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalKeyAction {
     #[default]
     Press,
@@ -595,13 +597,13 @@ pub enum TerminalKeyAction {
     Release,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalKey {
     UnicodeScalar(u32),
     Named(TerminalNamedKey),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalNamedKey {
     Enter,
     Escape,
@@ -621,7 +623,7 @@ pub enum TerminalNamedKey {
 }
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
     pub struct TerminalModifiers: u16 {
         const SHIFT = 1 << 0;
         const CTRL = 1 << 1;
@@ -630,12 +632,12 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalTextEvent {
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerminalMouseEvent {
     pub kind: TerminalMouseEventKind,
     pub button: Option<TerminalMouseButton>,
@@ -649,7 +651,7 @@ pub struct TerminalMouseEvent {
     pub wheel_delta_y: f32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalMouseEventKind {
     Press,
     Release,
@@ -657,7 +659,7 @@ pub enum TerminalMouseEventKind {
     Wheel,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalMouseButton {
     Left,
     Middle,
@@ -667,7 +669,7 @@ pub enum TerminalMouseButton {
 }
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
     pub struct TerminalMouseButtons: u16 {
         const LEFT = 1 << 0;
         const MIDDLE = 1 << 1;
@@ -677,17 +679,17 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalFocusEvent {
     pub focused: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalPasteEvent {
     pub text: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerminalResizeEvent {
     pub cols: u16,
     pub rows: u16,
@@ -850,5 +852,165 @@ mod tests {
         assert!(matches!(mouse, TerminalInputEvent::Mouse(_)));
         assert!(matches!(paste, TerminalInputEvent::Paste(_)));
         assert!(matches!(raw, TerminalInputEvent::RawBytes(_)));
+    }
+
+    #[test]
+    fn postcard_round_trip_preserves_render_update_packet_fields() {
+        let update = TerminalRenderUpdate {
+            cols: 120,
+            rows: 40,
+            geometry: TerminalGeometry {
+                cell_width_px: 8.0,
+                cell_height_px: 16.0,
+                content_x_px: 1.0,
+                content_y_px: 2.0,
+                content_width_px: 960.0,
+                content_height_px: 640.0,
+            },
+            viewport_kind: TerminalViewportKind::NormalScrollback,
+            scrollback_offset_rows: 12,
+            scrollbar: TerminalScrollbarState::new(TerminalViewportKind::NormalScrollback, 200, 40, 12),
+            terminal_modes: vt::TerminalModeState {
+                active_alternate_screen: true,
+                application_cursor_keys: true,
+                alternate_scroll: true,
+                mouse_tracking: true,
+                mouse_tracking_mode: vt::MouseTrackingMode::Any,
+                mouse_report_format: vt::MouseReportFormat::SgrPixels,
+                mouse_sgr: true,
+                mouse_sgr_pixels: true,
+            },
+            render_generation: 42,
+            cursor: TerminalCursor {
+                col: 9,
+                row: 8,
+                visible: true,
+                style: TerminalCursorStyle::BlockHollow,
+                blink: true,
+                wide_tail: false,
+            },
+            dirty: DirtyState::Partial,
+            ops: vec![TerminalRenderUpdateOp {
+                kind: TerminalRenderUpdateOpKind::RowReplace,
+                first_row: 3,
+                row_count: 1,
+                col_count: 2,
+                rows: vec![TerminalRenderRow {
+                    row: 3,
+                    col_count: 2,
+                    cells: vec![TerminalRenderCell {
+                        graphemes: vec!['A' as u32, 0x0301],
+                        style: TerminalRenderStyle {
+                            flags: TerminalCellFlags::BOLD | TerminalCellFlags::UNDERLINE,
+                            width: TerminalCellWidth::Wide,
+                            resolved_fg: TerminalRgb { r: 1, g: 2, b: 3 },
+                            resolved_bg: TerminalRgb { r: 4, g: 5, b: 6 },
+                            fg_color: TerminalStyleColor::palette(7),
+                            bg_color: TerminalStyleColor::rgb(TerminalRgb { r: 8, g: 9, b: 10 }),
+                            underline_style: 2,
+                            underline_color: TerminalStyleColor::rgb(TerminalRgb { r: 11, g: 12, b: 13 }),
+                            protected: true,
+                            semantic: 4,
+                            has_hyperlink: true,
+                            hyperlink_id: 99,
+                            content_tag: 5,
+                            has_text: true,
+                            has_styling: true,
+                            style_id: 6,
+                        },
+                    }],
+                    wrap: true,
+                    wrap_continuation: true,
+                    has_graphemes: true,
+                    has_styling: true,
+                    has_hyperlink: true,
+                    semantic_prompt: 3,
+                    has_kitty_virtual_placeholder: true,
+                    dirty: true,
+                }],
+                src_row: 0,
+                dst_row: 3,
+            }],
+            image_resources: vec![TerminalImageResource {
+                image_id: 7,
+                generation: 9,
+                width_px: 100,
+                height_px: 50,
+                format: 1,
+                compression: 2,
+                data_len: 1234,
+            }],
+            image_placements: vec![TerminalImagePlacement {
+                image_id: 7,
+                generation: 9,
+                placement_id: 11,
+                z: -1,
+                viewport_col: 2,
+                viewport_row: 3,
+                grid_cols: 4,
+                grid_rows: 5,
+                pixel_width: 40,
+                pixel_height: 50,
+                source_x: 1,
+                source_y: 2,
+                source_width: 30,
+                source_height: 40,
+                x_offset_px: 6,
+                y_offset_px: 7,
+                flags: TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
+            }],
+        };
+
+        let bytes = postcard::to_allocvec(&update).expect("serialize update");
+        let decoded: TerminalRenderUpdate = postcard::from_bytes(&bytes).expect("deserialize update");
+
+        assert_eq!(decoded, update);
+    }
+
+    #[test]
+    fn postcard_round_trip_preserves_snapshot_and_input_packets() {
+        let snapshot = TerminalSnapshot {
+            cols: 2,
+            rows: 1,
+            geometry: TerminalGeometry::from_cell_size(2, 1, 8.0, 16.0),
+            viewport_kind: TerminalViewportKind::LiveAlternate,
+            scrollback_offset_rows: 0,
+            scrollbar: TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveAlternate, 1),
+            terminal_modes: vt::TerminalModeState { active_alternate_screen: true, ..vt::TerminalModeState::default() },
+            render_generation: 5,
+            cells: vec![TerminalCell {
+                graphemes: vec!['x' as u32],
+                fg: TerminalRgb { r: 1, g: 2, b: 3 },
+                bg: TerminalRgb { r: 4, g: 5, b: 6 },
+                underline_color: Some(TerminalRgb { r: 7, g: 8, b: 9 }),
+                flags: TerminalCellFlags::ITALIC | TerminalCellFlags::STRIKETHROUGH,
+                underline_style: 1,
+                width: TerminalCellWidth::Narrow,
+                protected: true,
+                semantic: 2,
+                has_hyperlink: true,
+            }],
+            cursor: TerminalCursor { col: 1, row: 0, visible: true, style: TerminalCursorStyle::Bar, blink: false, wide_tail: false },
+            dirty: DirtyState::Full,
+            dirty_rows: vec![0],
+        };
+        let input = TerminalInputEvent::Mouse(TerminalMouseEvent {
+            kind: TerminalMouseEventKind::Wheel,
+            button: None,
+            buttons: TerminalMouseButtons::LEFT | TerminalMouseButtons::RIGHT,
+            modifiers: TerminalModifiers::SHIFT | TerminalModifiers::CTRL,
+            cell_col: 1,
+            cell_row: 2,
+            x_px: 8.5,
+            y_px: 16.25,
+            wheel_delta_x: 1.0,
+            wheel_delta_y: -2.0,
+        });
+
+        let snapshot_bytes = postcard::to_allocvec(&snapshot).expect("serialize snapshot");
+        let input_bytes = postcard::to_allocvec(&input).expect("serialize input");
+
+        assert_eq!(postcard::from_bytes::<TerminalSnapshot>(&snapshot_bytes).expect("deserialize snapshot"), snapshot);
+        assert_eq!(postcard::from_bytes::<TerminalInputEvent>(&input_bytes).expect("deserialize input"), input);
     }
 }

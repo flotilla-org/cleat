@@ -120,12 +120,6 @@ impl SessionRuntime {
         }
     }
 
-    pub(crate) fn flush_recording_if_idle(&mut self, pty_readable: bool, client_readable: bool) {
-        if !pty_readable && !client_readable {
-            self.flush_recording();
-        }
-    }
-
     pub(crate) fn record_attach(&mut self) {
         self.record_custom_event('a', r#"{"client":"foreground"}"#);
     }

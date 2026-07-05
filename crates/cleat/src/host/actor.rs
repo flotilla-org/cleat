@@ -9,6 +9,7 @@ use std::{
         Arc,
     },
     thread,
+    time::Instant,
 };
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
@@ -25,7 +26,7 @@ use nix::{
 
 use crate::{
     platform::pty::PtyChild,
-    protocol::SignalTarget,
+    protocol::{InspectResult, SignalTarget},
     provider::{
         DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
         ViewportCommand, ViewportCommandOutcome,
@@ -40,13 +41,11 @@ const RAW_OUTPUT_TAP_CHUNKS: usize = 64;
 pub(crate) type WakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 pub(crate) type ImageResourceDataCallback = Box<dyn FnMut(&[u8]) -> bool + Send>;
 
-#[allow(dead_code)]
 pub(crate) struct RawOutputTap {
     rx: Receiver<Vec<u8>>,
 }
 
 impl RawOutputTap {
-    #[allow(dead_code)]
     pub(crate) fn try_recv(&self) -> Result<Vec<u8>, mpsc::TryRecvError> {
         self.rx.try_recv()
     }
@@ -261,7 +260,28 @@ pub(crate) enum SessionCommand {
     ScrollViewport { command: ViewportCommand, reply: mpsc::Sender<Result<ViewportCommandOutcome, String>> },
     Snapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     RenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
+    FullSnapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     ImageResourceData { image_id: u32, generation: u64, callback: ImageResourceDataCallback, reply: mpsc::Sender<Result<bool, String>> },
+    Inspect { has_controller: bool, watcher_count: usize, reply: mpsc::Sender<InspectResult> },
+    ApplyAttachState { cols: u16, rows: u16, capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<Option<Vec<u8>>, String>> },
+    ReplayPayload { capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<Option<Vec<u8>>, String>> },
+    CaptureText { reply: mpsc::Sender<Result<String, String>> },
+    ValidateTextMatching { reply: mpsc::Sender<Result<(), String>> },
+    ScreenContains { text: String, reply: mpsc::Sender<bool> },
+    LastPtyOutputAt { reply: mpsc::Sender<Option<Instant>> },
+    FlushRecording { reply: mpsc::Sender<()> },
+    RecordingActive { reply: mpsc::Sender<bool> },
+    RecordAttach { reply: mpsc::Sender<()> },
+    RecordDetach { reply: mpsc::Sender<()> },
+    WriteInputWithMark { bytes: Vec<u8>, marker_name: String, reply: mpsc::Sender<Result<u64, String>> },
+    PasteWithMark { text: Vec<u8>, marker_name: String, reply: mpsc::Sender<Result<u64, String>> },
+    SetRecording { enable: bool, reply: mpsc::Sender<Result<(), String>> },
+    Mark { name: Option<String>, reply: mpsc::Sender<Result<u64, String>> },
+    ResolveMarker { name: String, reply: mpsc::Sender<Option<u64>> },
+    ResolveNextMarker { after: u64, reply: mpsc::Sender<Option<u64>> },
+    DispatchSignal { signal: i32, target: SignalTarget, reply: mpsc::Sender<Result<(), String>> },
+    ExitCode { reply: mpsc::Sender<Option<i32>> },
+    ShouldKeepSessionDir { reply: mpsc::Sender<bool> },
     MarkObserved { generation: u64, reply: mpsc::Sender<bool> },
     ScrollbackExtent { reply: mpsc::Sender<TerminalScrollbackExtent> },
     ScrollbarState { reply: mpsc::Sender<TerminalScrollbarState> },
@@ -588,6 +608,126 @@ impl SessionActor {
         self.tx.send(SessionCommand::SubscribeRawOutput { reply }).map_err(|_| "session actor is not running".to_string())?;
         recv.recv().map_err(|_| "session actor did not reply".to_string())
     }
+
+    pub(crate) fn inspect(&self, has_controller: bool, watcher_count: usize) -> Result<InspectResult, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx
+            .send(SessionCommand::Inspect { has_controller, watcher_count, reply })
+            .map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn apply_attach_state(&self, cols: u16, rows: u16, capabilities: vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+        self.request_result(|reply| SessionCommand::ApplyAttachState { cols, rows, capabilities, reply })
+    }
+
+    pub(crate) fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::Resize { cols, rows, reply })
+    }
+
+    pub(crate) fn write_input(&self, bytes: Vec<u8>) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::WriteInput { bytes, reply })
+    }
+
+    pub(crate) fn paste(&self, text: Vec<u8>) -> Result<usize, String> {
+        self.request_result(|reply| SessionCommand::Paste { text, reply })
+    }
+
+    pub(crate) fn replay_payload(&self, capabilities: vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+        self.request_result(|reply| SessionCommand::ReplayPayload { capabilities, reply })
+    }
+
+    pub(crate) fn full_snapshot(&self) -> Result<TerminalSnapshot, String> {
+        self.request_result(|reply| SessionCommand::FullSnapshot { reply })
+    }
+
+    pub(crate) fn capture_text(&self) -> Result<String, String> {
+        self.request_result(|reply| SessionCommand::CaptureText { reply })
+    }
+
+    pub(crate) fn validate_text_matching(&self) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::ValidateTextMatching { reply })
+    }
+
+    pub(crate) fn screen_contains(&self, text: String) -> Result<bool, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::ScreenContains { text, reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn last_pty_output_at(&self) -> Result<Option<Instant>, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::LastPtyOutputAt { reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn flush_recording(&self) -> Result<(), String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::FlushRecording { reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn recording_active(&self) -> Result<bool, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::RecordingActive { reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn record_attach(&self) -> Result<(), String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::RecordAttach { reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn record_detach(&self) -> Result<(), String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::RecordDetach { reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn write_input_with_mark(&self, bytes: Vec<u8>, marker_name: String) -> Result<u64, String> {
+        self.request_result(|reply| SessionCommand::WriteInputWithMark { bytes, marker_name, reply })
+    }
+
+    pub(crate) fn paste_with_mark(&self, text: Vec<u8>, marker_name: String) -> Result<u64, String> {
+        self.request_result(|reply| SessionCommand::PasteWithMark { text, marker_name, reply })
+    }
+
+    pub(crate) fn set_recording(&self, enable: bool) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::SetRecording { enable, reply })
+    }
+
+    pub(crate) fn mark(&self, name: Option<String>) -> Result<u64, String> {
+        self.request_result(|reply| SessionCommand::Mark { name, reply })
+    }
+
+    pub(crate) fn resolve_marker(&self, name: String) -> Result<Option<u64>, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::ResolveMarker { name, reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn resolve_next_marker_after(&self, after: u64) -> Result<Option<u64>, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::ResolveNextMarker { after, reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn dispatch_signal(&self, signal: i32, target: SignalTarget) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::DispatchSignal { signal, target, reply })
+    }
+
+    pub(crate) fn exit_code(&self) -> Result<Option<i32>, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::ExitCode { reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
+
+    pub(crate) fn should_keep_session_dir(&self) -> Result<bool, String> {
+        let (reply, recv) = mpsc::channel();
+        self.tx.send(SessionCommand::ShouldKeepSessionDir { reply }).map_err(|_| "session actor is not running".to_string())?;
+        recv.recv().map_err(|_| "session actor did not reply".to_string())
+    }
 }
 
 impl Drop for SessionActor {
@@ -611,12 +751,26 @@ struct PumpResult {
     chunks: Vec<Vec<u8>>,
 }
 
-fn pump_session_runtime(runtime: &mut SessionRuntime, exited: &mut bool, has_active_client: bool) -> Result<PumpResult, String> {
+struct SessionActorLoopState {
+    observation: ObservationState,
+    exited: bool,
+    exit_code: Option<i32>,
+    has_active_client: bool,
+    raw_output_taps: Vec<SyncSender<Vec<u8>>>,
+}
+
+fn pump_session_runtime(
+    runtime: &mut SessionRuntime,
+    exited: &mut bool,
+    exit_code: &mut Option<i32>,
+    has_active_client: bool,
+) -> Result<PumpResult, String> {
     let mut exited_now = false;
     if !*exited {
-        if let Some(exit_code) = runtime.exit_code_if_exited()? {
-            runtime.record_exit_code(exit_code);
+        if let Some(code) = runtime.exit_code_if_exited()? {
+            runtime.record_exit_code(code);
             *exited = true;
+            *exit_code = Some(code);
             exited_now = true;
         }
     }
@@ -666,10 +820,13 @@ fn session_actor_loop(
     rx: mpsc::Receiver<SessionCommand>,
     #[cfg(unix)] command_wake: CommandWakeReader,
 ) {
-    let mut observation = ObservationState::new_with_mirror(rows, Some(mirror));
-    let mut exited = false;
-    let mut has_active_client = false;
-    let mut raw_output_taps = Vec::new();
+    let mut state = SessionActorLoopState {
+        observation: ObservationState::new_with_mirror(rows, Some(mirror)),
+        exited: false,
+        exit_code: None,
+        has_active_client: false,
+        raw_output_taps: Vec::new(),
+    };
     let _ = ready.send(Ok(()));
     #[cfg(unix)]
     loop {
@@ -682,33 +839,24 @@ fn session_actor_loop(
         };
         if readiness.command_readable {
             command_wake.drain();
-            if drain_session_commands(&rx, &mut runtime, &mut observation, &mut exited, &mut has_active_client, &mut raw_output_taps, &wake)
-            {
+            if drain_session_commands(&rx, &mut runtime, &mut state, &wake) {
                 break;
             }
         }
         if readiness.pty_readable {
-            session_actor_pump(&mut runtime, &mut observation, &mut exited, has_active_client, &mut raw_output_taps, &wake);
+            session_actor_pump(&mut runtime, &mut state, &wake);
         }
     }
     #[cfg(not(unix))]
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(10)) {
             Ok(command) => {
-                if session_actor_handle_command(
-                    command,
-                    &mut runtime,
-                    &mut observation,
-                    &mut exited,
-                    &mut has_active_client,
-                    &mut raw_output_taps,
-                    &wake,
-                ) {
+                if session_actor_handle_command(command, &mut runtime, &mut state, &wake) {
                     break;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                session_actor_pump(&mut runtime, &mut observation, &mut exited, has_active_client, &mut raw_output_taps, &wake);
+                session_actor_pump(&mut runtime, &mut state, &wake);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
@@ -721,16 +869,13 @@ fn session_actor_loop(
 fn drain_session_commands(
     rx: &mpsc::Receiver<SessionCommand>,
     runtime: &mut SessionRuntime,
-    observation: &mut ObservationState,
-    exited: &mut bool,
-    has_active_client: &mut bool,
-    raw_output_taps: &mut Vec<SyncSender<Vec<u8>>>,
+    state: &mut SessionActorLoopState,
     wake: &WakeCallback,
 ) -> bool {
     loop {
         match rx.try_recv() {
             Ok(command) => {
-                if session_actor_handle_command(command, runtime, observation, exited, has_active_client, raw_output_taps, wake) {
+                if session_actor_handle_command(command, runtime, state, wake) {
                     return true;
                 }
             }
@@ -746,10 +891,7 @@ fn drain_session_commands(
 fn session_actor_handle_command(
     command: SessionCommand,
     runtime: &mut SessionRuntime,
-    observation: &mut ObservationState,
-    exited: &mut bool,
-    has_active_client: &mut bool,
-    raw_output_taps: &mut Vec<SyncSender<Vec<u8>>>,
+    state: &mut SessionActorLoopState,
     wake: &WakeCallback,
 ) -> bool {
     let mut stop = false;
@@ -758,14 +900,14 @@ fn session_actor_handle_command(
             let cols = cols.max(1);
             let rows = rows.max(1);
             let result = runtime.resize(cols, rows).map(|_| {
-                mark_full_and_wake(observation, rows, wake);
+                mark_full_and_wake(&mut state.observation, rows, wake);
             });
             let _ = reply.send(result);
         }
         SessionCommand::SetCellSize { cell_width_px, cell_height_px, reply } => {
             let result = runtime.set_cell_size(cell_width_px, cell_height_px).map(|_| {
                 let rows = runtime.inspect(false, 0).terminal.rows;
-                mark_full_and_wake(observation, rows, wake);
+                mark_full_and_wake(&mut state.observation, rows, wake);
             });
             let _ = reply.send(result);
         }
@@ -773,7 +915,7 @@ fn session_actor_handle_command(
             let _ = reply.send(runtime.write_input(&bytes));
         }
         SessionCommand::Wheel { event, reply } => {
-            let result = route_wheel_event_on_actor(wake, runtime, observation, event);
+            let result = route_wheel_event_on_actor(wake, runtime, &mut state.observation, event);
             let _ = reply.send(result);
         }
         SessionCommand::Mouse { event, reply } => {
@@ -786,33 +928,105 @@ fn session_actor_handle_command(
             let result = runtime.scroll_viewport(command).inspect(|outcome| {
                 if *outcome == ViewportCommandOutcome::Moved {
                     let rows = runtime.inspect(false, 0).terminal.rows;
-                    mark_full_and_wake(observation, rows, wake);
+                    mark_full_and_wake(&mut state.observation, rows, wake);
                 }
             });
             let _ = reply.send(result);
         }
         SessionCommand::Snapshot { reply } => {
-            sync_terminal_modes_and_wake(runtime, observation, wake);
-            let result = runtime.snapshot(observation.dirty()).map(|mut snapshot| {
-                observation.annotate_snapshot(&mut snapshot);
+            sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
+            let result = runtime.snapshot(state.observation.dirty()).map(|mut snapshot| {
+                state.observation.annotate_snapshot(&mut snapshot);
                 snapshot
             });
             let _ = reply.send(result);
         }
         SessionCommand::RenderUpdate { reply } => {
-            sync_terminal_modes_and_wake(runtime, observation, wake);
-            let result = runtime.render_update(observation.dirty()).map(|mut update| {
-                observation.annotate_render_update(&mut update);
+            sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
+            let result = runtime.render_update(state.observation.dirty()).map(|mut update| {
+                state.observation.annotate_render_update(&mut update);
                 update
             });
             let _ = reply.send(result);
+        }
+        SessionCommand::FullSnapshot { reply } => {
+            let _ = reply.send(runtime.snapshot(DirtyState::Full));
         }
         SessionCommand::ImageResourceData { image_id, generation, mut callback, reply } => {
             let result = runtime.with_image_resource_data(image_id, generation, &mut callback);
             let _ = reply.send(result);
         }
+        SessionCommand::Inspect { has_controller, watcher_count, reply } => {
+            let _ = reply.send(runtime.inspect(has_controller, watcher_count));
+        }
+        SessionCommand::ApplyAttachState { cols, rows, capabilities, reply } => {
+            let cols = cols.max(1);
+            let rows = rows.max(1);
+            let result = runtime.apply_attach_state(cols, rows, &capabilities).inspect(|_| {
+                mark_full_and_wake(&mut state.observation, rows, wake);
+            });
+            let _ = reply.send(result);
+        }
+        SessionCommand::ReplayPayload { capabilities, reply } => {
+            let _ = reply.send(runtime.replay_payload(&capabilities));
+        }
+        SessionCommand::CaptureText { reply } => {
+            let _ = reply.send(runtime.capture_text());
+        }
+        SessionCommand::ValidateTextMatching { reply } => {
+            let _ = reply.send(runtime.validate_text_matching());
+        }
+        SessionCommand::ScreenContains { text, reply } => {
+            let _ = reply.send(runtime.screen_contains(&text));
+        }
+        SessionCommand::LastPtyOutputAt { reply } => {
+            let _ = reply.send(runtime.last_pty_output_at());
+        }
+        SessionCommand::FlushRecording { reply } => {
+            runtime.flush_recording();
+            let _ = reply.send(());
+        }
+        SessionCommand::RecordingActive { reply } => {
+            let _ = reply.send(runtime.recording_active());
+        }
+        SessionCommand::RecordAttach { reply } => {
+            runtime.record_attach();
+            let _ = reply.send(());
+        }
+        SessionCommand::RecordDetach { reply } => {
+            runtime.record_detach();
+            let _ = reply.send(());
+        }
+        SessionCommand::WriteInputWithMark { bytes, marker_name, reply } => {
+            let _ = reply.send(runtime.write_input_with_mark(&bytes, marker_name));
+        }
+        SessionCommand::PasteWithMark { text, marker_name, reply } => {
+            let result = runtime.encode_paste(&text).and_then(|bytes| runtime.write_input_with_mark(&bytes, marker_name));
+            let _ = reply.send(result);
+        }
+        SessionCommand::SetRecording { enable, reply } => {
+            let _ = reply.send(runtime.set_recording(enable));
+        }
+        SessionCommand::Mark { name, reply } => {
+            let _ = reply.send(runtime.mark(name));
+        }
+        SessionCommand::ResolveMarker { name, reply } => {
+            let _ = reply.send(runtime.resolve_marker(&name));
+        }
+        SessionCommand::ResolveNextMarker { after, reply } => {
+            let _ = reply.send(runtime.resolve_next_marker_after(after));
+        }
+        SessionCommand::DispatchSignal { signal, target, reply } => {
+            let _ = reply.send(runtime.dispatch_signal(signal, target));
+        }
+        SessionCommand::ExitCode { reply } => {
+            let _ = reply.send(state.exit_code);
+        }
+        SessionCommand::ShouldKeepSessionDir { reply } => {
+            let _ = reply.send(runtime.should_keep_session_dir());
+        }
         SessionCommand::MarkObserved { generation, reply } => {
-            let _ = reply.send(observation.mark_observed(generation));
+            let _ = reply.send(state.observation.mark_observed(generation));
         }
         SessionCommand::ScrollbackExtent { reply } => {
             let extent = runtime.scrollback_extent().unwrap_or_else(|_| TerminalScrollbackExtent {
@@ -829,53 +1043,46 @@ fn session_actor_handle_command(
             let _ = reply.send(scrollbar);
         }
         SessionCommand::SetClientPresence { active, reply } => {
-            *has_active_client = active;
+            state.has_active_client = active;
             let _ = reply.send(());
         }
         SessionCommand::SubscribeRawOutput { reply } => {
             let (tx, rx) = mpsc::sync_channel(RAW_OUTPUT_TAP_CHUNKS);
-            raw_output_taps.push(tx);
+            state.raw_output_taps.push(tx);
             let _ = reply.send(RawOutputTap { rx });
         }
         SessionCommand::Stop { terminate } => {
-            if terminate && !*exited {
+            if terminate && !state.exited {
                 let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
             }
             stop = true;
         }
     }
     if !stop {
-        session_actor_pump(runtime, observation, exited, *has_active_client, raw_output_taps, wake);
+        session_actor_pump(runtime, state, wake);
     }
     stop
 }
 
-fn session_actor_pump(
-    runtime: &mut SessionRuntime,
-    observation: &mut ObservationState,
-    exited: &mut bool,
-    has_active_client: bool,
-    raw_output_taps: &mut Vec<SyncSender<Vec<u8>>>,
-    wake: &WakeCallback,
-) {
-    match pump_session_runtime(runtime, exited, has_active_client) {
+fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoopState, wake: &WakeCallback) {
+    match pump_session_runtime(runtime, &mut state.exited, &mut state.exit_code, state.has_active_client) {
         Ok(result) => {
-            publish_raw_output(raw_output_taps, &result.chunks);
+            publish_raw_output(&mut state.raw_output_taps, &result.chunks);
             match result.outcome {
                 PumpOutcome::Clean => {}
-                PumpOutcome::PartialUnknown => mark_partial_unknown_and_wake(observation, wake),
+                PumpOutcome::PartialUnknown => mark_partial_unknown_and_wake(&mut state.observation, wake),
                 PumpOutcome::Full => {
                     let rows = runtime.inspect(false, 0).terminal.rows;
-                    mark_full_and_wake(observation, rows, wake);
+                    mark_full_and_wake(&mut state.observation, rows, wake);
                 }
             }
         }
         Err(_) => {
             let rows = runtime.inspect(false, 0).terminal.rows;
-            mark_full_and_wake(observation, rows, wake);
+            mark_full_and_wake(&mut state.observation, rows, wake);
         }
     }
-    sync_terminal_modes_and_wake(runtime, observation, wake);
+    sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
 }
 
 fn publish_raw_output(taps: &mut Vec<SyncSender<Vec<u8>>>, chunks: &[Vec<u8>]) {

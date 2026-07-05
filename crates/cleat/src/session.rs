@@ -16,6 +16,7 @@ use std::{
 use http::StatusCode;
 
 use crate::{
+    host::actor::{RawOutputTap, SessionActor},
     http_uds,
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
@@ -23,12 +24,10 @@ use crate::{
             bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
             set_stream_nonblocking, set_stream_read_timeout, shutdown_stream, SessionStream,
         },
-        pty::poll_session_ready,
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::Frame,
     runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
-    session_runtime::SessionRuntime,
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
 
@@ -37,6 +36,7 @@ const DETACH_CLEANUP_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const SESSION_DAEMON_SERVICING_TICK: Duration = Duration::from_millis(10);
 const TERMINATE_SIGNAL: i32 = 15;
 const SCREEN_STABLE_CHANGED_CELL_TOLERANCE: usize = 16;
 
@@ -508,7 +508,7 @@ fn write_http_wait_result(stream: &mut SessionStream, status: crate::protocol::W
 fn enqueue_output_chunk(
     root: &Path,
     id: &str,
-    runtime: &mut SessionRuntime,
+    actor: &SessionActor,
     active_client: &mut Option<ActiveClient>,
     watchers: &mut Vec<ActiveClient>,
     chunk: Vec<u8>,
@@ -517,11 +517,32 @@ fn enqueue_output_chunk(
     if let Some(client) = active_client.as_mut() {
         if client.enqueue_frame(&frame).is_err() {
             let _ = fs::remove_file(foreground_path(root, id));
-            runtime.record_detach();
+            let _ = actor.record_detach();
+            let _ = actor.set_client_presence(false);
             *active_client = None;
         }
     }
     watchers.retain_mut(|watcher| watcher.enqueue_frame(&frame).is_ok());
+}
+
+fn drain_raw_output_tap(
+    root: &Path,
+    id: &str,
+    actor: &SessionActor,
+    raw_output_tap: &RawOutputTap,
+    active_client: &mut Option<ActiveClient>,
+    watchers: &mut Vec<ActiveClient>,
+) -> bool {
+    let mut drained = false;
+    loop {
+        match raw_output_tap.try_recv() {
+            Ok(chunk) => {
+                drained = true;
+                enqueue_output_chunk(root, id, actor, active_client, watchers, chunk);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected) => return drained,
+        }
+    }
 }
 
 fn drain_watcher_inputs(watchers: &mut Vec<ActiveClient>) {
@@ -550,24 +571,25 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     set_listener_nonblocking(&listener, true)?;
     fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let mut runtime = SessionRuntime::spawn(session_dir.clone(), session, default_vt_engine(session)?)?;
+    let actor_session_dir = session_dir.clone();
+    let actor_session = session.clone();
+    let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
+        crate::session_runtime::SessionRuntime::spawn(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?)
+    })?;
+    let raw_output_tap = actor.subscribe_raw_output()?;
     let mut active_client: Option<ActiveClient> = None;
     let mut watchers: Vec<ActiveClient> = Vec::new();
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
     let mut pending_expects: Vec<PendingExpect> = Vec::new();
+    let mut should_keep_session_dir = session.record;
     loop {
-        let poll_result = poll_session_ready(
-            &listener,
-            active_client.as_ref().map(|client| &client.stream),
-            active_client.as_ref().map(|client| !client.pending_output.is_empty()).unwrap_or(false),
-            runtime.pty_child(),
-            100,
-        )?;
+        let mut did_work = false;
 
-        if poll_result.listener_readable {
+        loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    did_work = true;
                     // Accepted sockets inherit nonblocking mode from the listener on macOS/BSD.
                     // Reset to blocking so the initial frame read works correctly.
                     #[cfg(unix)]
@@ -590,7 +612,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     }
 
                     let mut http_state = HttpRequestState {
-                        runtime: &mut runtime,
+                        actor: &actor,
                         active_client: &mut active_client,
                         watchers: &mut watchers,
                         had_foreground_client: &mut had_foreground_client,
@@ -601,20 +623,19 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                     }
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(err) => return Err(format!("accept client: {err}")),
             }
         }
 
+        did_work |= drain_raw_output_tap(root, id, &actor, &raw_output_tap, &mut active_client, &mut watchers);
         drain_watcher_inputs(&mut watchers);
 
         if active_client.is_some() {
             let mut client_disconnected = false;
             let mut pending = VecDeque::new();
-            let client_read_timeout =
-                if poll_result.pty_readable || poll_result.client_writable { Duration::ZERO } else { Duration::from_millis(100) };
             if let Some(client) = active_client.as_mut() {
-                match client.drain_input_frames(&mut pending, client_read_timeout) {
+                match client.drain_input_frames(&mut pending, Duration::ZERO) {
                     Ok(true) => {}
                     Ok(false) => client_disconnected = true,
                     Err(err) => return Err(format!("read client frame: {err}")),
@@ -622,12 +643,13 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
 
             while let Some(frame) = pending.pop_front() {
+                did_work = true;
                 match frame {
                     Frame::Input(bytes) => {
-                        runtime.write_input(&bytes)?;
+                        actor.write_input(bytes)?;
                     }
                     Frame::Resize { cols, rows } => {
-                        runtime.resize(cols, rows)?;
+                        actor.resize(cols, rows)?;
                     }
                     _ => {}
                 }
@@ -635,37 +657,30 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
             if client_disconnected && active_client.is_some() {
                 let _ = fs::remove_file(foreground_path(root, id));
-                runtime.record_detach();
+                actor.record_detach()?;
+                actor.set_client_presence(false)?;
                 active_client = None;
+                did_work = true;
             }
         }
 
-        if poll_result.client_writable {
-            let client_writable = match active_client.as_mut() {
-                Some(client) => client.flush_pending_output()?,
-                None => true,
-            };
-            if !client_writable {
-                let _ = fs::remove_file(foreground_path(root, id));
-                runtime.record_detach();
-                active_client = None;
-            }
+        let client_writable = match active_client.as_mut() {
+            Some(client) => client.flush_pending_output()?,
+            None => true,
+        };
+        if !client_writable {
+            let _ = fs::remove_file(foreground_path(root, id));
+            actor.record_detach()?;
+            actor.set_client_presence(false)?;
+            active_client = None;
+            did_work = true;
         }
         flush_watchers(&mut watchers);
-
-        if poll_result.pty_readable {
-            let output = runtime.read_available_output(active_client.is_some())?;
-            for chunk in output.chunks {
-                enqueue_output_chunk(root, id, &mut runtime, &mut active_client, &mut watchers, chunk);
-            }
-        }
-
-        runtime.flush_recording_if_idle(poll_result.pty_readable, poll_result.client_readable);
 
         // Evaluate pending waits on each loop tick.
         // Write errors are intentionally discarded — the client may have disconnected.
         let screen_stable_fingerprint = if pending_waits.iter().any(|wait| wait.screen_stable.is_some()) {
-            runtime.snapshot(crate::provider::DirtyState::Full).ok().map(ScreenStableFingerprint::from_snapshot)
+            actor.full_snapshot().ok().map(ScreenStableFingerprint::from_snapshot)
         } else {
             None
         };
@@ -689,7 +704,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 match condition {
                     crate::protocol::WaitCondition::OutputIdle { quiet_ms } => {
                         // Silence measured from max(registration_time, last_output_time)
-                        let silence_since = match runtime.last_pty_output_at() {
+                        let silence_since = match actor.last_pty_output_at().ok().flatten() {
                             Some(t) if t > wait.registered_at => t,
                             _ => wait.registered_at,
                         };
@@ -700,7 +715,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         }
                     }
                     crate::protocol::WaitCondition::TextMatch { text } => {
-                        if runtime.screen_contains(text.as_str()) {
+                        if actor.screen_contains(text.clone()).unwrap_or(false) {
                             let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
                             return false;
                         }
@@ -722,7 +737,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
         // Evaluate pending expects by scanning the cast file for text matches.
         if !pending_expects.is_empty() {
-            runtime.flush_recording();
+            actor.flush_recording()?;
             let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
             pending_expects.retain_mut(|expect| {
                 let elapsed = expect.registered_at.elapsed();
@@ -750,12 +765,10 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 true
             });
         }
+        actor.flush_recording()?;
 
-        if let Some(exit_code) = runtime.exit_code_if_exited()? {
-            let output = runtime.drain_output_after_exit(active_client.is_some())?;
-            for chunk in output.chunks {
-                enqueue_output_chunk(root, id, &mut runtime, &mut active_client, &mut watchers, chunk);
-            }
+        if actor.exit_code()?.is_some() {
+            drain_raw_output_tap(root, id, &actor, &raw_output_tap, &mut active_client, &mut watchers);
             for mut wait in pending_waits.drain(..) {
                 let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
                 let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
@@ -764,12 +777,16 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 let elapsed_ms = expect.registered_at.elapsed().as_millis() as u64;
                 let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
             }
-            runtime.record_exit_code(exit_code);
             if let Some(client) = active_client.as_mut() {
                 let _ = client.flush_pending_output();
             }
             flush_watchers(&mut watchers);
+            should_keep_session_dir = actor.should_keep_session_dir().unwrap_or(should_keep_session_dir);
             break;
+        }
+
+        if !did_work {
+            thread::sleep(SESSION_DAEMON_SERVICING_TICK);
         }
     }
 
@@ -777,7 +794,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(daemon_pid_path(root, id));
     let _ = fs::remove_file(foreground_path(root, id));
-    if !runtime.should_keep_session_dir() {
+    if !should_keep_session_dir {
         let _ = fs::remove_dir_all(&session_dir);
     }
     Ok(())
@@ -789,7 +806,7 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
 }
 
 struct HttpRequestState<'a> {
-    runtime: &'a mut SessionRuntime,
+    actor: &'a SessionActor,
     active_client: &'a mut Option<ActiveClient>,
     watchers: &'a mut Vec<ActiveClient>,
     had_foreground_client: &'a mut bool,
@@ -817,16 +834,16 @@ fn handle_http_request(
         )
         .map_err(|err| format!("write HTTP response: {err}")),
         http_uds::Route::Sessions => {
-            let result = state.runtime.inspect(state.active_client.is_some(), state.watchers.len());
+            let result = state.actor.inspect(state.active_client.is_some(), state.watchers.len())?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions: vec![result] })
                 .map_err(|err| format!("write HTTP sessions response: {err}"))
         }
         http_uds::Route::SessionInspect { id } if id == daemon_id => {
-            let result = state.runtime.inspect(state.active_client.is_some(), state.watchers.len());
+            let result = state.actor.inspect(state.active_client.is_some(), state.watchers.len())?;
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
         }
         http_uds::Route::SessionDelete { id } if id == daemon_id => {
-            state.runtime.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader)?;
+            state.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
         }
         http_uds::Route::SessionAttach { id } if id == daemon_id => 'attach: {
@@ -839,7 +856,7 @@ fn handle_http_request(
             }
 
             let capabilities = attach_capabilities_from_http(body.capabilities);
-            let replay = state.runtime.apply_attach_state(body.cols, body.rows, &capabilities)?;
+            let replay = state.actor.apply_attach_state(body.cols, body.rows, capabilities)?;
             http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
             let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
             #[cfg(unix)]
@@ -856,14 +873,15 @@ fn handle_http_request(
             let _ = fs::write(foreground_path(root, daemon_id), b"1");
             *state.active_client = Some(client);
             *state.had_foreground_client = true;
-            state.runtime.record_attach();
+            state.actor.set_client_presence(true)?;
+            state.actor.record_attach()?;
             Ok(())
         }
         http_uds::Route::SessionWatch { id } if id == daemon_id => {
             let body: http_uds::AttachRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP watch request: {err}"))?;
             let capabilities = attach_capabilities_from_http(body.capabilities);
-            let replay = state.runtime.replay_payload(&capabilities)?;
+            let replay = state.actor.replay_payload(capabilities)?;
             http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
             let watch_stream = stream.try_clone().map_err(|err| format!("clone HTTP watch stream: {err}"))?;
             #[cfg(unix)]
@@ -880,22 +898,23 @@ fn handle_http_request(
         http_uds::Route::SessionDetach { id } if id == daemon_id => {
             let _ = fs::remove_file(foreground_path(root, daemon_id));
             if state.active_client.is_some() {
-                state.runtime.record_detach();
+                state.actor.record_detach()?;
             }
+            state.actor.set_client_presence(false)?;
             *state.active_client = None;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP detach response: {err}"))
         }
         http_uds::Route::SessionExpect { id } if id == daemon_id => 'expect: {
             let body: http_uds::ExpectRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP expect request: {err}"))?;
-            if !state.runtime.recording_active() {
+            if !state.actor.recording_active()? {
                 http_uds::write_error(stream, StatusCode::CONFLICT, "recording not active")
                     .map_err(|err| format!("write HTTP expect error: {err}"))?;
                 break 'expect Ok(());
             }
 
             let cast_path = root.join(daemon_id).join(crate::recording::CAST_FILE_NAME);
-            state.runtime.flush_recording();
+            state.actor.flush_recording()?;
             if cast_path.exists() {
                 if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, body.since_offset) {
                     let output: String = events.iter().map(|event| event.data.as_str()).collect();
@@ -932,21 +951,20 @@ fn handle_http_request(
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
                 http_uds::InputRequest::Text { text } => {
-                    state.runtime.write_input(text.as_bytes())?;
+                    state.actor.write_input(text.into_bytes())?;
                 }
                 http_uds::InputRequest::Paste { text } => {
-                    let bytes = state.runtime.encode_paste(text.as_bytes())?;
-                    state.runtime.write_input(&bytes)?;
+                    state.actor.paste(text.into_bytes())?;
                 }
                 http_uds::InputRequest::Key { key } => {
                     let bytes = http_input_key_bytes(key);
-                    state.runtime.write_input(&bytes)?;
+                    state.actor.write_input(bytes)?;
                 }
                 http_uds::InputRequest::RawBytes { bytes } => {
-                    state.runtime.write_input(&bytes)?;
+                    state.actor.write_input(bytes)?;
                 }
                 http_uds::InputRequest::Resize { cols, rows } => {
-                    state.runtime.resize(cols, rows)?;
+                    state.actor.resize(cols, rows)?;
                 }
             }
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP input response: {err}"))
@@ -954,61 +972,61 @@ fn handle_http_request(
         http_uds::Route::SessionKeys { id } if id == daemon_id => {
             let body: http_uds::KeysRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys request: {err}"))?;
-            state.runtime.write_input(&body.bytes)?;
+            state.actor.write_input(body.bytes)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP keys response: {err}"))
         }
         http_uds::Route::SessionKeysWithMark { id } if id == daemon_id => {
             let body: http_uds::KeysWithMarkRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys-with-mark request: {err}"))?;
-            let offset = state.runtime.write_input_with_mark(&body.bytes, body.marker_name)?;
+            let offset = state.actor.write_input_with_mark(body.bytes, body.marker_name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP keys-with-mark response: {err}"))
         }
         http_uds::Route::SessionPasteWithMark { id } if id == daemon_id => {
             let body: http_uds::PasteWithMarkRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP paste-with-mark request: {err}"))?;
-            let bytes = state.runtime.encode_paste(body.text.as_bytes())?;
-            let offset = state.runtime.write_input_with_mark(&bytes, body.marker_name)?;
+            let offset = state.actor.paste_with_mark(body.text.into_bytes(), body.marker_name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP paste-with-mark response: {err}"))
         }
         http_uds::Route::SessionRecord { id } if id == daemon_id => {
             let body: http_uds::RecordRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;
-            state.runtime.set_recording(body.enable)?;
+            state.actor.set_recording(body.enable)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP record response: {err}"))
         }
         http_uds::Route::SessionMark { id } if id == daemon_id => {
             let body: http_uds::MarkRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP mark request: {err}"))?;
-            let offset = state.runtime.mark(body.name)?;
+            let offset = state.actor.mark(body.name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP mark response: {err}"))
         }
         http_uds::Route::SessionResolveMarker { id } if id == daemon_id => {
             let body: http_uds::ResolveMarkerRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-marker request: {err}"))?;
-            match state.runtime.resolve_marker(&body.name) {
+            let marker_name = body.name;
+            match state.actor.resolve_marker(marker_name.clone())? {
                 Some(offset) => http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                     .map_err(|err| format!("write HTTP resolve-marker response: {err}")),
-                None => http_uds::write_error(stream, StatusCode::NOT_FOUND, &format!("marker not found: {}", body.name))
+                None => http_uds::write_error(stream, StatusCode::NOT_FOUND, &format!("marker not found: {marker_name}"))
                     .map_err(|err| format!("write HTTP resolve-marker error: {err}")),
             }
         }
         http_uds::Route::SessionResolveNextMarker { id } if id == daemon_id => {
             let body: http_uds::ResolveNextMarkerRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-next-marker request: {err}"))?;
-            let offset = state.runtime.resolve_next_marker_after(body.after);
+            let offset = state.actor.resolve_next_marker_after(body.after)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::ResolveNextMarkerResponse { offset })
                 .map_err(|err| format!("write HTTP resolve-next-marker response: {err}"))
         }
         http_uds::Route::SessionResize { id } if id == daemon_id => {
             let body: http_uds::ResizeRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resize request: {err}"))?;
-            state.runtime.resize(body.cols, body.rows)?;
+            state.actor.resize(body.cols, body.rows)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP resize response: {err}"))
         }
-        http_uds::Route::SessionScreen { id } if id == daemon_id => match state.runtime.capture_text() {
+        http_uds::Route::SessionScreen { id } if id == daemon_id => match state.actor.capture_text() {
             Ok(text) => http_uds::write_json(stream, StatusCode::OK, &http_uds::ScreenResponse { text })
                 .map_err(|err| format!("write HTTP screen response: {err}")),
             Err(err) => http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP screen error: {err}")),
@@ -1016,22 +1034,16 @@ fn handle_http_request(
         http_uds::Route::SessionSignal { id } if id == daemon_id => {
             let body: http_uds::SignalRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP signal request: {err}"))?;
-            state.runtime.dispatch_signal(body.signal, signal_target_from_http(body.target))?;
+            state.actor.dispatch_signal(body.signal, signal_target_from_http(body.target))?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP signal response: {err}"))
         }
-        http_uds::Route::SessionSnapshot { id } if id == daemon_id => {
-            let output = state.runtime.read_available_output(state.active_client.is_some())?;
-            for chunk in output.chunks {
-                enqueue_output_chunk(root, daemon_id, state.runtime, state.active_client, state.watchers, chunk);
+        http_uds::Route::SessionSnapshot { id } if id == daemon_id => match state.actor.full_snapshot() {
+            Ok(snapshot) => http_uds::write_json(stream, StatusCode::OK, &http_uds::snapshot_response(snapshot))
+                .map_err(|err| format!("write HTTP snapshot response: {err}")),
+            Err(err) => {
+                http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP snapshot error: {err}"))
             }
-            match state.runtime.snapshot(crate::provider::DirtyState::Full) {
-                Ok(snapshot) => http_uds::write_json(stream, StatusCode::OK, &http_uds::snapshot_response(snapshot))
-                    .map_err(|err| format!("write HTTP snapshot response: {err}")),
-                Err(err) => {
-                    http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP snapshot error: {err}"))
-                }
-            }
-        }
+        },
         http_uds::Route::SessionWait { id } if id == daemon_id => 'wait: {
             let body: http_uds::WaitRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP wait request: {err}"))?;
@@ -1046,7 +1058,7 @@ fn handle_http_request(
             let has_screen_stable =
                 conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::ScreenStable { .. }));
             if has_text_match {
-                if let Err(err) = state.runtime.validate_text_matching() {
+                if let Err(err) = state.actor.validate_text_matching() {
                     http_uds::write_error(stream, StatusCode::CONFLICT, &format!("text matching not supported: {err}"))
                         .map_err(|err| format!("write HTTP wait error: {err}"))?;
                     break 'wait Ok(());
@@ -1054,7 +1066,7 @@ fn handle_http_request(
             }
             let registered_at = Instant::now();
             let screen_stable = if has_screen_stable {
-                match state.runtime.snapshot(crate::provider::DirtyState::Full) {
+                match state.actor.full_snapshot() {
                     Ok(snapshot) => Some(ScreenStableState::new(ScreenStableFingerprint::from_snapshot(snapshot), registered_at)),
                     Err(err) => {
                         http_uds::write_error(stream, StatusCode::CONFLICT, &format!("screen stability not supported: {err}"))
@@ -1069,7 +1081,7 @@ fn handle_http_request(
             if has_text_match {
                 for condition in &conditions {
                     if let crate::protocol::WaitCondition::TextMatch { text } = condition {
-                        if state.runtime.screen_contains(text.as_str()) {
+                        if state.actor.screen_contains(text.clone())? {
                             http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
                                 status: http_uds::WaitStatusResponse::Ready,
                                 elapsed_ms: 0,

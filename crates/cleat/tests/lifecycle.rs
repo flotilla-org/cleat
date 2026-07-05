@@ -925,8 +925,8 @@ fn kill_preserves_session_directory_with_recording() {
 
     assert!(service.session_dir("alpha").exists(), "recording-bearing session directory should be preserved");
     assert!(cast_path.exists(), "recording should survive kill");
-    assert!(!session_socket_path(temp.path(), "alpha").exists(), "socket should not survive kill");
-    assert!(!daemon_pid_path(temp.path(), "alpha").exists(), "pid file should not survive kill");
+    assert!(session_socket_path(temp.path(), "alpha").exists(), "daemon socket should linger after session-scoped kill");
+    assert!(daemon_pid_path(temp.path(), "alpha").exists(), "daemon pid should linger after session-scoped kill");
 }
 
 #[test]
@@ -1679,12 +1679,13 @@ fn signal_term_to_leader_terminates_session() {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if !socket_path.exists() {
+        if service.inspect(&info.id).is_err() {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!socket_path.exists(), "socket should be gone after SIGTERM to leader");
+    assert!(service.inspect(&info.id).is_err(), "session should be gone after SIGTERM to leader");
+    assert!(socket_path.exists(), "daemon socket should linger after session exit");
 }
 
 #[test]
@@ -1701,6 +1702,12 @@ fn short_lived_session_reaps_its_directory_after_child_exit() {
     }
 
     assert!(!session_dir.exists(), "session directory should be reaped after child exit");
+
+    let beta = service
+        .create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create second session via lingering daemon");
+    assert_eq!(beta.id, "beta");
+    service.kill("beta").expect("kill second session");
 }
 
 #[test]

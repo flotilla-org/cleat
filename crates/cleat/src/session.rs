@@ -44,6 +44,7 @@ const DETACH_CLEANUP_SEQUENCE: &[u8] =
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SESSION_DAEMON_SERVICING_TICK: Duration = Duration::from_millis(10);
+const SESSION_DAEMON_IDLE_LINGER: Duration = Duration::from_secs(120);
 const SESSION_HTTP_HANDSHAKE_DEADLINE: Duration = Duration::from_millis(250);
 const SESSION_HTTP_RESPONSE_WRITE_DEADLINE: Duration = Duration::from_millis(250);
 const TERMINATE_SIGNAL: i32 = 15;
@@ -604,6 +605,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     let mut sessions = HashMap::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
     let mut exited_session: Option<(String, bool)> = None;
+    let mut idle_since = Some(Instant::now());
 
     loop {
         let mut did_work = false;
@@ -650,6 +652,9 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                     if let Err(err) = handle_http_request(root, daemon_name, &mut stream, request, &mut http_state) {
                         let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                     }
+                    if !sessions.is_empty() {
+                        idle_since = None;
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(err) => return Err(format!("accept client: {err}")),
@@ -675,9 +680,15 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         if let Some((session_id, should_keep_session_dir)) = exited_session.take() {
             cleanup_exited_session(&layout, &session_id, should_keep_session_dir);
             sessions.remove(&session_id);
-            if sessions.is_empty() {
+        }
+
+        if sessions.is_empty() {
+            let idle_started = idle_since.get_or_insert_with(Instant::now);
+            if idle_started.elapsed() >= SESSION_DAEMON_IDLE_LINGER {
                 break;
             }
+        } else {
+            idle_since = None;
         }
 
         if !did_work {

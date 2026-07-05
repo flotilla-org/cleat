@@ -511,6 +511,40 @@ struct PendingExpect {
     registered_at: Instant,
 }
 
+struct HostedSession {
+    actor: SessionActor,
+    raw_output_tap: RawOutputTap,
+    active_client: Option<ActiveClient>,
+    watchers: Vec<ActiveClient>,
+    packet_render_cache: PacketRenderCache,
+    had_foreground_client: bool,
+    pending_waits: Vec<PendingWait>,
+    pending_expects: Vec<PendingExpect>,
+    should_keep_session_dir: bool,
+}
+
+impl HostedSession {
+    fn spawn(session_dir: PathBuf, session: SessionMetadata) -> Result<Self, String> {
+        let actor_session_dir = session_dir;
+        let actor_session = session.clone();
+        let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
+            crate::session_runtime::SessionRuntime::spawn(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?)
+        })?;
+        let raw_output_tap = actor.subscribe_raw_output()?;
+        Ok(Self {
+            actor,
+            raw_output_tap,
+            active_client: None,
+            watchers: Vec::new(),
+            packet_render_cache: PacketRenderCache::default(),
+            had_foreground_client: false,
+            pending_waits: Vec::new(),
+            pending_expects: Vec::new(),
+            should_keep_session_dir: session.record,
+        })
+    }
+}
+
 fn write_http_wait_result(stream: &mut SessionStream, status: crate::protocol::WaitStatus, elapsed_ms: u64) -> std::io::Result<()> {
     http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse { status: wait_status_to_http(status), elapsed_ms })
 }
@@ -585,20 +619,11 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     set_listener_nonblocking(&listener, true)?;
     fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let actor_session_dir = session_dir.clone();
-    let actor_session = session.clone();
-    let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
-        crate::session_runtime::SessionRuntime::spawn(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?)
-    })?;
-    let mut raw_output_tap = actor.subscribe_raw_output()?;
-    let mut active_client: Option<ActiveClient> = None;
-    let mut watchers: Vec<ActiveClient> = Vec::new();
+    let mut sessions = HashMap::new();
+    sessions.insert(id.clone(), HostedSession::spawn(session_dir.clone(), session.clone())?);
     let mut packet_clients: Vec<PacketClient> = Vec::new();
-    let mut packet_render_cache = PacketRenderCache::default();
-    let mut had_foreground_client = false;
-    let mut pending_waits: Vec<PendingWait> = Vec::new();
-    let mut pending_expects: Vec<PendingExpect> = Vec::new();
-    let mut should_keep_session_dir = session.record;
+    let mut exited_session: Option<(String, bool)> = None;
+
     loop {
         let mut did_work = false;
 
@@ -641,15 +666,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         }
                     };
 
-                    let mut http_state = HttpRequestState {
-                        actor: &actor,
-                        active_client: &mut active_client,
-                        watchers: &mut watchers,
-                        packet_clients: &mut packet_clients,
-                        had_foreground_client: &mut had_foreground_client,
-                        pending_waits: &mut pending_waits,
-                        pending_expects: &mut pending_expects,
-                    };
+                    let mut http_state = HttpRequestState { sessions: &mut sessions, packet_clients: &mut packet_clients };
                     if let Err(err) = handle_http_request(root, id, &mut stream, request, &mut http_state) {
                         let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                     }
@@ -659,164 +676,23 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             }
         }
 
-        did_work |= drain_raw_output_tap(root, id, &actor, &mut raw_output_tap, &mut active_client, &mut watchers)?;
-        drain_watcher_inputs(&mut watchers);
-        did_work |= service_packet_clients(&actor, id, &mut packet_clients, &mut packet_render_cache)?;
-
-        if active_client.is_some() {
-            let mut client_disconnected = false;
-            let mut pending = VecDeque::new();
-            if let Some(client) = active_client.as_mut() {
-                match client.drain_input_frames(&mut pending, Duration::ZERO) {
-                    Ok(true) => {}
-                    Ok(false) => client_disconnected = true,
-                    Err(err) => return Err(format!("read client frame: {err}")),
-                }
-            }
-
-            while let Some(frame) = pending.pop_front() {
-                did_work = true;
-                match frame {
-                    Frame::Input(bytes) => {
-                        actor.write_input(bytes)?;
-                    }
-                    Frame::Resize { cols, rows } => {
-                        actor.resize(cols, rows)?;
-                    }
-                    _ => {}
-                }
-            }
-
-            if client_disconnected && active_client.is_some() {
-                let _ = fs::remove_file(foreground_path(root, id));
-                actor.record_detach()?;
-                actor.set_client_presence(false)?;
-                active_client = None;
-                did_work = true;
+        did_work |= service_packet_clients(&mut sessions, &mut packet_clients)?;
+        let session_ids: Vec<String> = sessions.keys().cloned().collect();
+        for session_id in session_ids {
+            let Some(hosted) = sessions.get_mut(&session_id) else {
+                continue;
+            };
+            did_work |= service_hosted_session(root, &session_id, hosted, &mut packet_clients)?;
+            if hosted.actor.exit_code()?.is_some() {
+                let should_keep_session_dir = finish_exited_session(root, &session_id, hosted, &mut packet_clients)?;
+                exited_session = Some((session_id, should_keep_session_dir));
+                break;
             }
         }
 
-        let client_writable = match active_client.as_mut() {
-            Some(client) => client.flush_pending_output()?,
-            None => true,
-        };
-        if !client_writable {
-            let _ = fs::remove_file(foreground_path(root, id));
-            actor.record_detach()?;
-            actor.set_client_presence(false)?;
-            active_client = None;
-            did_work = true;
-        }
-        flush_watchers(&mut watchers);
-        push_due_packet_renders(&actor, &mut packet_clients, &mut packet_render_cache)?;
         flush_packet_clients(&mut packet_clients);
 
-        // Evaluate pending waits on each loop tick.
-        // Write errors are intentionally discarded — the client may have disconnected.
-        let screen_stable_fingerprint = if pending_waits.iter().any(|wait| wait.screen_stable.is_some()) {
-            actor.full_snapshot().ok().map(ScreenStableFingerprint::from_snapshot)
-        } else {
-            None
-        };
-        let now = Instant::now();
-        pending_waits.retain_mut(|wait| {
-            let elapsed = wait.registered_at.elapsed();
-            let elapsed_ms = elapsed.as_millis() as u64;
-
-            // Check timeout first
-            if elapsed_ms >= wait.timeout_ms {
-                let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
-                return false;
-            }
-
-            if let (Some(state), Some(fingerprint)) = (wait.screen_stable.as_mut(), screen_stable_fingerprint.as_ref()) {
-                state.observe(fingerprint.clone(), now);
-            }
-
-            // Check conditions (OR semantics — any match wins)
-            for condition in &wait.conditions {
-                match condition {
-                    crate::protocol::WaitCondition::OutputIdle { quiet_ms } => {
-                        // Silence measured from max(registration_time, last_output_time)
-                        let silence_since = match actor.last_pty_output_at().ok().flatten() {
-                            Some(t) if t > wait.registered_at => t,
-                            _ => wait.registered_at,
-                        };
-                        let quiet_duration = silence_since.elapsed().as_millis() as u64;
-                        if quiet_duration >= *quiet_ms {
-                            let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
-                            return false;
-                        }
-                    }
-                    crate::protocol::WaitCondition::TextMatch { text } => {
-                        if actor.screen_contains(text.clone()).unwrap_or(false) {
-                            let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
-                            return false;
-                        }
-                    }
-                    crate::protocol::WaitCondition::ScreenStable { stable_ms } => {
-                        if let Some(state) = wait.screen_stable.as_ref() {
-                            let stable_duration_ms = state.stable_since.elapsed().as_millis() as u64;
-                            if stable_duration_ms >= *stable_ms {
-                                let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
-                                return false;
-                            }
-                        }
-                    }
-                }
-            }
-
-            true // keep waiting
-        });
-
-        // Evaluate pending expects by scanning the cast file for text matches.
-        if !pending_expects.is_empty() {
-            actor.flush_recording()?;
-            let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
-            pending_expects.retain_mut(|expect| {
-                let elapsed = expect.registered_at.elapsed();
-                let elapsed_ms = elapsed.as_millis() as u64;
-
-                if elapsed_ms >= expect.timeout_ms {
-                    let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
-                    return false;
-                }
-
-                if cast_path.exists() {
-                    let file_size = std::fs::metadata(&cast_path).map(|m| m.len()).unwrap_or(0);
-                    if file_size > expect.last_checked_file_size {
-                        expect.last_checked_file_size = file_size;
-                        if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, expect.since_offset) {
-                            let output: String = events.iter().map(|e| e.data.as_str()).collect();
-                            if output.contains(&expect.text) {
-                                let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
-                                return false;
-                            }
-                        }
-                    }
-                }
-
-                true
-            });
-        }
-        actor.flush_recording()?;
-
-        if actor.exit_code()?.is_some() {
-            drain_raw_output_tap(root, id, &actor, &mut raw_output_tap, &mut active_client, &mut watchers)?;
-            for mut wait in pending_waits.drain(..) {
-                let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
-                let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
-            }
-            for mut expect in pending_expects.drain(..) {
-                let elapsed_ms = expect.registered_at.elapsed().as_millis() as u64;
-                let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
-            }
-            if let Some(client) = active_client.as_mut() {
-                let _ = client.flush_pending_output();
-            }
-            flush_watchers(&mut watchers);
-            flush_packet_clients(&mut packet_clients);
-            should_keep_session_dir = actor.should_keep_session_dir().unwrap_or(should_keep_session_dir);
+        if exited_session.is_some() {
             break;
         }
 
@@ -825,14 +701,193 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         }
     }
 
-    let session_dir = root.join(id);
+    let (id, should_keep_session_dir) = exited_session.unwrap_or_else(|| (id.clone(), session.record));
+    let session_dir = root.join(&id);
     let _ = fs::remove_file(&socket_path);
-    let _ = fs::remove_file(daemon_pid_path(root, id));
-    let _ = fs::remove_file(foreground_path(root, id));
+    let _ = fs::remove_file(daemon_pid_path(root, &id));
+    let _ = fs::remove_file(foreground_path(root, &id));
     if !should_keep_session_dir {
         let _ = fs::remove_dir_all(&session_dir);
     }
     Ok(())
+}
+
+fn service_hosted_session(
+    root: &Path,
+    id: &str,
+    hosted: &mut HostedSession,
+    packet_clients: &mut Vec<PacketClient>,
+) -> Result<bool, String> {
+    let mut did_work = false;
+
+    did_work |= drain_raw_output_tap(root, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
+    drain_watcher_inputs(&mut hosted.watchers);
+
+    if hosted.active_client.is_some() {
+        let mut client_disconnected = false;
+        let mut pending = VecDeque::new();
+        if let Some(client) = hosted.active_client.as_mut() {
+            match client.drain_input_frames(&mut pending, Duration::ZERO) {
+                Ok(true) => {}
+                Ok(false) => client_disconnected = true,
+                Err(err) => return Err(format!("read client frame: {err}")),
+            }
+        }
+
+        while let Some(frame) = pending.pop_front() {
+            did_work = true;
+            match frame {
+                Frame::Input(bytes) => {
+                    hosted.actor.write_input(bytes)?;
+                }
+                Frame::Resize { cols, rows } => {
+                    hosted.actor.resize(cols, rows)?;
+                }
+                _ => {}
+            }
+        }
+
+        if client_disconnected && hosted.active_client.is_some() {
+            let _ = fs::remove_file(foreground_path(root, id));
+            hosted.actor.record_detach()?;
+            hosted.actor.set_client_presence(false)?;
+            hosted.active_client = None;
+            did_work = true;
+        }
+    }
+
+    let client_writable = match hosted.active_client.as_mut() {
+        Some(client) => client.flush_pending_output()?,
+        None => true,
+    };
+    if !client_writable {
+        let _ = fs::remove_file(foreground_path(root, id));
+        hosted.actor.record_detach()?;
+        hosted.actor.set_client_presence(false)?;
+        hosted.active_client = None;
+        did_work = true;
+    }
+    flush_watchers(&mut hosted.watchers);
+    push_due_packet_renders(id, &hosted.actor, packet_clients, &mut hosted.packet_render_cache)?;
+
+    service_pending_waits(&hosted.actor, &mut hosted.pending_waits);
+    service_pending_expects(root, id, &hosted.actor, &mut hosted.pending_expects)?;
+    hosted.actor.flush_recording()?;
+
+    Ok(did_work)
+}
+
+fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWait>) {
+    let screen_stable_fingerprint = if pending_waits.iter().any(|wait| wait.screen_stable.is_some()) {
+        actor.full_snapshot().ok().map(ScreenStableFingerprint::from_snapshot)
+    } else {
+        None
+    };
+    let now = Instant::now();
+    pending_waits.retain_mut(|wait| {
+        let elapsed = wait.registered_at.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+
+        if elapsed_ms >= wait.timeout_ms {
+            let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
+            return false;
+        }
+
+        if let (Some(state), Some(fingerprint)) = (wait.screen_stable.as_mut(), screen_stable_fingerprint.as_ref()) {
+            state.observe(fingerprint.clone(), now);
+        }
+
+        for condition in &wait.conditions {
+            match condition {
+                crate::protocol::WaitCondition::OutputIdle { quiet_ms } => {
+                    let silence_since = match actor.last_pty_output_at().ok().flatten() {
+                        Some(t) if t > wait.registered_at => t,
+                        _ => wait.registered_at,
+                    };
+                    let quiet_duration = silence_since.elapsed().as_millis() as u64;
+                    if quiet_duration >= *quiet_ms {
+                        let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
+                        return false;
+                    }
+                }
+                crate::protocol::WaitCondition::TextMatch { text } => {
+                    if actor.screen_contains(text.clone()).unwrap_or(false) {
+                        let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
+                        return false;
+                    }
+                }
+                crate::protocol::WaitCondition::ScreenStable { stable_ms } => {
+                    if let Some(state) = wait.screen_stable.as_ref() {
+                        let stable_duration_ms = state.stable_since.elapsed().as_millis() as u64;
+                        if stable_duration_ms >= *stable_ms {
+                            let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        true
+    });
+}
+
+fn service_pending_expects(root: &Path, id: &str, actor: &SessionActor, pending_expects: &mut Vec<PendingExpect>) -> Result<(), String> {
+    if pending_expects.is_empty() {
+        return Ok(());
+    }
+
+    actor.flush_recording()?;
+    let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
+    pending_expects.retain_mut(|expect| {
+        let elapsed = expect.registered_at.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+
+        if elapsed_ms >= expect.timeout_ms {
+            let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::Timeout, elapsed_ms);
+            return false;
+        }
+
+        if cast_path.exists() {
+            let file_size = std::fs::metadata(&cast_path).map(|m| m.len()).unwrap_or(0);
+            if file_size > expect.last_checked_file_size {
+                expect.last_checked_file_size = file_size;
+                if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, expect.since_offset) {
+                    let output: String = events.iter().map(|e| e.data.as_str()).collect();
+                    if output.contains(&expect.text) {
+                        let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    });
+    Ok(())
+}
+
+fn finish_exited_session(
+    root: &Path,
+    id: &str,
+    hosted: &mut HostedSession,
+    packet_clients: &mut Vec<PacketClient>,
+) -> Result<bool, String> {
+    drain_raw_output_tap(root, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
+    for mut wait in hosted.pending_waits.drain(..) {
+        let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
+        let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
+    }
+    for mut expect in hosted.pending_expects.drain(..) {
+        let elapsed_ms = expect.registered_at.elapsed().as_millis() as u64;
+        let _ = write_http_wait_result(&mut expect.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
+    }
+    if let Some(client) = hosted.active_client.as_mut() {
+        let _ = client.flush_pending_output();
+    }
+    flush_watchers(&mut hosted.watchers);
+    flush_packet_clients(packet_clients);
+    Ok(hosted.actor.should_keep_session_dir().unwrap_or(hosted.should_keep_session_dir))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -841,13 +896,8 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
 }
 
 struct HttpRequestState<'a> {
-    actor: &'a SessionActor,
-    active_client: &'a mut Option<ActiveClient>,
-    watchers: &'a mut Vec<ActiveClient>,
+    sessions: &'a mut HashMap<String, HostedSession>,
     packet_clients: &'a mut Vec<PacketClient>,
-    had_foreground_client: &'a mut bool,
-    pending_waits: &'a mut Vec<PendingWait>,
-    pending_expects: &'a mut Vec<PendingExpect>,
 }
 
 struct HttpHandshakeReader<'a> {
@@ -898,8 +948,12 @@ fn handle_http_request(
         )
         .map_err(|err| format!("write HTTP response: {err}")),
         http_uds::Route::Sessions => {
-            let result = state.actor.inspect(state.active_client.is_some(), state.watchers.len())?;
-            http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions: vec![result] })
+            let mut sessions = Vec::new();
+            for hosted in state.sessions.values() {
+                sessions.push(hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?);
+            }
+            sessions.sort_by(|a, b| a.session.id.cmp(&b.session.id));
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions })
                 .map_err(|err| format!("write HTTP sessions response: {err}"))
         }
         http_uds::Route::PacketConnect => {
@@ -909,38 +963,54 @@ fn handle_http_request(
                 return Ok(());
             }
 
-            let inspect = state.actor.inspect(state.active_client.is_some(), state.watchers.len())?;
+            let mut directory_entries = Vec::new();
+            for hosted in state.sessions.values() {
+                let inspect = hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?;
+                directory_entries.push(DirectoryEntry {
+                    session_id: inspect.session.id,
+                    cols: inspect.terminal.cols,
+                    rows: inspect.terminal.rows,
+                });
+            }
+            directory_entries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
             http_uds::write_packet_switching_protocols(stream).map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
             let packet_stream = stream.try_clone().map_err(|err| format!("clone HTTP packet stream: {err}"))?;
             #[cfg(unix)]
             set_stream_nonblocking(&packet_stream, true).map_err(|err| format!("set HTTP packet stream nonblocking: {err}"))?;
             let mut client = PacketClient::new(packet_stream)?;
             client.enqueue_control(MSG_CONTROL_HELLO, &ControlHello::current())?;
-            client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &DirectorySnapshot {
-                sessions: vec![DirectoryEntry { session_id: inspect.session.id, cols: inspect.terminal.cols, rows: inspect.terminal.rows }],
-            })?;
+            client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &DirectorySnapshot { sessions: directory_entries })?;
             state.packet_clients.push(client);
             Ok(())
         }
-        http_uds::Route::SessionInspect { id } if id == daemon_id => {
-            let result = state.actor.inspect(state.active_client.is_some(), state.watchers.len())?;
+        http_uds::Route::SessionInspect { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
+            let result = hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?;
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
         }
-        http_uds::Route::SessionDelete { id } if id == daemon_id => {
-            state.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader)?;
+        http_uds::Route::SessionDelete { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
+            hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
         }
-        http_uds::Route::SessionAttach { id } if id == daemon_id => 'attach: {
+        http_uds::Route::SessionAttach { id } => 'attach: {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
+                break 'attach write_http_not_found(stream);
+            };
             let body: http_uds::AttachRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP attach request: {err}"))?;
-            if state.active_client.is_some() {
+            if hosted.active_client.is_some() {
                 http_uds::write_error(stream, StatusCode::CONFLICT, "session already has a foreground client")
                     .map_err(|err| format!("write HTTP attach busy response: {err}"))?;
                 break 'attach Ok(());
             }
 
             let capabilities = attach_capabilities_from_http(body.capabilities);
-            let replay = state.actor.apply_attach_state(body.cols, body.rows, capabilities)?;
+            let replay = hosted.actor.apply_attach_state(body.cols, body.rows, capabilities)?;
             http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
             let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
             #[cfg(unix)]
@@ -948,24 +1018,27 @@ fn handle_http_request(
             let mut client = ActiveClient::new(attach_stream)?;
             if let Some(payload) = replay {
                 if !payload.is_empty() {
-                    if *state.had_foreground_client {
+                    if hosted.had_foreground_client {
                         client.enqueue_frame(&Frame::Output(REATTACH_CLEAR_SEQUENCE.to_vec()))?;
                     }
                     client.enqueue_frame(&Frame::Output(payload))?;
                 }
             }
-            let _ = fs::write(foreground_path(root, daemon_id), b"1");
-            *state.active_client = Some(client);
-            *state.had_foreground_client = true;
-            state.actor.set_client_presence(true)?;
-            state.actor.record_attach()?;
+            let _ = fs::write(foreground_path(root, &id), b"1");
+            hosted.active_client = Some(client);
+            hosted.had_foreground_client = true;
+            hosted.actor.set_client_presence(true)?;
+            hosted.actor.record_attach()?;
             Ok(())
         }
-        http_uds::Route::SessionWatch { id } if id == daemon_id => {
+        http_uds::Route::SessionWatch { id } => {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::AttachRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP watch request: {err}"))?;
             let capabilities = attach_capabilities_from_http(body.capabilities);
-            let replay = state.actor.replay_payload(capabilities)?;
+            let replay = hosted.actor.replay_payload(capabilities)?;
             http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
             let watch_stream = stream.try_clone().map_err(|err| format!("clone HTTP watch stream: {err}"))?;
             #[cfg(unix)]
@@ -976,29 +1049,35 @@ fn handle_http_request(
                     watcher.enqueue_frame(&Frame::Output(payload))?;
                 }
             }
-            state.watchers.push(watcher);
+            hosted.watchers.push(watcher);
             Ok(())
         }
-        http_uds::Route::SessionDetach { id } if id == daemon_id => {
-            let _ = fs::remove_file(foreground_path(root, daemon_id));
-            if state.active_client.is_some() {
-                state.actor.record_detach()?;
+        http_uds::Route::SessionDetach { id } => {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
+                return write_http_not_found(stream);
+            };
+            let _ = fs::remove_file(foreground_path(root, &id));
+            if hosted.active_client.is_some() {
+                hosted.actor.record_detach()?;
             }
-            state.actor.set_client_presence(false)?;
-            *state.active_client = None;
+            hosted.actor.set_client_presence(false)?;
+            hosted.active_client = None;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP detach response: {err}"))
         }
-        http_uds::Route::SessionExpect { id } if id == daemon_id => 'expect: {
+        http_uds::Route::SessionExpect { id } => 'expect: {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
+                break 'expect write_http_not_found(stream);
+            };
             let body: http_uds::ExpectRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP expect request: {err}"))?;
-            if !state.actor.recording_active()? {
+            if !hosted.actor.recording_active()? {
                 http_uds::write_error(stream, StatusCode::CONFLICT, "recording not active")
                     .map_err(|err| format!("write HTTP expect error: {err}"))?;
                 break 'expect Ok(());
             }
 
-            let cast_path = root.join(daemon_id).join(crate::recording::CAST_FILE_NAME);
-            state.actor.flush_recording()?;
+            let cast_path = root.join(&id).join(crate::recording::CAST_FILE_NAME);
+            hosted.actor.flush_recording()?;
             if cast_path.exists() {
                 if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, body.since_offset) {
                     let output: String = events.iter().map(|event| event.data.as_str()).collect();
@@ -1020,7 +1099,7 @@ fn handle_http_request(
                 break 'expect Ok(());
             }
             let initial_file_size = std::fs::metadata(&cast_path).map(|metadata| metadata.len()).unwrap_or(0);
-            state.pending_expects.push(PendingExpect {
+            hosted.pending_expects.push(PendingExpect {
                 stream: pending_stream,
                 text: body.text,
                 since_offset: body.since_offset,
@@ -1030,105 +1109,150 @@ fn handle_http_request(
             });
             Ok(())
         }
-        http_uds::Route::SessionInput { id } if id == daemon_id => {
+        http_uds::Route::SessionInput { id } => {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
                 http_uds::InputRequest::Text { text } => {
-                    state.actor.write_input(text.into_bytes())?;
+                    hosted.actor.write_input(text.into_bytes())?;
                 }
                 http_uds::InputRequest::Paste { text } => {
-                    state.actor.paste(text.into_bytes())?;
+                    hosted.actor.paste(text.into_bytes())?;
                 }
                 http_uds::InputRequest::Key { key } => {
                     let bytes = http_input_key_bytes(key);
-                    state.actor.write_input(bytes)?;
+                    hosted.actor.write_input(bytes)?;
                 }
                 http_uds::InputRequest::RawBytes { bytes } => {
-                    state.actor.write_input(bytes)?;
+                    hosted.actor.write_input(bytes)?;
                 }
                 http_uds::InputRequest::Resize { cols, rows } => {
-                    state.actor.resize(cols, rows)?;
+                    hosted.actor.resize(cols, rows)?;
                 }
             }
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP input response: {err}"))
         }
-        http_uds::Route::SessionKeys { id } if id == daemon_id => {
+        http_uds::Route::SessionKeys { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::KeysRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys request: {err}"))?;
-            state.actor.write_input(body.bytes)?;
+            hosted.actor.write_input(body.bytes)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP keys response: {err}"))
         }
-        http_uds::Route::SessionKeysWithMark { id } if id == daemon_id => {
+        http_uds::Route::SessionKeysWithMark { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::KeysWithMarkRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP keys-with-mark request: {err}"))?;
-            let offset = state.actor.write_input_with_mark(body.bytes, body.marker_name)?;
+            let offset = hosted.actor.write_input_with_mark(body.bytes, body.marker_name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP keys-with-mark response: {err}"))
         }
-        http_uds::Route::SessionPasteWithMark { id } if id == daemon_id => {
+        http_uds::Route::SessionPasteWithMark { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::PasteWithMarkRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP paste-with-mark request: {err}"))?;
-            let offset = state.actor.paste_with_mark(body.text.into_bytes(), body.marker_name)?;
+            let offset = hosted.actor.paste_with_mark(body.text.into_bytes(), body.marker_name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP paste-with-mark response: {err}"))
         }
-        http_uds::Route::SessionRecord { id } if id == daemon_id => {
+        http_uds::Route::SessionRecord { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::RecordRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;
-            state.actor.set_recording(body.enable)?;
+            hosted.actor.set_recording(body.enable)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP record response: {err}"))
         }
-        http_uds::Route::SessionMark { id } if id == daemon_id => {
+        http_uds::Route::SessionMark { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::MarkRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP mark request: {err}"))?;
-            let offset = state.actor.mark(body.name)?;
+            let offset = hosted.actor.mark(body.name)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                 .map_err(|err| format!("write HTTP mark response: {err}"))
         }
-        http_uds::Route::SessionResolveMarker { id } if id == daemon_id => {
+        http_uds::Route::SessionResolveMarker { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::ResolveMarkerRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-marker request: {err}"))?;
             let marker_name = body.name;
-            match state.actor.resolve_marker(marker_name.clone())? {
+            match hosted.actor.resolve_marker(marker_name.clone())? {
                 Some(offset) => http_uds::write_json(stream, StatusCode::OK, &http_uds::MarkResponse { offset })
                     .map_err(|err| format!("write HTTP resolve-marker response: {err}")),
                 None => http_uds::write_error(stream, StatusCode::NOT_FOUND, &format!("marker not found: {marker_name}"))
                     .map_err(|err| format!("write HTTP resolve-marker error: {err}")),
             }
         }
-        http_uds::Route::SessionResolveNextMarker { id } if id == daemon_id => {
+        http_uds::Route::SessionResolveNextMarker { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::ResolveNextMarkerRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resolve-next-marker request: {err}"))?;
-            let offset = state.actor.resolve_next_marker_after(body.after)?;
+            let offset = hosted.actor.resolve_next_marker_after(body.after)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::ResolveNextMarkerResponse { offset })
                 .map_err(|err| format!("write HTTP resolve-next-marker response: {err}"))
         }
-        http_uds::Route::SessionResize { id } if id == daemon_id => {
+        http_uds::Route::SessionResize { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::ResizeRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resize request: {err}"))?;
-            state.actor.resize(body.cols, body.rows)?;
+            hosted.actor.resize(body.cols, body.rows)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP resize response: {err}"))
         }
-        http_uds::Route::SessionScreen { id } if id == daemon_id => match state.actor.capture_text() {
-            Ok(text) => http_uds::write_json(stream, StatusCode::OK, &http_uds::ScreenResponse { text })
-                .map_err(|err| format!("write HTTP screen response: {err}")),
-            Err(err) => http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP screen error: {err}")),
-        },
-        http_uds::Route::SessionSignal { id } if id == daemon_id => {
+        http_uds::Route::SessionScreen { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
+            match hosted.actor.capture_text() {
+                Ok(text) => http_uds::write_json(stream, StatusCode::OK, &http_uds::ScreenResponse { text })
+                    .map_err(|err| format!("write HTTP screen response: {err}")),
+                Err(err) => {
+                    http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP screen error: {err}"))
+                }
+            }
+        }
+        http_uds::Route::SessionSignal { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
             let body: http_uds::SignalRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP signal request: {err}"))?;
-            state.actor.dispatch_signal(body.signal, signal_target_from_http(body.target))?;
+            hosted.actor.dispatch_signal(body.signal, signal_target_from_http(body.target))?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP signal response: {err}"))
         }
-        http_uds::Route::SessionSnapshot { id } if id == daemon_id => match state.actor.full_snapshot() {
-            Ok(snapshot) => http_uds::write_json(stream, StatusCode::OK, &http_uds::snapshot_response(snapshot))
-                .map_err(|err| format!("write HTTP snapshot response: {err}")),
-            Err(err) => {
-                http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP snapshot error: {err}"))
+        http_uds::Route::SessionSnapshot { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
+            match hosted.actor.full_snapshot() {
+                Ok(snapshot) => http_uds::write_json(stream, StatusCode::OK, &http_uds::snapshot_response(snapshot))
+                    .map_err(|err| format!("write HTTP snapshot response: {err}")),
+                Err(err) => {
+                    http_uds::write_error(stream, StatusCode::CONFLICT, &err).map_err(|err| format!("write HTTP snapshot error: {err}"))
+                }
             }
-        },
-        http_uds::Route::SessionWait { id } if id == daemon_id => 'wait: {
+        }
+        http_uds::Route::SessionWait { id } => 'wait: {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
+                break 'wait write_http_not_found(stream);
+            };
             let body: http_uds::WaitRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP wait request: {err}"))?;
             let conditions: Vec<_> = body.conditions.into_iter().map(wait_condition_from_http).collect();
@@ -1142,7 +1266,7 @@ fn handle_http_request(
             let has_screen_stable =
                 conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::ScreenStable { .. }));
             if has_text_match {
-                if let Err(err) = state.actor.validate_text_matching() {
+                if let Err(err) = hosted.actor.validate_text_matching() {
                     http_uds::write_error(stream, StatusCode::CONFLICT, &format!("text matching not supported: {err}"))
                         .map_err(|err| format!("write HTTP wait error: {err}"))?;
                     break 'wait Ok(());
@@ -1150,7 +1274,7 @@ fn handle_http_request(
             }
             let registered_at = Instant::now();
             let screen_stable = if has_screen_stable {
-                match state.actor.full_snapshot() {
+                match hosted.actor.full_snapshot() {
                     Ok(snapshot) => Some(ScreenStableState::new(ScreenStableFingerprint::from_snapshot(snapshot), registered_at)),
                     Err(err) => {
                         http_uds::write_error(stream, StatusCode::CONFLICT, &format!("screen stability not supported: {err}"))
@@ -1165,7 +1289,7 @@ fn handle_http_request(
             if has_text_match {
                 for condition in &conditions {
                     if let crate::protocol::WaitCondition::TextMatch { text } = condition {
-                        if state.actor.screen_contains(text.clone())? {
+                        if hosted.actor.screen_contains(text.clone())? {
                             http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
                                 status: http_uds::WaitStatusResponse::Ready,
                                 elapsed_ms: 0,
@@ -1183,7 +1307,7 @@ fn handle_http_request(
                     .map_err(|err| format!("write HTTP wait error: {err}"))?;
                 break 'wait Ok(());
             }
-            state.pending_waits.push(PendingWait {
+            hosted.pending_waits.push(PendingWait {
                 stream: pending_stream,
                 conditions,
                 screen_stable,
@@ -1196,6 +1320,10 @@ fn handle_http_request(
             http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
         }
     }
+}
+
+fn write_http_not_found(stream: &mut SessionStream) -> Result<(), String> {
+    http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
 }
 
 fn signal_target_from_http(target: http_uds::SignalTargetRequest) -> crate::protocol::SignalTarget {
@@ -1255,6 +1383,7 @@ struct PacketClient {
 }
 
 struct PacketSessionChannel {
+    session_id: String,
     in_flight_generation: Option<u64>,
     last_sent_generation: u64,
 }
@@ -1337,12 +1466,7 @@ impl PacketClient {
     }
 }
 
-fn service_packet_clients(
-    actor: &SessionActor,
-    daemon_id: &str,
-    packet_clients: &mut Vec<PacketClient>,
-    render_cache: &mut PacketRenderCache,
-) -> Result<bool, String> {
+fn service_packet_clients(sessions: &mut HashMap<String, HostedSession>, packet_clients: &mut Vec<PacketClient>) -> Result<bool, String> {
     let mut did_work = false;
     let mut index = 0;
     while index < packet_clients.len() {
@@ -1358,24 +1482,18 @@ fn service_packet_clients(
 
         while let Some(frame) = pending.pop_front() {
             did_work = true;
-            handle_packet_frame(actor, daemon_id, &mut packet_clients[index], frame, render_cache)?;
+            handle_packet_frame(sessions, &mut packet_clients[index], frame)?;
         }
         index += 1;
     }
     Ok(did_work)
 }
 
-fn handle_packet_frame(
-    actor: &SessionActor,
-    daemon_id: &str,
-    client: &mut PacketClient,
-    frame: PacketFrame,
-    render_cache: &mut PacketRenderCache,
-) -> Result<(), String> {
+fn handle_packet_frame(sessions: &mut HashMap<String, HostedSession>, client: &mut PacketClient, frame: PacketFrame) -> Result<(), String> {
     match (frame.channel, frame.msg_type) {
         (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL) => {
             let open = frame.decode::<OpenChannel>().map_err(|err| format!("decode open-channel packet: {err}"))?;
-            open_packet_channel(actor, daemon_id, client, open, render_cache)?;
+            open_packet_channel(sessions, client, open)?;
         }
         (CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL) => {
             let close = frame.decode::<CloseChannel>().map_err(|err| format!("decode close-channel packet: {err}"))?;
@@ -1383,23 +1501,30 @@ fn handle_packet_frame(
         }
         (channel, MSG_SESSION_ACK) if channel != CHANNEL_CONTROL => {
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
+            let session_id = client.channels.get(&channel).map(|session| session.session_id.clone());
             if let Some(session_channel) = client.channels.get_mut(&channel) {
                 if session_channel.in_flight_generation == Some(ack.generation) {
                     session_channel.in_flight_generation = None;
-                    actor.mark_observed(ack.generation);
+                    if let Some(hosted) = session_id.and_then(|id| sessions.get(&id)) {
+                        hosted.actor.mark_observed(ack.generation);
+                    }
                 }
             }
         }
         (channel, MSG_SESSION_INPUT) if channel != CHANNEL_CONTROL => {
             let input = frame.decode::<Input>().map_err(|err| format!("decode input packet: {err}"))?;
-            if client.channels.contains_key(&channel) {
-                route_packet_input_event(actor, input.event)?;
+            if let Some(session_id) = client.channels.get(&channel).map(|session| session.session_id.clone()) {
+                if let Some(hosted) = sessions.get(&session_id) {
+                    route_packet_input_event(&hosted.actor, input.event)?;
+                }
             }
         }
         (channel, MSG_SESSION_RESIZE) if channel != CHANNEL_CONTROL => {
             let resize = frame.decode::<Resize>().map_err(|err| format!("decode resize packet: {err}"))?;
-            if client.channels.contains_key(&channel) {
-                actor.resize(resize.cols, resize.rows)?;
+            if let Some(session_id) = client.channels.get(&channel).map(|session| session.session_id.clone()) {
+                if let Some(hosted) = sessions.get(&session_id) {
+                    hosted.actor.resize(resize.cols, resize.rows)?;
+                }
             }
         }
         _ => {}
@@ -1407,13 +1532,7 @@ fn handle_packet_frame(
     Ok(())
 }
 
-fn open_packet_channel(
-    actor: &SessionActor,
-    daemon_id: &str,
-    client: &mut PacketClient,
-    open: OpenChannel,
-    render_cache: &mut PacketRenderCache,
-) -> Result<(), String> {
+fn open_packet_channel(sessions: &mut HashMap<String, HostedSession>, client: &mut PacketClient, open: OpenChannel) -> Result<(), String> {
     if open.channel == CHANNEL_CONTROL {
         client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
             channel: open.channel,
@@ -1421,36 +1540,42 @@ fn open_packet_channel(
         })?;
         return Ok(());
     }
-    if open.session_id != daemon_id {
+    let Some(hosted) = sessions.get_mut(&open.session_id) else {
         client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
             channel: open.channel,
             message: format!("unknown session {}", open.session_id),
         })?;
         return Ok(());
-    }
+    };
 
-    let update = actor.full_render_update()?;
+    let session_id = open.session_id;
+    let update = hosted.actor.full_render_update()?;
     let generation = update.render_generation;
-    render_cache.store(update.clone());
+    hosted.packet_render_cache.store(update.clone());
     client.enqueue_frame(
         &PacketFrame::new(open.channel, MSG_SESSION_RENDER, &RenderPacket { update })
             .map_err(|err| format!("encode initial render packet: {err}"))?,
     )?;
-    client.channels.insert(open.channel, PacketSessionChannel { in_flight_generation: Some(generation), last_sent_generation: generation });
+    client.channels.insert(open.channel, PacketSessionChannel {
+        session_id,
+        in_flight_generation: Some(generation),
+        last_sent_generation: generation,
+    });
     Ok(())
 }
 
 fn push_due_packet_renders(
+    session_id: &str,
     actor: &SessionActor,
     packet_clients: &mut Vec<PacketClient>,
     render_cache: &mut PacketRenderCache,
 ) -> Result<(), String> {
-    if !packet_clients.iter().any(|client| !client.channels.is_empty()) {
+    if !packet_clients.iter().any(|client| client.channels.values().any(|channel| channel.session_id == session_id)) {
         return Ok(());
     }
 
     if actor.observation().dirty() != DirtyState::Clean {
-        let update = if has_packet_channel_lagging_cached_generation(packet_clients, render_cache) {
+        let update = if has_packet_channel_lagging_cached_generation(session_id, packet_clients, render_cache) {
             actor.full_render_update()?
         } else {
             actor.render_update()?
@@ -1470,7 +1595,10 @@ fn push_due_packet_renders(
             .channels
             .iter()
             .filter_map(|(channel, session)| {
-                (session.in_flight_generation.is_none() && session.last_sent_generation < latest_generation).then_some(*channel)
+                (session.session_id == session_id
+                    && session.in_flight_generation.is_none()
+                    && session.last_sent_generation < latest_generation)
+                    .then_some(*channel)
             })
             .collect();
         for channel in due_channels {
@@ -1487,11 +1615,18 @@ fn push_due_packet_renders(
     Ok(())
 }
 
-fn has_packet_channel_lagging_cached_generation(packet_clients: &[PacketClient], render_cache: &PacketRenderCache) -> bool {
+fn has_packet_channel_lagging_cached_generation(
+    session_id: &str,
+    packet_clients: &[PacketClient],
+    render_cache: &PacketRenderCache,
+) -> bool {
     let Some(latest_generation) = render_cache.latest_generation() else {
         return false;
     };
-    packet_clients.iter().flat_map(|client| client.channels.values()).any(|session| session.last_sent_generation < latest_generation)
+    packet_clients
+        .iter()
+        .flat_map(|client| client.channels.values())
+        .any(|session| session.session_id == session_id && session.last_sent_generation < latest_generation)
 }
 
 fn route_packet_input_event(actor: &SessionActor, event: TerminalInputEvent) -> Result<(), String> {

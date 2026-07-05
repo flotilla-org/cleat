@@ -20,6 +20,7 @@ pub const MSG_SESSION_INPUT: u8 = 18;
 pub const MSG_SESSION_RESIZE: u8 = 19;
 
 const HEADER_LEN: usize = 9;
+pub const MAX_PACKET_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlHello {
@@ -100,6 +101,9 @@ pub struct PacketFrame {
 impl PacketFrame {
     pub fn new<T: Serialize>(channel: u32, msg_type: u8, value: &T) -> std::io::Result<Self> {
         let payload = postcard::to_allocvec(value).map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+        if payload.len() > MAX_PACKET_PAYLOAD_LEN {
+            return Err(Error::new(ErrorKind::InvalidInput, "packet payload exceeds maximum length"));
+        }
         Ok(Self { channel, msg_type, payload })
     }
 
@@ -122,6 +126,9 @@ impl PacketFrame {
         let channel = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let msg_type = header[4];
         let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+        if len > MAX_PACKET_PAYLOAD_LEN {
+            return Err(Error::new(ErrorKind::InvalidData, "packet payload exceeds maximum length"));
+        }
         let mut payload = vec![0u8; len];
         reader.read_exact(&mut payload)?;
         Ok(Self { channel, msg_type, payload })
@@ -134,6 +141,9 @@ impl PacketFrame {
         let channel = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
         let msg_type = buffer[4];
         let len = u32::from_le_bytes([buffer[5], buffer[6], buffer[7], buffer[8]]) as usize;
+        if len > MAX_PACKET_PAYLOAD_LEN {
+            return Err(Error::new(ErrorKind::InvalidData, "packet payload exceeds maximum length"));
+        }
         let frame_len = HEADER_LEN.checked_add(len).ok_or_else(|| Error::new(ErrorKind::InvalidData, "packet length overflow"))?;
         if buffer.len() < frame_len {
             return Ok(None);
@@ -194,6 +204,12 @@ impl<S: Read + Write> PacketClient<S> {
             if frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER {
                 return frame.decode();
             }
+            if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_ERROR {
+                let error = frame.decode::<ControlError>()?;
+                if error.channel == channel {
+                    return Err(Error::new(ErrorKind::InvalidData, error.message));
+                }
+            }
         }
     }
 
@@ -246,5 +262,33 @@ mod tests {
         bytes.pop();
 
         assert!(PacketFrame::read_from_buffer(&mut bytes).expect("read partial").is_none());
+    }
+
+    #[test]
+    fn oversized_packet_payload_is_rejected_before_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CHANNEL_CONTROL.to_le_bytes());
+        bytes.push(MSG_CONTROL_HELLO);
+        bytes.extend_from_slice(&(MAX_PACKET_PAYLOAD_LEN as u32 + 1).to_le_bytes());
+
+        let err = PacketFrame::read(&mut bytes.as_slice()).expect_err("oversized frame rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        let err = PacketFrame::read_from_buffer(&mut bytes).expect_err("oversized buffered frame rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn packet_client_read_render_surfaces_matching_control_error() {
+        let mut bytes = Vec::new();
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_ERROR, &ControlError { channel: 7, message: "bad channel".to_string() })
+            .expect("encode error")
+            .write(&mut bytes)
+            .expect("write error");
+        let mut client = PacketClient::new(std::io::Cursor::new(bytes));
+
+        let err = client.read_render(7).expect_err("control error should surface");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "bad channel");
     }
 }

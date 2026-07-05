@@ -32,7 +32,9 @@ use crate::{
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::Frame,
-    provider::{DirtyState, TerminalInputEvent, TerminalKey, TerminalMouseButton, TerminalMouseEventKind, TerminalNamedKey},
+    provider::{
+        DirtyState, TerminalInputEvent, TerminalKey, TerminalMouseButton, TerminalMouseEventKind, TerminalNamedKey, TerminalRenderUpdate,
+    },
     runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
@@ -592,6 +594,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let mut active_client: Option<ActiveClient> = None;
     let mut watchers: Vec<ActiveClient> = Vec::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
+    let mut packet_render_cache = PacketRenderCache::default();
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
     let mut pending_expects: Vec<PendingExpect> = Vec::new();
@@ -658,7 +661,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
         did_work |= drain_raw_output_tap(root, id, &actor, &mut raw_output_tap, &mut active_client, &mut watchers)?;
         drain_watcher_inputs(&mut watchers);
-        did_work |= service_packet_clients(&actor, id, &mut packet_clients)?;
+        did_work |= service_packet_clients(&actor, id, &mut packet_clients, &mut packet_render_cache)?;
 
         if active_client.is_some() {
             let mut client_disconnected = false;
@@ -705,7 +708,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             did_work = true;
         }
         flush_watchers(&mut watchers);
-        push_due_packet_renders(&actor, &mut packet_clients)?;
+        push_due_packet_renders(&actor, &mut packet_clients, &mut packet_render_cache)?;
         flush_packet_clients(&mut packet_clients);
 
         // Evaluate pending waits on each loop tick.
@@ -1253,6 +1256,26 @@ struct PacketClient {
 
 struct PacketSessionChannel {
     in_flight_generation: Option<u64>,
+    last_sent_generation: u64,
+}
+
+#[derive(Default)]
+struct PacketRenderCache {
+    latest: Option<TerminalRenderUpdate>,
+}
+
+impl PacketRenderCache {
+    fn store(&mut self, update: TerminalRenderUpdate) {
+        self.latest = Some(update);
+    }
+
+    fn latest_generation(&self) -> Option<u64> {
+        self.latest.as_ref().map(|update| update.render_generation)
+    }
+
+    fn latest(&self) -> Option<&TerminalRenderUpdate> {
+        self.latest.as_ref()
+    }
 }
 
 impl PacketClient {
@@ -1314,7 +1337,12 @@ impl PacketClient {
     }
 }
 
-fn service_packet_clients(actor: &SessionActor, daemon_id: &str, packet_clients: &mut Vec<PacketClient>) -> Result<bool, String> {
+fn service_packet_clients(
+    actor: &SessionActor,
+    daemon_id: &str,
+    packet_clients: &mut Vec<PacketClient>,
+    render_cache: &mut PacketRenderCache,
+) -> Result<bool, String> {
     let mut did_work = false;
     let mut index = 0;
     while index < packet_clients.len() {
@@ -1330,18 +1358,24 @@ fn service_packet_clients(actor: &SessionActor, daemon_id: &str, packet_clients:
 
         while let Some(frame) = pending.pop_front() {
             did_work = true;
-            handle_packet_frame(actor, daemon_id, &mut packet_clients[index], frame)?;
+            handle_packet_frame(actor, daemon_id, &mut packet_clients[index], frame, render_cache)?;
         }
         index += 1;
     }
     Ok(did_work)
 }
 
-fn handle_packet_frame(actor: &SessionActor, daemon_id: &str, client: &mut PacketClient, frame: PacketFrame) -> Result<(), String> {
+fn handle_packet_frame(
+    actor: &SessionActor,
+    daemon_id: &str,
+    client: &mut PacketClient,
+    frame: PacketFrame,
+    render_cache: &mut PacketRenderCache,
+) -> Result<(), String> {
     match (frame.channel, frame.msg_type) {
         (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL) => {
             let open = frame.decode::<OpenChannel>().map_err(|err| format!("decode open-channel packet: {err}"))?;
-            open_packet_channel(actor, daemon_id, client, open)?;
+            open_packet_channel(actor, daemon_id, client, open, render_cache)?;
         }
         (CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL) => {
             let close = frame.decode::<CloseChannel>().map_err(|err| format!("decode close-channel packet: {err}"))?;
@@ -1350,8 +1384,10 @@ fn handle_packet_frame(actor: &SessionActor, daemon_id: &str, client: &mut Packe
         (channel, MSG_SESSION_ACK) if channel != CHANNEL_CONTROL => {
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
             if let Some(session_channel) = client.channels.get_mut(&channel) {
-                session_channel.in_flight_generation = None;
-                actor.mark_observed(ack.generation);
+                if session_channel.in_flight_generation == Some(ack.generation) {
+                    session_channel.in_flight_generation = None;
+                    actor.mark_observed(ack.generation);
+                }
             }
         }
         (channel, MSG_SESSION_INPUT) if channel != CHANNEL_CONTROL => {
@@ -1371,7 +1407,13 @@ fn handle_packet_frame(actor: &SessionActor, daemon_id: &str, client: &mut Packe
     Ok(())
 }
 
-fn open_packet_channel(actor: &SessionActor, daemon_id: &str, client: &mut PacketClient, open: OpenChannel) -> Result<(), String> {
+fn open_packet_channel(
+    actor: &SessionActor,
+    daemon_id: &str,
+    client: &mut PacketClient,
+    open: OpenChannel,
+    render_cache: &mut PacketRenderCache,
+) -> Result<(), String> {
     if open.channel == CHANNEL_CONTROL {
         client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
             channel: open.channel,
@@ -1389,34 +1431,51 @@ fn open_packet_channel(actor: &SessionActor, daemon_id: &str, client: &mut Packe
 
     let update = actor.full_render_update()?;
     let generation = update.render_generation;
+    render_cache.store(update.clone());
     client.enqueue_frame(
         &PacketFrame::new(open.channel, MSG_SESSION_RENDER, &RenderPacket { update })
             .map_err(|err| format!("encode initial render packet: {err}"))?,
     )?;
-    client.channels.insert(open.channel, PacketSessionChannel { in_flight_generation: Some(generation) });
+    client.channels.insert(open.channel, PacketSessionChannel { in_flight_generation: Some(generation), last_sent_generation: generation });
     Ok(())
 }
 
-fn push_due_packet_renders(actor: &SessionActor, packet_clients: &mut Vec<PacketClient>) -> Result<(), String> {
-    if actor.observation().dirty() == DirtyState::Clean {
+fn push_due_packet_renders(
+    actor: &SessionActor,
+    packet_clients: &mut Vec<PacketClient>,
+    render_cache: &mut PacketRenderCache,
+) -> Result<(), String> {
+    if !packet_clients.iter().any(|client| !client.channels.is_empty()) {
         return Ok(());
     }
 
+    if actor.observation().dirty() != DirtyState::Clean {
+        render_cache.store(actor.render_update()?);
+    }
+
+    let Some(latest_generation) = render_cache.latest_generation() else {
+        return Ok(());
+    };
+    let Some(update) = render_cache.latest().cloned() else {
+        return Ok(());
+    };
+
     for client in packet_clients {
-        let due_channels: Vec<u32> =
-            client.channels.iter().filter_map(|(channel, session)| session.in_flight_generation.is_none().then_some(*channel)).collect();
+        let due_channels: Vec<u32> = client
+            .channels
+            .iter()
+            .filter_map(|(channel, session)| {
+                (session.in_flight_generation.is_none() && session.last_sent_generation < latest_generation).then_some(*channel)
+            })
+            .collect();
         for channel in due_channels {
-            if actor.observation().dirty() == DirtyState::Clean {
-                return Ok(());
-            }
-            let update = actor.render_update()?;
-            let generation = update.render_generation;
             client.enqueue_frame(
-                &PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket { update })
+                &PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket { update: update.clone() })
                     .map_err(|err| format!("encode render packet: {err}"))?,
             )?;
             if let Some(session_channel) = client.channels.get_mut(&channel) {
-                session_channel.in_flight_generation = Some(generation);
+                session_channel.in_flight_generation = Some(latest_generation);
+                session_channel.last_sent_generation = latest_generation;
             }
         }
     }

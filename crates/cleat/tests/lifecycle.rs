@@ -736,6 +736,7 @@ fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
     std::thread::sleep(Duration::from_millis(500));
     packet_input(&mut stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "a".to_string() }));
     let first = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    packet_ack(&mut stream, 1, initial.render_generation);
     packet_input(&mut stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "b".to_string() }));
     expect_no_packet(&mut stream, Duration::from_millis(120));
 
@@ -744,6 +745,40 @@ fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
     assert!(coalesced.render_generation > first.render_generation);
     packet_ack(&mut stream, 1, coalesced.render_generation);
     expect_no_packet(&mut stream, Duration::from_millis(120));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_concurrent_channels_receive_same_dirty_generation() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let mut first_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut first_stream).expect("read first hello");
+    let _directory = PacketFrame::read(&mut first_stream).expect("read first directory");
+    packet_open_channel(&mut first_stream, 1, "alpha");
+    let first_initial = read_packet_render(&mut first_stream, 1, Duration::from_secs(2));
+    packet_ack(&mut first_stream, 1, first_initial.render_generation);
+
+    let mut second_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut second_stream).expect("read second hello");
+    let _directory = PacketFrame::read(&mut second_stream).expect("read second directory");
+    packet_open_channel(&mut second_stream, 1, "alpha");
+    let second_initial = read_packet_render(&mut second_stream, 1, Duration::from_secs(2));
+    packet_ack(&mut second_stream, 1, second_initial.render_generation);
+
+    std::thread::sleep(Duration::from_millis(500));
+    packet_input(&mut first_stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "x".to_string() }));
+    let first_update = read_packet_render(&mut first_stream, 1, Duration::from_secs(2));
+    let second_update = read_packet_render(&mut second_stream, 1, Duration::from_secs(2));
+
+    assert_eq!(first_update.render_generation, second_update.render_generation);
+    assert!(!first_update.ops.is_empty(), "first viewer should receive row content");
+    assert!(!second_update.ops.is_empty(), "second viewer should receive row content");
 }
 
 #[cfg(feature = "ghostty-vt")]

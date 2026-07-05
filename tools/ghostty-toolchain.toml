@@ -15,4 +15,4 @@ version = "0.15.2"
 [ghostty]
 repo = "https://github.com/rjwittams/ghostty.git"
 ref = "64daa599c531e6938bc4c52d9198a91f1e6ce8cf"
-build_step = "-Demit-lib-vt=true"
+build_step = "-Demit-lib-vt=true -Dsimd=true"

@@ -748,6 +748,35 @@ fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn packets_command_prints_render_summaries() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh -c 'sleep 1; printf \"\\033[?1003h\"; sleep 30'".into()),
+            false,
+        )
+        .expect("create alpha");
+    let cli = Cli::try_parse_from(["cleat", "packets", "alpha", "--count", "2"]).expect("parse packets");
+
+    let output = cli::execute(cli, &service).expect("execute packets").expect("packets output");
+    let lines: Vec<_> = output.lines().collect();
+
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("gen="), "{output}");
+    assert!(lines[0].contains("ops="), "{output}");
+    assert!(lines[0].contains("mode_changes=initial"), "{output}");
+    assert!(lines[1].contains("mode_changes="), "{output}");
+    assert!(lines[1].contains("mouse_tracking=true"), "{output}");
+    assert!(lines[1].contains("rows=0"), "{output}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn capture_returns_text_for_ghostty_sessions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

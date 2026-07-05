@@ -14,6 +14,7 @@ fn help_lists_expected_subcommands() {
     assert_eq!(subcommands, vec![
         "attach",
         "watch",
+        "packets",
         "launch",
         "list",
         "capture",
@@ -33,6 +34,12 @@ fn help_lists_expected_subcommands() {
         "expect"
     ]);
     assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
+}
+
+#[test]
+fn packets_command_parses() {
+    let cli = Cli::try_parse_from(["cleat", "packets", "demo", "--count", "3"]).expect("packets parses");
+    assert_eq!(cli.command, Command::Packets { id: "demo".into(), count: 3 });
 }
 
 #[test]

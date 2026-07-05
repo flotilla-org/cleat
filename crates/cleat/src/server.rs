@@ -1,4 +1,5 @@
 use std::{
+    io::Write,
     path::Path,
     thread,
     time::{Duration, Instant, SystemTime},
@@ -438,6 +439,44 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         watch_foreground(&self.layout, id)
+    }
+
+    pub fn connect_packets(
+        &self,
+        id: &str,
+    ) -> Result<(crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot), String> {
+        if !self.layout.root().join(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+
+        let socket_path = session_socket_path(self.layout.root(), id);
+        let mut stream = connect_session_socket(&socket_path)?;
+        write!(
+            stream,
+            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n"
+        )
+        .map_err(|err| format!("write packet upgrade request: {err}"))?;
+        let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read packet upgrade response: {err}"))?;
+        if response.status != StatusCode::SWITCHING_PROTOCOLS {
+            return Err(format!("unexpected packet response: {}", response.status));
+        }
+
+        let mut client = crate::packet::PacketClient::new(stream);
+        let hello = client.read_frame().map_err(|err| format!("read packet hello: {err}"))?;
+        if hello.channel != crate::packet::CHANNEL_CONTROL || hello.msg_type != crate::packet::MSG_CONTROL_HELLO {
+            return Err("packet stream did not start with control hello".to_string());
+        }
+        let hello = hello.decode::<crate::packet::ControlHello>().map_err(|err| format!("decode packet hello: {err}"))?;
+        if hello.version != crate::packet::PROTOCOL_VERSION {
+            return Err(format!("unsupported packet protocol version {}", hello.version));
+        }
+
+        let directory = client.read_frame().map_err(|err| format!("read packet directory: {err}"))?;
+        if directory.channel != crate::packet::CHANNEL_CONTROL || directory.msg_type != crate::packet::MSG_CONTROL_DIRECTORY_SNAPSHOT {
+            return Err("packet stream did not send a directory snapshot after hello".to_string());
+        }
+        let directory = directory.decode::<crate::packet::DirectorySnapshot>().map_err(|err| format!("decode packet directory: {err}"))?;
+        Ok((client, directory))
     }
 
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {

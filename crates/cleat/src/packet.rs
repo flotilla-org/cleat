@@ -144,6 +144,64 @@ impl PacketFrame {
     }
 }
 
+pub struct PacketClient<S> {
+    stream: S,
+    buffer: Vec<u8>,
+}
+
+impl<S: Read + Write> PacketClient<S> {
+    pub fn new(stream: S) -> Self {
+        Self { stream, buffer: Vec::new() }
+    }
+
+    pub fn open_channel(&mut self, channel: u32, session_id: &str) -> std::io::Result<()> {
+        self.write(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel { channel, session_id: session_id.to_string() })
+    }
+
+    pub fn close_channel(&mut self, channel: u32, reason: Option<String>) -> std::io::Result<()> {
+        self.write(CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, &CloseChannel { channel, reason })
+    }
+
+    pub fn ack(&mut self, channel: u32, generation: u64) -> std::io::Result<()> {
+        self.write(channel, MSG_SESSION_ACK, &Ack { generation })
+    }
+
+    pub fn input(&mut self, channel: u32, event: TerminalInputEvent) -> std::io::Result<()> {
+        self.write(channel, MSG_SESSION_INPUT, &Input { event })
+    }
+
+    pub fn resize(&mut self, channel: u32, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.write(channel, MSG_SESSION_RESIZE, &Resize { cols, rows })
+    }
+
+    pub fn read_frame(&mut self) -> std::io::Result<PacketFrame> {
+        loop {
+            if let Some(frame) = PacketFrame::read_from_buffer(&mut self.buffer)? {
+                return Ok(frame);
+            }
+            let mut chunk = [0; 8192];
+            let n = self.stream.read(&mut chunk)?;
+            if n == 0 {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "packet stream closed"));
+            }
+            self.buffer.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    pub fn read_render(&mut self, channel: u32) -> std::io::Result<RenderPacket> {
+        loop {
+            let frame = self.read_frame()?;
+            if frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER {
+                return frame.decode();
+            }
+        }
+    }
+
+    fn write<T: Serialize>(&mut self, channel: u32, msg_type: u8, value: &T) -> std::io::Result<()> {
+        PacketFrame::new(channel, msg_type, value)?.write(&mut self.stream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

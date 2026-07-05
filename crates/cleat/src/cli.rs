@@ -115,6 +115,13 @@ pub enum Command {
         #[arg(value_name = "ID")]
         id: String,
     },
+    /// Subscribe to packet render updates and print debug summaries
+    Packets {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long, default_value_t = 1, value_parser = parse_positive_usize, help = "Number of render packets to print")]
+        count: usize,
+    },
     /// Create a new session
     #[command(
         alias = "create",
@@ -501,6 +508,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
+        Command::Packets { id, count } => match run_packets_command(service, &id, count) {
+            Ok(lines) if lines.is_empty() => ExecResult::Ok(None),
+            Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
+            Err(err) => ExecResult::Err(err),
+        },
         Command::Launch { id, json, size, vt, cwd, cmd, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
@@ -931,6 +943,82 @@ fn format_session_status(status: &crate::protocol::SessionStatus) -> &'static st
     }
 }
 
+fn run_packets_command(service: &SessionService, id: &str, count: usize) -> Result<Vec<String>, String> {
+    let (mut client, directory) = service.connect_packets(id)?;
+    if !directory.sessions.iter().any(|entry| entry.session_id == id) {
+        return Err(format!("session {id} was not present in packet directory"));
+    }
+    const DEBUG_CHANNEL: u32 = 1;
+    client.open_channel(DEBUG_CHANNEL, id).map_err(|err| format!("open packet channel: {err}"))?;
+
+    let mut lines = Vec::with_capacity(count);
+    let mut previous_modes = None;
+    for _ in 0..count {
+        let packet = client.read_render(DEBUG_CHANNEL).map_err(|err| format!("read packet render: {err}"))?;
+        let update = packet.update;
+        lines.push(format_packet_summary(&update, previous_modes));
+        previous_modes = Some(update.terminal_modes);
+        client.ack(DEBUG_CHANNEL, update.render_generation).map_err(|err| format!("ack packet render: {err}"))?;
+    }
+    Ok(lines)
+}
+
+fn format_packet_summary(update: &crate::provider::TerminalRenderUpdate, previous_modes: Option<crate::vt::TerminalModeState>) -> String {
+    let full_replace_ops =
+        update.ops.iter().filter(|op| op.kind == crate::provider::TerminalRenderUpdateOpKind::FullVisibleReplace).count();
+    let row_replace_ops = update.ops.iter().filter(|op| op.kind == crate::provider::TerminalRenderUpdateOpKind::RowReplace).count();
+    let scroll_copy_ops = update.ops.iter().filter(|op| op.kind == crate::provider::TerminalRenderUpdateOpKind::ScrollCopy).count();
+    let changed_rows: u16 = update.ops.iter().map(|op| op.row_count).sum();
+    format!(
+        "gen={} ops={} full={} rows={} scroll={} changed_rows={} mode_changes={} images={}/{}",
+        update.render_generation,
+        update.ops.len(),
+        full_replace_ops,
+        row_replace_ops,
+        scroll_copy_ops,
+        changed_rows,
+        format_mode_changes(previous_modes, update.terminal_modes),
+        update.image_resources.len(),
+        update.image_placements.len()
+    )
+}
+
+fn format_mode_changes(previous: Option<crate::vt::TerminalModeState>, current: crate::vt::TerminalModeState) -> String {
+    let Some(previous) = previous else {
+        return "initial".to_string();
+    };
+    let mut changes = Vec::new();
+    if previous.active_alternate_screen != current.active_alternate_screen {
+        changes.push(format!("alt_screen={}", current.active_alternate_screen));
+    }
+    if previous.application_cursor_keys != current.application_cursor_keys {
+        changes.push(format!("app_cursor={}", current.application_cursor_keys));
+    }
+    if previous.alternate_scroll != current.alternate_scroll {
+        changes.push(format!("alt_scroll={}", current.alternate_scroll));
+    }
+    if previous.mouse_tracking != current.mouse_tracking {
+        changes.push(format!("mouse_tracking={}", current.mouse_tracking));
+    }
+    if previous.mouse_tracking_mode != current.mouse_tracking_mode {
+        changes.push(format!("mouse_mode={:?}", current.mouse_tracking_mode));
+    }
+    if previous.mouse_report_format != current.mouse_report_format {
+        changes.push(format!("mouse_format={:?}", current.mouse_report_format));
+    }
+    if previous.mouse_sgr != current.mouse_sgr {
+        changes.push(format!("mouse_sgr={}", current.mouse_sgr));
+    }
+    if previous.mouse_sgr_pixels != current.mouse_sgr_pixels {
+        changes.push(format!("mouse_sgr_pixels={}", current.mouse_sgr_pixels));
+    }
+    if changes.is_empty() {
+        "none".to_string()
+    } else {
+        changes.join(",")
+    }
+}
+
 fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
     use comfy_table::{presets::NOTHING, Table};
 
@@ -1000,6 +1088,15 @@ fn parse_terminal_size(value: &str) -> Result<TerminalSize, String> {
         return Err("size dimensions must be greater than zero".to_string());
     }
     Ok(TerminalSize { cols, rows })
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let count = value.parse::<usize>().map_err(|err| err.to_string())?;
+    if count == 0 {
+        Err("count must be at least 1".to_string())
+    } else {
+        Ok(count)
+    }
 }
 
 fn parse_repeat(value: &str) -> Result<usize, String> {

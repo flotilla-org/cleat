@@ -1,7 +1,7 @@
 use std::io::{Error, ErrorKind, Read, Write};
 
 use http::{
-    header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE},
+    header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, UPGRADE},
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub(crate) type HttpRequest = Request<Vec<u8>>;
 pub(crate) enum Route {
     Root,
     Health,
+    PacketConnect,
     Sessions,
     SessionDelete { id: String },
     SessionAttach { id: String },
@@ -464,6 +465,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
     match (request.method(), path) {
         (&Method::GET, "/") => Route::Root,
         (&Method::GET, "/healthz") => Route::Health,
+        (&Method::POST, "/connect") => Route::PacketConnect,
         (&Method::GET, "/sessions") => Route::Sessions,
         _ => {
             let Some(rest) = path.strip_prefix("/sessions/") else {
@@ -515,7 +517,19 @@ pub(crate) fn write_no_content(writer: &mut impl Write) -> std::io::Result<()> {
 }
 
 pub(crate) fn write_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
-    write!(writer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n")
+    write_switching_protocols_for(writer, "cleat-attach/1")
+}
+
+pub(crate) fn write_packet_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
+    write_switching_protocols_for(writer, "cleat-packet/1")
+}
+
+fn write_switching_protocols_for(writer: &mut impl Write, upgrade: &str) -> std::io::Result<()> {
+    write!(writer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\n\r\n")
+}
+
+pub(crate) fn request_has_upgrade_token(request: &HttpRequest, token: &str) -> bool {
+    request.headers().get(UPGRADE).and_then(|value| value.to_str().ok()).is_some_and(|value| value.eq_ignore_ascii_case(token))
 }
 
 pub(crate) fn write_error(writer: &mut impl Write, status: StatusCode, message: &str) -> std::io::Result<()> {
@@ -714,6 +728,7 @@ mod tests {
     fn routes_provider_critical_session_endpoints() {
         let cases = [
             ("GET", "/healthz", Route::Health),
+            ("POST", "/connect", Route::PacketConnect),
             ("GET", "/sessions", Route::Sessions),
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
             ("DELETE", "/sessions/alpha", Route::SessionDelete { id: "alpha".to_string() }),

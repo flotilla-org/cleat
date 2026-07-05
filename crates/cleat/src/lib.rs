@@ -6,6 +6,7 @@ pub mod duration_parser;
 mod host;
 mod http_uds;
 pub mod keys;
+pub mod packet;
 pub mod platform;
 pub mod protocol;
 pub mod provider;

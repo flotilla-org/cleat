@@ -18,6 +18,9 @@ use http::StatusCode;
 use crate::{
     host::actor::{RawOutputTap, SessionActor},
     http_uds,
+    packet::{
+        ControlHello, DirectoryEntry, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO,
+    },
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
         ipc::{
@@ -585,6 +588,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
     let mut raw_output_tap = actor.subscribe_raw_output()?;
     let mut active_client: Option<ActiveClient> = None;
     let mut watchers: Vec<ActiveClient> = Vec::new();
+    let mut packet_clients: Vec<PacketClient> = Vec::new();
     let mut had_foreground_client = false;
     let mut pending_waits: Vec<PendingWait> = Vec::new();
     let mut pending_expects: Vec<PendingExpect> = Vec::new();
@@ -635,6 +639,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         actor: &actor,
                         active_client: &mut active_client,
                         watchers: &mut watchers,
+                        packet_clients: &mut packet_clients,
                         had_foreground_client: &mut had_foreground_client,
                         pending_waits: &mut pending_waits,
                         pending_expects: &mut pending_expects,
@@ -650,6 +655,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
         did_work |= drain_raw_output_tap(root, id, &actor, &mut raw_output_tap, &mut active_client, &mut watchers)?;
         drain_watcher_inputs(&mut watchers);
+        drain_packet_client_inputs(&mut packet_clients);
 
         if active_client.is_some() {
             let mut client_disconnected = false;
@@ -696,6 +702,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             did_work = true;
         }
         flush_watchers(&mut watchers);
+        flush_packet_clients(&mut packet_clients);
 
         // Evaluate pending waits on each loop tick.
         // Write errors are intentionally discarded — the client may have disconnected.
@@ -801,6 +808,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                 let _ = client.flush_pending_output();
             }
             flush_watchers(&mut watchers);
+            flush_packet_clients(&mut packet_clients);
             should_keep_session_dir = actor.should_keep_session_dir().unwrap_or(should_keep_session_dir);
             break;
         }
@@ -829,6 +837,7 @@ struct HttpRequestState<'a> {
     actor: &'a SessionActor,
     active_client: &'a mut Option<ActiveClient>,
     watchers: &'a mut Vec<ActiveClient>,
+    packet_clients: &'a mut Vec<PacketClient>,
     had_foreground_client: &'a mut bool,
     pending_waits: &'a mut Vec<PendingWait>,
     pending_expects: &'a mut Vec<PendingExpect>,
@@ -885,6 +894,26 @@ fn handle_http_request(
             let result = state.actor.inspect(state.active_client.is_some(), state.watchers.len())?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions: vec![result] })
                 .map_err(|err| format!("write HTTP sessions response: {err}"))
+        }
+        http_uds::Route::PacketConnect => {
+            if !http_uds::request_has_upgrade_token(&request, "cleat-packet/1") {
+                http_uds::write_error(stream, StatusCode::BAD_REQUEST, "missing Upgrade: cleat-packet/1")
+                    .map_err(|err| format!("write HTTP packet upgrade error: {err}"))?;
+                return Ok(());
+            }
+
+            let inspect = state.actor.inspect(state.active_client.is_some(), state.watchers.len())?;
+            http_uds::write_packet_switching_protocols(stream).map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
+            let packet_stream = stream.try_clone().map_err(|err| format!("clone HTTP packet stream: {err}"))?;
+            #[cfg(unix)]
+            set_stream_nonblocking(&packet_stream, true).map_err(|err| format!("set HTTP packet stream nonblocking: {err}"))?;
+            let mut client = PacketClient::new(packet_stream)?;
+            client.enqueue_control(MSG_CONTROL_HELLO, &ControlHello::current())?;
+            client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &DirectorySnapshot {
+                sessions: vec![DirectoryEntry { session_id: inspect.session.id, cols: inspect.terminal.cols, rows: inspect.terminal.rows }],
+            })?;
+            state.packet_clients.push(client);
+            Ok(())
         }
         http_uds::Route::SessionInspect { id } if id == daemon_id => {
             let result = state.actor.inspect(state.active_client.is_some(), state.watchers.len())?;
@@ -1208,6 +1237,84 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
             http_uds::NamedKey::ArrowLeft => b"\x1b[D".to_vec(),
         },
     }
+}
+
+struct PacketClient {
+    stream: SessionStream,
+    pending_output: Vec<u8>,
+    input_reader: ActiveClientReader,
+    input_buffer: Vec<u8>,
+}
+
+impl PacketClient {
+    fn new(stream: SessionStream) -> Result<Self, String> {
+        let input_reader = ActiveClientReader::new(&stream)?;
+        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new() })
+    }
+
+    fn enqueue_control<T: serde::Serialize>(&mut self, msg_type: u8, value: &T) -> Result<(), String> {
+        let frame = PacketFrame::new(CHANNEL_CONTROL, msg_type, value).map_err(|err| format!("encode packet control frame: {err}"))?;
+        self.enqueue_frame(&frame)
+    }
+
+    fn enqueue_frame(&mut self, frame: &PacketFrame) -> Result<(), String> {
+        let mut encoded = Vec::new();
+        frame.write(&mut encoded).map_err(|err| format!("buffer packet frame: {err}"))?;
+        if self.pending_output.len().saturating_add(encoded.len()) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
+            return Err(format!("packet client output backlog exceeded {} bytes", MAX_PENDING_CLIENT_OUTPUT_BYTES));
+        }
+        self.pending_output.extend_from_slice(&encoded);
+        Ok(())
+    }
+
+    fn drain_input_frames(&mut self, pending: &mut VecDeque<PacketFrame>, timeout: Duration) -> Result<bool, std::io::Error> {
+        let mut first_poll = true;
+        loop {
+            let chunk = if first_poll {
+                first_poll = false;
+                self.input_reader.poll_timeout(&mut self.stream, timeout)?
+            } else {
+                self.input_reader.poll(&mut self.stream)?
+            };
+            match chunk {
+                Some(bytes) if bytes.is_empty() => return Ok(false),
+                Some(bytes) => self.input_buffer.extend_from_slice(&bytes),
+                None => break,
+            }
+        }
+
+        while let Some(frame) = PacketFrame::read_from_buffer(&mut self.input_buffer)? {
+            pending.push_back(frame);
+        }
+        Ok(true)
+    }
+
+    fn flush_pending_output(&mut self) -> Result<bool, String> {
+        while !self.pending_output.is_empty() {
+            match self.stream.write(&self.pending_output) {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    self.pending_output.drain(..n);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) if is_graceful_socket_shutdown(&err) => return Ok(false),
+                Err(err) => return Err(format!("flush packet client output: {err}")),
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn drain_packet_client_inputs(packet_clients: &mut Vec<PacketClient>) {
+    let mut ignored = VecDeque::new();
+    packet_clients.retain_mut(|client| {
+        ignored.clear();
+        client.drain_input_frames(&mut ignored, Duration::ZERO).unwrap_or_default()
+    });
+}
+
+fn flush_packet_clients(packet_clients: &mut Vec<PacketClient>) {
+    packet_clients.retain_mut(|client| client.flush_pending_output().unwrap_or(false));
 }
 
 struct ActiveClient {

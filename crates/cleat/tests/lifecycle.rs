@@ -15,6 +15,9 @@ use clap::Parser;
 use cleat::session::foreground_path;
 use cleat::{
     cli::{self, Cli, ExecResult},
+    packet::{
+        ControlHello, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO, PROTOCOL_VERSION,
+    },
     protocol::{Frame, SessionInfo},
     provider::ProviderFeatures,
     provider_ffi::{
@@ -67,6 +70,18 @@ fn http_attach_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, ca
 
 fn http_watch_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, capabilities: ClientCapabilities) -> UnixStream {
     http_upgrade_stream(root, id, "watch", cols, rows, capabilities)
+}
+
+fn http_packet_stream(root: &std::path::Path, id: &str) -> UnixStream {
+    let socket_path = session_socket_path(root, id);
+    let mut stream = UnixStream::connect(&socket_path).expect("connect session socket");
+    write!(stream, "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",)
+        .expect("write packet upgrade request");
+
+    let response = read_http_response_head(&mut stream);
+    assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
+    assert!(response.contains("Upgrade: cleat-packet/1\r\n"), "{response}");
+    stream
 }
 
 fn http_upgrade_stream(
@@ -546,6 +561,31 @@ fn create_respawns_over_a_stale_crashed_daemon() {
     assert_eq!(sessions.len(), 1, "exactly one live session after respawn");
     assert_eq!(sessions[0].id, id);
     service.kill(id).expect("kill respawned session");
+}
+
+#[test]
+fn packet_connect_emits_hello_and_directory_snapshot() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    stream.set_read_timeout(Some(Duration::from_secs(2))).expect("set read timeout");
+
+    let hello_frame = PacketFrame::read(&mut stream).expect("read hello");
+    let directory_frame = PacketFrame::read(&mut stream).expect("read directory");
+
+    assert_eq!(hello_frame.channel, CHANNEL_CONTROL);
+    assert_eq!(hello_frame.msg_type, MSG_CONTROL_HELLO);
+    assert_eq!(hello_frame.decode::<ControlHello>().expect("decode hello").version, PROTOCOL_VERSION);
+    assert_eq!(directory_frame.channel, CHANNEL_CONTROL);
+    assert_eq!(directory_frame.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
+    assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![cleat::packet::DirectoryEntry {
+        session_id: "alpha".to_string(),
+        cols: 80,
+        rows: 24
+    }]);
 }
 
 #[cfg(feature = "ghostty-vt")]

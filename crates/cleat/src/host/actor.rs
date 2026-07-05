@@ -260,6 +260,7 @@ pub(crate) enum SessionCommand {
     ScrollViewport { command: ViewportCommand, reply: mpsc::Sender<Result<ViewportCommandOutcome, String>> },
     Snapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     RenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
+    FullRenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
     FullSnapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     ImageResourceData { image_id: u32, generation: u64, callback: ImageResourceDataCallback, reply: mpsc::Sender<Result<bool, String>> },
     Inspect { has_controller: bool, watcher_count: usize, reply: mpsc::Sender<Result<InspectResult, String>> },
@@ -623,8 +624,20 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::Resize { cols, rows, reply })
     }
 
+    pub(crate) fn set_cell_size(&self, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::SetCellSize { cell_width_px, cell_height_px, reply })
+    }
+
     pub(crate) fn write_input(&self, bytes: Vec<u8>) -> Result<(), String> {
         self.request_result(|reply| SessionCommand::WriteInput { bytes, reply })
+    }
+
+    pub(crate) fn wheel(&self, event: SessionWheelEvent) -> Result<usize, String> {
+        self.request_result(|reply| SessionCommand::Wheel { event, reply })
+    }
+
+    pub(crate) fn mouse(&self, event: SessionMouseEvent) -> Result<usize, String> {
+        self.request_result(|reply| SessionCommand::Mouse { event, reply })
     }
 
     pub(crate) fn paste(&self, text: Vec<u8>) -> Result<usize, String> {
@@ -637,6 +650,18 @@ impl SessionActor {
 
     pub(crate) fn full_snapshot(&self) -> Result<TerminalSnapshot, String> {
         self.request_result(|reply| SessionCommand::FullSnapshot { reply })
+    }
+
+    pub(crate) fn render_update(&self) -> Result<TerminalRenderUpdate, String> {
+        self.request_result(|reply| SessionCommand::RenderUpdate { reply })
+    }
+
+    pub(crate) fn full_render_update(&self) -> Result<TerminalRenderUpdate, String> {
+        self.request_result(|reply| SessionCommand::FullRenderUpdate { reply })
+    }
+
+    pub(crate) fn mark_observed(&self, generation: u64) -> bool {
+        self.request(|reply| SessionCommand::MarkObserved { generation, reply }, false)
     }
 
     pub(crate) fn capture_text(&self) -> Result<String, String> {
@@ -923,6 +948,16 @@ fn session_actor_handle_command(
             sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
             let result = runtime.render_update(state.observation.dirty()).map(|mut update| {
                 state.observation.annotate_render_update(&mut update);
+                update
+            });
+            let _ = reply.send(result);
+        }
+        SessionCommand::FullRenderUpdate { reply } => {
+            session_actor_pump(runtime, state, wake);
+            sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
+            let result = runtime.render_update(DirtyState::Full).map(|mut update| {
+                update.render_generation = state.observation.render_generation;
+                update.dirty = DirtyState::Full;
                 update
             });
             let _ = reply.send(result);

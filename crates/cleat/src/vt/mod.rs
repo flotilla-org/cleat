@@ -18,7 +18,7 @@ use crate::provider::{
     ViewportCommand, ViewportCommandOutcome,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ClientCapabilities {
     pub color_level: ColorLevel,
@@ -35,7 +35,7 @@ impl ClientCapabilities {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ColorLevel {
     Sixteen,
     Ansi256,
@@ -43,14 +43,14 @@ pub enum ColorLevel {
     TrueColor,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Rgb {
     pub r: u8,
     pub g: u8,
     pub b: u8,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalColors {
     pub default_foreground: Option<Rgb>,
     pub default_background: Option<Rgb>,
@@ -58,7 +58,7 @@ pub struct TerminalColors {
 }
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
     pub struct CellFlags: u16 {
         const BOLD          = 1 << 0;
         const ITALIC        = 1 << 1;
@@ -72,7 +72,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CellWidth {
     #[default]
     Narrow,
@@ -81,7 +81,7 @@ pub enum CellWidth {
     SpacerHead,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedCell {
     pub graphemes: Vec<u32>,
     pub fg: Rgb,
@@ -95,7 +95,7 @@ pub struct ResolvedCell {
     pub has_hyperlink: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CursorStyle {
     Bar,
     #[default]
@@ -104,7 +104,7 @@ pub enum CursorStyle {
     BlockHollow,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CursorState {
     pub col: u16,
     pub row: u16,
@@ -114,7 +114,7 @@ pub struct CursorState {
     pub wide_tail: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScreenGrid {
     pub cells: Vec<ResolvedCell>,
     pub cols: u16,
@@ -157,7 +157,7 @@ impl ScreenGrid {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MouseTrackingMode {
     #[default]
     None,
@@ -167,7 +167,7 @@ pub enum MouseTrackingMode {
     Any,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MouseReportFormat {
     #[default]
     Legacy,
@@ -175,7 +175,7 @@ pub enum MouseReportFormat {
     SgrPixels,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalModeState {
     pub active_alternate_screen: bool,
     pub application_cursor_keys: bool,
@@ -220,7 +220,7 @@ impl VtEngineKind {
 }
 
 /// Backend-neutral mouse event action.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MouseAction {
     Press,
     Release,
@@ -229,7 +229,7 @@ pub enum MouseAction {
 
 /// Backend-neutral mouse button identity (named, not numbered: the wire
 /// button codes differ between Cleat and Ghostty and are resolved per backend).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
     Middle,
@@ -243,7 +243,7 @@ pub enum MouseButton {
 }
 
 /// Keyboard modifiers relevant to mouse encoding.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MouseModifiers {
     pub shift: bool,
     pub ctrl: bool,

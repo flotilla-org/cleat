@@ -13,12 +13,13 @@ default = []
 ghostty-vt = ["dep:png"]
 
 [dependencies]
-bitflags = "2"
+bitflags = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 http = "1"
 httparse = "1"
 humantime = "2"
+postcard = { version = "1", features = ["alloc"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"

@@ -15,6 +15,9 @@ use clap::Parser;
 use cleat::session::foreground_path;
 use cleat::{
     cli::{self, Cli, ExecResult},
+    packet::{
+        ControlHello, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO, PROTOCOL_VERSION,
+    },
     protocol::{Frame, SessionInfo},
     provider::ProviderFeatures,
     provider_ffi::{
@@ -26,6 +29,11 @@ use cleat::{
     server::{EndBound, SessionService, StartBound},
     session::{daemon_pid_path, session_socket_path},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
+};
+#[cfg(feature = "ghostty-vt")]
+use cleat::{
+    packet::{Ack, Input, OpenChannel, RenderPacket, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER},
+    provider::{TerminalInputEvent, TerminalPasteEvent, TerminalRenderUpdate, TerminalTextEvent},
 };
 
 fn service_for(path: &std::path::Path) -> SessionService {
@@ -67,6 +75,84 @@ fn http_attach_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, ca
 
 fn http_watch_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, capabilities: ClientCapabilities) -> UnixStream {
     http_upgrade_stream(root, id, "watch", cols, rows, capabilities)
+}
+
+fn http_packet_stream(root: &std::path::Path, id: &str) -> UnixStream {
+    let socket_path = session_socket_path(root, id);
+    let mut stream = UnixStream::connect(&socket_path).expect("connect session socket");
+    write!(stream, "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",)
+        .expect("write packet upgrade request");
+
+    let response = read_http_response_head(&mut stream);
+    assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
+    assert!(response.contains("Upgrade: cleat-packet/1\r\n"), "{response}");
+    stream
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_write<T: serde::Serialize>(stream: &mut UnixStream, channel: u32, msg_type: u8, value: &T) {
+    PacketFrame::new(channel, msg_type, value).expect("encode packet frame").write(stream).expect("write packet frame");
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_open_channel(stream: &mut UnixStream, channel: u32, session_id: &str) {
+    packet_write(stream, CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel { channel, session_id: session_id.to_string() });
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_ack(stream: &mut UnixStream, channel: u32, generation: u64) {
+    packet_write(stream, channel, MSG_SESSION_ACK, &Ack { generation });
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_input(stream: &mut UnixStream, channel: u32, event: TerminalInputEvent) {
+    packet_write(stream, channel, MSG_SESSION_INPUT, &Input { event });
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn read_packet_render(stream: &mut UnixStream, channel: u32, timeout: Duration) -> TerminalRenderUpdate {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+    let deadline = Instant::now() + timeout;
+    let mut buffer = Vec::new();
+    while Instant::now() < deadline {
+        while let Some(frame) = PacketFrame::read_from_buffer(&mut buffer).expect("parse packet buffer") {
+            if frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER {
+                return frame.decode::<RenderPacket>().expect("decode render packet").update;
+            }
+        }
+        let mut chunk = [0; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("packet stream closed while waiting for render packet"),
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(err) if packet_read_would_wait(&err) => {}
+            Err(err) => panic!("read packet frame: {err}"),
+        }
+    }
+    panic!("timed out waiting for render packet on channel {channel}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn expect_no_packet(stream: &mut UnixStream, timeout: Duration) {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+    let deadline = Instant::now() + timeout;
+    let mut buffer = Vec::new();
+    while Instant::now() < deadline {
+        if let Some(frame) = PacketFrame::read_from_buffer(&mut buffer).expect("parse packet buffer") {
+            panic!("unexpected packet frame: {frame:?}");
+        }
+        let mut chunk = [0; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(err) if packet_read_would_wait(&err) => {}
+            Err(err) => panic!("read packet frame: {err}"),
+        }
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_read_would_wait(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) || err.raw_os_error() == Some(libc::EINVAL)
 }
 
 fn http_upgrade_stream(
@@ -546,6 +632,223 @@ fn create_respawns_over_a_stale_crashed_daemon() {
     assert_eq!(sessions.len(), 1, "exactly one live session after respawn");
     assert_eq!(sessions[0].id, id);
     service.kill(id).expect("kill respawned session");
+}
+
+#[test]
+fn packet_connect_emits_hello_and_directory_snapshot() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    stream.set_read_timeout(Some(Duration::from_secs(2))).expect("set read timeout");
+
+    let hello_frame = PacketFrame::read(&mut stream).expect("read hello");
+    let directory_frame = PacketFrame::read(&mut stream).expect("read directory");
+
+    assert_eq!(hello_frame.channel, CHANNEL_CONTROL);
+    assert_eq!(hello_frame.msg_type, MSG_CONTROL_HELLO);
+    assert_eq!(hello_frame.decode::<ControlHello>().expect("decode hello").version, PROTOCOL_VERSION);
+    assert_eq!(directory_frame.channel, CHANNEL_CONTROL);
+    assert_eq!(directory_frame.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
+    assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![cleat::packet::DirectoryEntry {
+        session_id: "alpha".to_string(),
+        cols: 80,
+        rows: 24
+    }]);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_channel_initial_render_and_packet_input_flow() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+
+    packet_open_channel(&mut stream, 1, "alpha");
+    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    assert_eq!(initial.dirty, cleat::provider::DirtyState::Full);
+    assert!(!initial.ops.is_empty());
+    packet_ack(&mut stream, 1, initial.render_generation);
+
+    std::thread::sleep(Duration::from_millis(500));
+    packet_input(&mut stream, 1, TerminalInputEvent::Paste(TerminalPasteEvent { text: "packet paste".to_string() }));
+    let update = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    assert!(update.render_generation > initial.render_generation);
+    assert!(!update.ops.is_empty());
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_mode_only_change_produces_zero_row_ops() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh -c 'sleep 1; printf \"\\033[?1003h\"; sleep 30'".into()),
+            false,
+        )
+        .expect("create alpha");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+    packet_open_channel(&mut stream, 1, "alpha");
+    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    packet_ack(&mut stream, 1, initial.render_generation);
+
+    let update = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+
+    assert!(update.terminal_modes.mouse_tracking);
+    assert_eq!(update.terminal_modes.mouse_tracking_mode, vt::MouseTrackingMode::Any);
+    assert!(update.ops.is_empty(), "mode-only packet should not carry row ops: {:?}", update.ops);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+    packet_open_channel(&mut stream, 1, "alpha");
+    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    packet_ack(&mut stream, 1, initial.render_generation);
+
+    std::thread::sleep(Duration::from_millis(500));
+    packet_input(&mut stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "a".to_string() }));
+    let first = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    packet_ack(&mut stream, 1, initial.render_generation);
+    packet_input(&mut stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "b".to_string() }));
+    expect_no_packet(&mut stream, Duration::from_millis(120));
+
+    packet_ack(&mut stream, 1, first.render_generation);
+    let coalesced = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    assert!(coalesced.render_generation > first.render_generation);
+    packet_ack(&mut stream, 1, coalesced.render_generation);
+    expect_no_packet(&mut stream, Duration::from_millis(120));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_concurrent_channels_receive_same_dirty_generation() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let mut first_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut first_stream).expect("read first hello");
+    let _directory = PacketFrame::read(&mut first_stream).expect("read first directory");
+    packet_open_channel(&mut first_stream, 1, "alpha");
+    let first_initial = read_packet_render(&mut first_stream, 1, Duration::from_secs(2));
+    packet_ack(&mut first_stream, 1, first_initial.render_generation);
+
+    let mut second_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut second_stream).expect("read second hello");
+    let _directory = PacketFrame::read(&mut second_stream).expect("read second directory");
+    packet_open_channel(&mut second_stream, 1, "alpha");
+    let second_initial = read_packet_render(&mut second_stream, 1, Duration::from_secs(2));
+    packet_ack(&mut second_stream, 1, second_initial.render_generation);
+
+    std::thread::sleep(Duration::from_millis(500));
+    packet_input(&mut first_stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "x".to_string() }));
+    let first_update = read_packet_render(&mut first_stream, 1, Duration::from_secs(2));
+    let second_update = read_packet_render(&mut second_stream, 1, Duration::from_secs(2));
+
+    assert_eq!(first_update.render_generation, second_update.render_generation);
+    assert!(!first_update.ops.is_empty(), "first viewer should receive row content");
+    assert!(!second_update.ops.is_empty(), "second viewer should receive row content");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_lagging_channel_receives_cached_generation_after_session_goes_clean() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let mut fast_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut fast_stream).expect("read fast hello");
+    let _directory = PacketFrame::read(&mut fast_stream).expect("read fast directory");
+    packet_open_channel(&mut fast_stream, 1, "alpha");
+    let fast_initial = read_packet_render(&mut fast_stream, 1, Duration::from_secs(2));
+    packet_ack(&mut fast_stream, 1, fast_initial.render_generation);
+
+    let mut slow_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut slow_stream).expect("read slow hello");
+    let _directory = PacketFrame::read(&mut slow_stream).expect("read slow directory");
+    packet_open_channel(&mut slow_stream, 1, "alpha");
+    let slow_initial = read_packet_render(&mut slow_stream, 1, Duration::from_secs(2));
+
+    std::thread::sleep(Duration::from_millis(500));
+    packet_input(&mut fast_stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "y".to_string() }));
+    let fast_update = loop {
+        let update = read_packet_render(&mut fast_stream, 1, Duration::from_secs(2));
+        if !update.ops.is_empty() {
+            break update;
+        }
+        packet_ack(&mut fast_stream, 1, update.render_generation);
+    };
+    packet_ack(&mut fast_stream, 1, fast_update.render_generation);
+
+    packet_ack(&mut slow_stream, 1, slow_initial.render_generation);
+    let slow_update = read_packet_render(&mut slow_stream, 1, Duration::from_secs(2));
+
+    assert_eq!(slow_update.render_generation, fast_update.render_generation);
+    assert!(!slow_update.ops.is_empty(), "lagging viewer should receive cached row content after fast ack");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packets_command_prints_render_summaries() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh -c 'sleep 1; printf \"\\033[?1003h\"; sleep 30'".into()),
+            false,
+        )
+        .expect("create alpha");
+    let cli = Cli::try_parse_from(["cleat", "packets", "alpha", "--count", "2"]).expect("parse packets");
+
+    let output = cli::execute(cli, &service).expect("execute packets").expect("packets output");
+    let lines: Vec<_> = output.lines().collect();
+
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("gen="), "{output}");
+    assert!(lines[0].contains("ops="), "{output}");
+    assert!(lines[0].contains("mode_changes=initial"), "{output}");
+    assert!(lines[1].contains("mode_changes="), "{output}");
+    assert!(lines[1].contains("mouse_tracking=true"), "{output}");
+    assert!(lines[1].contains("rows=0"), "{output}");
 }
 
 #[cfg(feature = "ghostty-vt")]

@@ -13,7 +13,7 @@ fn named_sessions_use_supplied_name_as_id() {
 
     assert_eq!(session.id, "demo");
     assert_eq!(session.vt_engine, VtEngineKind::Passthrough);
-    assert!(temp.path().join("runtime").join("demo").exists());
+    assert!(layout.session_dir("demo").exists());
 }
 
 #[test]

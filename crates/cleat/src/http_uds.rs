@@ -25,6 +25,7 @@ pub(crate) enum Route {
     Health,
     PacketConnect,
     Sessions,
+    SessionCreate,
     SessionDelete { id: String },
     SessionAttach { id: String },
     SessionWatch { id: String },
@@ -201,6 +202,11 @@ pub(crate) struct SignalRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionListResponse {
     pub sessions: Vec<crate::protocol::InspectResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CreateSessionResponse {
+    pub session: crate::runtime::SessionMetadata,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -467,6 +473,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
         (&Method::GET, "/healthz") => Route::Health,
         (&Method::POST, "/connect") => Route::PacketConnect,
         (&Method::GET, "/sessions") => Route::Sessions,
+        (&Method::POST, "/sessions") => Route::SessionCreate,
         _ => {
             let Some(rest) = path.strip_prefix("/sessions/") else {
                 return Route::NotFound;
@@ -730,6 +737,7 @@ mod tests {
             ("GET", "/healthz", Route::Health),
             ("POST", "/connect", Route::PacketConnect),
             ("GET", "/sessions", Route::Sessions),
+            ("POST", "/sessions", Route::SessionCreate),
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
             ("DELETE", "/sessions/alpha", Route::SessionDelete { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/attach", Route::SessionAttach { id: "alpha".to_string() }),

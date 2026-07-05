@@ -26,8 +26,8 @@ use crate::{
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
         ipc::{
-            bind_session_listener, connect_session_stream, session_socket_path as platform_session_socket_path, set_listener_nonblocking,
-            set_stream_nonblocking, set_stream_read_timeout, set_stream_write_timeout, shutdown_stream, SessionStream,
+            bind_session_listener, connect_session_stream, set_listener_nonblocking, set_stream_nonblocking, set_stream_read_timeout,
+            set_stream_write_timeout, shutdown_stream, try_connect_session_stream, SessionStream,
         },
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
@@ -39,7 +39,6 @@ use crate::{
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
 
-const FOREGROUND_NAME: &str = "foreground";
 const DETACH_CLEANUP_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
@@ -241,54 +240,27 @@ pub fn ensure_session_started(
     cmd: Option<String>,
     options: SessionStartOptions,
 ) -> Result<SessionMetadata, String> {
-    // If a named session directory already exists with a live socket, reuse it.
-    if let Some(ref id_str) = id {
-        let socket_path = session_socket_path(layout.root(), id_str);
-        if socket_path.exists() {
-            if is_session_daemon_alive(layout.root(), id_str) {
-                // Daemon is running — return the id. The caller should use inspect()
-                // if it needs the session's actual config.
-                let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
-                return Ok(SessionMetadata {
-                    id: id_str.clone(),
-                    vt_engine,
-                    cwd,
-                    cmd,
-                    record: options.record,
-                    initial_size: options.initial_size,
-                    colors: options.colors,
-                });
-            }
-            // Stale socket from a crashed daemon. Remove it so the respawned daemon
-            // binds cleanly and wait_for_socket waits for the new listener rather
-            // than returning on the leftover file. The session directory and its
-            // recording survive, so falling through to the create path recreates
-            // the session from its prior output (see recreate::seed_engine_from_cast).
-            //
-            // A removal failure other than "already gone" (e.g. a permissions
-            // problem) would otherwise surface downstream as an opaque socket-bind
-            // error (EADDRINUSE), so report the real cause here instead.
-            match fs::remove_file(&socket_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(format!("remove stale session socket {}: {err}", socket_path.display())),
-            }
-        }
-    }
-
-    // Create a new session and spawn the daemon.
     let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
     vt_engine.ensure_available()?;
-    let mut session = layout.create_session(id, vt_engine, cwd, cmd)?;
+    let id = id.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
+    crate::runtime::validate_runtime_name(&id)?;
+    let mut session = layout.session_metadata(id, vt_engine, cwd, cmd);
     session.record = options.record;
     session.initial_size = options.initial_size;
     session.colors = options.colors;
 
-    let socket_path = session_socket_path(layout.root(), &session.id);
-    spawn_daemon_process(layout.root(), &session)?;
-    wait_for_socket(&socket_path)?;
-
-    Ok(session)
+    ensure_daemon_started(layout)?;
+    let mut stream = connect_session_stream(&layout.socket_path())?;
+    let body = serde_json::to_vec(&session).map_err(|err| format!("serialize session create request: {err}"))?;
+    http_uds::write_request(&mut stream, http::Method::POST, "/sessions", &body)
+        .map_err(|err| format!("write session create request: {err}"))?;
+    let response = http_uds::read_response(&mut stream).map_err(|err| format!("read session create response: {err}"))?;
+    if response.status != StatusCode::OK {
+        return Err(http_error_message(http_uds::HttpResponse { status: response.status, body: response.body }));
+    }
+    let response: http_uds::CreateSessionResponse =
+        serde_json::from_slice(&response.body).map_err(|err| format!("parse session create response: {err}"))?;
+    Ok(response.session)
 }
 
 pub fn attach_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundAttach, String> {
@@ -300,7 +272,7 @@ pub fn watch_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundAt
 }
 
 fn connect_foreground_upgrade(layout: &RuntimeLayout, id: &str, role: &str) -> Result<ForegroundAttach, String> {
-    let socket_path = session_socket_path(layout.root(), id);
+    let socket_path = layout.socket_path();
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         let mut stream = connect_session_stream(&socket_path)?;
@@ -327,15 +299,17 @@ fn connect_foreground_upgrade(layout: &RuntimeLayout, id: &str, role: &str) -> R
 }
 
 pub fn session_socket_path(root: &Path, id: &str) -> PathBuf {
-    platform_session_socket_path(root, id)
+    let _ = id;
+    RuntimeLayout::new(root.to_path_buf()).socket_path()
 }
 
 pub fn daemon_pid_path(root: &Path, id: &str) -> PathBuf {
-    crate::platform::daemon::daemon_pid_path(root, id)
+    let _ = id;
+    RuntimeLayout::new(root.to_path_buf()).daemon_pid_path()
 }
 
 pub fn foreground_path(root: &Path, id: &str) -> PathBuf {
-    root.join(id).join(FOREGROUND_NAME)
+    RuntimeLayout::new(root.to_path_buf()).foreground_path(id)
 }
 
 fn default_vt_engine(session: &SessionMetadata) -> Result<Box<dyn VtEngine>, String> {
@@ -550,7 +524,7 @@ fn write_http_wait_result(stream: &mut SessionStream, status: crate::protocol::W
 }
 
 fn enqueue_output_chunk(
-    root: &Path,
+    layout: &RuntimeLayout,
     id: &str,
     actor: &SessionActor,
     active_client: &mut Option<ActiveClient>,
@@ -560,7 +534,7 @@ fn enqueue_output_chunk(
     let frame = Frame::Output(chunk);
     if let Some(client) = active_client.as_mut() {
         if client.enqueue_frame(&frame).is_err() {
-            let _ = fs::remove_file(foreground_path(root, id));
+            let _ = fs::remove_file(layout.foreground_path(id));
             let _ = actor.record_detach();
             let _ = actor.set_client_presence(false);
             *active_client = None;
@@ -570,7 +544,7 @@ fn enqueue_output_chunk(
 }
 
 fn drain_raw_output_tap(
-    root: &Path,
+    layout: &RuntimeLayout,
     id: &str,
     actor: &SessionActor,
     raw_output_tap: &mut RawOutputTap,
@@ -582,7 +556,7 @@ fn drain_raw_output_tap(
         match raw_output_tap.try_recv() {
             Ok(chunk) => {
                 drained = true;
-                enqueue_output_chunk(root, id, actor, active_client, watchers, chunk);
+                enqueue_output_chunk(layout, id, actor, active_client, watchers, chunk);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(drained),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -606,21 +580,28 @@ fn flush_watchers(watchers: &mut Vec<ActiveClient>) {
 }
 
 #[cfg(any(unix, windows))]
-pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), String> {
-    let id = &session.id;
-    let session_dir = root.join(id);
-    fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
-    let socket_path = session_socket_path(root, id);
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path);
-    }
-
-    let listener = bind_session_listener(&socket_path)?;
+pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> {
+    let layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(daemon_name.to_string())?;
+    layout.ensure_daemon_dirs()?;
+    let socket_path = layout.socket_path();
+    let listener = match bind_session_listener(&socket_path) {
+        Ok(listener) => listener,
+        Err(first_err) => {
+            if try_connect_session_stream(&socket_path).is_ok() {
+                return Ok(());
+            }
+            match fs::remove_file(&socket_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("remove stale daemon socket {}: {err}", socket_path.display())),
+            }
+            bind_session_listener(&socket_path).map_err(|second_err| format!("{first_err}; after stale cleanup: {second_err}"))?
+        }
+    };
     set_listener_nonblocking(&listener, true)?;
-    fs::write(daemon_pid_path(root, id), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
+    fs::write(layout.daemon_pid_path(), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
 
     let mut sessions = HashMap::new();
-    sessions.insert(id.clone(), HostedSession::spawn(session_dir.clone(), session.clone())?);
     let mut packet_clients: Vec<PacketClient> = Vec::new();
     let mut exited_session: Option<(String, bool)> = None;
 
@@ -641,16 +622,15 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                     {
                         set_stream_nonblocking(&stream, true).map_err(|err| format!("set accepted stream nonblocking: {err}"))?;
                     }
-                    set_stream_write_timeout(&stream, Some(SESSION_HTTP_RESPONSE_WRITE_DEADLINE))?;
+                    let _ = set_stream_write_timeout(&stream, Some(SESSION_HTTP_RESPONSE_WRITE_DEADLINE));
                     let request = {
                         let mut reader = HttpHandshakeReader::new(&mut stream, SESSION_HTTP_HANDSHAKE_DEADLINE);
                         let mut prefix = [0; 5];
                         if let Err(err) = reader.read_exact(&mut prefix) {
-                            let _ = Frame::Error(format!("failed to read request: {err}")).write(&mut stream);
+                            let _ = err;
                             continue;
                         }
                         if !http_uds::looks_like_http_prefix(&prefix) {
-                            let _ = Frame::Error("session daemon requires HTTP requests".to_string()).write(&mut stream);
                             continue;
                         }
                         match http_uds::read_request_with_prefix(&mut reader, &prefix) {
@@ -666,8 +646,8 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
                         }
                     };
 
-                    let mut http_state = HttpRequestState { sessions: &mut sessions, packet_clients: &mut packet_clients };
-                    if let Err(err) = handle_http_request(root, id, &mut stream, request, &mut http_state) {
+                    let mut http_state = HttpRequestState { layout: &layout, sessions: &mut sessions, packet_clients: &mut packet_clients };
+                    if let Err(err) = handle_http_request(root, daemon_name, &mut stream, request, &mut http_state) {
                         let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                     }
                 }
@@ -682,9 +662,9 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             let Some(hosted) = sessions.get_mut(&session_id) else {
                 continue;
             };
-            did_work |= service_hosted_session(root, &session_id, hosted, &mut packet_clients)?;
+            did_work |= service_hosted_session(&layout, &session_id, hosted, &mut packet_clients)?;
             if hosted.actor.exit_code()?.is_some() {
-                let should_keep_session_dir = finish_exited_session(root, &session_id, hosted, &mut packet_clients)?;
+                let should_keep_session_dir = finish_exited_session(&layout, &session_id, hosted, &mut packet_clients)?;
                 exited_session = Some((session_id, should_keep_session_dir));
                 break;
             }
@@ -692,8 +672,12 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
         flush_packet_clients(&mut packet_clients);
 
-        if exited_session.is_some() {
-            break;
+        if let Some((session_id, should_keep_session_dir)) = exited_session.take() {
+            cleanup_exited_session(&layout, &session_id, should_keep_session_dir);
+            sessions.remove(&session_id);
+            if sessions.is_empty() {
+                break;
+            }
         }
 
         if !did_work {
@@ -701,26 +685,29 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
         }
     }
 
-    let (id, should_keep_session_dir) = exited_session.unwrap_or_else(|| (id.clone(), session.record));
-    let session_dir = root.join(&id);
     let _ = fs::remove_file(&socket_path);
-    let _ = fs::remove_file(daemon_pid_path(root, &id));
-    let _ = fs::remove_file(foreground_path(root, &id));
-    if !should_keep_session_dir {
-        let _ = fs::remove_dir_all(&session_dir);
-    }
+    let _ = fs::remove_file(layout.daemon_pid_path());
     Ok(())
 }
 
+fn cleanup_exited_session(layout: &RuntimeLayout, id: &str, should_keep_session_dir: bool) {
+    let session_dir = layout.session_dir(id);
+    let _ = fs::remove_file(layout.foreground_path(id));
+    if !should_keep_session_dir {
+        let _ = fs::remove_dir_all(&session_dir);
+    }
+}
+
 fn service_hosted_session(
-    root: &Path,
+    layout: &RuntimeLayout,
     id: &str,
     hosted: &mut HostedSession,
     packet_clients: &mut Vec<PacketClient>,
 ) -> Result<bool, String> {
     let mut did_work = false;
 
-    did_work |= drain_raw_output_tap(root, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
+    did_work |=
+        drain_raw_output_tap(layout, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
     drain_watcher_inputs(&mut hosted.watchers);
 
     if hosted.active_client.is_some() {
@@ -748,7 +735,7 @@ fn service_hosted_session(
         }
 
         if client_disconnected && hosted.active_client.is_some() {
-            let _ = fs::remove_file(foreground_path(root, id));
+            let _ = fs::remove_file(layout.foreground_path(id));
             hosted.actor.record_detach()?;
             hosted.actor.set_client_presence(false)?;
             hosted.active_client = None;
@@ -761,7 +748,7 @@ fn service_hosted_session(
         None => true,
     };
     if !client_writable {
-        let _ = fs::remove_file(foreground_path(root, id));
+        let _ = fs::remove_file(layout.foreground_path(id));
         hosted.actor.record_detach()?;
         hosted.actor.set_client_presence(false)?;
         hosted.active_client = None;
@@ -771,7 +758,7 @@ fn service_hosted_session(
     push_due_packet_renders(id, &hosted.actor, packet_clients, &mut hosted.packet_render_cache)?;
 
     service_pending_waits(&hosted.actor, &mut hosted.pending_waits);
-    service_pending_expects(root, id, &hosted.actor, &mut hosted.pending_expects)?;
+    service_pending_expects(layout, id, &hosted.actor, &mut hosted.pending_expects)?;
     hosted.actor.flush_recording()?;
 
     Ok(did_work)
@@ -832,13 +819,18 @@ fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWa
     });
 }
 
-fn service_pending_expects(root: &Path, id: &str, actor: &SessionActor, pending_expects: &mut Vec<PendingExpect>) -> Result<(), String> {
+fn service_pending_expects(
+    layout: &RuntimeLayout,
+    id: &str,
+    actor: &SessionActor,
+    pending_expects: &mut Vec<PendingExpect>,
+) -> Result<(), String> {
     if pending_expects.is_empty() {
         return Ok(());
     }
 
     actor.flush_recording()?;
-    let cast_path = root.join(id).join(crate::recording::CAST_FILE_NAME);
+    let cast_path = layout.session_dir(id).join(crate::recording::CAST_FILE_NAME);
     pending_expects.retain_mut(|expect| {
         let elapsed = expect.registered_at.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
@@ -868,12 +860,12 @@ fn service_pending_expects(root: &Path, id: &str, actor: &SessionActor, pending_
 }
 
 fn finish_exited_session(
-    root: &Path,
+    layout: &RuntimeLayout,
     id: &str,
     hosted: &mut HostedSession,
     packet_clients: &mut Vec<PacketClient>,
 ) -> Result<bool, String> {
-    drain_raw_output_tap(root, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
+    drain_raw_output_tap(layout, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
     for mut wait in hosted.pending_waits.drain(..) {
         let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
         let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
@@ -896,6 +888,7 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
 }
 
 struct HttpRequestState<'a> {
+    layout: &'a RuntimeLayout,
     sessions: &'a mut HashMap<String, HostedSession>,
     packet_clients: &'a mut Vec<PacketClient>,
 }
@@ -930,7 +923,7 @@ impl Read for HttpHandshakeReader<'_> {
 }
 
 fn handle_http_request(
-    root: &Path,
+    _root: &Path,
     daemon_id: &str,
     stream: &mut SessionStream,
     request: http_uds::HttpRequest,
@@ -955,6 +948,20 @@ fn handle_http_request(
             sessions.sort_by(|a, b| a.session.id.cmp(&b.session.id));
             http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions })
                 .map_err(|err| format!("write HTTP sessions response: {err}"))
+        }
+        http_uds::Route::SessionCreate => {
+            let session: SessionMetadata =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP session create request: {err}"))?;
+            crate::runtime::validate_runtime_name(&session.id)?;
+            session.vt_engine.ensure_available()?;
+            if !state.sessions.contains_key(&session.id) {
+                let session_dir = state.layout.session_dir(&session.id);
+                fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
+                let hosted = HostedSession::spawn(session_dir, session.clone())?;
+                state.sessions.insert(session.id.clone(), hosted);
+            }
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::CreateSessionResponse { session })
+                .map_err(|err| format!("write HTTP session create response: {err}"))
         }
         http_uds::Route::PacketConnect => {
             if !http_uds::request_has_upgrade_token(&request, "cleat-packet/1") {
@@ -1024,7 +1031,7 @@ fn handle_http_request(
                     client.enqueue_frame(&Frame::Output(payload))?;
                 }
             }
-            let _ = fs::write(foreground_path(root, &id), b"1");
+            let _ = fs::write(state.layout.foreground_path(&id), b"1");
             hosted.active_client = Some(client);
             hosted.had_foreground_client = true;
             hosted.actor.set_client_presence(true)?;
@@ -1056,7 +1063,7 @@ fn handle_http_request(
             let Some(hosted) = state.sessions.get_mut(&id) else {
                 return write_http_not_found(stream);
             };
-            let _ = fs::remove_file(foreground_path(root, &id));
+            let _ = fs::remove_file(state.layout.foreground_path(&id));
             if hosted.active_client.is_some() {
                 hosted.actor.record_detach()?;
             }
@@ -1076,7 +1083,7 @@ fn handle_http_request(
                 break 'expect Ok(());
             }
 
-            let cast_path = root.join(&id).join(crate::recording::CAST_FILE_NAME);
+            let cast_path = state.layout.session_dir(&id).join(crate::recording::CAST_FILE_NAME);
             hosted.actor.flush_recording()?;
             if cast_path.exists() {
                 if let Ok(events) = crate::cast_reader::read_output_since(&cast_path, body.since_offset) {
@@ -1849,12 +1856,39 @@ impl ActiveClientReader {
 fn wait_for_socket(path: &Path) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if path.exists() {
+        if try_connect_session_stream(path).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(20));
     }
     Err(format!("timed out waiting for socket {}", path.display()))
+}
+
+fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String> {
+    if try_connect_session_stream(&layout.socket_path()).is_ok() && is_session_daemon_alive(layout.root(), layout.daemon_name()) {
+        return Ok(());
+    }
+
+    if layout.socket_path().exists() && !is_session_daemon_alive(layout.root(), layout.daemon_name()) {
+        match fs::remove_file(layout.socket_path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("remove stale daemon socket {}: {err}", layout.socket_path().display())),
+        }
+    }
+
+    layout.ensure_daemon_dirs()?;
+    spawn_daemon_process(layout.root(), layout.daemon_name())?;
+    wait_for_socket(&layout.socket_path())
+}
+
+fn http_error_message(response: http_uds::HttpResponse) -> String {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body) {
+        if let Some(message) = value.get("error").and_then(|value| value.as_str()) {
+            return message.to_string();
+        }
+    }
+    format!("HTTP request returned {}", response.status)
 }
 
 #[cfg(test)]
@@ -1880,7 +1914,9 @@ mod tests {
         use std::{fs, os::unix::net::UnixListener, sync::mpsc, thread, time::Duration};
 
         let temp = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(temp.path().join("alpha")).expect("create session dir");
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        layout.ensure_daemon_dirs().expect("create daemon dirs");
+        fs::create_dir_all(layout.session_dir("alpha")).expect("create session dir");
         let socket_path = session_socket_path(temp.path(), "alpha");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
         let (tx, rx) = mpsc::channel();
@@ -1895,7 +1931,6 @@ mod tests {
                 .expect("write response");
         });
 
-        let layout = RuntimeLayout::new(temp.path().to_path_buf());
         let attach = attach_foreground(&layout, "alpha").expect("attach");
         drop(attach);
         let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");

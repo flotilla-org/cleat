@@ -4,7 +4,7 @@ use cleat::{
     runtime::{RuntimeLayout, TerminalSize},
     server::SessionService,
     session::session_socket_path,
-    vt::{self, Rgb, VtEngineKind},
+    vt::{self, VtEngineKind},
 };
 
 #[test]
@@ -361,41 +361,10 @@ fn record_flags_explicit_record_enables() {
 }
 
 #[test]
-fn serve_parses_all_flags() {
-    let cli = Cli::try_parse_from([
-        "cleat",
-        "serve",
-        "--id",
-        "alpha",
-        "--vt",
-        "passthrough",
-        "--cmd",
-        "bash",
-        "--cwd",
-        "/tmp",
-        "--size",
-        "132x43",
-        "--record",
-        "--color-foreground",
-        "123456",
-        "--color-background",
-        "#abcdef",
-        "--color-cursor",
-        "fedcba",
-    ])
-    .expect("parse serve");
-    assert!(matches!(
-        cli.command,
-        Command::Serve {
-            ref id,
-            size: Some(TerminalSize { cols: 132, rows: 43 }),
-            record: true,
-            color_foreground: Some(Rgb { r: 0x12, g: 0x34, b: 0x56 }),
-            color_background: Some(Rgb { r: 0xab, g: 0xcd, b: 0xef }),
-            color_cursor: Some(Rgb { r: 0xfe, g: 0xdc, b: 0xba }),
-            ..
-        } if id == "alpha"
-    ));
+fn serve_parses_as_daemon_scoped_command() {
+    let cli = Cli::try_parse_from(["cleat", "--server", "alternate", "serve"]).expect("parse serve");
+    assert_eq!(cli.server, "alternate");
+    assert!(matches!(cli.command, Command::Serve));
 }
 
 #[test]
@@ -408,6 +377,7 @@ fn mark_command_parses_session_id() {
 fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,
+        server: cleat::runtime::DEFAULT_DAEMON_NAME.to_string(),
         command: Command::SendKeys {
             id: "demo".into(),
             literal: false,
@@ -610,7 +580,7 @@ fn send_command_rejects_submit_with_no_enter() {
 fn send_submit_posts_paste_then_enter_input_requests() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-    std::fs::create_dir_all(temp.path().join("alpha")).expect("create session dir");
+    std::fs::create_dir_all(service.session_dir("alpha")).expect("create session dir");
 
     let socket_path = session_socket_path(temp.path(), "alpha");
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind socket");
@@ -642,7 +612,7 @@ fn send_submit_posts_paste_then_enter_input_requests() {
 fn send_submit_with_mark_marks_before_paste_and_returns_offset() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-    std::fs::create_dir_all(temp.path().join("alpha")).expect("create session dir");
+    std::fs::create_dir_all(service.session_dir("alpha")).expect("create session dir");
 
     let socket_path = session_socket_path(temp.path(), "alpha");
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind socket");

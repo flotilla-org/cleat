@@ -6,9 +6,9 @@ use crate::{
     http_uds,
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
-    runtime::{SessionMetadata, TerminalSize},
+    runtime::{TerminalSize, DEFAULT_DAEMON_NAME},
     server::{EndBound, FallbackReason, SessionService, StartBound},
-    vt::{Rgb, TerminalColors, VtEngineKind},
+    vt::VtEngineKind,
 };
 
 #[derive(Debug, Parser)]
@@ -33,6 +33,9 @@ use crate::{
 pub struct Cli {
     #[arg(long, hide = true)]
     pub runtime_root: Option<PathBuf>,
+
+    #[arg(long, global = true, default_value = DEFAULT_DAEMON_NAME, value_parser = parse_runtime_name)]
+    pub server: String,
 
     #[command(subcommand)]
     pub command: Command,
@@ -404,28 +407,7 @@ resolved through the live daemon socket. \n\
         json: bool,
     },
     #[command(hide = true)]
-    Serve {
-        #[arg(long)]
-        id: String,
-        #[arg(long, value_enum, default_value_t = crate::vt::default_vt_engine_kind())]
-        vt: VtEngineKind,
-        #[arg(long)]
-        cmd: Option<String>,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        #[arg(long, value_name = "COLSxROWS", value_parser = parse_terminal_size)]
-        size: Option<TerminalSize>,
-        // Internal: the daemon spawner passes the already-resolved value as a
-        // presence flag, so there is no default-on / env handling here.
-        #[arg(long)]
-        record: bool,
-        #[arg(long, hide = true, value_parser = parse_rgb)]
-        color_foreground: Option<Rgb>,
-        #[arg(long, hide = true, value_parser = parse_rgb)]
-        color_background: Option<Rgb>,
-        #[arg(long, hide = true, value_parser = parse_rgb)]
-        color_cursor: Option<Rgb>,
-    },
+    Serve,
 }
 
 /// Uses `command()` instead of `Cli::parse()` so --help renders the workflow
@@ -476,6 +458,11 @@ impl ExecResult {
 }
 
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
+    let service = match service.with_daemon(cli.server.clone()) {
+        Ok(service) => service,
+        Err(err) => return ExecResult::Err(err),
+    };
+    let service = &service;
     match cli.command {
         Command::Attach { id, no_create, vt, cwd, cmd, record } => {
             // Windows can provide basic sessions through ConPTY plus the
@@ -615,7 +602,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                     }
                 }
                 (None, Some(id)) => {
-                    let cast_path = service.layout_root().join(&id).join(crate::recording::CAST_FILE_NAME);
+                    let cast_path = service.session_dir(&id).join(crate::recording::CAST_FILE_NAME);
                     if !cast_path.exists() {
                         return ExecResult::Err(format!("replay: no recording for session {id}"));
                     }
@@ -764,25 +751,10 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
         }
-        Command::Serve { id, vt, cmd, cwd, size, record, color_foreground, color_background, color_cursor } => {
-            let session = SessionMetadata {
-                id,
-                vt_engine: vt,
-                cwd,
-                cmd,
-                record,
-                initial_size: size.unwrap_or_default(),
-                colors: TerminalColors {
-                    default_foreground: color_foreground,
-                    default_background: color_background,
-                    default_cursor: color_cursor,
-                },
-            };
-            match service.serve(&session) {
-                Ok(()) => ExecResult::Ok(None),
-                Err(e) => ExecResult::Err(e),
-            }
-        }
+        Command::Serve => match service.serve() {
+            Ok(()) => ExecResult::Ok(None),
+            Err(e) => ExecResult::Err(e),
+        },
     }
 }
 
@@ -1068,17 +1040,6 @@ fn parse_signal_target(target: &str) -> Result<crate::protocol::SignalTarget, St
     }
 }
 
-fn parse_rgb(value: &str) -> Result<Rgb, String> {
-    let value = value.strip_prefix('#').unwrap_or(value);
-    if value.len() != 6 {
-        return Err("RGB colors must use six hex digits".to_string());
-    }
-    let r = u8::from_str_radix(&value[0..2], 16).map_err(|err| format!("parse red channel: {err}"))?;
-    let g = u8::from_str_radix(&value[2..4], 16).map_err(|err| format!("parse green channel: {err}"))?;
-    let b = u8::from_str_radix(&value[4..6], 16).map_err(|err| format!("parse blue channel: {err}"))?;
-    Ok(Rgb { r, g, b })
-}
-
 fn parse_terminal_size(value: &str) -> Result<TerminalSize, String> {
     let (cols, rows) =
         value.split_once('x').or_else(|| value.split_once('X')).ok_or_else(|| "size must be formatted as COLSxROWS".to_string())?;
@@ -1088,6 +1049,11 @@ fn parse_terminal_size(value: &str) -> Result<TerminalSize, String> {
         return Err("size dimensions must be greater than zero".to_string());
     }
     Ok(TerminalSize { cols, rows })
+}
+
+fn parse_runtime_name(value: &str) -> Result<String, String> {
+    crate::runtime::validate_runtime_name(value)?;
+    Ok(value.to_string())
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {

@@ -19,7 +19,7 @@ use crate::{
         TerminalViewportKind, ViewportCommand, ViewportCommandOutcome, TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
     },
     runtime::{RuntimeLayout, TerminalSize},
-    session::{ensure_session_started, session_socket_path, SessionStartOptions},
+    session::{ensure_session_started, SessionStartOptions},
     session_runtime::SessionRuntime,
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
@@ -1699,7 +1699,7 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let cols = desc.cols.max(1);
     let rows = desc.rows.max(1);
     metadata.initial_size = TerminalSize { cols, rows };
-    let session_dir = layout.root().join(&metadata.id);
+    let session_dir = layout.session_dir(&metadata.id);
     let initial_geometry = TerminalGeometry::from_cell_size(cols, rows, desc.cell_width_px, desc.cell_height_px);
     let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(initial_geometry);
     let wake = provider.wake.clone();
@@ -1795,7 +1795,7 @@ fn daemon_snapshot(session: &mut DaemonSession) -> Result<TerminalSnapshot, Stri
 }
 
 fn daemon_request(session: &DaemonSession, method: Method, path: &str, body: &[u8]) -> Result<http_uds::HttpResponse, String> {
-    let socket_path = session_socket_path(&session.runtime_root, &session.id);
+    let socket_path = RuntimeLayout::new(session.runtime_root.clone()).socket_path();
     let mut stream = connect_session_stream(&socket_path)?;
     http_uds::write_request(&mut stream, method, path, body).map_err(|err| format!("write HTTP request: {err}"))?;
     http_uds::read_response(&mut stream).map_err(|err| format!("read HTTP response: {err}"))

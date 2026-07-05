@@ -1,7 +1,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -16,10 +16,12 @@ use std::{
 use http::StatusCode;
 
 use crate::{
-    host::actor::{RawOutputTap, SessionActor},
+    host::actor::{RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
     http_uds,
     packet::{
-        ControlHello, DirectoryEntry, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO,
+        Ack, CloseChannel, ControlError, ControlHello, DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame, RenderPacket,
+        Resize, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO,
+        MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE,
     },
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
@@ -30,6 +32,7 @@ use crate::{
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::Frame,
+    provider::{DirtyState, TerminalInputEvent, TerminalKey, TerminalMouseButton, TerminalMouseEventKind, TerminalNamedKey},
     runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
@@ -655,7 +658,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
 
         did_work |= drain_raw_output_tap(root, id, &actor, &mut raw_output_tap, &mut active_client, &mut watchers)?;
         drain_watcher_inputs(&mut watchers);
-        drain_packet_client_inputs(&mut packet_clients);
+        did_work |= service_packet_clients(&actor, id, &mut packet_clients)?;
 
         if active_client.is_some() {
             let mut client_disconnected = false;
@@ -702,6 +705,7 @@ pub fn run_session_daemon(root: &Path, session: &SessionMetadata) -> Result<(), 
             did_work = true;
         }
         flush_watchers(&mut watchers);
+        push_due_packet_renders(&actor, &mut packet_clients)?;
         flush_packet_clients(&mut packet_clients);
 
         // Evaluate pending waits on each loop tick.
@@ -1244,12 +1248,17 @@ struct PacketClient {
     pending_output: Vec<u8>,
     input_reader: ActiveClientReader,
     input_buffer: Vec<u8>,
+    channels: HashMap<u32, PacketSessionChannel>,
+}
+
+struct PacketSessionChannel {
+    in_flight_generation: Option<u64>,
 }
 
 impl PacketClient {
     fn new(stream: SessionStream) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
-        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new() })
+        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new(), channels: HashMap::new() })
     }
 
     fn enqueue_control<T: serde::Serialize>(&mut self, msg_type: u8, value: &T) -> Result<(), String> {
@@ -1305,12 +1314,217 @@ impl PacketClient {
     }
 }
 
-fn drain_packet_client_inputs(packet_clients: &mut Vec<PacketClient>) {
-    let mut ignored = VecDeque::new();
-    packet_clients.retain_mut(|client| {
-        ignored.clear();
-        client.drain_input_frames(&mut ignored, Duration::ZERO).unwrap_or_default()
-    });
+fn service_packet_clients(actor: &SessionActor, daemon_id: &str, packet_clients: &mut Vec<PacketClient>) -> Result<bool, String> {
+    let mut did_work = false;
+    let mut index = 0;
+    while index < packet_clients.len() {
+        let mut pending = VecDeque::new();
+        let connected = packet_clients[index]
+            .drain_input_frames(&mut pending, Duration::ZERO)
+            .map_err(|err| format!("read packet client frame: {err}"))?;
+        if !connected {
+            packet_clients.swap_remove(index);
+            did_work = true;
+            continue;
+        }
+
+        while let Some(frame) = pending.pop_front() {
+            did_work = true;
+            handle_packet_frame(actor, daemon_id, &mut packet_clients[index], frame)?;
+        }
+        index += 1;
+    }
+    Ok(did_work)
+}
+
+fn handle_packet_frame(actor: &SessionActor, daemon_id: &str, client: &mut PacketClient, frame: PacketFrame) -> Result<(), String> {
+    match (frame.channel, frame.msg_type) {
+        (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL) => {
+            let open = frame.decode::<OpenChannel>().map_err(|err| format!("decode open-channel packet: {err}"))?;
+            open_packet_channel(actor, daemon_id, client, open)?;
+        }
+        (CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL) => {
+            let close = frame.decode::<CloseChannel>().map_err(|err| format!("decode close-channel packet: {err}"))?;
+            client.channels.remove(&close.channel);
+        }
+        (channel, MSG_SESSION_ACK) if channel != CHANNEL_CONTROL => {
+            let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
+            if let Some(session_channel) = client.channels.get_mut(&channel) {
+                session_channel.in_flight_generation = None;
+                actor.mark_observed(ack.generation);
+            }
+        }
+        (channel, MSG_SESSION_INPUT) if channel != CHANNEL_CONTROL => {
+            let input = frame.decode::<Input>().map_err(|err| format!("decode input packet: {err}"))?;
+            if client.channels.contains_key(&channel) {
+                route_packet_input_event(actor, input.event)?;
+            }
+        }
+        (channel, MSG_SESSION_RESIZE) if channel != CHANNEL_CONTROL => {
+            let resize = frame.decode::<Resize>().map_err(|err| format!("decode resize packet: {err}"))?;
+            if client.channels.contains_key(&channel) {
+                actor.resize(resize.cols, resize.rows)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn open_packet_channel(actor: &SessionActor, daemon_id: &str, client: &mut PacketClient, open: OpenChannel) -> Result<(), String> {
+    if open.channel == CHANNEL_CONTROL {
+        client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+            channel: open.channel,
+            message: "session channel must be non-zero".to_string(),
+        })?;
+        return Ok(());
+    }
+    if open.session_id != daemon_id {
+        client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+            channel: open.channel,
+            message: format!("unknown session {}", open.session_id),
+        })?;
+        return Ok(());
+    }
+
+    let update = actor.full_render_update()?;
+    let generation = update.render_generation;
+    client.enqueue_frame(
+        &PacketFrame::new(open.channel, MSG_SESSION_RENDER, &RenderPacket { update })
+            .map_err(|err| format!("encode initial render packet: {err}"))?,
+    )?;
+    client.channels.insert(open.channel, PacketSessionChannel { in_flight_generation: Some(generation) });
+    Ok(())
+}
+
+fn push_due_packet_renders(actor: &SessionActor, packet_clients: &mut Vec<PacketClient>) -> Result<(), String> {
+    if actor.observation().dirty() == DirtyState::Clean {
+        return Ok(());
+    }
+
+    for client in packet_clients {
+        let due_channels: Vec<u32> =
+            client.channels.iter().filter_map(|(channel, session)| session.in_flight_generation.is_none().then_some(*channel)).collect();
+        for channel in due_channels {
+            if actor.observation().dirty() == DirtyState::Clean {
+                return Ok(());
+            }
+            let update = actor.render_update()?;
+            let generation = update.render_generation;
+            client.enqueue_frame(
+                &PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket { update })
+                    .map_err(|err| format!("encode render packet: {err}"))?,
+            )?;
+            if let Some(session_channel) = client.channels.get_mut(&channel) {
+                session_channel.in_flight_generation = Some(generation);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn route_packet_input_event(actor: &SessionActor, event: TerminalInputEvent) -> Result<(), String> {
+    match event {
+        TerminalInputEvent::Text(event) => actor.write_input(event.text.into_bytes()),
+        TerminalInputEvent::Paste(event) => actor.paste(event.text.into_bytes()).map(|_| ()),
+        TerminalInputEvent::RawBytes(bytes) => actor.write_input(bytes),
+        TerminalInputEvent::Resize(event) => {
+            actor.resize(event.cols, event.rows)?;
+            if event.cell_width_px.is_finite()
+                && event.cell_height_px.is_finite()
+                && event.cell_width_px > 0.0
+                && event.cell_height_px > 0.0
+            {
+                actor.set_cell_size(event.cell_width_px.round() as u32, event.cell_height_px.round() as u32)?;
+            }
+            Ok(())
+        }
+        TerminalInputEvent::Mouse(event) => route_packet_mouse_event(actor, event),
+        TerminalInputEvent::Key(event) => actor.write_input(packet_key_event_bytes(event)),
+        TerminalInputEvent::Focus(_) => Ok(()),
+    }
+}
+
+fn route_packet_mouse_event(actor: &SessionActor, event: crate::provider::TerminalMouseEvent) -> Result<(), String> {
+    let modifiers = vt::MouseModifiers {
+        shift: event.modifiers.contains(crate::provider::TerminalModifiers::SHIFT),
+        ctrl: event.modifiers.contains(crate::provider::TerminalModifiers::CTRL),
+        alt: event.modifiers.contains(crate::provider::TerminalModifiers::ALT),
+    };
+    if event.kind == TerminalMouseEventKind::Wheel {
+        actor.wheel(SessionWheelEvent {
+            modifiers,
+            cell_col: event.cell_col,
+            cell_row: event.cell_row,
+            x_px: event.x_px,
+            y_px: event.y_px,
+            wheel_delta_x: event.wheel_delta_x,
+            wheel_delta_y: event.wheel_delta_y,
+        })?;
+        return Ok(());
+    }
+
+    let action = match event.kind {
+        TerminalMouseEventKind::Press => vt::MouseAction::Press,
+        TerminalMouseEventKind::Release => vt::MouseAction::Release,
+        TerminalMouseEventKind::Move => vt::MouseAction::Motion,
+        TerminalMouseEventKind::Wheel => unreachable!("wheel handled above"),
+    };
+    actor.mouse(SessionMouseEvent {
+        action,
+        button: event.button.and_then(packet_mouse_button),
+        any_button_pressed: !event.buttons.is_empty(),
+        modifiers,
+        x_px: event.x_px,
+        y_px: event.y_px,
+    })?;
+    Ok(())
+}
+
+fn packet_mouse_button(button: TerminalMouseButton) -> Option<vt::MouseButton> {
+    match button {
+        TerminalMouseButton::Left => Some(vt::MouseButton::Left),
+        TerminalMouseButton::Middle => Some(vt::MouseButton::Middle),
+        TerminalMouseButton::Right => Some(vt::MouseButton::Right),
+        TerminalMouseButton::Back | TerminalMouseButton::Forward => None,
+    }
+}
+
+fn packet_key_event_bytes(event: crate::provider::TerminalKeyEvent) -> Vec<u8> {
+    if let Some(text) = event.generated_text {
+        return text.into_bytes();
+    }
+    match event.key {
+        TerminalKey::UnicodeScalar(codepoint) => char::from_u32(codepoint).map(|ch| ch.to_string().into_bytes()).unwrap_or_default(),
+        TerminalKey::Named(key) => packet_named_key_bytes(key),
+    }
+}
+
+fn packet_named_key_bytes(key: TerminalNamedKey) -> Vec<u8> {
+    match key {
+        TerminalNamedKey::Enter => b"\r".to_vec(),
+        TerminalNamedKey::Escape => b"\x1b".to_vec(),
+        TerminalNamedKey::Backspace => b"\x7f".to_vec(),
+        TerminalNamedKey::Tab => b"\t".to_vec(),
+        TerminalNamedKey::Delete => b"\x1b[3~".to_vec(),
+        TerminalNamedKey::Insert => b"\x1b[2~".to_vec(),
+        TerminalNamedKey::Home => b"\x1b[H".to_vec(),
+        TerminalNamedKey::End => b"\x1b[F".to_vec(),
+        TerminalNamedKey::PageUp => b"\x1b[5~".to_vec(),
+        TerminalNamedKey::PageDown => b"\x1b[6~".to_vec(),
+        TerminalNamedKey::ArrowUp => b"\x1b[A".to_vec(),
+        TerminalNamedKey::ArrowDown => b"\x1b[B".to_vec(),
+        TerminalNamedKey::ArrowLeft => b"\x1b[D".to_vec(),
+        TerminalNamedKey::ArrowRight => b"\x1b[C".to_vec(),
+        TerminalNamedKey::Function(n) => match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5..=12 => format!("\x1b[{}~", u16::from(n) + 10).into_bytes(),
+            _ => Vec::new(),
+        },
+    }
 }
 
 fn flush_packet_clients(packet_clients: &mut Vec<PacketClient>) {

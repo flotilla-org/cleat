@@ -30,6 +30,11 @@ use cleat::{
     session::{daemon_pid_path, session_socket_path},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
+#[cfg(feature = "ghostty-vt")]
+use cleat::{
+    packet::{Ack, Input, OpenChannel, RenderPacket, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER},
+    provider::{TerminalInputEvent, TerminalPasteEvent, TerminalRenderUpdate, TerminalTextEvent},
+};
 
 fn service_for(path: &std::path::Path) -> SessionService {
     SessionService::new(RuntimeLayout::new(path.to_path_buf()))
@@ -82,6 +87,72 @@ fn http_packet_stream(root: &std::path::Path, id: &str) -> UnixStream {
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
     assert!(response.contains("Upgrade: cleat-packet/1\r\n"), "{response}");
     stream
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_write<T: serde::Serialize>(stream: &mut UnixStream, channel: u32, msg_type: u8, value: &T) {
+    PacketFrame::new(channel, msg_type, value).expect("encode packet frame").write(stream).expect("write packet frame");
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_open_channel(stream: &mut UnixStream, channel: u32, session_id: &str) {
+    packet_write(stream, CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel { channel, session_id: session_id.to_string() });
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_ack(stream: &mut UnixStream, channel: u32, generation: u64) {
+    packet_write(stream, channel, MSG_SESSION_ACK, &Ack { generation });
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_input(stream: &mut UnixStream, channel: u32, event: TerminalInputEvent) {
+    packet_write(stream, channel, MSG_SESSION_INPUT, &Input { event });
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn read_packet_render(stream: &mut UnixStream, channel: u32, timeout: Duration) -> TerminalRenderUpdate {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+    let deadline = Instant::now() + timeout;
+    let mut buffer = Vec::new();
+    while Instant::now() < deadline {
+        while let Some(frame) = PacketFrame::read_from_buffer(&mut buffer).expect("parse packet buffer") {
+            if frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER {
+                return frame.decode::<RenderPacket>().expect("decode render packet").update;
+            }
+        }
+        let mut chunk = [0; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("packet stream closed while waiting for render packet"),
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(err) if packet_read_would_wait(&err) => {}
+            Err(err) => panic!("read packet frame: {err}"),
+        }
+    }
+    panic!("timed out waiting for render packet on channel {channel}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn expect_no_packet(stream: &mut UnixStream, timeout: Duration) {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+    let deadline = Instant::now() + timeout;
+    let mut buffer = Vec::new();
+    while Instant::now() < deadline {
+        if let Some(frame) = PacketFrame::read_from_buffer(&mut buffer).expect("parse packet buffer") {
+            panic!("unexpected packet frame: {frame:?}");
+        }
+        let mut chunk = [0; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(err) if packet_read_would_wait(&err) => {}
+            Err(err) => panic!("read packet frame: {err}"),
+        }
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_read_would_wait(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) || err.raw_os_error() == Some(libc::EINVAL)
 }
 
 fn http_upgrade_stream(
@@ -586,6 +657,93 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
         cols: 80,
         rows: 24
     }]);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_channel_initial_render_and_packet_input_flow() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+
+    packet_open_channel(&mut stream, 1, "alpha");
+    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    assert_eq!(initial.dirty, cleat::provider::DirtyState::Full);
+    assert!(!initial.ops.is_empty());
+    packet_ack(&mut stream, 1, initial.render_generation);
+
+    std::thread::sleep(Duration::from_millis(500));
+    packet_input(&mut stream, 1, TerminalInputEvent::Paste(TerminalPasteEvent { text: "packet paste".to_string() }));
+    let update = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    assert!(update.render_generation > initial.render_generation);
+    assert!(!update.ops.is_empty());
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_mode_only_change_produces_zero_row_ops() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh -c 'sleep 1; printf \"\\033[?1003h\"; sleep 30'".into()),
+            false,
+        )
+        .expect("create alpha");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+    packet_open_channel(&mut stream, 1, "alpha");
+    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    packet_ack(&mut stream, 1, initial.render_generation);
+
+    let update = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+
+    assert!(update.terminal_modes.mouse_tracking);
+    assert_eq!(update.terminal_modes.mouse_tracking_mode, vt::MouseTrackingMode::Any);
+    assert!(update.ops.is_empty(), "mode-only packet should not carry row ops: {:?}", update.ops);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+    packet_open_channel(&mut stream, 1, "alpha");
+    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    packet_ack(&mut stream, 1, initial.render_generation);
+
+    std::thread::sleep(Duration::from_millis(500));
+    packet_input(&mut stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "a".to_string() }));
+    let first = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    packet_input(&mut stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "b".to_string() }));
+    expect_no_packet(&mut stream, Duration::from_millis(120));
+
+    packet_ack(&mut stream, 1, first.render_generation);
+    let coalesced = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    assert!(coalesced.render_generation > first.render_generation);
+    packet_ack(&mut stream, 1, coalesced.render_generation);
+    expect_no_packet(&mut stream, Duration::from_millis(120));
 }
 
 #[cfg(feature = "ghostty-vt")]

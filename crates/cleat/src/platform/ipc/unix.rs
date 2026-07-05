@@ -27,6 +27,10 @@ pub fn set_stream_read_timeout(stream: &SessionStream, timeout: Option<Duration>
     stream.set_read_timeout(timeout).map_err(|err| format!("set stream read timeout: {err}"))
 }
 
+pub fn set_stream_write_timeout(stream: &SessionStream, timeout: Option<Duration>) -> Result<(), String> {
+    stream.set_write_timeout(timeout).map_err(|err| format!("set stream write timeout: {err}"))
+}
+
 pub fn shutdown_stream(stream: &SessionStream) {
     let _ = stream.shutdown(Shutdown::Both);
 }

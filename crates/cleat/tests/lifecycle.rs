@@ -132,6 +132,17 @@ fn collect_output_until(stream: &mut UnixStream, needle: &str, timeout: Duration
     String::from_utf8_lossy(&output).into_owned()
 }
 
+fn drain_available_output(stream: &mut UnixStream) {
+    stream.set_read_timeout(Some(Duration::from_millis(20))).expect("set read timeout");
+    loop {
+        match Frame::read(stream) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut => return,
+            Err(err) => panic!("drain output frame: {err}"),
+        }
+    }
+}
+
 struct EnvVarGuard {
     key: &'static str,
     original: Option<std::ffi::OsString>,
@@ -843,6 +854,44 @@ fn watcher_receives_live_output_without_taking_control() {
     assert!(controller_output.contains("watched-from-control"), "controller output was {controller_output:?}");
     assert!(watcher_output.contains("watched-from-control"), "watcher output was {watcher_output:?}");
     assert!(!watcher_output.contains("ignored-from-watcher"), "watcher input should be ignored, got {watcher_output:?}");
+}
+
+#[test]
+fn dribbling_http_handshake_does_not_block_attached_output() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let cmd = r#"i=0; while :; do printf 'dribble-tick-%04d\n' "$i"; i=$((i+1)); sleep 0.05; done"#;
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some(cmd.into()), false).expect("create alpha");
+
+    let mut controller = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::conservative_fallback());
+    let initial_output = collect_output_until(&mut controller, "dribble-tick-", Duration::from_secs(2));
+    assert!(initial_output.contains("dribble-tick-"), "initial output was {initial_output:?}");
+    drain_available_output(&mut controller);
+
+    let socket_path = session_socket_path(temp.path(), "alpha");
+    let dribbler = std::thread::spawn(move || {
+        let mut stream = UnixStream::connect(socket_path).expect("connect dribbler");
+        let request = b"POST /sessions/alpha/inspect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\n\r\n";
+        for (index, byte) in request.iter().enumerate() {
+            if let Err(err) = stream.write_all(&[*byte]) {
+                assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "write dribbled byte: {err}");
+                return;
+            }
+            if index >= 4 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    });
+
+    let output_while_dribbling = collect_output_until(&mut controller, "dribble-tick-", Duration::from_millis(750));
+    dribbler.join().expect("join dribbler");
+
+    assert!(
+        output_while_dribbling.contains("dribble-tick-"),
+        "attached output stalled behind a partial HTTP request; received {output_while_dribbling:?}"
+    );
 }
 
 #[test]

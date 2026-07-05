@@ -139,6 +139,10 @@ pub fn set_stream_read_timeout(_stream: &SessionStream, _timeout: Option<Duratio
     Ok(())
 }
 
+pub fn set_stream_write_timeout(_stream: &SessionStream, _timeout: Option<Duration>) -> Result<(), String> {
+    Ok(())
+}
+
 pub fn shutdown_stream(stream: &SessionStream) {
     unsafe {
         CancelIoEx(stream.handle, null_mut());

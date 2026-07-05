@@ -3,20 +3,15 @@ use std::{
     path::PathBuf,
     ptr, slice,
     str::Utf8Error,
-    sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering},
-        mpsc, Arc, Mutex,
-    },
-    thread,
-    time::Duration,
+    sync::{Arc, Mutex},
 };
 
 use http::{Method, StatusCode};
 
 use crate::{
+    host::actor::{ObservationState, SessionActor, SessionCommand, SessionMouseEvent, SessionWheelEvent},
     http_uds, keys,
     platform::ipc::connect_session_stream,
-    protocol::SignalTarget,
     provider::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
         TerminalGeometry, TerminalImagePlacement, TerminalImageResource, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalRgb,
@@ -25,7 +20,7 @@ use crate::{
     },
     runtime::{RuntimeLayout, TerminalSize},
     session::{ensure_session_started, session_socket_path, SessionStartOptions},
-    session_runtime::{PtyOutput, SessionRuntime},
+    session_runtime::SessionRuntime,
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
@@ -133,8 +128,6 @@ pub const CLEAT_IMAGE_FORMAT_GRAY: u32 = 4;
 pub const CLEAT_IMAGE_COMPRESSION_NONE: u32 = 0;
 pub const CLEAT_IMAGE_COMPRESSION_ZLIB_DEFLATE: u32 = 1;
 pub const CLEAT_IMAGE_PLACEMENT_VIRTUAL: u32 = TERMINAL_IMAGE_PLACEMENT_VIRTUAL;
-
-const POSIX_SIGTERM: i32 = 15;
 
 pub type CleatImageResourceDataFn = Option<unsafe extern "C" fn(user_data: *mut c_void, data: *const u8, data_len: usize) -> bool>;
 
@@ -538,9 +531,7 @@ struct MockSession {
 }
 
 struct InProcessSession {
-    tx: mpsc::Sender<InProcessCommand>,
-    observation: Arc<ObservationMirror>,
-    worker: Option<thread::JoinHandle<()>>,
+    actor: SessionActor,
 }
 
 struct DaemonSession {
@@ -557,273 +548,6 @@ pub type CleatWakeFn = Option<unsafe extern "C" fn(*mut c_void)>;
 pub struct WakeCallback {
     wake: CleatWakeFn,
     user_data: usize,
-}
-
-#[derive(Clone, Debug)]
-struct ObservationState {
-    render_generation: u64,
-    observed_generation: u64,
-    dirty: DirtyState,
-    dirty_rows: Vec<u16>,
-    terminal_modes: Option<vt::TerminalModeState>,
-    mirror: Option<Arc<ObservationMirror>>,
-}
-
-impl ObservationState {
-    fn new(rows: u16) -> Self {
-        Self::new_with_mirror(rows, None)
-    }
-
-    fn new_with_mirror(rows: u16, mirror: Option<Arc<ObservationMirror>>) -> Self {
-        let mut state = Self {
-            render_generation: 0,
-            observed_generation: 0,
-            dirty: DirtyState::Clean,
-            dirty_rows: Vec::new(),
-            terminal_modes: None,
-            mirror,
-        };
-        state.mark_full(rows);
-        state
-    }
-
-    fn dirty(&self) -> DirtyState {
-        if self.render_generation > self.observed_generation {
-            self.dirty
-        } else {
-            DirtyState::Clean
-        }
-    }
-
-    fn mark_full(&mut self, _rows: u16) -> bool {
-        let was_clean = self.dirty() == DirtyState::Clean;
-        self.render_generation = self.render_generation.saturating_add(1);
-        self.dirty = DirtyState::Full;
-        self.dirty_rows.clear();
-        self.publish_mirror();
-        was_clean
-    }
-
-    fn mark_partial_rows(&mut self, rows: impl IntoIterator<Item = u16>) -> bool {
-        let was_clean = self.dirty() == DirtyState::Clean;
-        self.render_generation = self.render_generation.saturating_add(1);
-        if self.dirty != DirtyState::Full {
-            self.dirty = DirtyState::Partial;
-            for row in rows {
-                if !self.dirty_rows.contains(&row) {
-                    self.dirty_rows.push(row);
-                }
-            }
-            self.dirty_rows.sort_unstable();
-        }
-        self.publish_mirror();
-        was_clean
-    }
-
-    fn mark_partial_unknown(&mut self) -> bool {
-        let was_clean = self.dirty() == DirtyState::Clean;
-        self.render_generation = self.render_generation.saturating_add(1);
-        if self.dirty != DirtyState::Full {
-            self.dirty = DirtyState::Partial;
-            self.dirty_rows.clear();
-        }
-        self.publish_mirror();
-        was_clean
-    }
-
-    fn sync_terminal_modes(&mut self, terminal_modes: vt::TerminalModeState) -> bool {
-        let previous = self.terminal_modes.replace(terminal_modes);
-        match previous {
-            None => false,
-            Some(previous) if previous == terminal_modes => false,
-            Some(_) => self.mark_partial_unknown(),
-        }
-    }
-
-    fn mark_observed(&mut self, generation: u64) -> bool {
-        if generation > self.render_generation {
-            return false;
-        }
-        self.observed_generation = self.observed_generation.max(generation);
-        if self.observed_generation >= self.render_generation {
-            self.dirty = DirtyState::Clean;
-            self.dirty_rows.clear();
-        }
-        self.publish_mirror();
-        true
-    }
-
-    fn annotate_snapshot(&self, snapshot: &mut TerminalSnapshot) {
-        snapshot.render_generation = self.render_generation;
-        snapshot.dirty = self.dirty();
-        snapshot.dirty_rows = if snapshot.dirty == DirtyState::Partial {
-            if self.dirty_rows.is_empty() {
-                snapshot.dirty_rows.clone()
-            } else {
-                self.dirty_rows.clone()
-            }
-        } else {
-            Vec::new()
-        };
-    }
-
-    fn annotate_render_update(&self, update: &mut TerminalRenderUpdate) {
-        update.render_generation = self.render_generation;
-        let dirty = self.dirty();
-        if dirty == DirtyState::Clean {
-            update.dirty = DirtyState::Clean;
-            update.ops.clear();
-        } else if update.dirty == DirtyState::Clean {
-            update.dirty = dirty;
-        }
-    }
-
-    fn publish_mirror(&self) {
-        if let Some(mirror) = &self.mirror {
-            mirror.store(self.render_generation, self.observed_generation, self.dirty);
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ObservationMirror {
-    render_generation: AtomicU64,
-    observed_generation: AtomicU64,
-    dirty: AtomicU8,
-}
-
-impl ObservationMirror {
-    fn new() -> Self {
-        Self {
-            render_generation: AtomicU64::new(0),
-            observed_generation: AtomicU64::new(0),
-            dirty: AtomicU8::new(dirty_state_to_u8(DirtyState::Clean)),
-        }
-    }
-
-    fn store(&self, render_generation: u64, observed_generation: u64, dirty: DirtyState) {
-        self.dirty.store(dirty_state_to_u8(dirty), AtomicOrdering::SeqCst);
-        self.observed_generation.store(observed_generation, AtomicOrdering::SeqCst);
-        self.render_generation.store(render_generation, AtomicOrdering::SeqCst);
-    }
-
-    fn dirty(&self) -> DirtyState {
-        let render_generation = self.render_generation.load(AtomicOrdering::SeqCst);
-        let observed_generation = self.observed_generation.load(AtomicOrdering::SeqCst);
-        if render_generation > observed_generation {
-            dirty_state_from_u8(self.dirty.load(AtomicOrdering::SeqCst))
-        } else {
-            DirtyState::Clean
-        }
-    }
-}
-
-fn dirty_state_to_u8(dirty: DirtyState) -> u8 {
-    match dirty {
-        DirtyState::Clean => 0,
-        DirtyState::Partial => 1,
-        DirtyState::Full => 2,
-    }
-}
-
-fn dirty_state_from_u8(value: u8) -> DirtyState {
-    match value {
-        1 => DirtyState::Partial,
-        2 => DirtyState::Full,
-        _ => {
-            debug_assert_eq!(value, 0, "unexpected DirtyState byte");
-            DirtyState::Clean
-        }
-    }
-}
-
-impl Drop for InProcessSession {
-    fn drop(&mut self) {
-        let _ = self.tx.send(InProcessCommand::Stop { terminate: true });
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CleatWheelEvent {
-    modifiers: u16,
-    cell_col: u16,
-    cell_row: u16,
-    x_px: f32,
-    y_px: f32,
-    wheel_delta_x: f32,
-    wheel_delta_y: f32,
-}
-
-#[derive(Clone, Copy)]
-struct CleatMouseEvent {
-    mouse_kind: u32,
-    mouse_button: u32,
-    mouse_buttons: u16,
-    modifiers: u16,
-    x_px: f32,
-    y_px: f32,
-}
-
-enum InProcessCommand {
-    Resize {
-        cols: u16,
-        rows: u16,
-        reply: mpsc::Sender<Result<(), String>>,
-    },
-    SetCellSize {
-        cell_width_px: u32,
-        cell_height_px: u32,
-        reply: mpsc::Sender<Result<(), String>>,
-    },
-    WriteInput {
-        bytes: Vec<u8>,
-        reply: mpsc::Sender<Result<(), String>>,
-    },
-    Wheel {
-        event: CleatWheelEvent,
-        reply: mpsc::Sender<Result<usize, String>>,
-    },
-    Mouse {
-        event: CleatMouseEvent,
-        reply: mpsc::Sender<Result<usize, String>>,
-    },
-    Paste {
-        text: Vec<u8>,
-        reply: mpsc::Sender<Result<usize, String>>,
-    },
-    ScrollViewport {
-        command: ViewportCommand,
-        reply: mpsc::Sender<Result<ViewportCommandOutcome, String>>,
-    },
-    Snapshot {
-        reply: mpsc::Sender<Result<TerminalSnapshot, String>>,
-    },
-    RenderUpdate {
-        reply: mpsc::Sender<Result<TerminalRenderUpdate, String>>,
-    },
-    ImageResourceData {
-        image_id: u32,
-        generation: u64,
-        callback: CleatImageResourceDataFn,
-        user_data: usize,
-        reply: mpsc::Sender<Result<bool, String>>,
-    },
-    MarkObserved {
-        generation: u64,
-        reply: mpsc::Sender<bool>,
-    },
-    ScrollbackExtent {
-        reply: mpsc::Sender<TerminalScrollbackExtent>,
-    },
-    ScrollbarState {
-        reply: mpsc::Sender<TerminalScrollbarState>,
-    },
-    Stop {
-        terminate: bool,
-    },
 }
 
 struct OwnedSnapshot {
@@ -1290,7 +1014,7 @@ pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: 
             true
         }
         SessionBackend::InProcess(in_process) => {
-            in_process_request_result(in_process, |reply| InProcessCommand::Resize { cols: cols.max(1), rows: rows.max(1), reply }).is_ok()
+            in_process.actor.request_result(|reply| SessionCommand::Resize { cols: cols.max(1), rows: rows.max(1), reply }).is_ok()
         }
         SessionBackend::Daemon(daemon) => {
             if daemon_resize(daemon, cols.max(1), rows.max(1)).is_err() {
@@ -1327,9 +1051,7 @@ pub unsafe extern "C" fn cleat_session_update_geometry(session: *mut CleatSessio
         }
         SessionBackend::InProcess(in_process) => {
             let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(geometry);
-            if in_process_request_result(in_process, |reply| InProcessCommand::SetCellSize { cell_width_px, cell_height_px, reply })
-                .is_err()
-            {
+            if in_process.actor.request_result(|reply| SessionCommand::SetCellSize { cell_width_px, cell_height_px, reply }).is_err() {
                 return false;
             }
             session.geometry = geometry;
@@ -1443,7 +1165,7 @@ fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> Opti
             Err(_) => None,
         },
         SessionBackend::InProcess(in_process) => match input_event_bytes(event) {
-            Ok(Some(bytes)) => in_process_request_result(in_process, |reply| InProcessCommand::WriteInput { bytes, reply }).ok().map(|_| 1),
+            Ok(Some(bytes)) => in_process.actor.request_result(|reply| SessionCommand::WriteInput { bytes, reply }).ok().map(|_| 1),
             Ok(None) if is_wheel_event(event) => route_in_process_wheel_event(in_process, event),
             Ok(None) if event.kind == CLEAT_INPUT_MOUSE => route_in_process_mouse_event(in_process, event),
             Ok(None) if event.kind == CLEAT_INPUT_PASTE => route_in_process_paste_event(in_process, event),
@@ -1468,8 +1190,8 @@ fn is_wheel_event(event: &CleatInputEvent) -> bool {
 }
 
 fn route_in_process_wheel_event(in_process: &InProcessSession, event: &CleatInputEvent) -> Option<usize> {
-    let wheel = CleatWheelEvent {
-        modifiers: event.modifiers,
+    let wheel = SessionWheelEvent {
+        modifiers: mouse_modifiers(event.modifiers),
         cell_col: event.cell_col,
         cell_row: event.cell_row,
         x_px: event.x_px,
@@ -1477,35 +1199,38 @@ fn route_in_process_wheel_event(in_process: &InProcessSession, event: &CleatInpu
         wheel_delta_x: event.wheel_delta_x,
         wheel_delta_y: event.wheel_delta_y,
     };
-    in_process_request_result(in_process, |reply| InProcessCommand::Wheel { event: wheel, reply }).ok()
+    in_process.actor.request_result(|reply| SessionCommand::Wheel { event: wheel, reply }).ok()
 }
 
 fn route_in_process_paste_event(in_process: &InProcessSession, event: &CleatInputEvent) -> Option<usize> {
     let text = read_event_text_bytes(event).ok()?;
-    in_process_request_result(in_process, |reply| InProcessCommand::Paste { text, reply }).ok()
-}
-
-fn route_in_process_paste_on_actor(runtime: &mut SessionRuntime, text: &[u8]) -> Result<usize, String> {
-    // The engine wraps in bracketed-paste markers when the program enabled mode
-    // 2004 and strips unsafe bytes; otherwise it returns the text unchanged.
-    let bytes = runtime.encode_paste(text)?;
-    if bytes.is_empty() {
-        return Ok(0);
-    }
-    runtime.write_input(&bytes)?;
-    Ok(1)
+    in_process.actor.request_result(|reply| SessionCommand::Paste { text, reply }).ok()
 }
 
 fn route_in_process_mouse_event(in_process: &InProcessSession, event: &CleatInputEvent) -> Option<usize> {
-    let mouse = CleatMouseEvent {
-        mouse_kind: event.mouse_kind,
-        mouse_button: event.mouse_button,
-        mouse_buttons: event.mouse_buttons,
-        modifiers: event.modifiers,
+    let action = match event.mouse_kind {
+        CLEAT_MOUSE_PRESS => vt::MouseAction::Press,
+        CLEAT_MOUSE_RELEASE => vt::MouseAction::Release,
+        CLEAT_MOUSE_MOVE => vt::MouseAction::Motion,
+        _ => return Some(0),
+    };
+    let mouse = SessionMouseEvent {
+        action,
+        button: cleat_mouse_button(event.mouse_button),
+        any_button_pressed: event.mouse_buttons != 0,
+        modifiers: mouse_modifiers(event.modifiers),
         x_px: event.x_px,
         y_px: event.y_px,
     };
-    in_process_request_result(in_process, |reply| InProcessCommand::Mouse { event: mouse, reply }).ok()
+    in_process.actor.request_result(|reply| SessionCommand::Mouse { event: mouse, reply }).ok()
+}
+
+fn mouse_modifiers(modifiers: u16) -> vt::MouseModifiers {
+    vt::MouseModifiers {
+        shift: modifiers & CLEAT_MOD_SHIFT != 0,
+        ctrl: modifiers & CLEAT_MOD_CTRL != 0,
+        alt: modifiers & CLEAT_MOD_ALT != 0,
+    }
 }
 
 /// Map a Cleat button id to a backend-neutral named button. Wheel directions are
@@ -1521,126 +1246,11 @@ fn cleat_mouse_button(button: u32) -> Option<vt::MouseButton> {
     }
 }
 
-fn route_in_process_mouse_event_on_actor(runtime: &mut SessionRuntime, event: CleatMouseEvent) -> Result<usize, String> {
-    let action = match event.mouse_kind {
-        CLEAT_MOUSE_PRESS => vt::MouseAction::Press,
-        CLEAT_MOUSE_RELEASE => vt::MouseAction::Release,
-        CLEAT_MOUSE_MOVE => vt::MouseAction::Motion,
-        _ => return Ok(0),
-    };
-    let button = cleat_mouse_button(event.mouse_button);
-    let any_button_pressed = event.mouse_buttons != 0;
-    let modifiers = vt::MouseModifiers {
-        shift: event.modifiers & CLEAT_MOD_SHIFT != 0,
-        ctrl: event.modifiers & CLEAT_MOD_CTRL != 0,
-        alt: event.modifiers & CLEAT_MOD_ALT != 0,
-    };
-    // The encoder gates against the live tracking mode and dedupes motion, so an
-    // empty result just means "nothing to report" for this event.
-    let bytes = runtime.encode_mouse(action, button, any_button_pressed, modifiers, event.x_px, event.y_px)?;
-    if bytes.is_empty() {
-        return Ok(0);
-    }
-    runtime.write_input(&bytes)?;
-    Ok(1)
-}
-
-fn route_in_process_wheel_event_on_actor(
-    wake: &Arc<Mutex<WakeCallback>>,
-    runtime: &mut SessionRuntime,
-    observation: &mut ObservationState,
-    event: CleatWheelEvent,
-) -> Result<usize, String> {
-    let modes = runtime.terminal_mode_state()?;
-    if modes.mouse_tracking {
-        let bytes = mouse_report_bytes_from_wheel(event, modes).ok_or_else(|| "mouse wheel event cannot be encoded".to_string())?;
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        runtime.write_input(&bytes)?;
-        return Ok(1);
-    }
-
-    if modes.active_alternate_screen && modes.alternate_scroll {
-        let bytes = alternate_scroll_cursor_bytes_from_wheel(event, modes);
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        runtime.write_input(&bytes)?;
-        return Ok(1);
-    }
-
-    let delta_rows = viewport_delta_rows_from_wheel(event);
-    if delta_rows == 0 {
-        return Ok(0);
-    }
-    match runtime.scroll_viewport(ViewportCommand::DeltaRows(delta_rows)) {
-        Ok(ViewportCommandOutcome::Moved) => {
-            let rows = runtime.inspect(false, 0).terminal.rows;
-            mark_full_and_wake(observation, rows, wake);
-            Ok(0)
-        }
-        Ok(ViewportCommandOutcome::NoOp | ViewportCommandOutcome::Unsupported) => Ok(0),
-        Err(err) => Err(err),
-    }
-}
-
-fn wheel_tick_count(delta: f32) -> usize {
-    if !delta.is_finite() {
-        return 0;
-    }
-    let rounded = delta.round().abs();
-    if rounded == 0.0 {
-        0
-    } else if rounded > usize::MAX as f32 {
-        usize::MAX
-    } else {
-        rounded as usize
-    }
-}
-
-fn viewport_delta_rows_from_wheel(event: CleatWheelEvent) -> i64 {
-    if !event.wheel_delta_y.is_finite() {
-        return 0;
-    }
-    let rounded = event.wheel_delta_y.round();
-    if rounded == 0.0 {
-        return 0;
-    }
-    let rows = if rounded > i64::MAX as f32 {
-        i64::MAX
-    } else if rounded < i64::MIN as f32 {
-        i64::MIN
-    } else {
-        rounded as i64
-    };
-    rows.saturating_neg()
-}
-
-fn alternate_scroll_cursor_bytes_from_wheel(event: CleatWheelEvent, modes: vt::TerminalModeState) -> Vec<u8> {
-    let count = wheel_tick_count(event.wheel_delta_y);
-    if count == 0 {
-        return Vec::new();
-    }
-    let seq = if event.wheel_delta_y.is_sign_positive() {
-        if modes.application_cursor_keys {
-            b"\x1bOA".as_slice()
-        } else {
-            b"\x1b[A".as_slice()
-        }
-    } else if modes.application_cursor_keys {
-        b"\x1bOB".as_slice()
-    } else {
-        b"\x1b[B".as_slice()
-    };
-    seq.repeat(count)
-}
-
 #[cfg(test)]
 fn mouse_report_bytes(event: &CleatInputEvent, modes: vt::TerminalModeState) -> Option<Vec<u8>> {
-    mouse_report_bytes_from_wheel(
-        CleatWheelEvent {
-            modifiers: event.modifiers,
+    crate::host::actor::mouse_report_bytes_from_wheel(
+        SessionWheelEvent {
+            modifiers: mouse_modifiers(event.modifiers),
             cell_col: event.cell_col,
             cell_row: event.cell_row,
             x_px: event.x_px,
@@ -1654,9 +1264,9 @@ fn mouse_report_bytes(event: &CleatInputEvent, modes: vt::TerminalModeState) -> 
 
 #[cfg(test)]
 fn alternate_scroll_cursor_bytes(event: &CleatInputEvent, modes: vt::TerminalModeState) -> Vec<u8> {
-    alternate_scroll_cursor_bytes_from_wheel(
-        CleatWheelEvent {
-            modifiers: event.modifiers,
+    crate::host::actor::alternate_scroll_cursor_bytes_from_wheel(
+        SessionWheelEvent {
+            modifiers: mouse_modifiers(event.modifiers),
             cell_col: event.cell_col,
             cell_row: event.cell_row,
             x_px: event.x_px,
@@ -1666,81 +1276,6 @@ fn alternate_scroll_cursor_bytes(event: &CleatInputEvent, modes: vt::TerminalMod
         },
         modes,
     )
-}
-
-fn mouse_report_bytes_from_wheel(event: CleatWheelEvent, modes: vt::TerminalModeState) -> Option<Vec<u8>> {
-    let y_count = wheel_tick_count(event.wheel_delta_y);
-    let x_count = wheel_tick_count(event.wheel_delta_x);
-    if y_count == 0 && x_count == 0 {
-        return Some(Vec::new());
-    }
-
-    let mut out = Vec::new();
-    let modifiers = mouse_report_modifier_code(event.modifiers);
-    if y_count > 0 {
-        let button = if event.wheel_delta_y.is_sign_positive() { 64 } else { 65 } + modifiers;
-        append_mouse_report(&mut out, button, y_count, event, modes)?;
-    }
-    if x_count > 0 {
-        let button = if event.wheel_delta_x.is_sign_positive() { 66 } else { 67 } + modifiers;
-        append_mouse_report(&mut out, button, x_count, event, modes)?;
-    }
-    Some(out)
-}
-
-fn append_mouse_report(
-    out: &mut Vec<u8>,
-    button_code: u16,
-    count: usize,
-    event: CleatWheelEvent,
-    modes: vt::TerminalModeState,
-) -> Option<()> {
-    let (x, y) = if modes.mouse_sgr_pixels {
-        (one_based_coordinate(event.x_px), one_based_coordinate(event.y_px))
-    } else {
-        (u32::from(event.cell_col) + 1, u32::from(event.cell_row) + 1)
-    };
-
-    for _ in 0..count {
-        if modes.mouse_sgr || modes.mouse_sgr_pixels {
-            out.extend_from_slice(format!("\x1b[<{button_code};{x};{y}M").as_bytes());
-        } else {
-            let b = legacy_mouse_byte(button_code)?;
-            let x = legacy_mouse_byte(u16::try_from(x).ok()?)?;
-            let y = legacy_mouse_byte(u16::try_from(y).ok()?)?;
-            out.extend_from_slice(&[b'\x1b', b'[', b'M', b, x, y]);
-        }
-    }
-    Some(())
-}
-
-fn mouse_report_modifier_code(modifiers: u16) -> u16 {
-    let mut code = 0;
-    if modifiers & CLEAT_MOD_SHIFT != 0 {
-        code += 4;
-    }
-    if modifiers & CLEAT_MOD_ALT != 0 {
-        code += 8;
-    }
-    if modifiers & CLEAT_MOD_CTRL != 0 {
-        code += 16;
-    }
-    code
-}
-
-fn one_based_coordinate(value: f32) -> u32 {
-    if !value.is_finite() || value <= 0.0 {
-        1
-    } else if value >= u32::MAX as f32 {
-        u32::MAX
-    } else {
-        value.round() as u32 + 1
-    }
-}
-
-fn legacy_mouse_byte(value: u16) -> Option<u8> {
-    let encoded = value.checked_add(32)?;
-    u8::try_from(encoded).ok()
 }
 
 fn record_input_acceptance(session: &mut CleatSession, count: usize, out: *mut CleatInputResult) {
@@ -1773,7 +1308,7 @@ pub unsafe extern "C" fn cleat_session_write_bytes(session: *mut CleatSession, b
             true
         }
         SessionBackend::InProcess(in_process) => {
-            in_process_request_result(in_process, |reply| InProcessCommand::WriteInput { bytes: bytes.to_vec(), reply }).is_ok()
+            in_process.actor.request_result(|reply| SessionCommand::WriteInput { bytes: bytes.to_vec(), reply }).is_ok()
         }
         SessionBackend::Daemon(daemon) => {
             if daemon_write_bytes(daemon, bytes).is_err() {
@@ -1798,7 +1333,7 @@ pub unsafe extern "C" fn cleat_session_poll(session: *mut CleatSession) -> Cleat
     };
     match &mut session.backend {
         SessionBackend::Mock(mock) => mock.observation.dirty().into(),
-        SessionBackend::InProcess(in_process) => in_process.observation.dirty().into(),
+        SessionBackend::InProcess(in_process) => in_process.actor.observation().dirty().into(),
         SessionBackend::Daemon(daemon) => daemon.observation.dirty().into(),
     }
 }
@@ -1813,7 +1348,7 @@ pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> Cl
     unsafe { session.as_ref() }
         .map(|session| match &session.backend {
             SessionBackend::Mock(mock) => mock.observation.dirty().into(),
-            SessionBackend::InProcess(in_process) => in_process.observation.dirty().into(),
+            SessionBackend::InProcess(in_process) => in_process.actor.observation().dirty().into(),
             SessionBackend::Daemon(daemon) => daemon.observation.dirty().into(),
         })
         .unwrap_or(CleatDirtyState::Full)
@@ -1832,7 +1367,7 @@ pub unsafe extern "C" fn cleat_session_mark_observed(session: *mut CleatSession,
     match &mut session.backend {
         SessionBackend::Mock(mock) => mock.observation.mark_observed(generation),
         SessionBackend::InProcess(in_process) => {
-            in_process_request(in_process, |reply| InProcessCommand::MarkObserved { generation, reply }, false)
+            in_process.actor.request(|reply| SessionCommand::MarkObserved { generation, reply }, false)
         }
         SessionBackend::Daemon(daemon) => daemon.observation.mark_observed(generation),
     }
@@ -1929,12 +1464,10 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
             mock.observation.annotate_snapshot(&mut snapshot);
             snapshot
         }
-        SessionBackend::InProcess(in_process) => {
-            match in_process_request_result(in_process, |reply| InProcessCommand::Snapshot { reply }) {
-                Ok(snapshot) => snapshot,
-                Err(_) => return false,
-            }
-        }
+        SessionBackend::InProcess(in_process) => match in_process.actor.request_result(|reply| SessionCommand::Snapshot { reply }) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return false,
+        },
         SessionBackend::Daemon(daemon) => match daemon_snapshot(daemon) {
             Ok(mut snapshot) => {
                 daemon.observation.annotate_snapshot(&mut snapshot);
@@ -1975,12 +1508,10 @@ pub unsafe extern "C" fn cleat_session_render_update(session: *mut CleatSession,
             mock.observation.annotate_snapshot(&mut snapshot);
             TerminalRenderUpdate::from_snapshot(snapshot)
         }
-        SessionBackend::InProcess(in_process) => {
-            match in_process_request_result(in_process, |reply| InProcessCommand::RenderUpdate { reply }) {
-                Ok(update) => update,
-                Err(_) => return false,
-            }
-        }
+        SessionBackend::InProcess(in_process) => match in_process.actor.request_result(|reply| SessionCommand::RenderUpdate { reply }) {
+            Ok(update) => update,
+            Err(_) => return false,
+        },
         SessionBackend::Daemon(daemon) => match daemon_snapshot(daemon) {
             Ok(mut snapshot) => {
                 daemon.observation.annotate_snapshot(&mut snapshot);
@@ -2021,14 +1552,18 @@ pub unsafe extern "C" fn cleat_session_with_image_resource_data(
     };
     match &mut session.backend {
         SessionBackend::Mock(_) | SessionBackend::Daemon(_) => false,
-        SessionBackend::InProcess(in_process) => in_process_request_result(in_process, |reply| InProcessCommand::ImageResourceData {
-            image_id,
-            generation,
-            callback: Some(callback),
-            user_data: user_data as usize,
-            reply,
-        })
-        .unwrap_or(false),
+        SessionBackend::InProcess(in_process) => {
+            let user_data = user_data as usize;
+            in_process
+                .actor
+                .request_result(|reply| SessionCommand::ImageResourceData {
+                    image_id,
+                    generation,
+                    callback: Box::new(move |bytes| unsafe { callback(user_data as *mut c_void, bytes.as_ptr(), bytes.len()) }),
+                    reply,
+                })
+                .unwrap_or(false)
+        }
     }
 }
 
@@ -2059,7 +1594,7 @@ fn session_scrollback_extent(session: &mut CleatSession) -> TerminalScrollbackEx
     match &mut session.backend {
         SessionBackend::Mock(mock) => TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: mock.rows, alternate_screen: false },
         SessionBackend::InProcess(in_process) => {
-            in_process_request(in_process, |reply| InProcessCommand::ScrollbackExtent { reply }, TerminalScrollbackExtent {
+            in_process.actor.request(|reply| SessionCommand::ScrollbackExtent { reply }, TerminalScrollbackExtent {
                 normal_scrollback_rows: 0,
                 live_rows: 0,
                 alternate_screen: false,
@@ -2075,7 +1610,7 @@ fn session_scrollbar_state(session: &mut CleatSession) -> TerminalScrollbarState
     match &mut session.backend {
         SessionBackend::Mock(mock) => TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, mock.rows),
         SessionBackend::InProcess(in_process) => {
-            in_process_request(in_process, |reply| InProcessCommand::ScrollbarState { reply }, TerminalScrollbarState::default())
+            in_process.actor.request(|reply| SessionCommand::ScrollbarState { reply }, TerminalScrollbarState::default())
         }
         SessionBackend::Daemon(daemon) => TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, daemon.rows),
     }
@@ -2090,43 +1625,11 @@ fn session_scroll_viewport(session: &mut CleatSession, command: Option<ViewportC
             ViewportCommand::Top | ViewportCommand::Bottom | ViewportCommand::DeltaRows(_) => ViewportCommandOutcome::NoOp,
         },
         SessionBackend::InProcess(in_process) => {
-            match in_process_request_result(in_process, |reply| InProcessCommand::ScrollViewport { command, reply }) {
+            match in_process.actor.request_result(|reply| SessionCommand::ScrollViewport { command, reply }) {
                 Ok(outcome) => outcome,
                 Err(_) => ViewportCommandOutcome::Unsupported,
             }
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PumpOutcome {
-    Clean,
-    PartialUnknown,
-    Full,
-}
-
-fn pump_in_process_runtime(runtime: &mut SessionRuntime, exited: &mut bool) -> Result<PumpOutcome, String> {
-    let mut exited_now = false;
-    if !*exited {
-        if let Some(exit_code) = runtime.exit_code_if_exited()? {
-            runtime.record_exit_code(exit_code);
-            *exited = true;
-            exited_now = true;
-        }
-    }
-    let output = if exited_now {
-        runtime.drain_output_after_exit(false)?
-    } else if *exited {
-        PtyOutput { chunks: Vec::new() }
-    } else {
-        runtime.read_available_output(false)?
-    };
-    if exited_now {
-        Ok(PumpOutcome::Full)
-    } else if !output.chunks.is_empty() {
-        Ok(PumpOutcome::PartialUnknown)
-    } else {
-        Ok(PumpOutcome::Clean)
     }
 }
 
@@ -2142,20 +1645,6 @@ fn mark_partial_rows_and_wake(observation: &mut ObservationState, rows: impl Int
     }
 }
 
-fn mark_partial_unknown_and_wake(observation: &mut ObservationState, wake: &Arc<Mutex<WakeCallback>>) {
-    if observation.mark_partial_unknown() {
-        notify_wake(wake);
-    }
-}
-
-fn sync_terminal_modes_and_wake(runtime: &SessionRuntime, observation: &mut ObservationState, wake: &Arc<Mutex<WakeCallback>>) {
-    if let Ok(terminal_modes) = runtime.terminal_mode_state() {
-        if observation.sync_terminal_modes(terminal_modes) {
-            notify_wake(wake);
-        }
-    }
-}
-
 fn notify_wake(wake: &Arc<Mutex<WakeCallback>>) {
     let callback = match wake.lock() {
         Ok(callback) => *callback,
@@ -2164,171 +1653,6 @@ fn notify_wake(wake: &Arc<Mutex<WakeCallback>>) {
     if let Some(wake) = callback.wake {
         unsafe { wake(callback.user_data as *mut c_void) };
     }
-}
-
-fn in_process_request<T>(session: &InProcessSession, make_command: impl FnOnce(mpsc::Sender<T>) -> InProcessCommand, fallback: T) -> T {
-    let (reply, recv) = mpsc::channel();
-    if session.tx.send(make_command(reply)).is_err() {
-        return fallback;
-    }
-    recv.recv().unwrap_or(fallback)
-}
-
-fn in_process_request_result<T>(
-    session: &InProcessSession,
-    make_command: impl FnOnce(mpsc::Sender<Result<T, String>>) -> InProcessCommand,
-) -> Result<T, String> {
-    let (reply, recv) = mpsc::channel();
-    session.tx.send(make_command(reply)).map_err(|_| "in-process session actor is not running".to_string())?;
-    recv.recv().map_err(|_| "in-process session actor did not reply".to_string())?
-}
-
-fn in_process_actor_loop(
-    mut runtime: SessionRuntime,
-    wake: Arc<Mutex<WakeCallback>>,
-    rows: u16,
-    mirror: Arc<ObservationMirror>,
-    ready: mpsc::Sender<Result<(), String>>,
-    rx: mpsc::Receiver<InProcessCommand>,
-) {
-    let mut observation = ObservationState::new_with_mirror(rows, Some(mirror));
-    let mut exited = false;
-    let _ = ready.send(Ok(()));
-    loop {
-        match rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(command) => {
-                if in_process_actor_handle_command(command, &mut runtime, &mut observation, &mut exited, &wake) {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                in_process_actor_pump(&mut runtime, &mut observation, &mut exited, &wake);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
-                break;
-            }
-        }
-    }
-}
-
-fn in_process_actor_handle_command(
-    command: InProcessCommand,
-    runtime: &mut SessionRuntime,
-    observation: &mut ObservationState,
-    exited: &mut bool,
-    wake: &Arc<Mutex<WakeCallback>>,
-) -> bool {
-    let mut stop = false;
-    match command {
-        InProcessCommand::Resize { cols, rows, reply } => {
-            let cols = cols.max(1);
-            let rows = rows.max(1);
-            let result = runtime.resize(cols, rows).map(|_| {
-                mark_full_and_wake(observation, rows, wake);
-            });
-            let _ = reply.send(result);
-        }
-        InProcessCommand::SetCellSize { cell_width_px, cell_height_px, reply } => {
-            let result = runtime.set_cell_size(cell_width_px, cell_height_px).map(|_| {
-                let rows = runtime.inspect(false, 0).terminal.rows;
-                mark_full_and_wake(observation, rows, wake);
-            });
-            let _ = reply.send(result);
-        }
-        InProcessCommand::WriteInput { bytes, reply } => {
-            let _ = reply.send(runtime.write_input(&bytes));
-        }
-        InProcessCommand::Wheel { event, reply } => {
-            let result = route_in_process_wheel_event_on_actor(wake, runtime, observation, event);
-            let _ = reply.send(result);
-        }
-        InProcessCommand::Mouse { event, reply } => {
-            let _ = reply.send(route_in_process_mouse_event_on_actor(runtime, event));
-        }
-        InProcessCommand::Paste { text, reply } => {
-            let _ = reply.send(route_in_process_paste_on_actor(runtime, &text));
-        }
-        InProcessCommand::ScrollViewport { command, reply } => {
-            let result = runtime.scroll_viewport(command).inspect(|outcome| {
-                if *outcome == ViewportCommandOutcome::Moved {
-                    let rows = runtime.inspect(false, 0).terminal.rows;
-                    mark_full_and_wake(observation, rows, wake);
-                }
-            });
-            let _ = reply.send(result);
-        }
-        InProcessCommand::Snapshot { reply } => {
-            sync_terminal_modes_and_wake(runtime, observation, wake);
-            let result = runtime.snapshot(observation.dirty()).map(|mut snapshot| {
-                observation.annotate_snapshot(&mut snapshot);
-                snapshot
-            });
-            let _ = reply.send(result);
-        }
-        InProcessCommand::RenderUpdate { reply } => {
-            sync_terminal_modes_and_wake(runtime, observation, wake);
-            let result = runtime.render_update(observation.dirty()).map(|mut update| {
-                observation.annotate_render_update(&mut update);
-                update
-            });
-            let _ = reply.send(result);
-        }
-        InProcessCommand::ImageResourceData { image_id, generation, callback, user_data, reply } => {
-            let result = match callback {
-                Some(callback) => {
-                    let mut call_client = |bytes: &[u8]| unsafe { callback(user_data as *mut c_void, bytes.as_ptr(), bytes.len()) };
-                    runtime.with_image_resource_data(image_id, generation, &mut call_client)
-                }
-                None => Ok(false),
-            };
-            let _ = reply.send(result);
-        }
-        InProcessCommand::MarkObserved { generation, reply } => {
-            let _ = reply.send(observation.mark_observed(generation));
-        }
-        InProcessCommand::ScrollbackExtent { reply } => {
-            let extent = runtime.scrollback_extent().unwrap_or_else(|_| TerminalScrollbackExtent {
-                normal_scrollback_rows: 0,
-                live_rows: runtime.inspect(false, 0).terminal.rows,
-                alternate_screen: false,
-            });
-            let _ = reply.send(extent);
-        }
-        InProcessCommand::ScrollbarState { reply } => {
-            let scrollbar = runtime.scrollbar_state().unwrap_or_else(|_| {
-                TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, runtime.inspect(false, 0).terminal.rows)
-            });
-            let _ = reply.send(scrollbar);
-        }
-        InProcessCommand::Stop { terminate } => {
-            if terminate && !*exited {
-                let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
-            }
-            stop = true;
-        }
-    }
-    if !stop {
-        in_process_actor_pump(runtime, observation, exited, wake);
-    }
-    stop
-}
-
-fn in_process_actor_pump(
-    runtime: &mut SessionRuntime,
-    observation: &mut ObservationState,
-    exited: &mut bool,
-    wake: &Arc<Mutex<WakeCallback>>,
-) {
-    match pump_in_process_runtime(runtime, exited) {
-        Ok(PumpOutcome::Clean) => {}
-        Ok(PumpOutcome::PartialUnknown) => mark_partial_unknown_and_wake(observation, wake),
-        Ok(PumpOutcome::Full) | Err(_) => {
-            let rows = runtime.inspect(false, 0).terminal.rows;
-            mark_full_and_wake(observation, rows, wake);
-        }
-    }
-    sync_terminal_modes_and_wake(runtime, observation, wake);
 }
 
 /// # Safety
@@ -2379,32 +1703,17 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let initial_geometry = TerminalGeometry::from_cell_size(cols, rows, desc.cell_width_px, desc.cell_height_px);
     let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(initial_geometry);
     let wake = provider.wake.clone();
-    let observation = Arc::new(ObservationMirror::new());
-    let actor_observation = observation.clone();
-    let (tx, rx) = mpsc::channel();
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let result = (|| {
-            let mut vt_engine = vt::make_vt_engine_with_colors(vt_engine, cols, rows, colors)?;
-            vt_engine.set_cell_size(cell_width_px, cell_height_px)?;
-            let mut runtime = SessionRuntime::spawn(session_dir, &metadata, vt_engine)?;
-            runtime.resize(cols, rows)?;
-            Ok(runtime)
-        })();
-        match result {
-            Ok(runtime) => in_process_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx),
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-            }
-        }
-    });
-    match ready_rx.recv().map_err(|_| "in-process session actor did not report startup".to_string())? {
-        Ok(()) => Ok(InProcessSession { tx, observation, worker: Some(worker) }),
-        Err(err) => {
-            let _ = worker.join();
-            Err(err)
-        }
-    }
+    let actor_wake = Arc::new(move || notify_wake(&wake));
+    let actor = SessionActor::spawn(rows, actor_wake, move || {
+        let mut vt_engine = vt::make_vt_engine_with_colors(vt_engine, cols, rows, colors)?;
+        vt_engine.set_cell_size(cell_width_px, cell_height_px)?;
+        let mut runtime = SessionRuntime::spawn(session_dir, &metadata, vt_engine)?;
+        runtime.resize(cols, rows)?;
+        Ok(runtime)
+    })
+    .map_err(|err| err.replace("session actor", "in-process session actor"))?;
+    actor.set_client_presence(false)?;
+    Ok(InProcessSession { actor })
 }
 
 fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
@@ -2801,11 +2110,21 @@ fn cell_width_tag(width: TerminalCellWidth) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
 
     use super::*;
-    use crate::provider::{
-        TerminalImagePlacement, TerminalImageResource, TerminalRenderCell, TerminalRenderRow, TerminalRenderStyle, TerminalRenderUpdateOp,
+    use crate::{
+        host::actor::ObservationMirror,
+        provider::{
+            TerminalImagePlacement, TerminalImageResource, TerminalRenderCell, TerminalRenderRow, TerminalRenderStyle,
+            TerminalRenderUpdateOp,
+        },
     };
 
     unsafe extern "C" fn count_wake(user_data: *mut c_void) {
@@ -3082,11 +2401,11 @@ mod tests {
 
     #[test]
     fn in_process_dirty_queries_do_not_wait_for_actor_replies() {
-        let (tx, _rx) = mpsc::channel::<InProcessCommand>();
+        let (tx, _rx) = mpsc::channel::<SessionCommand>();
         let observation = Arc::new(ObservationMirror::new());
         observation.store(1, 0, DirtyState::Full);
         let session = Box::into_raw(Box::new(CleatSession {
-            backend: SessionBackend::InProcess(Box::new(InProcessSession { tx, observation, worker: None })),
+            backend: SessionBackend::InProcess(Box::new(InProcessSession { actor: SessionActor::from_parts(tx, observation, None) })),
             geometry: TerminalGeometry::default(),
             next_input_sequence: 1,
             wake: Arc::new(Mutex::new(WakeCallback::default())),
@@ -3111,11 +2430,11 @@ mod tests {
 
     #[test]
     fn in_process_dirty_queries_read_clean_mirror_state() {
-        let (tx, _rx) = mpsc::channel::<InProcessCommand>();
+        let (tx, _rx) = mpsc::channel::<SessionCommand>();
         let observation = Arc::new(ObservationMirror::new());
         observation.store(1, 1, DirtyState::Full);
         let session = Box::into_raw(Box::new(CleatSession {
-            backend: SessionBackend::InProcess(Box::new(InProcessSession { tx, observation, worker: None })),
+            backend: SessionBackend::InProcess(Box::new(InProcessSession { actor: SessionActor::from_parts(tx, observation, None) })),
             geometry: TerminalGeometry::default(),
             next_input_sequence: 1,
             wake: Arc::new(Mutex::new(WakeCallback::default())),
@@ -3134,11 +2453,11 @@ mod tests {
 
     #[test]
     fn in_process_dirty_queries_read_partial_mirror_state() {
-        let (tx, _rx) = mpsc::channel::<InProcessCommand>();
+        let (tx, _rx) = mpsc::channel::<SessionCommand>();
         let observation = Arc::new(ObservationMirror::new());
         observation.store(2, 1, DirtyState::Partial);
         let session = Box::into_raw(Box::new(CleatSession {
-            backend: SessionBackend::InProcess(Box::new(InProcessSession { tx, observation, worker: None })),
+            backend: SessionBackend::InProcess(Box::new(InProcessSession { actor: SessionActor::from_parts(tx, observation, None) })),
             geometry: TerminalGeometry::default(),
             next_input_sequence: 1,
             wake: Arc::new(Mutex::new(WakeCallback::default())),

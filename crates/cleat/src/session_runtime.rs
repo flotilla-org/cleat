@@ -394,6 +394,10 @@ impl SessionRuntime {
         self.recorder.is_some()
     }
 
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session.id
+    }
+
     fn read_available_output_inner(&mut self, has_active_client: bool, after_exit: bool) -> Result<PtyOutput, String> {
         let mut chunks = Vec::new();
         let mut budget = PTY_READ_BUDGET_PER_PUMP;
@@ -404,7 +408,10 @@ impl SessionRuntime {
                 break;
             }
             let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
-            match self.pty_child.read_output(&mut buf) {
+            // Cap the final read to the remaining budget so the slice bound
+            // is hard, not "budget plus one buffer".
+            let want = if after_exit { buf.len() } else { buf.len().min(budget) };
+            match self.pty_child.read_output(&mut buf[..want]) {
                 Ok(0) => break,
                 Ok(n) => {
                     budget = budget.saturating_sub(n);

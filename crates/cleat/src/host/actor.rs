@@ -783,21 +783,32 @@ impl SessionActor {
     }
 }
 
+/// How long `Drop` waits inline for the worker before handing the join to a
+/// reaper thread. Covers the common case (the worker honors Stop within one
+/// pump slice, tens of ms) without ever stalling the servicing thread on a
+/// wedged worker.
+const ACTOR_DROP_INLINE_WAIT: Duration = Duration::from_millis(100);
+
 impl Drop for SessionActor {
     fn drop(&mut self) {
         let _ = self.tx.send(SessionCommand::Stop { terminate: true });
         if let Some(worker) = self.worker.take() {
-            // Bounded join: drop runs on the daemon's servicing thread, which
-            // must never block indefinitely on one session (ADR 0004). The
-            // worker honors Stop between pump slices; if it is wedged past
-            // the deadline, detach — the thread still runs its own teardown
-            // (child terminate, recording flush) whenever it gets unstuck.
-            let deadline = Instant::now() + ACTOR_REPLY_DEADLINE;
+            // Drop runs on the daemon's servicing thread, which must never
+            // block long on one session (ADR 0004) — the residual inline
+            // bound here is deliberately small and the slow path moves off
+            // the shared thread entirely. The worker still runs its own
+            // teardown (child terminate, recording flush) whenever it
+            // finishes; the reaper just collects it.
+            let deadline = Instant::now() + ACTOR_DROP_INLINE_WAIT;
             while !worker.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
             }
             if worker.is_finished() {
                 let _ = worker.join();
+            } else {
+                thread::spawn(move || {
+                    let _ = worker.join();
+                });
             }
         }
     }
@@ -1139,9 +1150,27 @@ fn session_actor_handle_command(
     stop
 }
 
+#[cfg(not(debug_assertions))]
+fn maybe_panic_actor_for_test(_session_id: &str) {}
+
+/// Test hook mirroring `maybe_panic_for_containment_test`: lets a lifecycle
+/// test kill the actor worker thread without recording an exit, to exercise
+/// the daemon's worker-died fault path.
+#[cfg(debug_assertions)]
+fn maybe_panic_actor_for_test(session_id: &str) {
+    if std::env::var("CLEAT_TEST_PANIC_ACTOR").as_deref() == Ok(session_id) {
+        panic!("test-requested actor panic for session {session_id}");
+    }
+}
+
 fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoopState, wake: &WakeCallback) {
     match pump_session_runtime(runtime, &mut state.exited, &mut state.exit_code, state.has_active_client) {
         Ok(result) => {
+            // Fires only on pumps that read output, so session creation
+            // (whose command handling also pumps) completes first.
+            if !result.chunks.is_empty() {
+                maybe_panic_actor_for_test(runtime.session_id());
+            }
             publish_raw_output(&mut state.raw_output_taps, &result.chunks);
             // Flush actor-side after each pump slice: the servicing loop no
             // longer round-trips into the actor for it, and recording only

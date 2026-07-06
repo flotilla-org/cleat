@@ -3,7 +3,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::{
     io,
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering},
+        atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering as AtomicOrdering},
         mpsc,
         mpsc::{Receiver, SyncSender},
         Arc,
@@ -208,7 +208,7 @@ pub(crate) struct ObservationMirror {
     /// Exit code recorded by the actor when it reaps the child; lets the
     /// daemon's servicing loop poll for exit without a blocking round-trip
     /// into a possibly-busy actor (ADR 0004: never-blocked servicing side).
-    exit_code: std::sync::atomic::AtomicI64,
+    exit_code: AtomicI64,
 }
 
 impl ObservationMirror {
@@ -217,7 +217,7 @@ impl ObservationMirror {
             render_generation: AtomicU64::new(0),
             observed_generation: AtomicU64::new(0),
             dirty: AtomicU8::new(dirty_state_to_u8(DirtyState::Clean)),
-            exit_code: std::sync::atomic::AtomicI64::new(EXIT_CODE_UNSET),
+            exit_code: AtomicI64::new(EXIT_CODE_UNSET),
         }
     }
 

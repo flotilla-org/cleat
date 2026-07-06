@@ -560,8 +560,11 @@ pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]
         return Err("packet stream did not start with control hello".to_string());
     }
     let hello = hello.decode::<ControlHello>().map_err(|err| format!("decode packet hello: {err}"))?;
-    if hello.version != PROTOCOL_VERSION {
-        return Err(format!("unsupported packet protocol version {}", hello.version));
+    if !hello.accepts(PROTOCOL_VERSION) {
+        return Err(format!(
+            "incompatible packet protocol: daemon supports {}..={}, client speaks {}",
+            hello.min_supported_version, hello.version, PROTOCOL_VERSION
+        ));
     }
 
     let directory = PacketFrame::read(&mut stream).map_err(|err| format!("read packet directory: {err}"))?;

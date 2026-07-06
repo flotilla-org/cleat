@@ -34,6 +34,13 @@ impl ControlHello {
     pub fn current() -> Self {
         Self { version: PROTOCOL_VERSION, min_supported_version: PROTOCOL_VERSION }
     }
+
+    /// The hello advertises the version range this daemon speaks,
+    /// `min_supported_version..=version`. A client is compatible when its own
+    /// protocol version falls inside that range.
+    pub fn accepts(&self, client_version: u16) -> bool {
+        (self.min_supported_version..=self.version).contains(&client_version)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +291,22 @@ impl<S: Read + Write> PacketClient<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_accepts_client_versions_inside_advertised_range() {
+        let hello = ControlHello { version: 4, min_supported_version: 2 };
+
+        assert!(hello.accepts(2));
+        assert!(hello.accepts(3));
+        assert!(hello.accepts(4));
+        assert!(!hello.accepts(1));
+        assert!(!hello.accepts(5));
+    }
+
+    #[test]
+    fn current_hello_accepts_current_protocol_version() {
+        assert!(ControlHello::current().accepts(PROTOCOL_VERSION));
+    }
 
     #[test]
     fn codec_round_trips_postcard_control_payloads() {

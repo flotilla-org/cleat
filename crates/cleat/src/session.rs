@@ -640,7 +640,14 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         // failures.
         if last_registration_check.elapsed() >= SESSION_DAEMON_REGISTRATION_CHECK_INTERVAL {
             last_registration_check = Instant::now();
-            let registered = fs::read_to_string(layout.daemon_pid_path()).map(|contents| contents.trim() == daemon_pid).unwrap_or(false);
+            // Only a definitively missing pid file (or one naming another
+            // process) counts as deregistration. A transient read failure
+            // (EIO, permissions blip) must not self-terminate a healthy
+            // daemon — that would drop every hosted session.
+            let registered = match fs::read_to_string(layout.daemon_pid_path()) {
+                Ok(contents) => contents.trim() == daemon_pid,
+                Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+            };
             if !registered && registration_was_lost {
                 for hosted in sessions.values() {
                     let _ = hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader);
@@ -725,7 +732,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                     None
                 };
                 Ok((session_did_work, should_keep_session_dir))
-            })?;
+            });
             match service_result {
                 Some((session_did_work, Some(should_keep_session_dir))) => {
                     did_work |= session_did_work;
@@ -778,15 +785,22 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn contain_session_unwind<T, F>(id: &str, action: F) -> Result<Option<T>, String>
+/// Contains both panics and errors from servicing one session: either way
+/// the caller faults that session and the daemon keeps serving the others.
+/// `None` means the session must be faulted.
+fn contain_session_unwind<T, F>(id: &str, action: F) -> Option<T>
 where
     F: FnOnce() -> Result<T, String>,
 {
     match panic::catch_unwind(AssertUnwindSafe(action)) {
-        Ok(result) => result.map(Some),
+        Ok(Ok(result)) => Some(result),
+        Ok(Err(err)) => {
+            eprintln!("contained error while servicing session {id}: {err}");
+            None
+        }
         Err(payload) => {
             eprintln!("contained panic while servicing session {id}: {}", panic_payload_message(payload.as_ref()));
-            Ok(None)
+            None
         }
     }
 }
@@ -1095,7 +1109,7 @@ fn finish_exited_session(
     layout: &RuntimeLayout,
     id: &str,
     hosted: &mut HostedSession,
-    packet_clients: &mut Vec<PacketClient>,
+    packet_clients: &mut [PacketClient],
 ) -> Result<bool, String> {
     drain_raw_output_tap(layout, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
     for mut wait in hosted.pending_waits.drain(..) {
@@ -1652,6 +1666,10 @@ struct PacketClient {
     channels: HashMap<u32, PacketSessionChannel>,
     selectors: Vec<String>,
     known_directory_sessions: HashSet<String>,
+    /// Marked when this client's transport fails or its output backlog
+    /// overflows. Client failures are never daemon-fatal: the client is
+    /// reaped (with role release) on the next servicing pass.
+    dead: bool,
 }
 
 struct PacketSessionChannel {
@@ -1692,6 +1710,7 @@ impl PacketClient {
             channels: HashMap::new(),
             selectors,
             known_directory_sessions: initial_directory.sessions.iter().map(|entry| entry.session_id.clone()).collect(),
+            dead: false,
         })
     }
 
@@ -1700,11 +1719,20 @@ impl PacketClient {
         self.enqueue_frame(&frame)
     }
 
+    /// Errors only on encode failures (a programming error in frame
+    /// construction). A reader that stalls long enough to overflow its
+    /// backlog is a client-scoped failure: the client is marked dead and
+    /// reaped later, never surfaced as a daemon-level error.
     fn enqueue_frame(&mut self, frame: &PacketFrame) -> Result<(), String> {
+        if self.dead {
+            return Ok(());
+        }
         let mut encoded = Vec::new();
         frame.write(&mut encoded).map_err(|err| format!("buffer packet frame: {err}"))?;
         if self.pending_output.len().saturating_add(encoded.len()) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
-            return Err(format!("packet client output backlog exceeded {} bytes", MAX_PENDING_CLIENT_OUTPUT_BYTES));
+            self.dead = true;
+            self.pending_output = Vec::new();
+            return Ok(());
         }
         self.pending_output.extend_from_slice(&encoded);
         Ok(())
@@ -1757,9 +1785,10 @@ fn service_packet_clients(
     let mut index = 0;
     while index < packet_clients.len() {
         let mut pending = VecDeque::new();
-        let connected = packet_clients[index]
-            .drain_input_frames(&mut pending, Duration::ZERO)
-            .map_err(|err| format!("read packet client frame: {err}"))?;
+        // A transport read error is a client-scoped failure, exactly like a
+        // clean disconnect: drop the one client, never the daemon.
+        let connected =
+            !packet_clients[index].dead && packet_clients[index].drain_input_frames(&mut pending, Duration::ZERO).unwrap_or(false);
         if !connected {
             let removed = packet_clients.swap_remove(index);
             release_packet_client_roles(layout, sessions, &removed, packet_clients)?;
@@ -1769,9 +1798,20 @@ fn service_packet_clients(
 
         while let Some(frame) = pending.pop_front() {
             did_work = true;
-            let updates = handle_packet_frame(layout, sessions, packet_clients, index, frame)?;
-            for entry in updates {
-                broadcast_directory_upsert(entry, packet_clients)?;
+            // A frame-handling error is scoped to the client that sent the
+            // frame (its channel bookkeeping is suspect from here on): drop
+            // that client, keep the daemon and its sessions running.
+            match handle_packet_frame(layout, sessions, packet_clients, index, frame) {
+                Ok(updates) => {
+                    for entry in updates {
+                        broadcast_directory_upsert(entry, packet_clients)?;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("dropping packet client after frame error: {err}");
+                    packet_clients[index].dead = true;
+                    break;
+                }
             }
         }
         index += 1;
@@ -1800,8 +1840,13 @@ fn release_packet_client_roles(
     affected.dedup();
     for session_id in affected {
         if let Some(hosted) = sessions.get(session_id) {
-            let entry = directory_entry_for_session(layout, hosted, packet_clients)?;
-            broadcast_directory_upsert(entry, packet_clients)?;
+            // A failing session actor must not turn role release into a
+            // daemon-fatal error; the session faults on its own servicing
+            // pass and broadcasts its removal there.
+            match directory_entry_for_session(layout, hosted, packet_clients) {
+                Ok(entry) => broadcast_directory_upsert(entry, packet_clients)?,
+                Err(err) => eprintln!("skipping directory update for session {session_id}: {err}"),
+            }
         }
     }
     Ok(())
@@ -2216,8 +2261,18 @@ fn packet_named_key_bytes(key: TerminalNamedKey) -> Vec<u8> {
     }
 }
 
-fn flush_packet_clients(packet_clients: &mut Vec<PacketClient>) {
-    packet_clients.retain_mut(|client| client.flush_pending_output().unwrap_or(false));
+/// Flush failures mark the client dead rather than dropping it here:
+/// removal happens in `service_packet_clients`, which also releases any
+/// controller role the client held.
+fn flush_packet_clients(packet_clients: &mut [PacketClient]) {
+    for client in packet_clients {
+        if client.dead {
+            continue;
+        }
+        if !client.flush_pending_output().unwrap_or(false) {
+            client.dead = true;
+        }
+    }
 }
 
 struct ActiveClient {
@@ -2462,6 +2517,33 @@ mod tests {
     fn graceful_socket_shutdown_classifies_broken_pipe_disconnects() {
         let err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         assert!(super::is_graceful_socket_shutdown(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packet_client_backlog_overflow_marks_client_dead_not_daemon_fatal() {
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
+        let mut client = super::PacketClient::new(1, stream, Vec::new(), &crate::packet::DirectorySnapshot { sessions: Vec::new() })
+            .expect("create packet client");
+        client.pending_output = vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1];
+
+        let frame = crate::packet::PacketFrame { channel: 1, msg_type: 0, payload: vec![0; 64] };
+        client.enqueue_frame(&frame).expect("overflow must not surface as a daemon-level error");
+
+        assert!(client.dead, "overflowing client should be marked dead for reaping");
+        assert!(client.pending_output.is_empty(), "backlog should be released");
+
+        client.enqueue_frame(&frame).expect("enqueue to a dead client is a no-op");
+        assert!(client.pending_output.is_empty());
+    }
+
+    #[test]
+    fn contain_session_unwind_contains_errors_as_faults() {
+        let contained = super::contain_session_unwind("alpha", || -> Result<(), String> { Err("actor died".into()) });
+        assert!(contained.is_none(), "a servicing error should fault the session, not the daemon");
+
+        let ok = super::contain_session_unwind("alpha", || Ok(7));
+        assert_eq!(ok, Some(7));
     }
 
     #[cfg(unix)]

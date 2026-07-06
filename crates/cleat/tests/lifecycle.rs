@@ -528,6 +528,24 @@ fn tag_command_adds_and_removes_opaque_tags() {
 }
 
 #[test]
+fn tag_command_applies_mutations_in_cli_order() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+
+    let cli = Cli::try_parse_from(["cleat", "tag", "alpha", "-role=impl", "+role=impl"]).expect("parse remove then add");
+    let output = cli::execute(cli, &service).expect("execute remove then add").expect("tag output");
+    assert_eq!(output, "role=impl");
+    assert_eq!(service.inspect("alpha").expect("inspect alpha").session.tags, vec!["role=impl"]);
+
+    let cli = Cli::try_parse_from(["cleat", "tag", "alpha", "+role=impl", "-role=impl"]).expect("parse add then remove");
+    let output = cli::execute(cli, &service).expect("execute add then remove");
+    assert_eq!(output, None);
+    assert!(service.inspect("alpha").expect("inspect alpha").session.tags.is_empty());
+}
+
+#[test]
 fn directory_subscription_filters_and_emits_lifecycle_deltas() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

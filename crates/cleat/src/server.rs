@@ -229,8 +229,14 @@ impl SessionService {
                 }
                 Ok(sessions)
             }
-            Err(err) => sweep_dead_daemon_sessions(&self.layout, err)
-                .map(|sessions| sessions.into_iter().filter(|session| session_matches_selectors(session, selectors)).collect()),
+            Err(err) => {
+                if daemon_control_is_unavailable(&self.layout) {
+                    sweep_dead_daemon_sessions(&self.layout, err)
+                        .map(|sessions| sessions.into_iter().filter(|session| session_matches_selectors(session, selectors)).collect())
+                } else {
+                    Err(err)
+                }
+            }
         }
     }
 
@@ -1077,6 +1083,41 @@ mod tests {
         assert!(!layout.foreground_path("kept").exists(), "volatile foreground marker should be removed");
         assert!(!discarded_dir.exists(), "non-recreatable session should be removed");
         assert!(!layout.daemon_pid_path().exists(), "stale daemon pid should be removed");
+    }
+
+    #[test]
+    fn list_http_error_from_reachable_daemon_does_not_sweep_sessions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        let kept_dir = create_test_session_dir(temp.path(), "kept");
+        let discarded_dir = create_test_session_dir(temp.path(), "discarded");
+        fs::write(kept_dir.join(crate::recording::CAST_FILE_NAME), b"{\"version\":3}\n").expect("write cast");
+        fs::write(layout.daemon_pid_path(), std::process::id().to_string()).expect("write pid");
+
+        let listener = UnixListener::bind(layout.socket_path()).expect("bind socket");
+        let reader = thread::spawn(move || {
+            for index in 0..3 {
+                use std::io::Write;
+
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                if index == 1 {
+                    let _request = read_http_request_for_test(&mut stream);
+                    stream
+                        .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops")
+                        .expect("write error response");
+                }
+            }
+        });
+
+        let service = SessionService::new(layout.clone());
+        let err = service.list_all_with_selectors(&[]).expect_err("live daemon HTTP error should propagate");
+
+        reader.join().expect("join reader");
+        assert!(err.contains("500 Internal Server Error"), "{err}");
+        assert!(kept_dir.exists(), "recreatable session should remain");
+        assert!(discarded_dir.exists(), "non-recreatable live session should not be swept");
+        assert!(layout.socket_path().exists(), "daemon socket should remain reachable");
+        assert!(layout.daemon_pid_path().exists(), "daemon pid should remain");
     }
 
     #[test]

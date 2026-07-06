@@ -2054,6 +2054,8 @@ impl ActiveClientReader {
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), String> {
+    // Feature builds can spend several seconds loading the Ghostty VT library
+    // and starting the daemon process under CI load before the socket is bound.
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if try_connect_session_stream(path).is_ok() {

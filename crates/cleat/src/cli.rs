@@ -975,17 +975,27 @@ fn parse_tag_mutations(mutations: Vec<String>) -> Result<(Vec<String>, Vec<Strin
     let mut add = Vec::new();
     let mut remove = Vec::new();
     for mutation in mutations {
-        let (target, tag) = if let Some(tag) = mutation.strip_prefix('+') {
-            (&mut add, tag)
+        let (is_add, tag) = if let Some(tag) = mutation.strip_prefix('+') {
+            (true, tag)
         } else if let Some(tag) = mutation.strip_prefix('-') {
-            (&mut remove, tag)
+            (false, tag)
         } else {
             return Err(format!("tag mutation must start with + or -: {mutation}"));
         };
         if tag.is_empty() {
             return Err("tag mutation must include a tag after + or -".to_string());
         }
-        target.push(tag.to_string());
+        if is_add {
+            remove.retain(|existing| existing != tag);
+            if !add.iter().any(|existing| existing == tag) {
+                add.push(tag.to_string());
+            }
+        } else {
+            add.retain(|existing| existing != tag);
+            if !remove.iter().any(|existing| existing == tag) {
+                remove.push(tag.to_string());
+            }
+        }
     }
     crate::runtime::normalize_tags(&mut add);
     crate::runtime::normalize_tags(&mut remove);
@@ -1006,7 +1016,7 @@ fn run_list_watch_command(service: &SessionService, selectors: &[String], json: 
         )
         .map_err(|err| format!("write directory snapshot: {err}"))?;
     } else {
-        writeln!(stdout, "snapshot\t{}", format_directory_snapshot(&snapshot)).map_err(|err| format!("write directory snapshot: {err}"))?;
+        writeln!(stdout, "{}", format_directory_snapshot(&snapshot)).map_err(|err| format!("write directory snapshot: {err}"))?;
     }
     stdout.flush().map_err(|err| format!("flush directory snapshot: {err}"))?;
 
@@ -1029,9 +1039,9 @@ fn run_list_watch_command(service: &SessionService, selectors: &[String], json: 
 
 fn format_directory_snapshot(snapshot: &crate::packet::DirectorySnapshot) -> String {
     if snapshot.sessions.is_empty() {
-        "empty".to_string()
+        "snapshot\tempty".to_string()
     } else {
-        snapshot.sessions.iter().map(format_directory_entry).collect::<Vec<_>>().join("\n")
+        snapshot.sessions.iter().map(|entry| format!("snapshot\t{}", format_directory_entry(entry))).collect::<Vec<_>>().join("\n")
     }
 }
 

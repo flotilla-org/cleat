@@ -775,6 +775,52 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_skips_closed_channels() {
+        let (_temp, layout) = test_layout();
+        let daemon = FakeDaemon::bind(&layout);
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+
+        let mut server = daemon.accept(vec![directory_entry("alpha"), directory_entry("beta")]);
+        wait_until(|| connection.is_connected());
+        let (closed_channel, closed_slot) = connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller);
+        let (live_channel, _live_slot) = connection.open_session_channel("beta".to_string(), 80, 24, ChannelRole::Controller);
+        for _ in 0..4 {
+            PacketFrame::read(&mut server).expect("initial open/resize frames");
+        }
+
+        // The daemon reports alpha's channel dead (e.g. the session exited).
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_ERROR, &crate::packet::ControlError {
+            channel: closed_channel,
+            message: "session alpha exited".to_string(),
+        })
+        .expect("control error frame")
+        .write(&mut server)
+        .expect("write control error");
+        wait_until(|| closed_slot.lock().expect("slot").closed.is_some());
+
+        drop(server);
+        wait_until(|| !connection.is_connected());
+
+        // Only the live channel is reopened; a closed channel would just
+        // re-error on every reconnect until the FFI caller destroys it.
+        let mut server = daemon.accept(vec![directory_entry("beta")]);
+        wait_until(|| connection.is_connected());
+        let open = PacketFrame::read(&mut server).expect("reopen frame");
+        assert_eq!(open.decode::<OpenChannel>().expect("reopen payload"), OpenChannel {
+            channel: live_channel,
+            session_id: "beta".to_string(),
+            role: ChannelRole::Controller,
+            take: false
+        });
+        let resize = PacketFrame::read(&mut server).expect("resize frame");
+        assert_eq!((resize.channel, resize.msg_type), (live_channel, MSG_SESSION_RESIZE));
+        server.set_read_timeout(Some(std::time::Duration::from_millis(100))).expect("set read timeout");
+        assert!(PacketFrame::read(&mut server).is_err(), "closed channel must not be reopened");
+
+        connection.shutdown();
+    }
+
+    #[test]
     fn directory_deltas_apply_and_bump_generation() {
         let (_temp, layout) = test_layout();
         let daemon = FakeDaemon::bind(&layout);

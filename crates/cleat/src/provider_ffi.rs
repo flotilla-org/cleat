@@ -550,10 +550,11 @@ pub struct CleatDirectory {
     pub entry_count: usize,
 }
 
+/// Keeps the heap buffers behind `directory`'s FFI pointers alive.
 struct OwnedDirectory {
     directory: CleatDirectory,
-    entries: Vec<CleatDirectoryEntry>,
-    tag_lists: Vec<Vec<CleatStr>>,
+    _entries: Vec<CleatDirectoryEntry>,
+    _tag_lists: Vec<Vec<CleatStr>>,
     _strings: Vec<String>,
 }
 
@@ -611,18 +612,17 @@ impl OwnedDirectory {
                 rows: entry.rows,
             })
             .collect();
-        let mut owned = Box::new(Self {
-            directory: CleatDirectory { generation, entries: ptr::null(), entry_count: entries.len() },
-            entries,
-            tag_lists,
+        // Every pointer handed to the FFI targets a Vec/String HEAP buffer.
+        // Moving the owning headers into the struct/Box relocates only the
+        // headers, never the buffers, so the pointers computed above stay
+        // valid — nothing here is self-referential and no fix-up is needed.
+        let entries_ptr = if entries.is_empty() { ptr::null() } else { entries.as_ptr() };
+        Box::new(Self {
+            directory: CleatDirectory { generation, entries: entries_ptr, entry_count: entries.len() },
+            _entries: entries,
+            _tag_lists: tag_lists,
             _strings: strings,
-        });
-        // Self-referential fix-ups: the boxed vectors' addresses are stable now.
-        owned.directory.entries = if owned.entries.is_empty() { ptr::null() } else { owned.entries.as_ptr() };
-        for (entry, tags) in owned.entries.iter_mut().zip(owned.tag_lists.iter()) {
-            entry.tags = if tags.is_empty() { ptr::null() } else { tags.as_ptr() };
-        }
-        owned
+        })
     }
 }
 

@@ -1267,6 +1267,7 @@ fn handle_http_request(
             };
             let body: http_uds::AttachRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP attach request: {err}"))?;
+            vacate_dead_packet_controller(hosted, state.packet_clients);
             if hosted.active_client.is_some() || hosted.packet_controller.is_some() {
                 http_uds::write_error(stream, StatusCode::CONFLICT, "session already has a foreground client")
                     .map_err(|err| format!("write HTTP attach busy response: {err}"))?;
@@ -1852,6 +1853,20 @@ fn release_packet_client_roles(
     Ok(())
 }
 
+/// A dead client awaiting reaping must not hold the controller slot against
+/// a live requester (packet role grants and legacy attach alike).
+fn vacate_dead_packet_controller(hosted: &mut HostedSession, packet_clients: &[PacketClient]) {
+    if let Some(current) = hosted.packet_controller {
+        if !packet_controller_holder_is_live(current, packet_clients) {
+            hosted.packet_controller = None;
+        }
+    }
+}
+
+fn packet_controller_holder_is_live(current: PacketChannelRef, packet_clients: &[PacketClient]) -> bool {
+    packet_clients.iter().any(|client| client.id == current.client_id && !client.dead)
+}
+
 /// Resolve a controller/watcher request for `requester`, demoting the current
 /// packet controller when `take` is set. A legacy stream controller is never
 /// preempted (a raw attach cannot be demoted to read-only), so requests grant
@@ -1874,14 +1889,7 @@ fn grant_packet_role(
             if hosted.active_client.is_some() {
                 return Ok(ChannelRole::Watcher);
             }
-            // A dead client awaiting reaping must not hold the controller
-            // slot against a live requester.
-            if let Some(current) = hosted.packet_controller {
-                let holder_is_live = packet_clients.iter().any(|client| client.id == current.client_id && !client.dead);
-                if !holder_is_live {
-                    hosted.packet_controller = None;
-                }
-            }
+            vacate_dead_packet_controller(hosted, packet_clients);
             match hosted.packet_controller {
                 None => {
                     hosted.packet_controller = Some(requester);
@@ -2537,6 +2545,21 @@ mod tests {
 
         client.enqueue_frame(&frame).expect("enqueue to a dead client is a no-op");
         assert!(client.pending_output.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_packet_client_does_not_hold_the_controller_slot() {
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
+        let mut client = super::PacketClient::new(7, stream, Vec::new(), &crate::packet::DirectorySnapshot { sessions: Vec::new() })
+            .expect("create packet client");
+        let holder = super::PacketChannelRef { client_id: 7, channel: 1 };
+
+        assert!(super::packet_controller_holder_is_live(holder, std::slice::from_ref(&client)));
+
+        client.dead = true;
+        assert!(!super::packet_controller_holder_is_live(holder, std::slice::from_ref(&client)));
+        assert!(!super::packet_controller_holder_is_live(holder, &[]), "a reaped holder is not live either");
     }
 
     #[test]

@@ -21,6 +21,14 @@ use crate::{
 
 const PTY_READ_BUFFER_SIZE: usize = 64 * 1024;
 const SNAPSHOT_INTERVAL_BYTES: u64 = 256 * 1024;
+/// Per-pump read budget. A PTY child that produces output faster than the
+/// VT engine consumes it (`yes` at saturation) would otherwise keep one
+/// `read_available_output` call spinning forever, starving the actor's
+/// command channel — and with it the daemon's whole control plane. The
+/// actor's readiness poll re-arms immediately, so bounding the slice costs
+/// no throughput; it only guarantees commands drain between slices. Two
+/// reads keeps a slice around ~100ms even for a debug-build VT engine.
+const PTY_READ_BUDGET_PER_PUMP: usize = 2 * PTY_READ_BUFFER_SIZE;
 
 pub(crate) struct SessionRuntime {
     session: SessionMetadata,
@@ -388,11 +396,18 @@ impl SessionRuntime {
 
     fn read_available_output_inner(&mut self, has_active_client: bool, after_exit: bool) -> Result<PtyOutput, String> {
         let mut chunks = Vec::new();
+        let mut budget = PTY_READ_BUDGET_PER_PUMP;
         loop {
+            // Draining after exit is finite (the child is gone), so the
+            // budget applies only to live pumps.
+            if !after_exit && budget == 0 {
+                break;
+            }
             let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
             match self.pty_child.read_output(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    budget = budget.saturating_sub(n);
                     let bytes = &buf[..n];
                     self.last_pty_output_at = Some(Instant::now());
                     self.vt_engine.feed(bytes)?;

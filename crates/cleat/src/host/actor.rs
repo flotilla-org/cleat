@@ -9,7 +9,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
@@ -36,6 +36,14 @@ use crate::{
 };
 
 const POSIX_SIGTERM: i32 = 15;
+/// Ceiling on any reply wait against a session actor. The actor's pump slice
+/// is budgeted (see `PTY_READ_BUDGET_PER_PUMP`), so healthy replies arrive in
+/// milliseconds even under output flood; hitting this deadline means the
+/// actor is genuinely wedged (stuck VT engine, blocked disk). Callers get an
+/// error — and the daemon's servicing loop faults that one session — instead
+/// of one actor freezing the entire control plane (ADR 0004: the servicing
+/// side is never blocked).
+const ACTOR_REPLY_DEADLINE: Duration = Duration::from_secs(5);
 const RAW_OUTPUT_TAP_CHUNKS: usize = 64;
 
 pub(crate) type WakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -123,6 +131,17 @@ impl ObservationState {
         was_clean
     }
 
+    /// Publish the child's exit code to the mirror (once), waking observers
+    /// on the transition.
+    pub(crate) fn record_exit(&mut self, code: i32, wake: &WakeCallback) {
+        if let Some(mirror) = &self.mirror {
+            if mirror.exit_code().is_none() {
+                mirror.record_exit(code);
+                wake();
+            }
+        }
+    }
+
     pub(crate) fn sync_terminal_modes(&mut self, terminal_modes: vt::TerminalModeState) -> bool {
         let previous = self.terminal_modes.replace(terminal_modes);
         match previous {
@@ -177,11 +196,19 @@ impl ObservationState {
     }
 }
 
+/// Sentinel for "the session has not exited"; exit codes are i32, so this
+/// value is unreachable.
+const EXIT_CODE_UNSET: i64 = i64::MIN;
+
 #[derive(Debug)]
 pub(crate) struct ObservationMirror {
     render_generation: AtomicU64,
     observed_generation: AtomicU64,
     dirty: AtomicU8,
+    /// Exit code recorded by the actor when it reaps the child; lets the
+    /// daemon's servicing loop poll for exit without a blocking round-trip
+    /// into a possibly-busy actor (ADR 0004: never-blocked servicing side).
+    exit_code: std::sync::atomic::AtomicI64,
 }
 
 impl ObservationMirror {
@@ -190,6 +217,18 @@ impl ObservationMirror {
             render_generation: AtomicU64::new(0),
             observed_generation: AtomicU64::new(0),
             dirty: AtomicU8::new(dirty_state_to_u8(DirtyState::Clean)),
+            exit_code: std::sync::atomic::AtomicI64::new(EXIT_CODE_UNSET),
+        }
+    }
+
+    pub(crate) fn record_exit(&self, code: i32) {
+        self.exit_code.store(code as i64, AtomicOrdering::SeqCst);
+    }
+
+    pub(crate) fn exit_code(&self) -> Option<i32> {
+        match self.exit_code.load(AtomicOrdering::SeqCst) {
+            EXIT_CODE_UNSET => None,
+            code => Some(code as i32),
         }
     }
 
@@ -282,7 +321,6 @@ pub(crate) enum SessionCommand {
     ResolveMarker { name: String, reply: mpsc::Sender<Result<Option<u64>, String>> },
     ResolveNextMarker { after: u64, reply: mpsc::Sender<Result<Option<u64>, String>> },
     DispatchSignal { signal: i32, target: SignalTarget, reply: mpsc::Sender<Result<(), String>> },
-    ExitCode { reply: mpsc::Sender<Result<Option<i32>, String>> },
     ShouldKeepSessionDir { reply: mpsc::Sender<Result<bool, String>> },
     MarkObserved { generation: u64, reply: mpsc::Sender<bool> },
     ScrollbackExtent { reply: mpsc::Sender<TerminalScrollbackExtent> },
@@ -586,12 +624,19 @@ impl SessionActor {
         &self.observation
     }
 
+    /// True when the actor's worker thread has stopped. Combined with a
+    /// missing mirror exit code this means the actor died without reaping
+    /// its child — the session must be faulted.
+    pub(crate) fn worker_finished(&self) -> bool {
+        self.worker.as_ref().map(|worker| worker.is_finished()).unwrap_or(true)
+    }
+
     pub(crate) fn request<T>(&self, make_command: impl FnOnce(mpsc::Sender<T>) -> SessionCommand, fallback: T) -> T {
         let (reply, recv) = mpsc::channel();
         if self.tx.send(make_command(reply)).is_err() {
             return fallback;
         }
-        recv.recv().unwrap_or(fallback)
+        recv.recv_timeout(ACTOR_REPLY_DEADLINE).unwrap_or(fallback)
     }
 
     pub(crate) fn request_result<T>(
@@ -600,7 +645,11 @@ impl SessionActor {
     ) -> Result<T, String> {
         let (reply, recv) = mpsc::channel();
         self.tx.send(make_command(reply)).map_err(|_| "session actor is not running".to_string())?;
-        recv.recv().map_err(|_| "session actor did not reply".to_string())?
+        match recv.recv_timeout(ACTOR_REPLY_DEADLINE) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("session actor did not reply within {ACTOR_REPLY_DEADLINE:?}")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("session actor did not reply".to_string()),
+        }
     }
 
     pub(crate) fn set_client_presence(&self, active: bool) -> Result<(), String> {
@@ -729,10 +778,6 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::DispatchSignal { signal, target, reply })
     }
 
-    pub(crate) fn exit_code(&self) -> Result<Option<i32>, String> {
-        self.request_result(|reply| SessionCommand::ExitCode { reply })
-    }
-
     pub(crate) fn should_keep_session_dir(&self) -> Result<bool, String> {
         self.request_result(|reply| SessionCommand::ShouldKeepSessionDir { reply })
     }
@@ -742,7 +787,18 @@ impl Drop for SessionActor {
     fn drop(&mut self) {
         let _ = self.tx.send(SessionCommand::Stop { terminate: true });
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            // Bounded join: drop runs on the daemon's servicing thread, which
+            // must never block indefinitely on one session (ADR 0004). The
+            // worker honors Stop between pump slices; if it is wedged past
+            // the deadline, detach — the thread still runs its own teardown
+            // (child terminate, recording flush) whenever it gets unstuck.
+            let deadline = Instant::now() + ACTOR_REPLY_DEADLINE;
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -1041,9 +1097,6 @@ fn session_actor_handle_command(
         SessionCommand::DispatchSignal { signal, target, reply } => {
             let _ = reply.send(runtime.dispatch_signal(signal, target));
         }
-        SessionCommand::ExitCode { reply } => {
-            let _ = reply.send(Ok(state.exit_code));
-        }
         SessionCommand::ShouldKeepSessionDir { reply } => {
             let _ = reply.send(Ok(runtime.should_keep_session_dir()));
         }
@@ -1090,6 +1143,12 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
     match pump_session_runtime(runtime, &mut state.exited, &mut state.exit_code, state.has_active_client) {
         Ok(result) => {
             publish_raw_output(&mut state.raw_output_taps, &result.chunks);
+            // Flush actor-side after each pump slice: the servicing loop no
+            // longer round-trips into the actor for it, and recording only
+            // grows when the pump runs.
+            if !result.chunks.is_empty() || state.exited {
+                runtime.flush_recording();
+            }
             match result.outcome {
                 PumpOutcome::Clean => {}
                 PumpOutcome::PartialUnknown => mark_partial_unknown_and_wake(&mut state.observation, wake),
@@ -1102,6 +1161,11 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
         Err(_) => {
             let rows = runtime.inspect(false, 0).terminal.rows;
             mark_full_and_wake(&mut state.observation, rows, wake);
+        }
+    }
+    if state.exited {
+        if let Some(code) = state.exit_code {
+            state.observation.record_exit(code, wake);
         }
     }
     sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);

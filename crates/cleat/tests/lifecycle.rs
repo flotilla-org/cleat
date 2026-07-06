@@ -2051,6 +2051,51 @@ fn stale_foreground_file_does_not_block_attach() {
     let (_session, _attach) = service.attach(Some("alpha".into()), None, None, None, false).expect("attach with stale foreground marker");
 }
 
+// A session flooding output at PTY saturation (`yes`) must not starve the
+// daemon's control plane: the actor's pump slice is budgeted so commands
+// keep draining, and the serve loop's actor requests carry a deadline
+// (ADR 0004: the servicing side is never blocked). Probes use a raw
+// socket with a read timeout because the CLI client would hang forever
+// in the failure mode this guards against.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn control_socket_answers_while_a_session_floods_output() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    // The delay lets the create response escape before the flood begins.
+    service.create(Some("flood".into()), None, None, Some("sh -c 'sleep 0.3; exec yes'".into()), false).expect("create flood session");
+    std::thread::sleep(Duration::from_millis(700));
+
+    for probe in 0..5 {
+        let start = Instant::now();
+        let socket = session_socket_path(temp.path(), "flood");
+        let mut stream = UnixStream::connect(&socket).expect("connect control socket");
+        stream.set_read_timeout(Some(Duration::from_secs(2))).expect("set read timeout");
+        stream.write_all(b"GET /sessions HTTP/1.1\r\nHost: cleat\r\n\r\n").expect("write list request");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => panic!("probe {probe}: daemon closed the control socket"),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    panic!("probe {probe}: control plane starved by output flood after {:?}: {err}", start.elapsed())
+                }
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(2), "probe {probe}: control response took {:?} under output flood", start.elapsed());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    service.kill("flood").expect("kill flood session");
+}
+
 #[test]
 fn daemon_exits_when_runtime_root_is_removed() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());

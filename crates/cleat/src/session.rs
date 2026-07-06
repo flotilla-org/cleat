@@ -726,7 +726,13 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             let service_result = contain_session_unwind(&session_id, || -> Result<(bool, Option<bool>), String> {
                 maybe_panic_for_containment_test(&session_id);
                 let session_did_work = service_hosted_session(&layout, &session_id, hosted, &mut packet_clients)?;
-                let should_keep_session_dir = if hosted.actor.exit_code()?.is_some() {
+                // Exit state is read from the observation mirror — never a
+                // blocking round-trip into a possibly-busy actor.
+                let exit_code = hosted.actor.observation().exit_code();
+                if exit_code.is_none() && hosted.actor.worker_finished() {
+                    return Err("session actor stopped without reporting an exit".to_string());
+                }
+                let should_keep_session_dir = if exit_code.is_some() {
                     Some(finish_exited_session(&layout, &session_id, hosted, &mut packet_clients)?)
                 } else {
                     None
@@ -1005,7 +1011,8 @@ fn service_hosted_session(
 
     service_pending_waits(&hosted.actor, &mut hosted.pending_waits);
     service_pending_expects(layout, id, &hosted.actor, &mut hosted.pending_expects)?;
-    hosted.actor.flush_recording()?;
+    // Recording flush happens actor-side after each pump slice; no per-tick
+    // round-trip here (ADR 0004: the servicing side is never blocked).
 
     Ok(did_work)
 }

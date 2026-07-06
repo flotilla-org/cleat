@@ -134,6 +134,10 @@ impl SessionService {
     }
 
     pub fn list(&self) -> Result<Vec<SessionInfo>, String> {
+        self.list_with_selectors(&[])
+    }
+
+    pub fn list_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
         if !self.layout.root().exists() {
             return Ok(vec![]);
         }
@@ -164,7 +168,7 @@ impl SessionService {
                     for result in result.sessions {
                         let status =
                             if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
-                        sessions.push(SessionInfo {
+                        let info = SessionInfo {
                             id: result.session.id,
                             vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
                             vt_engine_status: result.session.vt_engine_status,
@@ -174,11 +178,18 @@ impl SessionService {
                             tags: result.session.tags,
                             status,
                             error: None,
-                        });
+                        };
+                        if session_matches_selectors(&info, selectors) {
+                            sessions.push(info);
+                        }
                     }
                 }
                 Err(err) => {
-                    sessions.extend(list_preserved_sessions_with_error(&daemon_service.layout, err)?);
+                    sessions.extend(
+                        list_preserved_sessions_with_error(&daemon_service.layout, err)?
+                            .into_iter()
+                            .filter(|session| session_matches_selectors(session, selectors)),
+                    );
                 }
             }
         }
@@ -422,14 +433,32 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
+        self.connect_directory(&[]).and_then(|(client, directory)| {
+            if directory.sessions.iter().any(|entry| entry.session_id == id) {
+                Ok((client, directory))
+            } else {
+                Err(format!("session {id} was not present in packet directory"))
+            }
+        })
+    }
+
+    pub fn connect_directory(
+        &self,
+        selectors: &[String],
+    ) -> Result<(crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot), String> {
+        crate::session::ensure_daemon_started(&self.layout)?;
 
         let socket_path = self.layout.socket_path();
         let mut stream = connect_session_socket(&socket_path)?;
+        let body = serde_json::to_vec(&http_uds::DirectorySubscribeRequest { selectors: selectors.to_vec() })
+            .map_err(|err| format!("serialize directory subscribe request: {err}"))?;
         write!(
             stream,
-            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n"
+            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",
+            body.len()
         )
         .map_err(|err| format!("write packet upgrade request: {err}"))?;
+        stream.write_all(&body).map_err(|err| format!("write directory subscribe request: {err}"))?;
         let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read packet upgrade response: {err}"))?;
         if response.status != StatusCode::SWITCHING_PROTOCOLS {
             return Err(format!("unexpected packet response: {}", response.status));
@@ -628,6 +657,10 @@ impl SessionService {
         http_uds::write_request(&mut stream, method, path, &body).map_err(|err| format!("write HTTP request: {err}"))?;
         http_uds::read_response(&mut stream).map_err(|err| format!("read HTTP response: {err}"))
     }
+}
+
+fn session_matches_selectors(session: &SessionInfo, selectors: &[String]) -> bool {
+    selectors.iter().all(|selector| session.tags.contains(selector))
 }
 
 fn session_socket_is_stale(socket_path: &Path) -> bool {

@@ -152,6 +152,10 @@ pub enum Command {
     List {
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(long, help = "Watch directory updates after printing the initial snapshot")]
+        watch: bool,
+        #[arg(long = "selector", value_name = "TAG", allow_hyphen_values = true, help = "Require an exact opaque tag match; repeatable")]
+        selectors: Vec<String>,
     },
     /// Add or remove opaque session tags
     Tag {
@@ -538,8 +542,18 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(Some(created.id))
             }
         }
-        Command::List { json } => {
-            let sessions = match service.list() {
+        Command::List { json, watch, selectors } => {
+            let selectors = match normalize_cli_tags(selectors) {
+                Ok(selectors) => selectors,
+                Err(err) => return ExecResult::Err(err),
+            };
+            if watch {
+                return match run_list_watch_command(service, &selectors, json) {
+                    Ok(()) => ExecResult::Ok(None),
+                    Err(err) => ExecResult::Err(err),
+                };
+            }
+            let sessions = match service.list_with_selectors(&selectors) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
@@ -974,6 +988,75 @@ fn parse_tag_mutations(mutations: Vec<String>) -> Result<(Vec<String>, Vec<Strin
     crate::runtime::normalize_tags(&mut add);
     crate::runtime::normalize_tags(&mut remove);
     Ok((add, remove))
+}
+
+fn run_list_watch_command(service: &SessionService, selectors: &[String], json: bool) -> Result<(), String> {
+    use std::io::Write;
+
+    let (mut client, snapshot) = service.connect_directory(selectors)?;
+    let mut stdout = std::io::stdout().lock();
+    if json {
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string(&serde_json::json!({"kind": "snapshot", "sessions": snapshot.sessions}))
+                .map_err(|err| format!("serialize directory snapshot: {err}"))?
+        )
+        .map_err(|err| format!("write directory snapshot: {err}"))?;
+    } else {
+        writeln!(stdout, "snapshot\t{}", format_directory_snapshot(&snapshot)).map_err(|err| format!("write directory snapshot: {err}"))?;
+    }
+    stdout.flush().map_err(|err| format!("flush directory snapshot: {err}"))?;
+
+    loop {
+        let delta = client.read_directory_delta().map_err(|err| format!("read directory delta: {err}"))?;
+        if json {
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string(&serde_json::json!({"kind": "delta", "delta": delta}))
+                    .map_err(|err| format!("serialize directory delta: {err}"))?
+            )
+            .map_err(|err| format!("write directory delta: {err}"))?;
+        } else {
+            writeln!(stdout, "{}", format_directory_delta(&delta)).map_err(|err| format!("write directory delta: {err}"))?;
+        }
+        stdout.flush().map_err(|err| format!("flush directory delta: {err}"))?;
+    }
+}
+
+fn format_directory_snapshot(snapshot: &crate::packet::DirectorySnapshot) -> String {
+    if snapshot.sessions.is_empty() {
+        "empty".to_string()
+    } else {
+        snapshot.sessions.iter().map(format_directory_entry).collect::<Vec<_>>().join("\n")
+    }
+}
+
+fn format_directory_delta(delta: &crate::packet::DirectoryDelta) -> String {
+    let mut lines = Vec::new();
+    lines.extend(delta.upserted.iter().map(|entry| format!("upsert\t{}", format_directory_entry(entry))));
+    lines.extend(delta.removed_session_ids.iter().map(|id| format!("remove\t{id}")));
+    if lines.is_empty() {
+        "delta\tempty".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn format_directory_entry(entry: &crate::packet::DirectoryEntry) -> String {
+    let mut fields = vec![
+        entry.session_id.clone(),
+        entry.state.clone(),
+        format!("{}x{}", entry.cols, entry.rows),
+        format!("controllers={}", entry.controller_count),
+        format!("watchers={}", entry.watcher_count),
+        format!("recreatable={}", if entry.recreatable { "yes" } else { "no" }),
+    ];
+    if !entry.tags.is_empty() {
+        fields.push(format!("tags={}", entry.tags.join(",")));
+    }
+    fields.join("\t")
 }
 
 fn run_packets_command(service: &SessionService, id: &str, count: usize) -> Result<Vec<String>, String> {

@@ -16,7 +16,8 @@ use cleat::session::foreground_path;
 use cleat::{
     cli::{self, Cli, ExecResult},
     packet::{
-        ControlHello, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO, PROTOCOL_VERSION,
+        ControlHello, DirectoryDelta, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA,
+        MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO, PROTOCOL_VERSION,
     },
     protocol::{Frame, SessionInfo},
     provider::ProviderFeatures,
@@ -78,10 +79,28 @@ fn http_watch_stream(root: &std::path::Path, id: &str, cols: u16, rows: u16, cap
 }
 
 fn http_packet_stream(root: &std::path::Path, id: &str) -> UnixStream {
+    http_packet_stream_with_selectors(root, id, &[])
+}
+
+fn http_packet_stream_with_selectors(root: &std::path::Path, id: &str, selectors: &[String]) -> UnixStream {
     let socket_path = session_socket_path(root, id);
     let mut stream = UnixStream::connect(&socket_path).expect("connect session socket");
-    write!(stream, "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",)
+    let body = if selectors.is_empty() { String::new() } else { serde_json::json!({ "selectors": selectors }).to_string() };
+    if body.is_empty() {
+        write!(
+            stream,
+            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",
+        )
         .expect("write packet upgrade request");
+    } else {
+        write!(
+            stream,
+            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write packet upgrade request");
+    }
 
     let response = read_http_response_head(&mut stream);
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
@@ -131,6 +150,39 @@ fn read_packet_render(stream: &mut UnixStream, channel: u32, timeout: Duration) 
     panic!("timed out waiting for render packet on channel {channel}");
 }
 
+fn read_directory_delta_named(stream: &mut UnixStream, timeout: Duration, label: &str) -> DirectoryDelta {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+    let deadline = Instant::now() + timeout;
+    let mut buffer = Vec::new();
+    while Instant::now() < deadline {
+        while let Some(frame) = PacketFrame::read_from_buffer(&mut buffer).expect("parse packet buffer") {
+            if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_DIRECTORY_DELTA {
+                return frame.decode::<DirectoryDelta>().expect("decode directory delta");
+            }
+        }
+        let mut chunk = [0; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("packet stream closed while waiting for directory delta"),
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(err) if packet_read_would_wait(&err) => {}
+            Err(err) => panic!("read packet frame: {err}"),
+        }
+    }
+    panic!("timed out waiting for {label}");
+}
+
+fn read_until_directory_remove(stream: &mut UnixStream, session_id: &str, timeout: Duration) -> DirectoryDelta {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let delta = read_directory_delta_named(stream, remaining, &format!("remove delta for {session_id}"));
+        if delta.removed_session_ids.iter().any(|id| id == session_id) {
+            return delta;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for remove delta for {session_id}");
+    }
+}
+
 #[cfg(feature = "ghostty-vt")]
 fn expect_no_packet(stream: &mut UnixStream, timeout: Duration) {
     stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
@@ -150,7 +202,6 @@ fn expect_no_packet(stream: &mut UnixStream, timeout: Duration) {
     }
 }
 
-#[cfg(feature = "ghostty-vt")]
 fn packet_read_would_wait(err: &std::io::Error) -> bool {
     matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) || err.raw_os_error() == Some(libc::EINVAL)
 }
@@ -396,6 +447,47 @@ fn list_and_inspect_report_opaque_tags() {
 }
 
 #[test]
+fn list_selector_requires_exact_opaque_tag_matches() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create_with_options(
+            Some("alpha".into()),
+            Some(VtEngineKind::Passthrough),
+            None,
+            Some("zsh".into()),
+            cleat::session::SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags: vec!["role=impl".into(), "task=99".into()],
+            },
+        )
+        .expect("create alpha");
+    service
+        .create_with_options(
+            Some("beta".into()),
+            Some(VtEngineKind::Passthrough),
+            None,
+            Some("zsh".into()),
+            cleat::session::SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags: vec!["role=shepherd".into()],
+            },
+        )
+        .expect("create beta");
+    let cli = Cli::try_parse_from(["cleat", "list", "--selector", "role=impl", "--selector", "task=99"]).expect("parse list");
+
+    let output = cli::execute(cli, &service).expect("execute list").expect("list output");
+
+    assert!(output.contains("alpha"), "{output}");
+    assert!(!output.contains("beta"), "{output}");
+}
+
+#[test]
 fn tag_command_adds_and_removes_opaque_tags() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
@@ -408,6 +500,89 @@ fn tag_command_adds_and_removes_opaque_tags() {
 
     assert_eq!(output, "task=99");
     assert_eq!(inspect.session.tags, vec!["task=99"]);
+}
+
+#[test]
+fn directory_subscription_filters_and_emits_lifecycle_deltas() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let selector = "role=impl".to_string();
+    service
+        .create_with_options(
+            Some("alpha".into()),
+            Some(VtEngineKind::Passthrough),
+            None,
+            Some("sleep 30".into()),
+            cleat::session::SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags: vec![selector.clone()],
+            },
+        )
+        .expect("create alpha");
+    let mut stream = http_packet_stream_with_selectors(temp.path(), "alpha", std::slice::from_ref(&selector));
+    stream.set_read_timeout(Some(Duration::from_secs(2))).expect("set read timeout");
+    let hello_frame = PacketFrame::read(&mut stream).expect("read hello");
+    let directory_frame = PacketFrame::read(&mut stream).expect("read directory");
+
+    assert_eq!(hello_frame.channel, CHANNEL_CONTROL);
+    assert_eq!(hello_frame.msg_type, MSG_CONTROL_HELLO);
+    assert_eq!(directory_frame.channel, CHANNEL_CONTROL);
+    assert_eq!(directory_frame.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
+    let snapshot = directory_frame.decode::<DirectorySnapshot>().expect("decode directory");
+    assert_eq!(snapshot.sessions.iter().map(|entry| entry.session_id.as_str()).collect::<Vec<_>>(), vec!["alpha"]);
+
+    service
+        .create_with_options(
+            Some("gamma".into()),
+            Some(VtEngineKind::Passthrough),
+            None,
+            Some("sleep 30".into()),
+            cleat::session::SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags: vec![selector.clone()],
+            },
+        )
+        .expect("create gamma");
+    let delta = read_directory_delta_named(&mut stream, Duration::from_secs(30), "gamma create delta");
+    assert_eq!(delta.removed_session_ids, Vec::<String>::new());
+    assert_eq!(delta.upserted.iter().map(|entry| entry.session_id.as_str()).collect::<Vec<_>>(), vec!["gamma"]);
+
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
+    service.update_tags("beta", vec![selector.clone()], Vec::new()).expect("tag beta");
+    let delta = read_directory_delta_named(&mut stream, Duration::from_secs(30), "beta retag delta");
+    assert_eq!(delta.upserted.iter().map(|entry| entry.session_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+
+    let (_info, attach) = service.attach(Some("beta".into()), None, None, None, true).expect("attach beta");
+    let delta = read_directory_delta_named(&mut stream, Duration::from_secs(30), "beta attach delta");
+    assert_eq!(delta.upserted[0].session_id, "beta");
+    assert_eq!(delta.upserted[0].controller_count, 1);
+    drop(attach);
+
+    service
+        .create_with_options(
+            Some("short".into()),
+            Some(VtEngineKind::Passthrough),
+            None,
+            Some("true".into()),
+            cleat::session::SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags: vec![selector.clone()],
+            },
+        )
+        .expect("create short");
+    let delta = read_until_directory_remove(&mut stream, "short", Duration::from_secs(30));
+    assert_eq!(delta.removed_session_ids, vec!["short"]);
+
+    service.update_tags("alpha", Vec::new(), vec![selector]).expect("untag alpha");
+    let delta = read_until_directory_remove(&mut stream, "alpha", Duration::from_secs(30));
+    assert_eq!(delta.removed_session_ids, vec!["alpha"]);
 }
 
 #[test]
@@ -699,8 +874,26 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
     assert_eq!(directory_frame.channel, CHANNEL_CONTROL);
     assert_eq!(directory_frame.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
     assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![
-        cleat::packet::DirectoryEntry { session_id: "alpha".to_string(), tags: Vec::new(), cols: 80, rows: 24 },
-        cleat::packet::DirectoryEntry { session_id: "beta".to_string(), tags: Vec::new(), cols: 80, rows: 24 },
+        cleat::packet::DirectoryEntry {
+            session_id: "alpha".to_string(),
+            tags: Vec::new(),
+            state: "running".to_string(),
+            controller_count: 0,
+            watcher_count: 0,
+            recreatable: false,
+            cols: 80,
+            rows: 24,
+        },
+        cleat::packet::DirectoryEntry {
+            session_id: "beta".to_string(),
+            tags: Vec::new(),
+            state: "running".to_string(),
+            controller_count: 0,
+            watcher_count: 0,
+            recreatable: false,
+            cols: 80,
+            rows: 24,
+        },
     ]);
 }
 

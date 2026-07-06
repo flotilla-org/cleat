@@ -216,6 +216,12 @@ pub(crate) struct SessionListResponse {
     pub sessions: Vec<crate::protocol::InspectResult>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) struct DirectorySubscribeRequest {
+    #[serde(default)]
+    pub selectors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CreateSessionResponse {
     pub session: crate::runtime::SessionMetadata,

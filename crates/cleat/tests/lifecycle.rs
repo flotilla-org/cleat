@@ -1901,11 +1901,32 @@ fn daemon_exits_when_runtime_root_is_removed() {
 
     // Delete the runtime root out from under the daemon, exactly as a dropped
     // test tempdir would. The hosted `cat` never exits on its own, so only
-    // the root watchdog can reap this daemon.
+    // the registration watchdog can reap this daemon.
     std::fs::remove_dir_all(temp.path()).expect("remove runtime root");
 
-    // The daemon is our direct child, so poll with waitpid rather than
-    // kill(pid, 0): an exited-but-unreaped zombie still answers signals.
+    wait_for_daemon_exit(pid, "daemon should exit after its runtime root is removed");
+}
+
+#[test]
+fn daemon_exits_when_pid_file_names_another_process() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("cat".into()), false).expect("create alpha");
+
+    let pid_path = daemon_pid_path(temp.path(), "alpha");
+    let pid: i32 = std::fs::read_to_string(&pid_path).expect("read daemon pid").trim().parse().expect("parse daemon pid");
+
+    // Simulate a successor daemon reclaiming the identity: the pid file no
+    // longer names this daemon, so it should fence itself off and exit.
+    std::fs::write(&pid_path, "999999999").expect("overwrite daemon pid");
+
+    wait_for_daemon_exit(pid, "daemon should exit after losing its pid-file registration");
+}
+
+/// The daemon is our direct child, so poll with waitpid rather than
+/// kill(pid, 0): an exited-but-unreaped zombie still answers signals.
+fn wait_for_daemon_exit(pid: i32, message: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut status: libc::c_int = 0;
@@ -1914,7 +1935,7 @@ fn daemon_exits_when_runtime_root_is_removed() {
             break;
         }
         assert!(rc == 0, "waitpid on session daemon failed: {rc}");
-        assert!(Instant::now() < deadline, "daemon should exit after its runtime root is removed");
+        assert!(Instant::now() < deadline, "{message}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }

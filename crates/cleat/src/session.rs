@@ -50,7 +50,7 @@ const SESSION_DAEMON_IDLE_LINGER: Duration = Duration::from_secs(120);
 const SESSION_HTTP_HANDSHAKE_DEADLINE: Duration = Duration::from_millis(250);
 const SESSION_HTTP_RESPONSE_WRITE_DEADLINE: Duration = Duration::from_millis(250);
 const TERMINATE_SIGNAL: i32 = 15;
-const SESSION_DAEMON_ROOT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const SESSION_DAEMON_REGISTRATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SCREEN_STABLE_CHANGED_CELL_TOLERANCE: usize = 16;
 
 #[derive(Debug)]
@@ -618,7 +618,8 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         }
     };
     set_listener_nonblocking(&listener, true)?;
-    fs::write(layout.daemon_pid_path(), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
+    let daemon_pid = std::process::id().to_string();
+    fs::write(layout.daemon_pid_path(), &daemon_pid).map_err(|err| format!("write daemon pid: {err}"))?;
 
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
@@ -626,25 +627,29 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     let mut exited_session: Option<(String, bool)> = None;
     let mut faulted_session: Option<String> = None;
     let mut idle_since = Some(Instant::now());
-    let mut last_root_check = Instant::now();
-    let mut root_was_missing = false;
+    let mut last_registration_check = Instant::now();
+    let mut registration_was_lost = false;
 
     loop {
-        // The runtime root owns this daemon's lifetime. If it disappears
-        // (e.g. a test tempdir was cleaned up), the socket and pid file went
-        // with it, so nothing can ever reach us again — terminate the hosted
-        // sessions and exit instead of servicing them forever. Two
-        // consecutive misses guard against a transient stat failure.
-        if last_root_check.elapsed() >= SESSION_DAEMON_ROOT_CHECK_INTERVAL {
-            last_root_check = Instant::now();
-            let root_missing = !layout.root().exists();
-            if root_missing && root_was_missing {
+        // Self-fencing watchdog: the pid file registers which process owns
+        // this daemon identity. If it no longer names us — the runtime root
+        // was deleted (e.g. a test tempdir was cleaned up), or another daemon
+        // reclaimed the socket — no client can ever route to us again, so
+        // terminate the hosted sessions and exit instead of servicing them
+        // forever. Two consecutive misses guard against transient read
+        // failures.
+        if last_registration_check.elapsed() >= SESSION_DAEMON_REGISTRATION_CHECK_INTERVAL {
+            last_registration_check = Instant::now();
+            let registered = fs::read_to_string(layout.daemon_pid_path()).map(|contents| contents.trim() == daemon_pid).unwrap_or(false);
+            if !registered && registration_was_lost {
                 for hosted in sessions.values() {
                     let _ = hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader);
                 }
+                // Deliberately leave the socket and pid file alone on this
+                // path: they are either already gone or owned by a successor.
                 return Ok(());
             }
-            root_was_missing = root_missing;
+            registration_was_lost = !registered;
         }
 
         let mut did_work = false;

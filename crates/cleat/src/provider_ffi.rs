@@ -1355,15 +1355,20 @@ pub unsafe extern "C" fn cleat_session_connection_state(session: *const CleatSes
     match &session.backend {
         SessionBackend::Mock(_) | SessionBackend::InProcess(_) => CLEAT_SESSION_STREAMING,
         SessionBackend::Daemon(daemon) => {
-            let slot = match daemon.slot.lock() {
-                Ok(slot) => slot,
+            // Copy the slot fields before checking connectivity:
+            // is_connected() takes the connection-state lock, and the reader
+            // thread takes connection-state -> slot (install_connection,
+            // request_role), so holding the slot across it would invert the
+            // lock order and deadlock the connection.
+            let (closed, streaming) = match daemon.slot.lock() {
+                Ok(slot) => (slot.closed.is_some(), slot.pending.is_some() || slot.last.render_generation > 0),
                 Err(_) => return CLEAT_SESSION_CLOSED,
             };
-            if slot.closed.is_some() {
+            if closed {
                 CLEAT_SESSION_CLOSED
             } else if !daemon.connection.is_connected() {
                 CLEAT_SESSION_DISCONNECTED
-            } else if slot.pending.is_some() || slot.last.render_generation > 0 {
+            } else if streaming {
                 CLEAT_SESSION_STREAMING
             } else {
                 CLEAT_SESSION_CONNECTING

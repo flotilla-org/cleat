@@ -111,6 +111,10 @@ impl LastKnown {
 
 /// Per-session-channel state shared between the reader thread and the FFI
 /// caller.
+///
+/// Lock order: the connection-state mutex is always taken BEFORE a channel
+/// slot (`install_connection`, `request_role`). Never call a connection
+/// method that takes the state lock while holding a slot guard.
 pub(crate) struct ChannelSlot {
     pub session_id: String,
     /// Latest un-consumed render packet. The ack-gated protocol guarantees at
@@ -416,11 +420,17 @@ impl DaemonConnection {
             let reopen: Vec<(u32, String, u16, u16, ChannelRole)> = state
                 .channels
                 .iter()
-                .map(|(channel, slot)| {
+                .filter_map(|(channel, slot)| {
                     let mut slot = slot.lock().expect("channel slot lock");
+                    // A closed channel (session gone) stays closed; reopening
+                    // it would just re-error on every reconnect until the FFI
+                    // caller destroys the session.
+                    if slot.closed.is_some() {
+                        return None;
+                    }
                     // the old grant died with the connection
                     slot.granted_role = None;
-                    (*channel, slot.session_id.clone(), slot.desired_cols, slot.desired_rows, slot.desired_role)
+                    Some((*channel, slot.session_id.clone(), slot.desired_cols, slot.desired_rows, slot.desired_role))
                 })
                 .collect();
             (reopen, std::mem::take(&mut state.queued_input))

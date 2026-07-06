@@ -1874,6 +1874,14 @@ fn grant_packet_role(
             if hosted.active_client.is_some() {
                 return Ok(ChannelRole::Watcher);
             }
+            // A dead client awaiting reaping must not hold the controller
+            // slot against a live requester.
+            if let Some(current) = hosted.packet_controller {
+                let holder_is_live = packet_clients.iter().any(|client| client.id == current.client_id && !client.dead);
+                if !holder_is_live {
+                    hosted.packet_controller = None;
+                }
+            }
             match hosted.packet_controller {
                 None => {
                     hosted.packet_controller = Some(requester);
@@ -1947,47 +1955,25 @@ fn handle_packet_frame(
         }
         (channel, MSG_SESSION_INPUT) if channel != CHANNEL_CONTROL => {
             let input = frame.decode::<Input>().map_err(|err| format!("decode input packet: {err}"))?;
-            if let Some((session_id, role)) =
-                packet_clients[index].channels.get(&channel).map(|session| (session.session_id.clone(), session.role))
-            {
-                // watcher input is dropped, not errored: read-only by role
-                if role == ChannelRole::Controller {
-                    if let Some(hosted) = sessions.get(&session_id) {
-                        route_packet_input_event(&hosted.actor, input.event)?;
-                    }
-                }
+            if let Some(hosted) = controller_session(sessions, packet_clients, index, channel) {
+                route_packet_input_event(&hosted.actor, input.event)?;
             }
         }
         (channel, MSG_SESSION_RESIZE) if channel != CHANNEL_CONTROL => {
             let resize = frame.decode::<Resize>().map_err(|err| format!("decode resize packet: {err}"))?;
-            if let Some((session_id, role)) =
-                packet_clients[index].channels.get(&channel).map(|session| (session.session_id.clone(), session.role))
-            {
-                // watchers never resize the session
-                if role == ChannelRole::Controller {
-                    if let Some(hosted) = sessions.get(&session_id) {
-                        hosted.actor.resize(resize.cols, resize.rows)?;
-                        updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
-                    }
-                }
+            if let Some(hosted) = controller_session(sessions, packet_clients, index, channel) {
+                hosted.actor.resize(resize.cols, resize.rows)?;
+                updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
             }
         }
         (channel, MSG_SESSION_VIEWPORT) if channel != CHANNEL_CONTROL => {
             let viewport = frame.decode::<crate::packet::Viewport>().map_err(|err| format!("decode viewport packet: {err}"))?;
-            if let Some((session_id, role)) =
-                packet_clients[index].channels.get(&channel).map(|session| (session.session_id.clone(), session.role))
-            {
-                // the viewport is session-global state; only the controller
-                // moves it. outcome flows back as viewport/scrollbar state in
-                // the next render packet; no reply message
-                if role == ChannelRole::Controller {
-                    if let Some(hosted) = sessions.get(&session_id) {
-                        let _ = hosted.actor.request_result(|reply| crate::host::actor::SessionCommand::ScrollViewport {
-                            command: viewport.command,
-                            reply,
-                        });
-                    }
-                }
+            // the viewport is session-global state; outcome flows back as
+            // viewport/scrollbar state in the next render packet; no reply
+            if let Some(hosted) = controller_session(sessions, packet_clients, index, channel) {
+                let _ = hosted
+                    .actor
+                    .request_result(|reply| crate::host::actor::SessionCommand::ScrollViewport { command: viewport.command, reply });
             }
         }
         (channel, MSG_SESSION_ROLE) if channel != CHANNEL_CONTROL => {
@@ -1997,6 +1983,22 @@ fn handle_packet_frame(
         _ => {}
     }
     Ok(updates)
+}
+
+/// The session a channel controls: `Some` only when the channel exists and
+/// holds the controller role. Watcher traffic on session-mutating messages
+/// is dropped by role, not errored.
+fn controller_session<'a>(
+    sessions: &'a HashMap<String, HostedSession>,
+    packet_clients: &[PacketClient],
+    index: usize,
+    channel: u32,
+) -> Option<&'a HostedSession> {
+    let session_channel = packet_clients[index].channels.get(&channel)?;
+    if session_channel.role != ChannelRole::Controller {
+        return None;
+    }
+    sessions.get(&session_channel.session_id)
 }
 
 fn apply_packet_role_request(

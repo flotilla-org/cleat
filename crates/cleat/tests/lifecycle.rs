@@ -162,23 +162,8 @@ impl<'a> PacketReader<'a> {
         Self { stream, buffer: Vec::new() }
     }
 
-    fn next_matching(&mut self, timeout: Duration, mut keep: impl FnMut(&PacketFrame) -> bool, label: &str) -> PacketFrame {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            while let Some(frame) = PacketFrame::read_from_buffer(&mut self.buffer).expect("parse packet buffer") {
-                if keep(&frame) {
-                    return frame;
-                }
-            }
-            let mut chunk = [0; 4096];
-            match self.stream.read(&mut chunk) {
-                Ok(0) => panic!("packet stream closed while waiting for {label}"),
-                Ok(n) => self.buffer.extend_from_slice(&chunk[..n]),
-                Err(err) if packet_read_would_wait(&err) => {}
-                Err(err) => panic!("read packet frame: {err}"),
-            }
-        }
-        panic!("timed out waiting for {label}");
+    fn next_matching(&mut self, timeout: Duration, keep: impl FnMut(&PacketFrame) -> bool, label: &str) -> PacketFrame {
+        next_matching_packet_frame(self.stream, &mut self.buffer, timeout, keep, label)
     }
 
     fn role(&mut self, channel: u32, timeout: Duration) -> ChannelRole {
@@ -196,21 +181,66 @@ impl<'a> PacketReader<'a> {
     }
 
     fn expect_no_render(&mut self, channel: u32, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            while let Some(frame) = PacketFrame::read_from_buffer(&mut self.buffer).expect("parse packet buffer") {
-                assert!(
-                    !(frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER),
-                    "unexpected render packet on channel {channel}"
-                );
+        assert_no_matching_packet_frame(
+            self.stream,
+            &mut self.buffer,
+            timeout,
+            |frame| frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER,
+            "render packet",
+        );
+    }
+}
+
+/// The single read/parse/timeout loop behind every packet-frame test helper.
+/// Frames not selected by `keep` are consumed and discarded.
+fn next_matching_packet_frame(
+    stream: &mut UnixStream,
+    buffer: &mut Vec<u8>,
+    timeout: Duration,
+    mut keep: impl FnMut(&PacketFrame) -> bool,
+    label: &str,
+) -> PacketFrame {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        while let Some(frame) = PacketFrame::read_from_buffer(buffer).expect("parse packet buffer") {
+            if keep(&frame) {
+                return frame;
             }
-            let mut chunk = [0; 4096];
-            match self.stream.read(&mut chunk) {
-                Ok(0) => return,
-                Ok(n) => self.buffer.extend_from_slice(&chunk[..n]),
-                Err(err) if packet_read_would_wait(&err) => {}
-                Err(err) => panic!("read packet frame: {err}"),
-            }
+        }
+        let mut chunk = [0; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("packet stream closed while waiting for {label}"),
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(err) if packet_read_would_wait(&err) => {}
+            Err(err) => panic!("read packet frame: {err}"),
+        }
+    }
+    panic!("timed out waiting for {label}");
+}
+
+/// Companion to `next_matching_packet_frame`: asserts no frame selected by
+/// `reject` arrives before the timeout (or the stream closes).
+#[cfg(feature = "ghostty-vt")]
+fn assert_no_matching_packet_frame(
+    stream: &mut UnixStream,
+    buffer: &mut Vec<u8>,
+    timeout: Duration,
+    mut reject: impl FnMut(&PacketFrame) -> bool,
+    label: &str,
+) {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        while let Some(frame) = PacketFrame::read_from_buffer(buffer).expect("parse packet buffer") {
+            assert!(!reject(&frame), "unexpected {label}: {frame:?}");
+        }
+        let mut chunk = [0; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(err) if packet_read_would_wait(&err) => {}
+            Err(err) => panic!("read packet frame: {err}"),
         }
     }
 }
@@ -227,43 +257,28 @@ fn packet_input(stream: &mut UnixStream, channel: u32, event: TerminalInputEvent
 
 #[cfg(feature = "ghostty-vt")]
 fn read_packet_render(stream: &mut UnixStream, buffer: &mut Vec<u8>, channel: u32, timeout: Duration) -> TerminalRenderUpdate {
-    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        while let Some(frame) = PacketFrame::read_from_buffer(buffer).expect("parse packet buffer") {
-            if frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER {
-                return frame.decode::<RenderPacket>().expect("decode render packet").update;
-            }
-        }
-        let mut chunk = [0; 4096];
-        match stream.read(&mut chunk) {
-            Ok(0) => panic!("packet stream closed while waiting for render packet"),
-            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-            Err(err) if packet_read_would_wait(&err) => {}
-            Err(err) => panic!("read packet frame: {err}"),
-        }
-    }
-    panic!("timed out waiting for render packet on channel {channel}");
+    next_matching_packet_frame(
+        stream,
+        buffer,
+        timeout,
+        |frame| frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER,
+        &format!("render packet on channel {channel}"),
+    )
+    .decode::<RenderPacket>()
+    .expect("decode render packet")
+    .update
 }
 
 fn read_directory_delta_named(stream: &mut UnixStream, buffer: &mut Vec<u8>, timeout: Duration, label: &str) -> DirectoryDelta {
-    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        while let Some(frame) = PacketFrame::read_from_buffer(buffer).expect("parse packet buffer") {
-            if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_DIRECTORY_DELTA {
-                return frame.decode::<DirectoryDelta>().expect("decode directory delta");
-            }
-        }
-        let mut chunk = [0; 4096];
-        match stream.read(&mut chunk) {
-            Ok(0) => panic!("packet stream closed while waiting for directory delta"),
-            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-            Err(err) if packet_read_would_wait(&err) => {}
-            Err(err) => panic!("read packet frame: {err}"),
-        }
-    }
-    panic!("timed out waiting for {label}");
+    next_matching_packet_frame(
+        stream,
+        buffer,
+        timeout,
+        |frame| frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_DIRECTORY_DELTA,
+        label,
+    )
+    .decode::<DirectoryDelta>()
+    .expect("decode directory delta")
 }
 
 fn read_until_directory_remove(stream: &mut UnixStream, buffer: &mut Vec<u8>, session_id: &str, timeout: Duration) -> DirectoryDelta {
@@ -280,20 +295,7 @@ fn read_until_directory_remove(stream: &mut UnixStream, buffer: &mut Vec<u8>, se
 
 #[cfg(feature = "ghostty-vt")]
 fn expect_no_render(stream: &mut UnixStream, buffer: &mut Vec<u8>, timeout: Duration) {
-    stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(frame) = PacketFrame::read_from_buffer(buffer).expect("parse packet buffer") {
-            assert!(frame.msg_type != MSG_SESSION_RENDER, "unexpected render packet frame: {frame:?}");
-        }
-        let mut chunk = [0; 4096];
-        match stream.read(&mut chunk) {
-            Ok(0) => return,
-            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-            Err(err) if packet_read_would_wait(&err) => {}
-            Err(err) => panic!("read packet frame: {err}"),
-        }
-    }
+    assert_no_matching_packet_frame(stream, buffer, timeout, |frame| frame.msg_type == MSG_SESSION_RENDER, "render packet");
 }
 
 fn packet_read_would_wait(err: &std::io::Error) -> bool {

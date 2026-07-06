@@ -1,7 +1,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{self, Read, Write},
     panic::{self, AssertUnwindSafe},
@@ -20,9 +20,10 @@ use crate::{
     host::actor::{RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
     http_uds,
     packet::{
-        Ack, CloseChannel, ControlError, ControlHello, DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame, RenderPacket,
-        Resize, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO,
-        MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE,
+        Ack, CloseChannel, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame,
+        RenderPacket, Resize, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT,
+        MSG_CONTROL_ERROR, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER,
+        MSG_SESSION_RESIZE,
     },
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
@@ -56,11 +57,12 @@ pub struct ForegroundAttach {
     stream: Arc<Mutex<SessionStream>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionStartOptions {
     pub record: bool,
     pub initial_size: TerminalSize,
     pub colors: vt::TerminalColors,
+    pub tags: Vec<String>,
 }
 
 impl ForegroundAttach {
@@ -250,6 +252,8 @@ pub fn ensure_session_started(
     session.record = options.record;
     session.initial_size = options.initial_size;
     session.colors = options.colors;
+    session.tags = options.tags;
+    crate::runtime::normalize_tags(&mut session.tags);
 
     ensure_daemon_started(layout)?;
     let mut stream = connect_session_stream(&layout.socket_path())?;
@@ -663,7 +667,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             }
         }
 
-        did_work |= service_packet_clients(&mut sessions, &mut packet_clients)?;
+        did_work |= service_packet_clients(&layout, &mut sessions, &mut packet_clients)?;
         let session_ids: Vec<String> = sessions.keys().cloned().collect();
         for session_id in session_ids {
             let Some(hosted) = sessions.get_mut(&session_id) else {
@@ -700,12 +704,14 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
 
         if let Some(session_id) = faulted_session.take() {
             cleanup_exited_session(&layout, &session_id, true);
+            broadcast_directory_remove(&session_id, &mut packet_clients)?;
             sessions.remove(&session_id);
             remove_packet_channels_for_session(&session_id, &mut packet_clients);
         }
 
         if let Some((session_id, should_keep_session_dir)) = exited_session.take() {
             cleanup_exited_session(&layout, &session_id, should_keep_session_dir);
+            broadcast_directory_remove(&session_id, &mut packet_clients)?;
             sessions.remove(&session_id);
             remove_packet_channels_for_session(&session_id, &mut packet_clients);
         }
@@ -758,6 +764,70 @@ fn remove_packet_channels_for_session(session_id: &str, packet_clients: &mut [Pa
     }
 }
 
+fn directory_entry_for_session(layout: &RuntimeLayout, hosted: &HostedSession) -> Result<DirectoryEntry, String> {
+    let inspect = hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?;
+    Ok(DirectoryEntry {
+        session_id: inspect.session.id.clone(),
+        tags: inspect.session.tags,
+        state: inspect.session.state,
+        controller_count: if hosted.active_client.is_some() { 1 } else { 0 },
+        watcher_count: u32::try_from(hosted.watchers.len()).unwrap_or(u32::MAX),
+        recreatable: crate::recreate::session_is_recreatable(&layout.session_dir(&inspect.session.id)),
+        cols: inspect.terminal.cols,
+        rows: inspect.terminal.rows,
+    })
+}
+
+fn directory_snapshot_for_sessions(
+    layout: &RuntimeLayout,
+    sessions: &HashMap<String, HostedSession>,
+    selectors: &[String],
+) -> Result<DirectorySnapshot, String> {
+    let mut entries = Vec::new();
+    for hosted in sessions.values() {
+        let entry = directory_entry_for_session(layout, hosted)?;
+        if directory_entry_matches_selectors(&entry, selectors) {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(DirectorySnapshot { sessions: entries })
+}
+
+fn directory_entry_matches_selectors(entry: &DirectoryEntry, selectors: &[String]) -> bool {
+    selectors.iter().all(|selector| entry.tags.contains(selector))
+}
+
+fn broadcast_directory_upsert(entry: DirectoryEntry, packet_clients: &mut Vec<PacketClient>) -> Result<(), String> {
+    for client in packet_clients {
+        if directory_entry_matches_selectors(&entry, &client.selectors) {
+            client.known_directory_sessions.insert(entry.session_id.clone());
+            client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                upserted: vec![entry.clone()],
+                removed_session_ids: Vec::new(),
+            })?;
+        } else if client.known_directory_sessions.remove(&entry.session_id) {
+            client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                upserted: Vec::new(),
+                removed_session_ids: vec![entry.session_id.clone()],
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn broadcast_directory_remove(session_id: &str, packet_clients: &mut Vec<PacketClient>) -> Result<(), String> {
+    for client in packet_clients {
+        if client.known_directory_sessions.remove(session_id) {
+            client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                upserted: Vec::new(),
+                removed_session_ids: vec![session_id.to_string()],
+            })?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(debug_assertions))]
 fn maybe_panic_for_containment_test(_session_id: &str) {}
 
@@ -783,6 +853,9 @@ fn service_hosted_session(
     packet_clients: &mut Vec<PacketClient>,
 ) -> Result<bool, String> {
     let mut did_work = false;
+    let previous_controller_count = hosted.active_client.is_some();
+    let previous_watcher_count = hosted.watchers.len();
+    let mut resized = false;
 
     did_work |=
         drain_raw_output_tap(layout, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
@@ -807,6 +880,7 @@ fn service_hosted_session(
                 }
                 Frame::Resize { cols, rows } => {
                     hosted.actor.resize(cols, rows)?;
+                    resized = true;
                 }
                 _ => {}
             }
@@ -834,6 +908,10 @@ fn service_hosted_session(
     }
     flush_watchers(&mut hosted.watchers);
     push_due_packet_renders(id, &hosted.actor, packet_clients, &mut hosted.packet_render_cache)?;
+
+    if resized || previous_controller_count != hosted.active_client.is_some() || previous_watcher_count != hosted.watchers.len() {
+        broadcast_directory_upsert(directory_entry_for_session(layout, hosted)?, packet_clients)?;
+    }
 
     service_pending_waits(&hosted.actor, &mut hosted.pending_waits);
     service_pending_expects(layout, id, &hosted.actor, &mut hosted.pending_expects)?;
@@ -1032,11 +1110,18 @@ fn handle_http_request(
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP session create request: {err}"))?;
             crate::runtime::validate_runtime_name(&session.id)?;
             session.vt_engine.ensure_available()?;
+            let mut created = false;
             if !state.sessions.contains_key(&session.id) {
                 let session_dir = state.layout.session_dir(&session.id);
                 fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
                 let hosted = HostedSession::spawn(session_dir, session.clone())?;
                 state.sessions.insert(session.id.clone(), hosted);
+                created = true;
+            }
+            if created {
+                if let Some(hosted) = state.sessions.get(&session.id) {
+                    broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+                }
             }
             http_uds::write_json(stream, StatusCode::OK, &http_uds::CreateSessionResponse { session })
                 .map_err(|err| format!("write HTTP session create response: {err}"))
@@ -1048,23 +1133,21 @@ fn handle_http_request(
                 return Ok(());
             }
 
-            let mut directory_entries = Vec::new();
-            for hosted in state.sessions.values() {
-                let inspect = hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?;
-                directory_entries.push(DirectoryEntry {
-                    session_id: inspect.session.id,
-                    cols: inspect.terminal.cols,
-                    rows: inspect.terminal.rows,
-                });
-            }
-            directory_entries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+            let subscribe = if request.body().is_empty() {
+                http_uds::DirectorySubscribeRequest::default()
+            } else {
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP directory subscribe request: {err}"))?
+            };
+            let mut selectors = subscribe.selectors;
+            crate::runtime::normalize_tags(&mut selectors);
+            let directory = directory_snapshot_for_sessions(state.layout, state.sessions, &selectors)?;
             http_uds::write_packet_switching_protocols(stream).map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
             let packet_stream = stream.try_clone().map_err(|err| format!("clone HTTP packet stream: {err}"))?;
             #[cfg(unix)]
             set_stream_nonblocking(&packet_stream, true).map_err(|err| format!("set HTTP packet stream nonblocking: {err}"))?;
-            let mut client = PacketClient::new(packet_stream)?;
+            let mut client = PacketClient::new(packet_stream, selectors, &directory)?;
             client.enqueue_control(MSG_CONTROL_HELLO, &ControlHello::current())?;
-            client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &DirectorySnapshot { sessions: directory_entries })?;
+            client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
             state.packet_clients.push(client);
             Ok(())
         }
@@ -1114,6 +1197,7 @@ fn handle_http_request(
             hosted.had_foreground_client = true;
             hosted.actor.set_client_presence(true)?;
             hosted.actor.record_attach()?;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
             Ok(())
         }
         http_uds::Route::SessionWatch { id } => {
@@ -1135,6 +1219,7 @@ fn handle_http_request(
                 }
             }
             hosted.watchers.push(watcher);
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
             Ok(())
         }
         http_uds::Route::SessionDetach { id } => {
@@ -1147,6 +1232,7 @@ fn handle_http_request(
             }
             hosted.actor.set_client_presence(false)?;
             hosted.active_client = None;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP detach response: {err}"))
         }
         http_uds::Route::SessionExpect { id } => 'expect: {
@@ -1216,6 +1302,7 @@ fn handle_http_request(
                 }
                 http_uds::InputRequest::Resize { cols, rows } => {
                     hosted.actor.resize(cols, rows)?;
+                    broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
                 }
             }
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP input response: {err}"))
@@ -1258,6 +1345,17 @@ fn handle_http_request(
             hosted.actor.set_recording(body.enable)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP record response: {err}"))
         }
+        http_uds::Route::SessionTags { id } => {
+            let Some(hosted) = state.sessions.get(&id) else {
+                return write_http_not_found(stream);
+            };
+            let body: http_uds::TagRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP tag request: {err}"))?;
+            let tags = hosted.actor.update_tags(body.add, body.remove)?;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::TagResponse { tags })
+                .map_err(|err| format!("write HTTP tag response: {err}"))
+        }
         http_uds::Route::SessionMark { id } => {
             let Some(hosted) = state.sessions.get(&id) else {
                 return write_http_not_found(stream);
@@ -1299,6 +1397,7 @@ fn handle_http_request(
             let body: http_uds::ResizeRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resize request: {err}"))?;
             hosted.actor.resize(body.cols, body.rows)?;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP resize response: {err}"))
         }
         http_uds::Route::SessionScreen { id } => {
@@ -1465,6 +1564,8 @@ struct PacketClient {
     input_reader: ActiveClientReader,
     input_buffer: Vec<u8>,
     channels: HashMap<u32, PacketSessionChannel>,
+    selectors: Vec<String>,
+    known_directory_sessions: HashSet<String>,
 }
 
 struct PacketSessionChannel {
@@ -1493,9 +1594,17 @@ impl PacketRenderCache {
 }
 
 impl PacketClient {
-    fn new(stream: SessionStream) -> Result<Self, String> {
+    fn new(stream: SessionStream, selectors: Vec<String>, initial_directory: &DirectorySnapshot) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
-        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new(), channels: HashMap::new() })
+        Ok(Self {
+            stream,
+            pending_output: Vec::new(),
+            input_reader,
+            input_buffer: Vec::new(),
+            channels: HashMap::new(),
+            selectors,
+            known_directory_sessions: initial_directory.sessions.iter().map(|entry| entry.session_id.clone()).collect(),
+        })
     }
 
     fn enqueue_control<T: serde::Serialize>(&mut self, msg_type: u8, value: &T) -> Result<(), String> {
@@ -1551,7 +1660,11 @@ impl PacketClient {
     }
 }
 
-fn service_packet_clients(sessions: &mut HashMap<String, HostedSession>, packet_clients: &mut Vec<PacketClient>) -> Result<bool, String> {
+fn service_packet_clients(
+    layout: &RuntimeLayout,
+    sessions: &mut HashMap<String, HostedSession>,
+    packet_clients: &mut Vec<PacketClient>,
+) -> Result<bool, String> {
     let mut did_work = false;
     let mut index = 0;
     while index < packet_clients.len() {
@@ -1567,14 +1680,22 @@ fn service_packet_clients(sessions: &mut HashMap<String, HostedSession>, packet_
 
         while let Some(frame) = pending.pop_front() {
             did_work = true;
-            handle_packet_frame(sessions, &mut packet_clients[index], frame)?;
+            if let Some(entry) = handle_packet_frame(layout, sessions, &mut packet_clients[index], frame)? {
+                broadcast_directory_upsert(entry, packet_clients)?;
+            }
         }
         index += 1;
     }
     Ok(did_work)
 }
 
-fn handle_packet_frame(sessions: &mut HashMap<String, HostedSession>, client: &mut PacketClient, frame: PacketFrame) -> Result<(), String> {
+fn handle_packet_frame(
+    layout: &RuntimeLayout,
+    sessions: &mut HashMap<String, HostedSession>,
+    client: &mut PacketClient,
+    frame: PacketFrame,
+) -> Result<Option<DirectoryEntry>, String> {
+    let mut directory_update = None;
     match (frame.channel, frame.msg_type) {
         (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL) => {
             let open = frame.decode::<OpenChannel>().map_err(|err| format!("decode open-channel packet: {err}"))?;
@@ -1609,12 +1730,13 @@ fn handle_packet_frame(sessions: &mut HashMap<String, HostedSession>, client: &m
             if let Some(session_id) = client.channels.get(&channel).map(|session| session.session_id.clone()) {
                 if let Some(hosted) = sessions.get(&session_id) {
                     hosted.actor.resize(resize.cols, resize.rows)?;
+                    directory_update = Some(directory_entry_for_session(layout, hosted)?);
                 }
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(directory_update)
 }
 
 fn open_packet_channel(sessions: &mut HashMap<String, HostedSession>, client: &mut PacketClient, open: OpenChannel) -> Result<(), String> {
@@ -1932,7 +2054,9 @@ impl ActiveClientReader {
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Feature builds can spend several seconds loading the Ghostty VT library
+    // and starting the daemon process under CI load before the socket is bound.
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if try_connect_session_stream(path).is_ok() {
             return Ok(());
@@ -1942,7 +2066,7 @@ fn wait_for_socket(path: &Path) -> Result<(), String> {
     Err(format!("timed out waiting for socket {}", path.display()))
 }
 
-fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String> {
+pub(crate) fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String> {
     if try_connect_session_stream(&layout.socket_path()).is_ok() && is_session_daemon_alive(layout.root(), layout.daemon_name()) {
         return Ok(());
     }
@@ -2083,6 +2207,7 @@ mod tests {
             vt_engine: vt::default_vt_engine_kind(),
             cwd: None,
             cmd: None,
+            tags: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
             colors: vt::TerminalColors::default(),
@@ -2106,6 +2231,7 @@ mod tests {
             vt_engine: vt::default_vt_engine_kind(),
             cwd: None,
             cmd: None,
+            tags: Vec::new(),
             record: false,
             initial_size: TerminalSize { cols: 120, rows: 40 },
             colors: vt::TerminalColors::default(),

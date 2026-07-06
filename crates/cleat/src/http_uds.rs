@@ -44,6 +44,7 @@ pub(crate) enum Route {
     SessionScreen { id: String },
     SessionSignal { id: String },
     SessionSnapshot { id: String },
+    SessionTags { id: String },
     SessionWait { id: String },
     NotFound,
 }
@@ -139,6 +140,17 @@ pub(crate) struct MarkResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TagRequest {
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TagResponse {
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ResolveMarkerRequest {
     pub name: String,
 }
@@ -202,6 +214,12 @@ pub(crate) struct SignalRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionListResponse {
     pub sessions: Vec<crate::protocol::InspectResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) struct DirectorySubscribeRequest {
+    #[serde(default)]
+    pub selectors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -501,6 +519,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::GET, Some("screen"), None) => Route::SessionScreen { id: id.to_string() },
                 (&Method::POST, Some("signal"), None) => Route::SessionSignal { id: id.to_string() },
                 (&Method::GET, Some("snapshot"), None) => Route::SessionSnapshot { id: id.to_string() },
+                (&Method::POST, Some("tags"), None) => Route::SessionTags { id: id.to_string() },
                 (&Method::POST, Some("wait"), None) => Route::SessionWait { id: id.to_string() },
                 _ => Route::NotFound,
             }
@@ -756,6 +775,7 @@ mod tests {
             ("GET", "/sessions/alpha/screen", Route::SessionScreen { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/signal", Route::SessionSignal { id: "alpha".to_string() }),
             ("GET", "/sessions/alpha/snapshot", Route::SessionSnapshot { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/tags", Route::SessionTags { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/wait", Route::SessionWait { id: "alpha".to_string() }),
         ];
 

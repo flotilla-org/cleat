@@ -61,9 +61,11 @@ find .tools/ghostty-install -maxdepth 3 | sort
 
 ## Session Model
 
-**One daemon per session.** Each `cleat launch` (or `cleat attach` to a new ID) spawns a dedicated daemon process that owns the session's PTY. The daemon exits when the child process exits.
+**Named daemons host sets of sessions.** A daemon is the process boundary for one named session set. The default daemon is named `default`; pass `--server NAME` to address a different daemon. A session address is therefore `(daemon, id)`, with an unqualified ID meaning "this ID in the selected daemon."
 
-**Session IDs.** You choose the ID (`cleat launch my-session`) or let cleat generate one (`session-<uuid>`). IDs are directory names under the runtime root, so use filesystem-safe characters. Launching with an ID that already has a running daemon reuses the existing session — no error, no duplicate.
+**Session IDs.** You choose the ID (`cleat launch my-session`) or let cleat generate one (`session-<uuid>`). IDs are directory names under their daemon's `sessions/` directory, so use filesystem-safe characters. Launching with an ID that already has a live session in the selected daemon reuses that session; it does not create a duplicate.
+
+**Tags.** Sessions may carry flat, opaque tags. Add them at launch with repeated `--tag TAG`, mutate them with `cleat tag <id> +TAG -TAG`, and filter directory reads with repeated `--selector TAG`. Selectors are exact whole-tag matches and are ANDed when repeated. `key=value` is only a client convention; cleat does not interpret tag keys, values, hierarchy, or globs.
 
 **Runtime directory.** Discovered in priority order:
 
@@ -72,38 +74,56 @@ find .tools/ghostty-install -maxdepth 3 | sort
 3. `$TMPDIR/cleat-<uid>`
 4. `/tmp/cleat-<uid>`
 
-Each session gets a subdirectory containing:
-- `socket` — Unix domain socket for client-daemon communication
-- `daemon.pid` — daemon process ID
-- `session.cast` — asciicast v3 recording (only if recording is enabled)
+Runtime layout v2 is daemon-scoped:
 
-**Liveness.** The socket file is the liveness indicator. If it exists, the daemon is running and accepting connections.
+```text
+<runtime-root>/
+  <daemon-name>/
+    socket
+    daemon.pid
+    sessions/
+      <session-id>/
+        session.cast
+        foreground
+```
 
-**Cleanup.** When the child process exits, the daemon removes the socket and PID file, then exits. If recording was active, the session directory and `.cast` file are preserved. Otherwise the entire session directory is removed.
+`socket` and `daemon.pid` belong to the daemon, not to an individual session. Session directories live under `sessions/`. `session.cast` is the asciicast v3 recording when recording is active. `foreground` is a transient attachment marker.
 
-**No persistence across restarts.** Sessions do not survive daemon crashes or host reboots — the PTY and process state are gone. Recording files survive if they were flushed to disk.
+**Liveness and discovery.** Session liveness is daemon state, not a per-session socket stat. `cleat list` queries the selected daemon. `cleat list --all` enumerates every daemon directory under the runtime root and queries or sweeps each daemon independently. If a daemon is definitively stale, cleat performs a daemon-scoped sweep: sessions with a non-empty recording are preserved as recreatable, and sessions without a recording are removed.
+
+**Linger and cleanup.** A daemon starts on first use of its name. When it has no live sessions, it lingers for 120 seconds before exiting so a burst of commands does not repeatedly bounce the daemon. When a child process exits, its session is removed unless it has a recording that makes it recreatable.
+
+**Recording and recreation.** CLI-created sessions record by default. Use `--no-record` to opt out, and `cleat record <id>` to enable recording on a running session. Recording is the persistence floor: a daemon crash or host reboot loses the PTY and process state, but a preserved recording can seed scrollback when the session is recreated.
 
 ## Behavioral Model
 
-Three layers cooperate during a session. Knowing which layer is authoritative for which behavior is the main thing to internalize before debugging with cleat — it's the most common source of confusion.
+Four surfaces cooperate during a session. Knowing which surface is authoritative for which behavior is the main thing to internalize before debugging with cleat.
 
-### Layers
+### Surfaces
 
 - **Host terminal** — your real terminal emulator (kitty, ghostty, iTerm, Terminal.app, etc). In play *only while a client is attached*. Renders output to you, supplies keyboard input, and answers the child's capability queries (DA, DSR, kitty/sixel protocol queries) with whatever the host terminal actually supports.
 - **VT engine** — cleat's internal terminal emulator (libghostty with `--features ghostty-vt`; the `passthrough` engine is a placeholder for testing). Always active. Parses child PTY output into a structured screen grid, tracks modes/cursor/styles, and — when *detached* — synthesizes replies to capability queries so the child's detection logic doesn't stall.
-- **Recording** — optional raw PTY output tee, stored as asciicast v3 in `session.cast`. Authoritative source for `transcript` and `expect`. Enabled per-session with `--record` or globally via `CLEAT_RECORD=1`.
+- **Recording** — default-on raw PTY output tee, stored as asciicast v3 in `session.cast`. Authoritative source for `transcript` and `expect`.
+- **Packet surface** — structured multiplexed control/render/directory protocol. `cleat packets` exposes the raw probe surface, and `cleat list --watch` uses the directory subscription to print a snapshot followed by lifecycle deltas.
 
-### Command → layer map
+### Command Map
 
 | Command | Exercises | Notes |
 |---|---|---|
-| `launch` | daemon + VT engine | Creates session, spawns daemon, initializes VT engine |
+| `--server NAME` | daemon selection | Selects the named daemon for the command; default is `default` |
+| `launch [--tag TAG]... [--record|--no-record]` | daemon + VT engine + recording | Creates or reuses a session in the selected daemon |
+| `tag <id> +TAG -TAG` | daemon directory state | Mutates opaque tags; tags are not interpreted by cleat |
 | `attach` / `detach` | host terminal + daemon | While attached, host terminal is authoritative for query replies |
-| `list`, `inspect`, `kill`, `signal` | daemon state | No VT / recording involvement |
+| `watch` | host terminal + daemon | Read-only live view; does not take foreground control |
+| `list [--selector TAG]...` | daemon directory state | One-shot read of the selected daemon's directory |
+| `list --all` | daemon directory state | Enumerates every daemon directory under the runtime root |
+| `list --watch [--selector TAG]...` | packet directory subscription | Prints a snapshot, then one line per directory delta |
+| `packets` | packet protocol | Opens the structured multiplexed probe surface |
+| `inspect`, `kill`, `signal` | daemon state | No VT / recording involvement |
 | `capture` | VT engine | Renders the current screen grid to text; errors on the `passthrough` engine |
 | `transcript`, `expect` | recording | Reads raw bytes from asciicast; no re-rendering |
-| `send`, `send-keys`, `interrupt`, `escape` | daemon → PTY | Writes to child stdin via the PTY master |
-| `record`, `mark` | recording | Mutates recording state |
+| `send`, `send --submit`, `send-keys`, `interrupt`, `escape` | daemon → PTY | Writes to child stdin via the PTY master; `--submit` sends paste/text then Enter |
+| `record`, `mark` | recording | Enables recording or writes a marker |
 | `wait --idle-time` | daemon | PTY-output idle timer |
 | `wait --text` | VT engine | Consults the rendered screen grid |
 | `wait --screen-stable` | VT engine | Waits for the rendered screen grid to stop changing |

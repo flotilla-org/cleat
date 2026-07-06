@@ -1729,6 +1729,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         record: desc.record,
         initial_size: TerminalSize { cols, rows },
         colors,
+        tags: Vec::new(),
     })?;
     let mut session =
         DaemonSession { id: metadata.id, runtime_root: provider.runtime_root.clone(), rows, observation: ObservationState::new(rows) };

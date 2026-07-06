@@ -48,6 +48,16 @@ pub struct DirectoryDelta {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub session_id: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub controller_count: u32,
+    #[serde(default)]
+    pub watcher_count: u32,
+    #[serde(default)]
+    pub recreatable: bool,
     pub cols: u16,
     pub rows: u16,
 }
@@ -213,6 +223,15 @@ impl<S: Read + Write> PacketClient<S> {
         }
     }
 
+    pub fn read_directory_delta(&mut self) -> std::io::Result<DirectoryDelta> {
+        loop {
+            let frame = self.read_frame()?;
+            if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_DIRECTORY_DELTA {
+                return frame.decode();
+            }
+        }
+    }
+
     fn write<T: Serialize>(&mut self, channel: u32, msg_type: u8, value: &T) -> std::io::Result<()> {
         PacketFrame::new(channel, msg_type, value)?.write(&mut self.stream)
     }
@@ -239,7 +258,18 @@ mod tests {
     #[test]
     fn buffer_reader_skips_unknown_message_payload_by_length() {
         let unknown = PacketFrame { channel: CHANNEL_CONTROL, msg_type: 250, payload: vec![1, 2, 3, 4] };
-        let directory = DirectorySnapshot { sessions: vec![DirectoryEntry { session_id: "alpha".to_string(), cols: 80, rows: 24 }] };
+        let directory = DirectorySnapshot {
+            sessions: vec![DirectoryEntry {
+                session_id: "alpha".to_string(),
+                tags: vec!["role=impl".to_string()],
+                state: "running".to_string(),
+                controller_count: 0,
+                watcher_count: 0,
+                recreatable: false,
+                cols: 80,
+                rows: 24,
+            }],
+        };
         let known = PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory).expect("encode directory");
         let mut bytes = Vec::new();
         unknown.write(&mut bytes).expect("write unknown");

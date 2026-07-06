@@ -17,6 +17,7 @@ fn help_lists_expected_subcommands() {
         "packets",
         "launch",
         "list",
+        "tag",
         "capture",
         "transcript",
         "replay",
@@ -115,6 +116,7 @@ fn launch_command_parses() {
         vt: None,
         cwd: None,
         cmd: Some("bash".into()),
+        tags: Vec::new(),
         record: RecordFlags::default()
     });
 }
@@ -148,8 +150,22 @@ fn launch_command_parses_positional_name() {
         vt: None,
         cwd: None,
         cmd: Some("bash".into()),
+        tags: Vec::new(),
         record: RecordFlags::default()
     });
+}
+
+#[test]
+fn launch_command_parses_repeatable_tags() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--tag", "role=impl", "--tag", "task=99"]).expect("launch --tag parses");
+    assert!(matches!(
+        cli.command,
+        Command::Launch {
+            id: Some(ref id),
+            tags: ref parsed_tags,
+            ..
+        } if id == "demo" && parsed_tags == &vec!["role=impl".to_string(), "task=99".to_string()]
+    ));
 }
 
 #[test]
@@ -162,6 +178,7 @@ fn launch_command_parses_json() {
         vt: None,
         cwd: None,
         cmd: None,
+        tags: Vec::new(),
         record: RecordFlags::default()
     });
 }
@@ -176,6 +193,7 @@ fn launch_command_parses_vt() {
         vt: Some(VtEngineKind::Ghostty),
         cwd: None,
         cmd: None,
+        tags: Vec::new(),
         record: RecordFlags::default()
     });
 }
@@ -190,6 +208,7 @@ fn create_alias_still_parses_as_launch() {
         vt: None,
         cwd: None,
         cmd: Some("bash".into()),
+        tags: Vec::new(),
         record: RecordFlags::default()
     });
 }
@@ -197,13 +216,36 @@ fn create_alias_still_parses_as_launch() {
 #[test]
 fn list_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "list"]).expect("list parses");
-    assert_eq!(cli.command, Command::List { json: false });
+    assert_eq!(cli.command, Command::List { json: false, watch: false, all: false, selectors: Vec::new() });
 }
 
 #[test]
 fn list_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "list", "--json"]).expect("list --json parses");
-    assert_eq!(cli.command, Command::List { json: true });
+    assert_eq!(cli.command, Command::List { json: true, watch: false, all: false, selectors: Vec::new() });
+}
+
+#[test]
+fn list_command_parses_watch_and_selectors() {
+    let cli =
+        Cli::try_parse_from(["cleat", "list", "--watch", "--selector", "role=impl", "--selector", "task=99"]).expect("list watch parses");
+    assert_eq!(cli.command, Command::List {
+        json: false,
+        watch: true,
+        all: false,
+        selectors: vec!["role=impl".to_string(), "task=99".to_string()]
+    });
+}
+
+#[test]
+fn list_command_parses_all() {
+    let cli = Cli::try_parse_from(["cleat", "list", "--all"]).expect("list --all parses");
+    assert_eq!(cli.command, Command::List { json: false, watch: false, all: true, selectors: Vec::new() });
+}
+
+#[test]
+fn list_command_rejects_all_with_watch() {
+    assert!(Cli::try_parse_from(["cleat", "list", "--all", "--watch"]).is_err());
 }
 
 #[test]

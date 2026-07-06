@@ -143,6 +143,8 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long, help = "Command to run (default: user's shell)")]
         cmd: Option<String>,
+        #[arg(long = "tag", value_name = "TAG", allow_hyphen_values = true, help = "Attach an opaque tag to the session; repeatable")]
+        tags: Vec<String>,
         #[command(flatten)]
         record: RecordFlags,
     },
@@ -150,6 +152,19 @@ pub enum Command {
     List {
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(long, help = "Watch directory updates after printing the initial snapshot")]
+        watch: bool,
+        #[arg(long, conflicts_with = "watch", help = "Enumerate sessions from every daemon directory under the runtime root")]
+        all: bool,
+        #[arg(long = "selector", value_name = "TAG", allow_hyphen_values = true, help = "Require an exact opaque tag match; repeatable")]
+        selectors: Vec<String>,
+    },
+    /// Add or remove opaque session tags
+    Tag {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(value_name = "+TAG|-TAG", required = true, num_args = 1.., allow_hyphen_values = true)]
+        mutations: Vec<String>,
     },
     /// Capture terminal screen content
     #[command(after_long_help = "Returns the current rendered screen from the VT engine.\n\
@@ -500,14 +515,23 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, json, size, vt, cwd, cmd, record } => {
+        Command::Launch { id, json, size, vt, cwd, cmd, tags, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
             if !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
             }
-            let created = match service.create_with_size(id, vt, cwd, cmd, record.enabled(), size.unwrap_or_default()) {
+            let tags = match normalize_cli_tags(tags) {
+                Ok(tags) => tags,
+                Err(err) => return ExecResult::Err(err),
+            };
+            let created = match service.create_with_options(id, vt, cwd, cmd, crate::session::SessionStartOptions {
+                record: record.enabled(),
+                initial_size: size.unwrap_or_default(),
+                colors: crate::vt::TerminalColors::default(),
+                tags,
+            }) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
@@ -520,8 +544,18 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(Some(created.id))
             }
         }
-        Command::List { json } => {
-            let sessions = match service.list() {
+        Command::List { json, watch, all, selectors } => {
+            let selectors = match normalize_cli_tags(selectors) {
+                Ok(selectors) => selectors,
+                Err(err) => return ExecResult::Err(err),
+            };
+            if watch {
+                return match run_list_watch_command(service, &selectors, json) {
+                    Ok(()) => ExecResult::Ok(None),
+                    Err(err) => ExecResult::Err(err),
+                };
+            }
+            let sessions = match if all { service.list_all_with_selectors(&selectors) } else { service.list_with_selectors(&selectors) } {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
@@ -534,6 +568,17 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(None)
             } else {
                 ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
+            }
+        }
+        Command::Tag { id, mutations } => {
+            let (add, remove) = match parse_tag_mutations(mutations) {
+                Ok(value) => value,
+                Err(err) => return ExecResult::Err(err),
+            };
+            match service.update_tags(&id, add, remove) {
+                Ok(tags) if tags.is_empty() => ExecResult::Ok(None),
+                Ok(tags) => ExecResult::Ok(Some(tags.join(" "))),
+                Err(e) => ExecResult::Err(e),
             }
         }
         Command::Capture { id } => match service.capture(&id) {
@@ -905,6 +950,9 @@ fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
     } else if let Some(cmd) = &session.cmd {
         fields.push(cmd.clone());
     }
+    if !session.tags.is_empty() {
+        fields.push(format!("tags={}", session.tags.join(",")));
+    }
     fields.join("\t")
 }
 
@@ -913,6 +961,114 @@ fn format_session_status(status: &crate::protocol::SessionStatus) -> &'static st
         crate::protocol::SessionStatus::Attached => "attached",
         crate::protocol::SessionStatus::Detached => "detached",
     }
+}
+
+fn normalize_cli_tags(mut tags: Vec<String>) -> Result<Vec<String>, String> {
+    if let Some(tag) = tags.iter().find(|tag| tag.is_empty()) {
+        return Err(format!("tag must not be empty: {tag:?}"));
+    }
+    crate::runtime::normalize_tags(&mut tags);
+    Ok(tags)
+}
+
+fn parse_tag_mutations(mutations: Vec<String>) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut add = Vec::new();
+    let mut remove = Vec::new();
+    for mutation in mutations {
+        let (is_add, tag) = if let Some(tag) = mutation.strip_prefix('+') {
+            (true, tag)
+        } else if let Some(tag) = mutation.strip_prefix('-') {
+            (false, tag)
+        } else {
+            return Err(format!("tag mutation must start with + or -: {mutation}"));
+        };
+        if tag.is_empty() {
+            return Err("tag mutation must include a tag after + or -".to_string());
+        }
+        if is_add {
+            remove.retain(|existing| existing != tag);
+            if !add.iter().any(|existing| existing == tag) {
+                add.push(tag.to_string());
+            }
+        } else {
+            add.retain(|existing| existing != tag);
+            if !remove.iter().any(|existing| existing == tag) {
+                remove.push(tag.to_string());
+            }
+        }
+    }
+    crate::runtime::normalize_tags(&mut add);
+    crate::runtime::normalize_tags(&mut remove);
+    Ok((add, remove))
+}
+
+fn run_list_watch_command(service: &SessionService, selectors: &[String], json: bool) -> Result<(), String> {
+    use std::io::Write;
+
+    let (mut client, snapshot) = service.connect_directory(selectors)?;
+    let mut stdout = std::io::stdout().lock();
+    if json {
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string(&serde_json::json!({"kind": "snapshot", "sessions": snapshot.sessions}))
+                .map_err(|err| format!("serialize directory snapshot: {err}"))?
+        )
+        .map_err(|err| format!("write directory snapshot: {err}"))?;
+    } else {
+        writeln!(stdout, "{}", format_directory_snapshot(&snapshot)).map_err(|err| format!("write directory snapshot: {err}"))?;
+    }
+    stdout.flush().map_err(|err| format!("flush directory snapshot: {err}"))?;
+
+    loop {
+        let delta = client.read_directory_delta().map_err(|err| format!("read directory delta: {err}"))?;
+        if json {
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string(&serde_json::json!({"kind": "delta", "delta": delta}))
+                    .map_err(|err| format!("serialize directory delta: {err}"))?
+            )
+            .map_err(|err| format!("write directory delta: {err}"))?;
+        } else {
+            writeln!(stdout, "{}", format_directory_delta(&delta)).map_err(|err| format!("write directory delta: {err}"))?;
+        }
+        stdout.flush().map_err(|err| format!("flush directory delta: {err}"))?;
+    }
+}
+
+fn format_directory_snapshot(snapshot: &crate::packet::DirectorySnapshot) -> String {
+    if snapshot.sessions.is_empty() {
+        "snapshot\tempty".to_string()
+    } else {
+        snapshot.sessions.iter().map(|entry| format!("snapshot\t{}", format_directory_entry(entry))).collect::<Vec<_>>().join("\n")
+    }
+}
+
+fn format_directory_delta(delta: &crate::packet::DirectoryDelta) -> String {
+    let mut lines = Vec::new();
+    lines.extend(delta.upserted.iter().map(|entry| format!("upsert\t{}", format_directory_entry(entry))));
+    lines.extend(delta.removed_session_ids.iter().map(|id| format!("remove\t{id}")));
+    if lines.is_empty() {
+        "delta\tempty".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn format_directory_entry(entry: &crate::packet::DirectoryEntry) -> String {
+    let mut fields = vec![
+        entry.session_id.clone(),
+        entry.state.clone(),
+        format!("{}x{}", entry.cols, entry.rows),
+        format!("controllers={}", entry.controller_count),
+        format!("watchers={}", entry.watcher_count),
+        format!("recreatable={}", if entry.recreatable { "yes" } else { "no" }),
+    ];
+    if !entry.tags.is_empty() {
+        fields.push(format!("tags={}", entry.tags.join(",")));
+    }
+    fields.join("\t")
 }
 
 fn run_packets_command(service: &SessionService, id: &str, count: usize) -> Result<Vec<String>, String> {
@@ -1001,6 +1157,9 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
     table.add_row(vec!["state", &result.session.state]);
     table.add_row(vec!["vt_engine", &format!("{} ({})", result.session.vt_engine, result.session.vt_engine_status)]);
     table.add_row(vec!["functional_vt", if result.session.functional_vt_available { "yes" } else { "no" }]);
+    if !result.session.tags.is_empty() {
+        table.add_row(vec!["tags", &result.session.tags.join(", ")]);
+    }
     table.add_row(vec!["terminal", &format!("{}x{}", result.terminal.cols, result.terminal.rows)]);
     table.add_row(vec!["leader_pid", &result.process.leader_pid.to_string()]);
     if let Some(fg) = result.process.foreground_pgid {

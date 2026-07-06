@@ -154,6 +154,8 @@ pub enum Command {
         json: bool,
         #[arg(long, help = "Watch directory updates after printing the initial snapshot")]
         watch: bool,
+        #[arg(long, conflicts_with = "watch", help = "Enumerate sessions from every daemon directory under the runtime root")]
+        all: bool,
         #[arg(long = "selector", value_name = "TAG", allow_hyphen_values = true, help = "Require an exact opaque tag match; repeatable")]
         selectors: Vec<String>,
     },
@@ -542,7 +544,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(Some(created.id))
             }
         }
-        Command::List { json, watch, selectors } => {
+        Command::List { json, watch, all, selectors } => {
             let selectors = match normalize_cli_tags(selectors) {
                 Ok(selectors) => selectors,
                 Err(err) => return ExecResult::Err(err),
@@ -553,7 +555,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                     Err(err) => ExecResult::Err(err),
                 };
             }
-            let sessions = match service.list_with_selectors(&selectors) {
+            let sessions = match if all { service.list_all_with_selectors(&selectors) } else { service.list_with_selectors(&selectors) } {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };

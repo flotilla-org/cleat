@@ -10,7 +10,10 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     http_uds,
-    platform::ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
+    platform::{
+        daemon::is_session_daemon_alive,
+        ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
+    },
     protocol::{SessionInfo, SessionStatus},
     runtime::{RuntimeLayout, TerminalSize},
     session::{attach_foreground, ensure_session_started, run_session_daemon, watch_foreground, ForegroundAttach, SessionStartOptions},
@@ -56,6 +59,12 @@ pub struct SliceOutcome {
 #[derive(Debug, Clone)]
 pub struct SessionService {
     layout: RuntimeLayout,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ListScope {
+    Current,
+    All,
 }
 
 impl SessionService {
@@ -138,63 +147,91 @@ impl SessionService {
     }
 
     pub fn list_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
+        self.list_daemons(selectors, ListScope::Current)
+    }
+
+    pub fn list_all_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
+        self.list_daemons(selectors, ListScope::All)
+    }
+
+    fn list_daemons(&self, selectors: &[String], scope: ListScope) -> Result<Vec<SessionInfo>, String> {
         if !self.layout.root().exists() {
             return Ok(vec![]);
         }
 
         let mut sessions = Vec::new();
-        let entries =
-            std::fs::read_dir(self.layout.root()).map_err(|err| format!("read runtime root {}: {err}", self.layout.root().display()))?;
-
-        for entry in entries {
-            let entry = entry.map_err(|err| format!("read runtime entry: {err}"))?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let daemon_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-            if !path.join("sessions").is_dir() {
-                continue;
-            }
+        for daemon_name in self.daemon_names(scope)? {
             let daemon_service = self.with_daemon(daemon_name)?;
-            if !daemon_service.layout.socket_path().exists() || session_socket_is_stale(&daemon_service.layout.socket_path()) {
-                continue;
-            }
-            match daemon_service.http_json_daemon::<_, http_uds::SessionListResponse>(Method::GET, "/sessions", &()) {
-                Ok(result) => {
-                    for result in result.sessions {
-                        let status =
-                            if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
-                        let info = SessionInfo {
-                            id: result.session.id,
-                            vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
-                            vt_engine_status: result.session.vt_engine_status,
-                            functional_vt_available: result.session.functional_vt_available,
-                            cwd: result.session.cwd,
-                            cmd: result.session.cmd,
-                            tags: result.session.tags,
-                            status,
-                            error: None,
-                        };
-                        if session_matches_selectors(&info, selectors) {
-                            sessions.push(info);
-                        }
-                    }
-                }
-                Err(err) => {
-                    sessions.extend(
-                        list_preserved_sessions_with_error(&daemon_service.layout, err)?
-                            .into_iter()
-                            .filter(|session| session_matches_selectors(session, selectors)),
-                    );
-                }
-            }
+            sessions.extend(daemon_service.list_one_daemon_with_selectors(selectors)?);
         }
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(sessions)
+    }
+
+    fn daemon_names(&self, scope: ListScope) -> Result<Vec<String>, String> {
+        match scope {
+            ListScope::Current => {
+                if self.layout.sessions_dir().is_dir() {
+                    Ok(vec![self.layout.daemon_name().to_string()])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            ListScope::All => {
+                let entries = std::fs::read_dir(self.layout.root())
+                    .map_err(|err| format!("read runtime root {}: {err}", self.layout.root().display()))?;
+                let mut names = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(|err| format!("read runtime entry: {err}"))?;
+                    let path = entry.path();
+                    if !path.is_dir() || !path.join("sessions").is_dir() {
+                        continue;
+                    }
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        names.push(name.to_string());
+                    }
+                }
+                names.sort();
+                Ok(names)
+            }
+        }
+    }
+
+    fn list_one_daemon_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
+        if !self.layout.sessions_dir().is_dir() {
+            return Ok(vec![]);
+        }
+        if daemon_control_is_unavailable(&self.layout) {
+            return sweep_dead_daemon_sessions(&self.layout, "daemon control socket is unavailable".to_string())
+                .map(|sessions| sessions.into_iter().filter(|session| session_matches_selectors(session, selectors)).collect());
+        }
+
+        match self.http_json_daemon::<_, http_uds::SessionListResponse>(Method::GET, "/sessions", &()) {
+            Ok(result) => {
+                let mut sessions = Vec::new();
+                for result in result.sessions {
+                    let status =
+                        if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
+                    let info = SessionInfo {
+                        id: result.session.id,
+                        vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
+                        vt_engine_status: result.session.vt_engine_status,
+                        functional_vt_available: result.session.functional_vt_available,
+                        cwd: result.session.cwd,
+                        cmd: result.session.cmd,
+                        tags: result.session.tags,
+                        status,
+                        error: None,
+                    };
+                    if session_matches_selectors(&info, selectors) {
+                        sessions.push(info);
+                    }
+                }
+                Ok(sessions)
+            }
+            Err(err) => sweep_dead_daemon_sessions(&self.layout, err)
+                .map(|sessions| sessions.into_iter().filter(|session| session_matches_selectors(session, selectors)).collect()),
+        }
     }
 
     pub fn kill(&self, id: &str) -> Result<(), String> {
@@ -210,6 +247,13 @@ impl SessionService {
             if !self.layout.session_dir(id).exists() {
                 return Ok(());
             }
+        }
+        if daemon_control_is_unavailable(&self.layout) {
+            let _ = sweep_dead_daemon_sessions(&self.layout, "daemon control socket is unavailable".to_string())?;
+            if purge && self.layout.session_dir(id).exists() {
+                return self.layout.remove_session(id);
+            }
+            return Ok(());
         }
         if purge || !crate::recreate::session_is_recreatable(&self.layout.session_dir(id)) {
             self.layout.remove_session(id)
@@ -667,7 +711,17 @@ fn session_socket_is_stale(socket_path: &Path) -> bool {
     try_connect_session_stream(socket_path).is_err()
 }
 
-fn list_preserved_sessions_with_error(layout: &RuntimeLayout, err: String) -> Result<Vec<SessionInfo>, String> {
+fn daemon_control_is_unavailable(layout: &RuntimeLayout) -> bool {
+    if !is_session_daemon_alive(layout.root(), layout.daemon_name()) {
+        return true;
+    }
+    if !layout.socket_path().exists() {
+        return !layout.daemon_pid_path().exists();
+    }
+    session_socket_is_stale(&layout.socket_path())
+}
+
+fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec<SessionInfo>, String> {
     let mut sessions = Vec::new();
     let entries = std::fs::read_dir(layout.sessions_dir()).map_err(|read_err| {
         format!("read daemon sessions directory {} after inspect failure ({err}): {read_err}", layout.sessions_dir().display())
@@ -675,12 +729,17 @@ fn list_preserved_sessions_with_error(layout: &RuntimeLayout, err: String) -> Re
     for entry in entries {
         let entry = entry.map_err(|read_err| format!("read daemon session entry: {read_err}"))?;
         let path = entry.path();
-        if !path.is_dir() || !crate::recreate::session_is_recreatable(&path) {
+        if !path.is_dir() {
             continue;
         }
         let Some(id) = path.file_name().and_then(|name| name.to_str()).map(str::to_string) else {
             continue;
         };
+        if !crate::recreate::session_is_recreatable(&path) {
+            layout.remove_session(&id)?;
+            continue;
+        }
+        let _ = std::fs::remove_file(layout.foreground_path(&id));
         sessions.push(SessionInfo {
             id,
             vt_engine: crate::vt::default_vt_engine_kind(),
@@ -693,7 +752,17 @@ fn list_preserved_sessions_with_error(layout: &RuntimeLayout, err: String) -> Re
             error: Some(err.clone()),
         });
     }
+    remove_stale_daemon_file(layout.socket_path(), "socket")?;
+    remove_stale_daemon_file(layout.daemon_pid_path(), "pid")?;
     Ok(sessions)
+}
+
+fn remove_stale_daemon_file(path: std::path::PathBuf, label: &str) -> Result<(), String> {
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("remove stale daemon {label} {}: {err}", path.display())),
+    }
 }
 
 /// Resolve start and end bounds into byte offsets against a cast file without
@@ -985,6 +1054,29 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(1), "purge should not wait for a missing socket");
         assert!(!session_dir.exists(), "purge should remove the preserved recording directory");
+    }
+
+    #[test]
+    fn list_sweeps_dead_daemon_and_preserves_only_recreatable_sessions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        let kept_dir = create_test_session_dir(temp.path(), "kept");
+        let discarded_dir = create_test_session_dir(temp.path(), "discarded");
+        fs::write(kept_dir.join(crate::recording::CAST_FILE_NAME), b"{\"version\":3}\n").expect("write cast");
+        fs::write(layout.foreground_path("kept"), b"12345").expect("write foreground marker");
+        fs::write(layout.daemon_pid_path(), "999999999").expect("write stale pid");
+
+        let service = SessionService::new(layout.clone());
+        let sessions = service.list_all_with_selectors(&[]).expect("list all");
+
+        assert_eq!(sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["kept"]);
+        assert_eq!(sessions[0].status, crate::protocol::SessionStatus::Detached);
+        assert!(sessions[0].error.as_deref().unwrap_or_default().contains("daemon control socket"));
+        assert!(kept_dir.exists(), "recreatable session should be preserved");
+        assert!(kept_dir.join(crate::recording::CAST_FILE_NAME).exists(), "recording should remain");
+        assert!(!layout.foreground_path("kept").exists(), "volatile foreground marker should be removed");
+        assert!(!discarded_dir.exists(), "non-recreatable session should be removed");
+        assert!(!layout.daemon_pid_path().exists(), "stale daemon pid should be removed");
     }
 
     #[test]

@@ -488,6 +488,31 @@ fn list_selector_requires_exact_opaque_tag_matches() {
 }
 
 #[test]
+fn list_defaults_to_selected_daemon_and_all_enumerates_every_daemon() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let other = service.with_daemon("other".to_string()).expect("other daemon");
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create alpha");
+    other.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
+
+    let default_sessions = service.list().expect("list default daemon");
+    let other_sessions = other.list().expect("list other daemon");
+    let all_sessions = service.list_all_with_selectors(&[]).expect("list all daemons");
+    let all_cli = Cli::try_parse_from(["cleat", "list", "--all"]).expect("parse list --all");
+    let all_output = cli::execute(all_cli, &service).expect("execute list --all").expect("list all output");
+
+    assert_eq!(default_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["alpha"]);
+    assert_eq!(other_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+    assert_eq!(all_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
+    assert!(all_output.contains("alpha"), "{all_output}");
+    assert!(all_output.contains("beta"), "{all_output}");
+
+    service.kill("alpha").expect("kill alpha");
+    other.kill("beta").expect("kill beta");
+}
+
+#[test]
 fn tag_command_adds_and_removes_opaque_tags() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

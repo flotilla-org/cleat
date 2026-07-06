@@ -216,20 +216,36 @@ fn create_alias_still_parses_as_launch() {
 #[test]
 fn list_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "list"]).expect("list parses");
-    assert_eq!(cli.command, Command::List { json: false, watch: false, selectors: Vec::new() });
+    assert_eq!(cli.command, Command::List { json: false, watch: false, all: false, selectors: Vec::new() });
 }
 
 #[test]
 fn list_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "list", "--json"]).expect("list --json parses");
-    assert_eq!(cli.command, Command::List { json: true, watch: false, selectors: Vec::new() });
+    assert_eq!(cli.command, Command::List { json: true, watch: false, all: false, selectors: Vec::new() });
 }
 
 #[test]
 fn list_command_parses_watch_and_selectors() {
     let cli =
         Cli::try_parse_from(["cleat", "list", "--watch", "--selector", "role=impl", "--selector", "task=99"]).expect("list watch parses");
-    assert_eq!(cli.command, Command::List { json: false, watch: true, selectors: vec!["role=impl".to_string(), "task=99".to_string()] });
+    assert_eq!(cli.command, Command::List {
+        json: false,
+        watch: true,
+        all: false,
+        selectors: vec!["role=impl".to_string(), "task=99".to_string()]
+    });
+}
+
+#[test]
+fn list_command_parses_all() {
+    let cli = Cli::try_parse_from(["cleat", "list", "--all"]).expect("list --all parses");
+    assert_eq!(cli.command, Command::List { json: false, watch: false, all: true, selectors: Vec::new() });
+}
+
+#[test]
+fn list_command_rejects_all_with_watch() {
+    assert!(Cli::try_parse_from(["cleat", "list", "--all", "--watch"]).is_err());
 }
 
 #[test]

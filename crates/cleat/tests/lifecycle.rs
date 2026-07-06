@@ -22,8 +22,10 @@ use cleat::{
     protocol::{Frame, SessionInfo},
     provider::ProviderFeatures,
     provider_ffi::{
-        cleat_provider_close, cleat_provider_open, cleat_session_create, cleat_session_destroy, cleat_session_write_bytes,
-        CleatProviderDesc, CleatSessionDesc, CLEAT_PROVIDER_ABI_VERSION, CLEAT_PROVIDER_BACKEND_DAEMON, CLEAT_PROVIDER_VT_PASSTHROUGH,
+        cleat_provider_close, cleat_provider_directory_generation, cleat_provider_directory_release, cleat_provider_directory_snapshot,
+        cleat_provider_open, cleat_session_connection_state, cleat_session_create, cleat_session_destroy, cleat_session_id,
+        cleat_session_write_bytes, CleatDirectory, CleatProviderDesc, CleatSessionDesc, CleatStr, CLEAT_PROVIDER_ABI_VERSION,
+        CLEAT_PROVIDER_BACKEND_DAEMON, CLEAT_PROVIDER_VT_PASSTHROUGH, CLEAT_SESSION_CLOSED,
     },
     recording::{SessionRecorder, CAST_FILE_NAME},
     runtime::{RuntimeLayout, TerminalSize},
@@ -38,6 +40,10 @@ use cleat::{
         MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_ROLE,
     },
     provider::{TerminalInputEvent, TerminalPasteEvent, TerminalRenderUpdate, TerminalTextEvent},
+    provider_ffi::{
+        cleat_session_attach, cleat_session_role, cleat_session_take_control, CLEAT_PROVIDER_VT_GHOSTTY, CLEAT_ROLE_CONTROLLER,
+        CLEAT_ROLE_WATCHER, CLEAT_SESSION_STREAMING,
+    },
 };
 
 fn service_for(path: &std::path::Path) -> SessionService {
@@ -47,6 +53,14 @@ fn service_for(path: &std::path::Path) -> SessionService {
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn wait_for_socket(path: &std::path::Path) {
@@ -936,6 +950,152 @@ fn daemon_provider_uses_client_supplied_id() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, "client-chosen-id");
     service.kill("client-chosen-id").expect("kill daemon session");
+}
+
+// Drives the daemon FFI surface end to end through the C ABI functions:
+// session identity, role grant, directory snapshot, attach-by-id,
+// take-control preemption, and closed-channel notification when the session
+// exits out from under attached clients.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn daemon_provider_ffi_attach_roles_directory_and_close() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::Builder::new().prefix("cleat-provider-").tempdir_in("/tmp").expect("tempdir");
+    let root = temp.path().to_string_lossy();
+    let command = b"cat";
+    let id = b"ffi-alpha";
+
+    unsafe {
+        let provider = cleat_provider_open(&CleatProviderDesc {
+            abi_version: CLEAT_PROVIDER_ABI_VERSION,
+            requested_features: ProviderFeatures::CELL_SNAPSHOTS.bits(),
+            backend: CLEAT_PROVIDER_BACKEND_DAEMON,
+            runtime_root: root.as_ptr(),
+            runtime_root_len: root.len(),
+            ..CleatProviderDesc::default()
+        });
+        assert!(!provider.is_null());
+
+        let controller = cleat_session_create(provider, &CleatSessionDesc {
+            cols: 80,
+            rows: 24,
+            vt_engine: CLEAT_PROVIDER_VT_GHOSTTY,
+            command: command.as_ptr(),
+            command_len: command.len(),
+            id: id.as_ptr(),
+            id_len: id.len(),
+            ..CleatSessionDesc::default()
+        });
+        assert!(!controller.is_null());
+
+        let mut id_out = CleatStr::default();
+        assert!(cleat_session_id(controller, &mut id_out));
+        assert_eq!(std::slice::from_raw_parts(id_out.ptr, id_out.len), id);
+
+        wait_until("controller role grant", || cleat_session_role(controller) == CLEAT_ROLE_CONTROLLER);
+        wait_until("streaming connection state", || cleat_session_connection_state(controller) == CLEAT_SESSION_STREAMING);
+        wait_until("directory generation bump", || cleat_provider_directory_generation(provider) > 0);
+        wait_until("directory lists the session with a controller", || {
+            let mut directory = CleatDirectory::default();
+            if !cleat_provider_directory_snapshot(provider, &mut directory) {
+                return false;
+            }
+            let entries = std::slice::from_raw_parts(directory.entries, directory.entry_count);
+            let found = entries
+                .iter()
+                .any(|entry| std::slice::from_raw_parts(entry.session_id.ptr, entry.session_id.len) == id && entry.controller_count >= 1);
+            cleat_provider_directory_release(provider, &mut directory);
+            found
+        });
+
+        let watcher = cleat_session_attach(provider, &CleatSessionDesc {
+            cols: 80,
+            rows: 24,
+            id: id.as_ptr(),
+            id_len: id.len(),
+            role: CLEAT_ROLE_WATCHER,
+            ..CleatSessionDesc::default()
+        });
+        assert!(!watcher.is_null());
+        wait_until("watcher role grant", || cleat_session_role(watcher) == CLEAT_ROLE_WATCHER);
+
+        assert!(cleat_session_take_control(watcher));
+        wait_until("take-control grant", || cleat_session_role(watcher) == CLEAT_ROLE_CONTROLLER);
+        wait_until("preempted controller demoted", || cleat_session_role(controller) == CLEAT_ROLE_WATCHER);
+
+        // Kill the session out of band: both attachments must observe the
+        // channel close rather than reporting stale STREAMING forever.
+        service_for(temp.path()).kill("ffi-alpha").expect("kill session");
+        wait_until("controller observes close", || cleat_session_connection_state(controller) == CLEAT_SESSION_CLOSED);
+        wait_until("watcher observes close", || cleat_session_connection_state(watcher) == CLEAT_SESSION_CLOSED);
+
+        cleat_session_destroy(watcher);
+        cleat_session_destroy(controller);
+        cleat_provider_close(provider);
+    }
+}
+
+// A session whose VT engine cannot serve render state (passthrough is a
+// placeholder engine) must fail its packet channel with a channel-scoped
+// error, not tear down the daemon that hosts every other session.
+#[test]
+fn daemon_provider_passthrough_channel_failure_is_contained() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::Builder::new().prefix("cleat-provider-").tempdir_in("/tmp").expect("tempdir");
+    let root = temp.path().to_string_lossy();
+    let command = b"cat";
+    let id = b"ffi-passthrough";
+
+    unsafe {
+        let provider = cleat_provider_open(&CleatProviderDesc {
+            abi_version: CLEAT_PROVIDER_ABI_VERSION,
+            requested_features: ProviderFeatures::CELL_SNAPSHOTS.bits(),
+            backend: CLEAT_PROVIDER_BACKEND_DAEMON,
+            runtime_root: root.as_ptr(),
+            runtime_root_len: root.len(),
+            ..CleatProviderDesc::default()
+        });
+        assert!(!provider.is_null());
+
+        let session = cleat_session_create(provider, &CleatSessionDesc {
+            cols: 80,
+            rows: 24,
+            vt_engine: CLEAT_PROVIDER_VT_PASSTHROUGH,
+            command: command.as_ptr(),
+            command_len: command.len(),
+            id: id.as_ptr(),
+            id_len: id.len(),
+            ..CleatSessionDesc::default()
+        });
+        assert!(!session.is_null());
+
+        let mut id_out = CleatStr::default();
+        assert!(cleat_session_id(session, &mut id_out));
+        assert_eq!(std::slice::from_raw_parts(id_out.ptr, id_out.len), id);
+
+        // The channel open fails daemon-side and surfaces as CLOSED (not
+        // DISCONNECTED, which would mean the daemon itself went down).
+        wait_until("channel failure surfaces as closed", || cleat_session_connection_state(session) == CLEAT_SESSION_CLOSED);
+
+        // The daemon survived: the directory subscription still answers and
+        // lists the session.
+        wait_until("directory generation bump", || cleat_provider_directory_generation(provider) > 0);
+        wait_until("directory lists the session", || {
+            let mut directory = CleatDirectory::default();
+            if !cleat_provider_directory_snapshot(provider, &mut directory) {
+                return false;
+            }
+            let entries = std::slice::from_raw_parts(directory.entries, directory.entry_count);
+            let found = entries.iter().any(|entry| std::slice::from_raw_parts(entry.session_id.ptr, entry.session_id.len) == id);
+            cleat_provider_directory_release(provider, &mut directory);
+            found
+        });
+
+        cleat_session_destroy(session);
+        cleat_provider_close(provider);
+    }
+
+    service_for(temp.path()).kill("ffi-passthrough").expect("kill session via a live daemon");
 }
 
 // A crashed daemon leaves its socket and PID files behind without going through

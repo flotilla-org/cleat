@@ -1832,6 +1832,11 @@ pub unsafe extern "C" fn cleat_session_scroll_viewport(
     true
 }
 
+/// Always returns false for daemon-backed sessions: they are fed by render
+/// updates rather than snapshots, and no full-grid state is held client-side.
+/// Use `cleat_session_render_update` instead; the first update after a channel
+/// opens is full-dirty and carries the complete grid.
+///
 /// # Safety
 ///
 /// `session` must be a valid session pointer. `out` must point to writable

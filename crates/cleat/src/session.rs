@@ -803,10 +803,21 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn remove_packet_channels_for_session(session_id: &str, packet_clients: &mut [PacketClient]) {
     for client in packet_clients {
-        client.channels.retain(|_, channel| channel.session_id != session_id);
+        // Tell the client each affected channel is gone before dropping it.
+        // Directory deltas are selector-filtered, so an attached client may
+        // never see the remove delta; the channel-scoped error is the only
+        // guaranteed close signal. Enqueue failures mean the client transport
+        // is already dead and its teardown path will reap it.
+        let closed: Vec<u32> = client.channels.iter().filter(|(_, ch)| ch.session_id == session_id).map(|(id, _)| *id).collect();
+        for channel in closed {
+            let _ = client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message: format!("session {session_id} exited") });
+            client.channels.remove(&channel);
+        }
     }
 }
 
+/// O(clients x channels) scan, run on every directory-entry build. Fine at
+/// expected client counts; cache per-session counters if that ever grows.
 fn packet_role_counts(session_id: &str, packet_clients: &[PacketClient]) -> (u32, u32) {
     let mut controllers = 0u32;
     let mut watchers = 0u32;
@@ -1997,10 +2008,22 @@ fn open_packet_channel(
         return Ok(());
     };
 
+    // Probe render state before granting a role: a session whose VT engine
+    // cannot serve it (e.g. the passthrough placeholder) must fail this one
+    // channel, not demote the current controller or tear down the daemon.
+    let update = match hosted.actor.full_render_update() {
+        Ok(update) => update,
+        Err(err) => {
+            packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+                channel: open.channel,
+                message: format!("open channel for session {}: {err}", open.session_id),
+            })?;
+            return Ok(());
+        }
+    };
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel: open.channel };
     let granted = grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?;
     let session_id = open.session_id;
-    let update = hosted.actor.full_render_update()?;
     let generation = update.render_generation;
     hosted.packet_render_cache.store(update.clone());
     let client = &mut packet_clients[index];

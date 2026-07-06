@@ -589,6 +589,10 @@ bool cleat_session_scroll_viewport(cleat_session *session,
  * same session.
  * dirty_rows is populated only when dirty is CLEAT_DIRTY_PARTIAL and the
  * provider knows exact dirty rows; otherwise dirty_row_count is zero.
+ * Always returns false for daemon-backed sessions: they are fed by render
+ * updates rather than snapshots, and no full-grid state is held client-side.
+ * Use cleat_session_render_update instead; the first update after a channel
+ * opens is full-dirty and carries the complete grid.
  */
 bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
 /*

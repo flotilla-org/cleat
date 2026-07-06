@@ -486,6 +486,13 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             if !no_create && !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
             }
+            // Install signal handlers before the handshake: the daemon
+            // considers us attached (and observers may act on it) the moment
+            // the grant lands, which can precede the relay starting.
+            let signal_handlers = match crate::platform::terminal::AttachSignalHandlers::install() {
+                Ok(handlers) => handlers,
+                Err(e) => return ExecResult::Err(e),
+            };
             let (attached, guard) = match service.attach(id, vt, cwd, cmd, no_create) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
@@ -495,17 +502,21 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                     return ExecResult::Err(e);
                 }
             }
-            match guard.relay_stdio() {
+            match guard.relay_stdio_with_handlers(signal_handlers) {
                 Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),
             }
         }
         Command::Watch { id } => {
+            let signal_handlers = match crate::platform::terminal::AttachSignalHandlers::install() {
+                Ok(handlers) => handlers,
+                Err(e) => return ExecResult::Err(e),
+            };
             let guard = match service.watch(&id) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
-            match guard.relay_stdio() {
+            match guard.relay_stdio_with_handlers(signal_handlers) {
                 Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),
             }

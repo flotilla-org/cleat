@@ -68,9 +68,19 @@ pub struct SessionStartOptions {
 
 impl ForegroundAttach {
     pub fn relay_stdio(self) -> Result<(), String> {
+        let signal_handlers = AttachSignalHandlers::install()?;
+        self.relay_stdio_with_handlers(signal_handlers)
+    }
+
+    /// Relay with handlers the caller installed *before* the attach
+    /// handshake. The daemon writes the foreground marker at attach grant;
+    /// a signal delivered between that grant and the relay starting must
+    /// already be caught, or the process dies with default disposition
+    /// (observed as a test race once the daemon got fast enough).
+    pub fn relay_stdio_with_handlers(self, signal_handlers: AttachSignalHandlers) -> Result<(), String> {
+        let _signal_handlers = signal_handlers;
         let mut cleanup = AttachCleanupGuard::stdout();
         let mut terminal = ForegroundTerminal::enter()?;
-        let _signal_handlers = AttachSignalHandlers::install()?;
         let read_handle = {
             let stream = self.stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
             stream.try_clone().map_err(|err| format!("clone attach stream: {err}"))?

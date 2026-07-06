@@ -20,10 +20,10 @@ use crate::{
     host::actor::{RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
     http_uds,
     packet::{
-        Ack, CloseChannel, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame,
-        RenderPacket, Resize, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT,
-        MSG_CONTROL_ERROR, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER,
-        MSG_SESSION_RESIZE,
+        Ack, ChannelRole, CloseChannel, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel,
+        PacketFrame, RenderPacket, Resize, RoleRequest, RoleState, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA,
+        MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT,
+        MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE, MSG_SESSION_VIEWPORT,
     },
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
@@ -50,6 +50,7 @@ const SESSION_DAEMON_IDLE_LINGER: Duration = Duration::from_secs(120);
 const SESSION_HTTP_HANDSHAKE_DEADLINE: Duration = Duration::from_millis(250);
 const SESSION_HTTP_RESPONSE_WRITE_DEADLINE: Duration = Duration::from_millis(250);
 const TERMINATE_SIGNAL: i32 = 15;
+const SESSION_DAEMON_REGISTRATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SCREEN_STABLE_CHANGED_CELL_TOLERANCE: usize = 16;
 
 #[derive(Debug)]
@@ -491,11 +492,22 @@ struct PendingExpect {
     registered_at: Instant,
 }
 
+/// Identity of a session channel on a packet connection, stable across the
+/// packet_clients vec's swap_remove reordering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PacketChannelRef {
+    client_id: u64,
+    channel: u32,
+}
+
 struct HostedSession {
     actor: SessionActor,
     raw_output_tap: RawOutputTap,
     active_client: Option<ActiveClient>,
     watchers: Vec<ActiveClient>,
+    /// Packet channel currently holding the controller role. Mutually
+    /// exclusive with `active_client` (the legacy stream controller).
+    packet_controller: Option<PacketChannelRef>,
     packet_render_cache: PacketRenderCache,
     had_foreground_client: bool,
     pending_waits: Vec<PendingWait>,
@@ -516,6 +528,7 @@ impl HostedSession {
             raw_output_tap,
             active_client: None,
             watchers: Vec::new(),
+            packet_controller: None,
             packet_render_cache: PacketRenderCache::default(),
             had_foreground_client: false,
             pending_waits: Vec::new(),
@@ -605,15 +618,47 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         }
     };
     set_listener_nonblocking(&listener, true)?;
-    fs::write(layout.daemon_pid_path(), std::process::id().to_string()).map_err(|err| format!("write daemon pid: {err}"))?;
+    let daemon_pid = std::process::id().to_string();
+    fs::write(layout.daemon_pid_path(), &daemon_pid).map_err(|err| format!("write daemon pid: {err}"))?;
 
-    let mut sessions = HashMap::new();
+    let mut sessions: HashMap<String, HostedSession> = HashMap::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
+    let mut next_packet_client_id: u64 = 1;
     let mut exited_session: Option<(String, bool)> = None;
     let mut faulted_session: Option<String> = None;
     let mut idle_since = Some(Instant::now());
+    let mut last_registration_check = Instant::now();
+    let mut registration_was_lost = false;
 
     loop {
+        // Self-fencing watchdog: the pid file registers which process owns
+        // this daemon identity. If it no longer names us — the runtime root
+        // was deleted (e.g. a test tempdir was cleaned up), or another daemon
+        // reclaimed the socket — no client can ever route to us again, so
+        // terminate the hosted sessions and exit instead of servicing them
+        // forever. Two consecutive misses guard against transient read
+        // failures.
+        if last_registration_check.elapsed() >= SESSION_DAEMON_REGISTRATION_CHECK_INTERVAL {
+            last_registration_check = Instant::now();
+            // Only a definitively missing pid file (or one naming another
+            // process) counts as deregistration. A transient read failure
+            // (EIO, permissions blip) must not self-terminate a healthy
+            // daemon — that would drop every hosted session.
+            let registered = match fs::read_to_string(layout.daemon_pid_path()) {
+                Ok(contents) => contents.trim() == daemon_pid,
+                Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+            };
+            if !registered && registration_was_lost {
+                for hosted in sessions.values() {
+                    let _ = hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader);
+                }
+                // Deliberately leave the socket and pid file alone on this
+                // path: they are either already gone or owned by a successor.
+                return Ok(());
+            }
+            registration_was_lost = !registered;
+        }
+
         let mut did_work = false;
 
         loop {
@@ -654,7 +699,12 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                         }
                     };
 
-                    let mut http_state = HttpRequestState { layout: &layout, sessions: &mut sessions, packet_clients: &mut packet_clients };
+                    let mut http_state = HttpRequestState {
+                        layout: &layout,
+                        sessions: &mut sessions,
+                        packet_clients: &mut packet_clients,
+                        next_packet_client_id: &mut next_packet_client_id,
+                    };
                     if let Err(err) = handle_http_request(root, daemon_name, &mut stream, request, &mut http_state) {
                         let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
                     }
@@ -682,7 +732,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                     None
                 };
                 Ok((session_did_work, should_keep_session_dir))
-            })?;
+            });
             match service_result {
                 Some((session_did_work, Some(should_keep_session_dir))) => {
                     did_work |= session_did_work;
@@ -735,15 +785,22 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn contain_session_unwind<T, F>(id: &str, action: F) -> Result<Option<T>, String>
+/// Contains both panics and errors from servicing one session: either way
+/// the caller faults that session and the daemon keeps serving the others.
+/// `None` means the session must be faulted.
+fn contain_session_unwind<T, F>(id: &str, action: F) -> Option<T>
 where
     F: FnOnce() -> Result<T, String>,
 {
     match panic::catch_unwind(AssertUnwindSafe(action)) {
-        Ok(result) => result.map(Some),
+        Ok(Ok(result)) => Some(result),
+        Ok(Err(err)) => {
+            eprintln!("contained error while servicing session {id}: {err}");
+            None
+        }
         Err(payload) => {
             eprintln!("contained panic while servicing session {id}: {}", panic_payload_message(payload.as_ref()));
-            Ok(None)
+            None
         }
     }
 }
@@ -760,18 +817,50 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn remove_packet_channels_for_session(session_id: &str, packet_clients: &mut [PacketClient]) {
     for client in packet_clients {
-        client.channels.retain(|_, channel| channel.session_id != session_id);
+        // Tell the client each affected channel is gone before dropping it.
+        // Directory deltas are selector-filtered, so an attached client may
+        // never see the remove delta; the channel-scoped error is the only
+        // guaranteed close signal. Enqueue failures mean the client transport
+        // is already dead and its teardown path will reap it.
+        let closed: Vec<u32> = client.channels.iter().filter(|(_, ch)| ch.session_id == session_id).map(|(id, _)| *id).collect();
+        for channel in closed {
+            let _ = client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message: format!("session {session_id} exited") });
+            client.channels.remove(&channel);
+        }
     }
 }
 
-fn directory_entry_for_session(layout: &RuntimeLayout, hosted: &HostedSession) -> Result<DirectoryEntry, String> {
+/// O(clients x channels) scan, run on every directory-entry build. Fine at
+/// expected client counts; cache per-session counters if that ever grows.
+fn packet_role_counts(session_id: &str, packet_clients: &[PacketClient]) -> (u32, u32) {
+    let mut controllers = 0u32;
+    let mut watchers = 0u32;
+    for client in packet_clients {
+        for session_channel in client.channels.values() {
+            if session_channel.session_id == session_id {
+                match session_channel.role {
+                    ChannelRole::Controller => controllers = controllers.saturating_add(1),
+                    ChannelRole::Watcher => watchers = watchers.saturating_add(1),
+                }
+            }
+        }
+    }
+    (controllers, watchers)
+}
+
+fn directory_entry_for_session(
+    layout: &RuntimeLayout,
+    hosted: &HostedSession,
+    packet_clients: &[PacketClient],
+) -> Result<DirectoryEntry, String> {
     let inspect = hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?;
+    let (packet_controllers, packet_watchers) = packet_role_counts(&inspect.session.id, packet_clients);
     Ok(DirectoryEntry {
         session_id: inspect.session.id.clone(),
         tags: inspect.session.tags,
         state: inspect.session.state,
-        controller_count: if hosted.active_client.is_some() { 1 } else { 0 },
-        watcher_count: u32::try_from(hosted.watchers.len()).unwrap_or(u32::MAX),
+        controller_count: (if hosted.active_client.is_some() { 1 } else { 0 }) + packet_controllers,
+        watcher_count: u32::try_from(hosted.watchers.len()).unwrap_or(u32::MAX).saturating_add(packet_watchers),
         recreatable: crate::recreate::session_is_recreatable(&layout.session_dir(&inspect.session.id)),
         cols: inspect.terminal.cols,
         rows: inspect.terminal.rows,
@@ -781,11 +870,12 @@ fn directory_entry_for_session(layout: &RuntimeLayout, hosted: &HostedSession) -
 fn directory_snapshot_for_sessions(
     layout: &RuntimeLayout,
     sessions: &HashMap<String, HostedSession>,
+    packet_clients: &[PacketClient],
     selectors: &[String],
 ) -> Result<DirectorySnapshot, String> {
     let mut entries = Vec::new();
     for hosted in sessions.values() {
-        let entry = directory_entry_for_session(layout, hosted)?;
+        let entry = directory_entry_for_session(layout, hosted, packet_clients)?;
         if directory_entry_matches_selectors(&entry, selectors) {
             entries.push(entry);
         }
@@ -910,7 +1000,7 @@ fn service_hosted_session(
     push_due_packet_renders(id, &hosted.actor, packet_clients, &mut hosted.packet_render_cache)?;
 
     if resized || previous_controller_count != hosted.active_client.is_some() || previous_watcher_count != hosted.watchers.len() {
-        broadcast_directory_upsert(directory_entry_for_session(layout, hosted)?, packet_clients)?;
+        broadcast_directory_upsert(directory_entry_for_session(layout, hosted, packet_clients)?, packet_clients)?;
     }
 
     service_pending_waits(&hosted.actor, &mut hosted.pending_waits);
@@ -1019,7 +1109,7 @@ fn finish_exited_session(
     layout: &RuntimeLayout,
     id: &str,
     hosted: &mut HostedSession,
-    packet_clients: &mut Vec<PacketClient>,
+    packet_clients: &mut [PacketClient],
 ) -> Result<bool, String> {
     drain_raw_output_tap(layout, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
     for mut wait in hosted.pending_waits.drain(..) {
@@ -1047,6 +1137,7 @@ struct HttpRequestState<'a> {
     layout: &'a RuntimeLayout,
     sessions: &'a mut HashMap<String, HostedSession>,
     packet_clients: &'a mut Vec<PacketClient>,
+    next_packet_client_id: &'a mut u64,
 }
 
 struct HttpHandshakeReader<'a> {
@@ -1120,7 +1211,10 @@ fn handle_http_request(
             }
             if created {
                 if let Some(hosted) = state.sessions.get(&session.id) {
-                    broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+                    broadcast_directory_upsert(
+                        directory_entry_for_session(state.layout, hosted, state.packet_clients)?,
+                        state.packet_clients,
+                    )?;
                 }
             }
             http_uds::write_json(stream, StatusCode::OK, &http_uds::CreateSessionResponse { session })
@@ -1140,12 +1234,14 @@ fn handle_http_request(
             };
             let mut selectors = subscribe.selectors;
             crate::runtime::normalize_tags(&mut selectors);
-            let directory = directory_snapshot_for_sessions(state.layout, state.sessions, &selectors)?;
+            let directory = directory_snapshot_for_sessions(state.layout, state.sessions, state.packet_clients, &selectors)?;
             http_uds::write_packet_switching_protocols(stream).map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
             let packet_stream = stream.try_clone().map_err(|err| format!("clone HTTP packet stream: {err}"))?;
             #[cfg(unix)]
             set_stream_nonblocking(&packet_stream, true).map_err(|err| format!("set HTTP packet stream nonblocking: {err}"))?;
-            let mut client = PacketClient::new(packet_stream, selectors, &directory)?;
+            let client_id = *state.next_packet_client_id;
+            *state.next_packet_client_id += 1;
+            let mut client = PacketClient::new(client_id, packet_stream, selectors, &directory)?;
             client.enqueue_control(MSG_CONTROL_HELLO, &ControlHello::current())?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
             state.packet_clients.push(client);
@@ -1171,7 +1267,8 @@ fn handle_http_request(
             };
             let body: http_uds::AttachRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP attach request: {err}"))?;
-            if hosted.active_client.is_some() {
+            vacate_dead_packet_controller(hosted, state.packet_clients);
+            if hosted.active_client.is_some() || hosted.packet_controller.is_some() {
                 http_uds::write_error(stream, StatusCode::CONFLICT, "session already has a foreground client")
                     .map_err(|err| format!("write HTTP attach busy response: {err}"))?;
                 break 'attach Ok(());
@@ -1197,7 +1294,7 @@ fn handle_http_request(
             hosted.had_foreground_client = true;
             hosted.actor.set_client_presence(true)?;
             hosted.actor.record_attach()?;
-            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             Ok(())
         }
         http_uds::Route::SessionWatch { id } => {
@@ -1219,7 +1316,7 @@ fn handle_http_request(
                 }
             }
             hosted.watchers.push(watcher);
-            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             Ok(())
         }
         http_uds::Route::SessionDetach { id } => {
@@ -1232,7 +1329,7 @@ fn handle_http_request(
             }
             hosted.actor.set_client_presence(false)?;
             hosted.active_client = None;
-            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP detach response: {err}"))
         }
         http_uds::Route::SessionExpect { id } => 'expect: {
@@ -1302,7 +1399,10 @@ fn handle_http_request(
                 }
                 http_uds::InputRequest::Resize { cols, rows } => {
                     hosted.actor.resize(cols, rows)?;
-                    broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+                    broadcast_directory_upsert(
+                        directory_entry_for_session(state.layout, hosted, state.packet_clients)?,
+                        state.packet_clients,
+                    )?;
                 }
             }
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP input response: {err}"))
@@ -1352,7 +1452,7 @@ fn handle_http_request(
             let body: http_uds::TagRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP tag request: {err}"))?;
             let tags = hosted.actor.update_tags(body.add, body.remove)?;
-            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::TagResponse { tags })
                 .map_err(|err| format!("write HTTP tag response: {err}"))
         }
@@ -1397,7 +1497,7 @@ fn handle_http_request(
             let body: http_uds::ResizeRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP resize request: {err}"))?;
             hosted.actor.resize(body.cols, body.rows)?;
-            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted)?, state.packet_clients)?;
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP resize response: {err}"))
         }
         http_uds::Route::SessionScreen { id } => {
@@ -1559,6 +1659,7 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 }
 
 struct PacketClient {
+    id: u64,
     stream: SessionStream,
     pending_output: Vec<u8>,
     input_reader: ActiveClientReader,
@@ -1566,10 +1667,15 @@ struct PacketClient {
     channels: HashMap<u32, PacketSessionChannel>,
     selectors: Vec<String>,
     known_directory_sessions: HashSet<String>,
+    /// Marked when this client's transport fails or its output backlog
+    /// overflows. Client failures are never daemon-fatal: the client is
+    /// reaped (with role release) on the next servicing pass.
+    dead: bool,
 }
 
 struct PacketSessionChannel {
     session_id: String,
+    role: ChannelRole,
     in_flight_generation: Option<u64>,
     last_sent_generation: u64,
 }
@@ -1594,9 +1700,10 @@ impl PacketRenderCache {
 }
 
 impl PacketClient {
-    fn new(stream: SessionStream, selectors: Vec<String>, initial_directory: &DirectorySnapshot) -> Result<Self, String> {
+    fn new(id: u64, stream: SessionStream, selectors: Vec<String>, initial_directory: &DirectorySnapshot) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
         Ok(Self {
+            id,
             stream,
             pending_output: Vec::new(),
             input_reader,
@@ -1604,6 +1711,7 @@ impl PacketClient {
             channels: HashMap::new(),
             selectors,
             known_directory_sessions: initial_directory.sessions.iter().map(|entry| entry.session_id.clone()).collect(),
+            dead: false,
         })
     }
 
@@ -1612,11 +1720,20 @@ impl PacketClient {
         self.enqueue_frame(&frame)
     }
 
+    /// Errors only on encode failures (a programming error in frame
+    /// construction). A reader that stalls long enough to overflow its
+    /// backlog is a client-scoped failure: the client is marked dead and
+    /// reaped later, never surfaced as a daemon-level error.
     fn enqueue_frame(&mut self, frame: &PacketFrame) -> Result<(), String> {
+        if self.dead {
+            return Ok(());
+        }
         let mut encoded = Vec::new();
         frame.write(&mut encoded).map_err(|err| format!("buffer packet frame: {err}"))?;
         if self.pending_output.len().saturating_add(encoded.len()) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
-            return Err(format!("packet client output backlog exceeded {} bytes", MAX_PENDING_CLIENT_OUTPUT_BYTES));
+            self.dead = true;
+            self.pending_output = Vec::new();
+            return Ok(());
         }
         self.pending_output.extend_from_slice(&encoded);
         Ok(())
@@ -1669,19 +1786,33 @@ fn service_packet_clients(
     let mut index = 0;
     while index < packet_clients.len() {
         let mut pending = VecDeque::new();
-        let connected = packet_clients[index]
-            .drain_input_frames(&mut pending, Duration::ZERO)
-            .map_err(|err| format!("read packet client frame: {err}"))?;
+        // A transport read error is a client-scoped failure, exactly like a
+        // clean disconnect: drop the one client, never the daemon.
+        let connected =
+            !packet_clients[index].dead && packet_clients[index].drain_input_frames(&mut pending, Duration::ZERO).unwrap_or(false);
         if !connected {
-            packet_clients.swap_remove(index);
+            let removed = packet_clients.swap_remove(index);
+            release_packet_client_roles(layout, sessions, &removed, packet_clients)?;
             did_work = true;
             continue;
         }
 
         while let Some(frame) = pending.pop_front() {
             did_work = true;
-            if let Some(entry) = handle_packet_frame(layout, sessions, &mut packet_clients[index], frame)? {
-                broadcast_directory_upsert(entry, packet_clients)?;
+            // A frame-handling error is scoped to the client that sent the
+            // frame (its channel bookkeeping is suspect from here on): drop
+            // that client, keep the daemon and its sessions running.
+            match handle_packet_frame(layout, sessions, packet_clients, index, frame) {
+                Ok(updates) => {
+                    for entry in updates {
+                        broadcast_directory_upsert(entry, packet_clients)?;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("dropping packet client after frame error: {err}");
+                    packet_clients[index].dead = true;
+                    break;
+                }
             }
         }
         index += 1;
@@ -1689,24 +1820,137 @@ fn service_packet_clients(
     Ok(did_work)
 }
 
+/// Free controller slots held by a disconnected packet client and re-announce
+/// the affected sessions' attachment counts.
+fn release_packet_client_roles(
+    layout: &RuntimeLayout,
+    sessions: &mut HashMap<String, HostedSession>,
+    removed: &PacketClient,
+    packet_clients: &mut Vec<PacketClient>,
+) -> Result<(), String> {
+    let mut affected: Vec<&String> = Vec::new();
+    for (channel, session_channel) in &removed.channels {
+        if let Some(hosted) = sessions.get_mut(&session_channel.session_id) {
+            if hosted.packet_controller == Some(PacketChannelRef { client_id: removed.id, channel: *channel }) {
+                hosted.packet_controller = None;
+            }
+        }
+        affected.push(&session_channel.session_id);
+    }
+    affected.sort();
+    affected.dedup();
+    for session_id in affected {
+        if let Some(hosted) = sessions.get(session_id) {
+            // A failing session actor must not turn role release into a
+            // daemon-fatal error; the session faults on its own servicing
+            // pass and broadcasts its removal there.
+            match directory_entry_for_session(layout, hosted, packet_clients) {
+                Ok(entry) => broadcast_directory_upsert(entry, packet_clients)?,
+                Err(err) => eprintln!("skipping directory update for session {session_id}: {err}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A dead client awaiting reaping must not hold the controller slot against
+/// a live requester (packet role grants and legacy attach alike).
+fn vacate_dead_packet_controller(hosted: &mut HostedSession, packet_clients: &[PacketClient]) {
+    if let Some(current) = hosted.packet_controller {
+        if !packet_controller_holder_is_live(current, packet_clients) {
+            hosted.packet_controller = None;
+        }
+    }
+}
+
+fn packet_controller_holder_is_live(current: PacketChannelRef, packet_clients: &[PacketClient]) -> bool {
+    packet_clients.iter().any(|client| client.id == current.client_id && !client.dead)
+}
+
+/// Resolve a controller/watcher request for `requester`, demoting the current
+/// packet controller when `take` is set. A legacy stream controller is never
+/// preempted (a raw attach cannot be demoted to read-only), so requests grant
+/// Watcher while one is attached.
+fn grant_packet_role(
+    hosted: &mut HostedSession,
+    packet_clients: &mut [PacketClient],
+    requester: PacketChannelRef,
+    role: ChannelRole,
+    take: bool,
+) -> Result<ChannelRole, String> {
+    match role {
+        ChannelRole::Watcher => {
+            if hosted.packet_controller == Some(requester) {
+                hosted.packet_controller = None;
+            }
+            Ok(ChannelRole::Watcher)
+        }
+        ChannelRole::Controller => {
+            if hosted.active_client.is_some() {
+                return Ok(ChannelRole::Watcher);
+            }
+            vacate_dead_packet_controller(hosted, packet_clients);
+            match hosted.packet_controller {
+                None => {
+                    hosted.packet_controller = Some(requester);
+                    Ok(ChannelRole::Controller)
+                }
+                Some(current) if current == requester => Ok(ChannelRole::Controller),
+                Some(current) => {
+                    if !take {
+                        return Ok(ChannelRole::Watcher);
+                    }
+                    for client in packet_clients.iter_mut() {
+                        if client.id != current.client_id {
+                            continue;
+                        }
+                        if let Some(session_channel) = client.channels.get_mut(&current.channel) {
+                            session_channel.role = ChannelRole::Watcher;
+                        }
+                        client.enqueue_frame(
+                            &PacketFrame::new(current.channel, MSG_SESSION_ROLE, &RoleState { role: ChannelRole::Watcher })
+                                .map_err(|err| format!("encode role demotion packet: {err}"))?,
+                        )?;
+                        break;
+                    }
+                    hosted.packet_controller = Some(requester);
+                    Ok(ChannelRole::Controller)
+                }
+            }
+        }
+    }
+}
+
 fn handle_packet_frame(
     layout: &RuntimeLayout,
     sessions: &mut HashMap<String, HostedSession>,
-    client: &mut PacketClient,
+    packet_clients: &mut [PacketClient],
+    index: usize,
     frame: PacketFrame,
-) -> Result<Option<DirectoryEntry>, String> {
-    let mut directory_update = None;
+) -> Result<Vec<DirectoryEntry>, String> {
+    let mut updates = Vec::new();
     match (frame.channel, frame.msg_type) {
         (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL) => {
             let open = frame.decode::<OpenChannel>().map_err(|err| format!("decode open-channel packet: {err}"))?;
-            open_packet_channel(sessions, client, open)?;
+            open_packet_channel(layout, sessions, packet_clients, index, open, &mut updates)?;
         }
         (CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL) => {
             let close = frame.decode::<CloseChannel>().map_err(|err| format!("decode close-channel packet: {err}"))?;
-            client.channels.remove(&close.channel);
+            let client_id = packet_clients[index].id;
+            if let Some(removed) = packet_clients[index].channels.remove(&close.channel) {
+                if let Some(hosted) = sessions.get_mut(&removed.session_id) {
+                    if hosted.packet_controller == Some(PacketChannelRef { client_id, channel: close.channel }) {
+                        hosted.packet_controller = None;
+                    }
+                }
+                if let Some(hosted) = sessions.get(&removed.session_id) {
+                    updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+                }
+            }
         }
         (channel, MSG_SESSION_ACK) if channel != CHANNEL_CONTROL => {
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
+            let client = &mut packet_clients[index];
             let session_id = client.channels.get(&channel).map(|session| session.session_id.clone());
             if let Some(session_channel) = client.channels.get_mut(&channel) {
                 if session_channel.in_flight_generation == Some(ack.generation) {
@@ -1719,55 +1963,142 @@ fn handle_packet_frame(
         }
         (channel, MSG_SESSION_INPUT) if channel != CHANNEL_CONTROL => {
             let input = frame.decode::<Input>().map_err(|err| format!("decode input packet: {err}"))?;
-            if let Some(session_id) = client.channels.get(&channel).map(|session| session.session_id.clone()) {
-                if let Some(hosted) = sessions.get(&session_id) {
-                    route_packet_input_event(&hosted.actor, input.event)?;
-                }
+            if let Some(hosted) = controller_session(sessions, packet_clients, index, channel) {
+                route_packet_input_event(&hosted.actor, input.event)?;
             }
         }
         (channel, MSG_SESSION_RESIZE) if channel != CHANNEL_CONTROL => {
             let resize = frame.decode::<Resize>().map_err(|err| format!("decode resize packet: {err}"))?;
-            if let Some(session_id) = client.channels.get(&channel).map(|session| session.session_id.clone()) {
-                if let Some(hosted) = sessions.get(&session_id) {
-                    hosted.actor.resize(resize.cols, resize.rows)?;
-                    directory_update = Some(directory_entry_for_session(layout, hosted)?);
-                }
+            if let Some(hosted) = controller_session(sessions, packet_clients, index, channel) {
+                hosted.actor.resize(resize.cols, resize.rows)?;
+                updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
             }
+        }
+        (channel, MSG_SESSION_VIEWPORT) if channel != CHANNEL_CONTROL => {
+            let viewport = frame.decode::<crate::packet::Viewport>().map_err(|err| format!("decode viewport packet: {err}"))?;
+            // the viewport is session-global state; outcome flows back as
+            // viewport/scrollbar state in the next render packet; no reply
+            if let Some(hosted) = controller_session(sessions, packet_clients, index, channel) {
+                let _ = hosted
+                    .actor
+                    .request_result(|reply| crate::host::actor::SessionCommand::ScrollViewport { command: viewport.command, reply });
+            }
+        }
+        (channel, MSG_SESSION_ROLE) if channel != CHANNEL_CONTROL => {
+            let request = frame.decode::<RoleRequest>().map_err(|err| format!("decode role request packet: {err}"))?;
+            apply_packet_role_request(layout, sessions, packet_clients, index, channel, request, &mut updates)?;
         }
         _ => {}
     }
-    Ok(directory_update)
+    Ok(updates)
 }
 
-fn open_packet_channel(sessions: &mut HashMap<String, HostedSession>, client: &mut PacketClient, open: OpenChannel) -> Result<(), String> {
+/// The session a channel controls: `Some` only when the channel exists and
+/// holds the controller role. Watcher traffic on session-mutating messages
+/// is dropped by role, not errored.
+fn controller_session<'a>(
+    sessions: &'a HashMap<String, HostedSession>,
+    packet_clients: &[PacketClient],
+    index: usize,
+    channel: u32,
+) -> Option<&'a HostedSession> {
+    let session_channel = packet_clients[index].channels.get(&channel)?;
+    if session_channel.role != ChannelRole::Controller {
+        return None;
+    }
+    sessions.get(&session_channel.session_id)
+}
+
+fn apply_packet_role_request(
+    layout: &RuntimeLayout,
+    sessions: &mut HashMap<String, HostedSession>,
+    packet_clients: &mut [PacketClient],
+    index: usize,
+    channel: u32,
+    request: RoleRequest,
+    updates: &mut Vec<DirectoryEntry>,
+) -> Result<(), String> {
+    let Some(session_id) = packet_clients[index].channels.get(&channel).map(|session| session.session_id.clone()) else {
+        return Ok(());
+    };
+    let Some(hosted) = sessions.get_mut(&session_id) else {
+        return Ok(());
+    };
+    let requester = PacketChannelRef { client_id: packet_clients[index].id, channel };
+    let granted = grant_packet_role(hosted, packet_clients, requester, request.role, request.take)?;
+    let client = &mut packet_clients[index];
+    if let Some(session_channel) = client.channels.get_mut(&channel) {
+        session_channel.role = granted;
+    }
+    client.enqueue_frame(
+        &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState { role: granted })
+            .map_err(|err| format!("encode role state packet: {err}"))?,
+    )?;
+    if let Some(hosted) = sessions.get(&session_id) {
+        updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+    }
+    Ok(())
+}
+
+fn open_packet_channel(
+    layout: &RuntimeLayout,
+    sessions: &mut HashMap<String, HostedSession>,
+    packet_clients: &mut [PacketClient],
+    index: usize,
+    open: OpenChannel,
+    updates: &mut Vec<DirectoryEntry>,
+) -> Result<(), String> {
     if open.channel == CHANNEL_CONTROL {
-        client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+        packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
             channel: open.channel,
             message: "session channel must be non-zero".to_string(),
         })?;
         return Ok(());
     }
     let Some(hosted) = sessions.get_mut(&open.session_id) else {
-        client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+        packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
             channel: open.channel,
             message: format!("unknown session {}", open.session_id),
         })?;
         return Ok(());
     };
 
+    // Probe render state before granting a role: a session whose VT engine
+    // cannot serve it (e.g. the passthrough placeholder) must fail this one
+    // channel, not demote the current controller or tear down the daemon.
+    let update = match hosted.actor.full_render_update() {
+        Ok(update) => update,
+        Err(err) => {
+            packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+                channel: open.channel,
+                message: format!("open channel for session {}: {err}", open.session_id),
+            })?;
+            return Ok(());
+        }
+    };
+    let requester = PacketChannelRef { client_id: packet_clients[index].id, channel: open.channel };
+    let granted = grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?;
     let session_id = open.session_id;
-    let update = hosted.actor.full_render_update()?;
     let generation = update.render_generation;
     hosted.packet_render_cache.store(update.clone());
+    let client = &mut packet_clients[index];
+    client.enqueue_frame(
+        &PacketFrame::new(open.channel, MSG_SESSION_ROLE, &RoleState { role: granted })
+            .map_err(|err| format!("encode role state packet: {err}"))?,
+    )?;
     client.enqueue_frame(
         &PacketFrame::new(open.channel, MSG_SESSION_RENDER, &RenderPacket { update })
             .map_err(|err| format!("encode initial render packet: {err}"))?,
     )?;
     client.channels.insert(open.channel, PacketSessionChannel {
-        session_id,
+        session_id: session_id.clone(),
+        role: granted,
         in_flight_generation: Some(generation),
         last_sent_generation: generation,
     });
+    if let Some(hosted) = sessions.get(&session_id) {
+        updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+    }
     Ok(())
 }
 
@@ -1940,8 +2271,18 @@ fn packet_named_key_bytes(key: TerminalNamedKey) -> Vec<u8> {
     }
 }
 
-fn flush_packet_clients(packet_clients: &mut Vec<PacketClient>) {
-    packet_clients.retain_mut(|client| client.flush_pending_output().unwrap_or(false));
+/// Flush failures mark the client dead rather than dropping it here:
+/// removal happens in `service_packet_clients`, which also releases any
+/// controller role the client held.
+fn flush_packet_clients(packet_clients: &mut [PacketClient]) {
+    for client in packet_clients {
+        if client.dead {
+            continue;
+        }
+        if !client.flush_pending_output().unwrap_or(false) {
+            client.dead = true;
+        }
+    }
 }
 
 struct ActiveClient {
@@ -2186,6 +2527,48 @@ mod tests {
     fn graceful_socket_shutdown_classifies_broken_pipe_disconnects() {
         let err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         assert!(super::is_graceful_socket_shutdown(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packet_client_backlog_overflow_marks_client_dead_not_daemon_fatal() {
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
+        let mut client = super::PacketClient::new(1, stream, Vec::new(), &crate::packet::DirectorySnapshot { sessions: Vec::new() })
+            .expect("create packet client");
+        client.pending_output = vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1];
+
+        let frame = crate::packet::PacketFrame { channel: 1, msg_type: 0, payload: vec![0; 64] };
+        client.enqueue_frame(&frame).expect("overflow must not surface as a daemon-level error");
+
+        assert!(client.dead, "overflowing client should be marked dead for reaping");
+        assert!(client.pending_output.is_empty(), "backlog should be released");
+
+        client.enqueue_frame(&frame).expect("enqueue to a dead client is a no-op");
+        assert!(client.pending_output.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_packet_client_does_not_hold_the_controller_slot() {
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
+        let mut client = super::PacketClient::new(7, stream, Vec::new(), &crate::packet::DirectorySnapshot { sessions: Vec::new() })
+            .expect("create packet client");
+        let holder = super::PacketChannelRef { client_id: 7, channel: 1 };
+
+        assert!(super::packet_controller_holder_is_live(holder, std::slice::from_ref(&client)));
+
+        client.dead = true;
+        assert!(!super::packet_controller_holder_is_live(holder, std::slice::from_ref(&client)));
+        assert!(!super::packet_controller_holder_is_live(holder, &[]), "a reaped holder is not live either");
+    }
+
+    #[test]
+    fn contain_session_unwind_contains_errors_as_faults() {
+        let contained = super::contain_session_unwind("alpha", || -> Result<(), String> { Err("actor died".into()) });
+        assert!(contained.is_none(), "a servicing error should fault the session, not the daemon");
+
+        let ok = super::contain_session_unwind("alpha", || Ok(7));
+        assert_eq!(ok, Some(7));
     }
 
     #[cfg(unix)]

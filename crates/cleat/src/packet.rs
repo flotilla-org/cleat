@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{TerminalInputEvent, TerminalRenderUpdate};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -18,6 +18,8 @@ pub const MSG_SESSION_RENDER: u8 = 16;
 pub const MSG_SESSION_ACK: u8 = 17;
 pub const MSG_SESSION_INPUT: u8 = 18;
 pub const MSG_SESSION_RESIZE: u8 = 19;
+pub const MSG_SESSION_VIEWPORT: u8 = 20;
+pub const MSG_SESSION_ROLE: u8 = 21;
 
 const HEADER_LEN: usize = 9;
 pub const MAX_PACKET_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
@@ -31,6 +33,13 @@ pub struct ControlHello {
 impl ControlHello {
     pub fn current() -> Self {
         Self { version: PROTOCOL_VERSION, min_supported_version: PROTOCOL_VERSION }
+    }
+
+    /// The hello advertises the version range this daemon speaks,
+    /// `min_supported_version..=version`. A client is compatible when its own
+    /// protocol version falls inside that range.
+    pub fn accepts(&self, client_version: u16) -> bool {
+        (self.min_supported_version..=self.version).contains(&client_version)
     }
 }
 
@@ -62,10 +71,39 @@ pub struct DirectoryEntry {
     pub rows: u16,
 }
 
+/// Attachment role of a session channel. One controller per session across
+/// packet and legacy stream clients: the controller's input, resize, and
+/// viewport commands are routed; watchers are read-only and never resize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelRole {
+    Watcher,
+    Controller,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenChannel {
     pub channel: u32,
     pub session_id: String,
+    /// Requested role; the granted role arrives as a `RoleState` before the
+    /// initial render packet (a controller request may be granted Watcher).
+    pub role: ChannelRole,
+    /// Preempt an existing packet controller. Never preempts a legacy stream
+    /// controller (there is no way to demote a raw attach to read-only).
+    pub take: bool,
+}
+
+/// Client→server on an open session channel: request a role change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleRequest {
+    pub role: ChannelRole,
+    pub take: bool,
+}
+
+/// Server→client on a session channel: the granted role, sent on open and on
+/// any later change (e.g. demotion because another client took control).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleState {
+    pub role: ChannelRole,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +137,14 @@ pub struct Input {
 pub struct Resize {
     pub cols: u16,
     pub rows: u16,
+}
+
+/// Client→server viewport movement (scrollbar drag, keyboard paging). The
+/// resulting viewport/scrollbar state flows back through the next render
+/// packet rather than a reply message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Viewport {
+    pub command: crate::provider::ViewportCommand,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,8 +220,13 @@ impl<S: Read + Write> PacketClient<S> {
         Self { stream, buffer: Vec::new() }
     }
 
-    pub fn open_channel(&mut self, channel: u32, session_id: &str) -> std::io::Result<()> {
-        self.write(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel { channel, session_id: session_id.to_string() })
+    pub fn open_channel(&mut self, channel: u32, session_id: &str, role: ChannelRole) -> std::io::Result<()> {
+        self.write(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
+            channel,
+            session_id: session_id.to_string(),
+            role,
+            take: false,
+        })
     }
 
     pub fn close_channel(&mut self, channel: u32, reason: Option<String>) -> std::io::Result<()> {
@@ -240,6 +291,22 @@ impl<S: Read + Write> PacketClient<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_accepts_client_versions_inside_advertised_range() {
+        let hello = ControlHello { version: 4, min_supported_version: 2 };
+
+        assert!(hello.accepts(2));
+        assert!(hello.accepts(3));
+        assert!(hello.accepts(4));
+        assert!(!hello.accepts(1));
+        assert!(!hello.accepts(5));
+    }
+
+    #[test]
+    fn current_hello_accepts_current_protocol_version() {
+        assert!(ControlHello::current().accepts(PROTOCOL_VERSION));
+    }
 
     #[test]
     fn codec_round_trips_postcard_control_payloads() {

@@ -9,13 +9,22 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 6u
+#define CLEAT_PROVIDER_ABI_VERSION 7u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
 #define CLEAT_PROVIDER_VT_DEFAULT 0u
 #define CLEAT_PROVIDER_VT_PASSTHROUGH 1u
 #define CLEAT_PROVIDER_VT_GHOSTTY 2u
+/* Transport state of a session (cleat_session_connection_state). */
+#define CLEAT_SESSION_CONNECTING 0u
+#define CLEAT_SESSION_STREAMING 1u
+#define CLEAT_SESSION_DISCONNECTED 2u
+#define CLEAT_SESSION_CLOSED 3u
+/* Attachment role (cleat_session_role / cleat_session_desc.role). */
+#define CLEAT_ROLE_UNKNOWN 0u
+#define CLEAT_ROLE_WATCHER 1u
+#define CLEAT_ROLE_CONTROLLER 2u
 #define CLEAT_INPUT_KEY 1u
 #define CLEAT_INPUT_TEXT 2u
 #define CLEAT_INPUT_MOUSE 3u
@@ -133,12 +142,32 @@ typedef enum cleat_dirty_state {
     CLEAT_DIRTY_FULL = 2,
 } cleat_dirty_state;
 
+/* Borrowed, non-NUL-terminated UTF-8 slice. */
+typedef struct cleat_str {
+    const uint8_t *ptr;
+    size_t len;
+} cleat_str;
+
 typedef struct cleat_provider_desc {
     uint32_t abi_version;
     uint32_t requested_features;
     uint32_t backend;
     const uint8_t *runtime_root;
     size_t runtime_root_len;
+    /*
+     * Daemon-backend only: name of the daemon under the runtime root (NULL for
+     * the default daemon). One provider talks to one daemon over one
+     * multiplexed packet connection; open one provider per daemon.
+     */
+    const uint8_t *daemon_name;
+    size_t daemon_name_len;
+    /*
+     * Daemon-backend only: optional directory subscription tag selectors.
+     * AND-only exact match against opaque session tags; empty subscribes to
+     * every session on the daemon.
+     */
+    const cleat_str *directory_selectors;
+    size_t directory_selector_count;
 } cleat_provider_desc;
 
 typedef struct cleat_session_desc {
@@ -160,7 +189,43 @@ typedef struct cleat_session_desc {
     size_t id_len;
     bool record;
     const struct cleat_session_colors *colors;
+    /*
+     * Daemon-backend only: opaque tags attached at creation (client convention
+     * is key=value, e.g. "project=uishell"). Ignored by other backends.
+     */
+    const cleat_str *tags;
+    size_t tag_count;
+    /*
+     * Daemon-backend only: requested attachment role. CLEAT_ROLE_UNKNOWN and
+     * CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
+     * another controller holds the session); CLEAT_ROLE_WATCHER attaches
+     * read-only. The granted role is reported by cleat_session_role.
+     */
+    uint32_t role;
 } cleat_session_desc;
+
+/*
+ * One entry of the daemon directory subscription. All cleat_str pointers
+ * borrow from the live directory and stay valid until
+ * cleat_provider_directory_release.
+ */
+typedef struct cleat_directory_entry {
+    cleat_str session_id;
+    cleat_str state;
+    const cleat_str *tags;
+    size_t tag_count;
+    uint32_t controller_count;
+    uint32_t watcher_count;
+    bool recreatable;
+    uint16_t cols;
+    uint16_t rows;
+} cleat_directory_entry;
+
+typedef struct cleat_directory {
+    uint64_t generation;
+    const cleat_directory_entry *entries;
+    size_t entry_count;
+} cleat_directory;
 
 typedef struct cleat_rgb {
     uint8_t r;
@@ -431,8 +496,53 @@ cleat_provider *cleat_provider_open(const cleat_provider_desc *desc);
 void cleat_provider_set_wake_callback(cleat_provider *provider, cleat_wake_fn *wake, void *user_data);
 void cleat_provider_close(cleat_provider *provider);
 
+/*
+ * Daemon directory subscription (Workspace Inventory feed). The generation
+ * counter starts at 0 before the first snapshot and bumps on every snapshot or
+ * delta (including retags); poll it and re-read the directory on change. Only
+ * one directory may be live per provider; release before requesting again.
+ * Entries are sorted by session id. Always 0/false for non-daemon providers.
+ */
+uint64_t cleat_provider_directory_generation(const cleat_provider *provider);
+bool cleat_provider_directory_snapshot(cleat_provider *provider, cleat_directory *out);
+void cleat_provider_directory_release(cleat_provider *provider, cleat_directory *directory);
+
 cleat_session *cleat_session_create(cleat_provider *provider, const cleat_session_desc *desc);
+/*
+ * Attach to an existing daemon session by id instead of creating one. Honors
+ * only id, cols, rows, and cell pixel sizes of the desc. If the session does
+ * not exist the daemon closes the channel and the session reports
+ * CLEAT_SESSION_CLOSED.
+ */
+cleat_session *cleat_session_attach(cleat_provider *provider, const cleat_session_desc *desc);
 void cleat_session_destroy(cleat_session *session);
+
+/*
+ * Daemon session id for attach-by-id and directory correlation (borrows from
+ * the session; valid until destroy). False for non-daemon sessions.
+ */
+bool cleat_session_id(const cleat_session *session, cleat_str *out);
+/*
+ * Transport state (CLEAT_SESSION_*). In-process sessions are always
+ * STREAMING. Daemon sessions report CONNECTING until the first render packet,
+ * DISCONNECTED while the connection is down (it reconnects with backoff and
+ * recovers on its own), and CLOSED once the daemon reported the session gone.
+ */
+uint32_t cleat_session_connection_state(const cleat_session *session);
+/*
+ * Granted attachment role (CLEAT_ROLE_*). In-process sessions are their own
+ * controllers. Daemon sessions report UNKNOWN until the daemon's grant
+ * arrives; the role can change later (another client may take control — the
+ * wake callback fires on the change). Watcher input, resize, and viewport
+ * commands are dropped daemon-side.
+ */
+uint32_t cleat_session_role(const cleat_session *session);
+/*
+ * Request the controller role, preempting another packet client's control if
+ * needed (a legacy `cleat attach` stream controller is never preempted). The
+ * grant lands asynchronously; poll cleat_session_role after wake.
+ */
+bool cleat_session_take_control(cleat_session *session);
 
 /* Updates row/column terminal size. Pixel geometry is updated separately. */
 bool cleat_session_resize(cleat_session *session, uint16_t cols, uint16_t rows);
@@ -479,6 +589,10 @@ bool cleat_session_scroll_viewport(cleat_session *session,
  * same session.
  * dirty_rows is populated only when dirty is CLEAT_DIRTY_PARTIAL and the
  * provider knows exact dirty rows; otherwise dirty_row_count is zero.
+ * Always returns false for daemon-backed sessions: they are fed by render
+ * updates rather than snapshots, and no full-grid state is held client-side.
+ * Use cleat_session_render_update instead; the first update after a channel
+ * opens is full-dirty and carries the complete grid.
  */
 bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
 /*

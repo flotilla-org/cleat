@@ -6,31 +6,38 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use http::{Method, StatusCode};
-
 use crate::{
     host::actor::{ObservationState, SessionActor, SessionCommand, SessionMouseEvent, SessionWheelEvent},
-    http_uds, keys,
-    platform::ipc::connect_session_stream,
+    keys,
     provider::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
-        TerminalGeometry, TerminalImagePlacement, TerminalImageResource, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalRgb,
-        TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalStyleColor, TerminalStyleColorTag,
-        TerminalViewportKind, ViewportCommand, ViewportCommandOutcome, TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
+        TerminalFocusEvent, TerminalGeometry, TerminalImagePlacement, TerminalImageResource, TerminalInputEvent, TerminalModifiers,
+        TerminalMouseButtons, TerminalMouseEvent, TerminalMouseEventKind, TerminalPasteEvent, TerminalRenderUpdate,
+        TerminalRenderUpdateOpKind, TerminalRgb, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalStyleColor,
+        TerminalStyleColorTag, TerminalTextEvent, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
+        TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
     },
+    provider_daemon::{ChannelSlot, DaemonConnection},
     runtime::{RuntimeLayout, TerminalSize},
     session::{ensure_session_started, SessionStartOptions},
     session_runtime::SessionRuntime,
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 6;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 7;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
 pub const CLEAT_PROVIDER_VT_DEFAULT: u32 = 0;
 pub const CLEAT_PROVIDER_VT_PASSTHROUGH: u32 = 1;
 pub const CLEAT_PROVIDER_VT_GHOSTTY: u32 = 2;
+pub const CLEAT_SESSION_CONNECTING: u32 = 0;
+pub const CLEAT_SESSION_STREAMING: u32 = 1;
+pub const CLEAT_SESSION_DISCONNECTED: u32 = 2;
+pub const CLEAT_SESSION_CLOSED: u32 = 3;
+pub const CLEAT_ROLE_UNKNOWN: u32 = 0;
+pub const CLEAT_ROLE_WATCHER: u32 = 1;
+pub const CLEAT_ROLE_CONTROLLER: u32 = 2;
 pub const CLEAT_INPUT_KEY: u32 = 1;
 pub const CLEAT_INPUT_TEXT: u32 = 2;
 pub const CLEAT_INPUT_MOUSE: u32 = 3;
@@ -152,12 +159,23 @@ impl From<DirtyState> for CleatDirtyState {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleatStr {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CleatProviderDesc {
     pub abi_version: u32,
     pub requested_features: u32,
     pub backend: u32,
     pub runtime_root: *const u8,
     pub runtime_root_len: usize,
+    pub daemon_name: *const u8,
+    pub daemon_name_len: usize,
+    pub directory_selectors: *const CleatStr,
+    pub directory_selector_count: usize,
 }
 
 #[repr(C)]
@@ -176,6 +194,13 @@ pub struct CleatSessionDesc {
     pub id_len: usize,
     pub record: bool,
     pub colors: *const CleatSessionColors,
+    pub tags: *const CleatStr,
+    pub tag_count: usize,
+    /// Requested attachment role for daemon sessions: CLEAT_ROLE_UNKNOWN /
+    /// CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
+    /// another controller holds the session); CLEAT_ROLE_WATCHER attaches
+    /// read-only. Ignored by other backends.
+    pub role: u32,
 }
 
 #[repr(C)]
@@ -499,6 +524,106 @@ pub struct CleatProvider {
     backend: ProviderBackend,
     runtime_root: PathBuf,
     wake: Arc<Mutex<WakeCallback>>,
+    daemon: Option<Arc<DaemonConnection>>,
+    last_directory: Option<Box<OwnedDirectory>>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CleatDirectoryEntry {
+    pub session_id: CleatStr,
+    pub state: CleatStr,
+    pub tags: *const CleatStr,
+    pub tag_count: usize,
+    pub controller_count: u32,
+    pub watcher_count: u32,
+    pub recreatable: bool,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CleatDirectory {
+    pub generation: u64,
+    pub entries: *const CleatDirectoryEntry,
+    pub entry_count: usize,
+}
+
+/// Keeps the heap buffers behind `directory`'s FFI pointers alive.
+struct OwnedDirectory {
+    directory: CleatDirectory,
+    _entries: Vec<CleatDirectoryEntry>,
+    _tag_lists: Vec<Vec<CleatStr>>,
+    _strings: Vec<String>,
+}
+
+impl OwnedDirectory {
+    fn from_state(generation: u64, mut sessions: Vec<crate::packet::DirectoryEntry>) -> Box<Self> {
+        struct EntryIndices {
+            session_id: usize,
+            state: usize,
+            tags: Vec<usize>,
+            controller_count: u32,
+            watcher_count: u32,
+            recreatable: bool,
+            cols: u16,
+            rows: u16,
+        }
+        sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        let mut strings = Vec::new();
+        let mut per_entry: Vec<EntryIndices> = Vec::with_capacity(sessions.len());
+        for entry in sessions {
+            let session_id = strings.len();
+            strings.push(entry.session_id);
+            let state = strings.len();
+            strings.push(entry.state);
+            let mut tags = Vec::with_capacity(entry.tags.len());
+            for tag in entry.tags {
+                tags.push(strings.len());
+                strings.push(tag);
+            }
+            per_entry.push(EntryIndices {
+                session_id,
+                state,
+                tags,
+                controller_count: entry.controller_count,
+                watcher_count: entry.watcher_count,
+                recreatable: entry.recreatable,
+                cols: entry.cols,
+                rows: entry.rows,
+            });
+        }
+        let str_ref = |index: usize| CleatStr { ptr: strings[index].as_ptr(), len: strings[index].len() };
+        let tag_lists: Vec<Vec<CleatStr>> =
+            per_entry.iter().map(|entry| entry.tags.iter().map(|&index| str_ref(index)).collect()).collect();
+        let entries: Vec<CleatDirectoryEntry> = per_entry
+            .iter()
+            .zip(tag_lists.iter())
+            .map(|(entry, tags)| CleatDirectoryEntry {
+                session_id: str_ref(entry.session_id),
+                state: str_ref(entry.state),
+                tags: if tags.is_empty() { ptr::null() } else { tags.as_ptr() },
+                tag_count: tags.len(),
+                controller_count: entry.controller_count,
+                watcher_count: entry.watcher_count,
+                recreatable: entry.recreatable,
+                cols: entry.cols,
+                rows: entry.rows,
+            })
+            .collect();
+        // Every pointer handed to the FFI targets a Vec/String HEAP buffer.
+        // Moving the owning headers into the struct/Box relocates only the
+        // headers, never the buffers, so the pointers computed above stay
+        // valid — nothing here is self-referential and no fix-up is needed.
+        let entries_ptr = if entries.is_empty() { ptr::null() } else { entries.as_ptr() };
+        Box::new(Self {
+            directory: CleatDirectory { generation, entries: entries_ptr, entry_count: entries.len() },
+            _entries: entries,
+            _tag_lists: tag_lists,
+            _strings: strings,
+        })
+    }
 }
 
 pub struct CleatSession {
@@ -536,9 +661,15 @@ struct InProcessSession {
 
 struct DaemonSession {
     id: String,
-    runtime_root: PathBuf,
-    rows: u16,
-    observation: ObservationState,
+    connection: Arc<DaemonConnection>,
+    channel: u32,
+    slot: Arc<Mutex<ChannelSlot>>,
+}
+
+impl Drop for DaemonSession {
+    fn drop(&mut self) {
+        self.connection.close_session_channel(self.channel);
+    }
 }
 
 pub type CleatWakeFn = Option<unsafe extern "C" fn(*mut c_void)>;
@@ -882,6 +1013,10 @@ pub unsafe extern "C" fn cleat_provider_open(desc: *const CleatProviderDesc) -> 
         backend: CLEAT_PROVIDER_BACKEND_MOCK,
         runtime_root: ptr::null(),
         runtime_root_len: 0,
+        daemon_name: ptr::null(),
+        daemon_name_len: 0,
+        directory_selectors: ptr::null(),
+        directory_selector_count: 0,
     });
     if requested.abi_version != CLEAT_PROVIDER_ABI_VERSION {
         return ptr::null_mut();
@@ -897,11 +1032,106 @@ pub unsafe extern "C" fn cleat_provider_open(desc: *const CleatProviderDesc) -> 
         Ok(None) => RuntimeLayout::discover().root().to_path_buf(),
         Err(_) => return ptr::null_mut(),
     };
+    let daemon_name = match read_optional_utf8(requested.daemon_name, requested.daemon_name_len) {
+        Ok(name) => name,
+        Err(_) => return ptr::null_mut(),
+    };
+    let selectors = match read_selector_strings(requested.directory_selectors, requested.directory_selector_count) {
+        Ok(selectors) => selectors,
+        Err(_) => return ptr::null_mut(),
+    };
     let features = ProviderFeatures::from_bits_truncate(requested.requested_features)
         | ProviderFeatures::CELL_SNAPSHOTS
         | ProviderFeatures::STRUCTURED_MOUSE_INPUT
         | ProviderFeatures::RENDER_UPDATES;
-    Box::into_raw(Box::new(CleatProvider { features, backend, runtime_root, wake: Arc::new(Mutex::new(WakeCallback::default())) }))
+    let wake = Arc::new(Mutex::new(WakeCallback::default()));
+    let daemon = if backend == ProviderBackend::Daemon {
+        let mut layout = RuntimeLayout::new(runtime_root.clone());
+        if let Some(name) = daemon_name {
+            layout = match layout.with_daemon(name) {
+                Ok(layout) => layout,
+                Err(_) => return ptr::null_mut(),
+            };
+        }
+        let wake_for_connection = Arc::clone(&wake);
+        Some(DaemonConnection::open(layout, selectors, Arc::new(move || notify_wake(&wake_for_connection))))
+    } else {
+        None
+    };
+    Box::into_raw(Box::new(CleatProvider { features, backend, runtime_root, wake, daemon, last_directory: None }))
+}
+
+/// Generation counter of the daemon directory subscription. Starts at 0
+/// before the first snapshot arrives and bumps on every snapshot or delta;
+/// callers poll it and re-read the directory when it changes. Always 0 for
+/// non-daemon providers.
+///
+/// # Safety
+///
+/// `provider` must be a valid provider pointer.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_provider_directory_generation(provider: *const CleatProvider) -> u64 {
+    unsafe { provider.as_ref() }
+        .and_then(|provider| provider.daemon.as_ref())
+        .map(|daemon| daemon.with_directory(|directory| directory.generation))
+        .unwrap_or(0)
+}
+
+/// Copy the current daemon directory (session ids, opaque tags, state,
+/// controller/watcher counts, sizes) into caller-visible storage. Entries are
+/// sorted by session id. Only one directory may be live per provider; release
+/// the previous one first.
+///
+/// # Safety
+///
+/// `provider` must be a valid provider pointer. `out` must point to writable
+/// `CleatDirectory` storage. Pointers in `out` stay valid until
+/// `cleat_provider_directory_release`.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_provider_directory_snapshot(provider: *mut CleatProvider, out: *mut CleatDirectory) -> bool {
+    let provider = match unsafe { provider.as_mut() } {
+        Some(provider) => provider,
+        None => return false,
+    };
+    if provider.last_directory.is_some() {
+        return false;
+    }
+    let out = match unsafe { out.as_mut() } {
+        Some(out) => out,
+        None => return false,
+    };
+    let Some(daemon) = provider.daemon.as_ref() else {
+        return false;
+    };
+    let (generation, sessions) =
+        daemon.with_directory(|directory| (directory.generation, directory.entries.values().cloned().collect::<Vec<_>>()));
+    let owned = OwnedDirectory::from_state(generation, sessions);
+    *out = owned.directory;
+    provider.last_directory = Some(owned);
+    true
+}
+
+/// # Safety
+///
+/// `provider` must be a valid provider pointer. `directory` must be the live
+/// directory returned by `cleat_provider_directory_snapshot`.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_provider_directory_release(provider: *mut CleatProvider, directory: *mut CleatDirectory) {
+    let Some(provider) = (unsafe { provider.as_mut() }) else {
+        return;
+    };
+    if let Some(directory) = unsafe { directory.as_mut() } {
+        *directory = CleatDirectory::default();
+    }
+    provider.last_directory = None;
+}
+
+fn read_selector_strings(selectors: *const CleatStr, count: usize) -> Result<Vec<String>, Utf8Error> {
+    if count == 0 || selectors.is_null() {
+        return Ok(Vec::new());
+    }
+    let slices = unsafe { slice::from_raw_parts(selectors, count) };
+    slices.iter().map(|selector| read_optional_utf8(selector.ptr, selector.len).map(|value| value.unwrap_or_default())).collect()
 }
 
 /// # Safety
@@ -929,7 +1159,11 @@ pub unsafe extern "C" fn cleat_provider_set_wake_callback(provider: *mut CleatPr
 #[no_mangle]
 pub unsafe extern "C" fn cleat_provider_close(provider: *mut CleatProvider) {
     if !provider.is_null() {
-        drop(unsafe { Box::from_raw(provider) });
+        let provider = unsafe { Box::from_raw(provider) };
+        if let Some(daemon) = &provider.daemon {
+            daemon.shutdown();
+        }
+        drop(provider);
     }
 }
 
@@ -960,6 +1194,9 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         id_len: 0,
         record: false,
         colors: ptr::null(),
+        tags: ptr::null(),
+        tag_count: 0,
+        role: CLEAT_ROLE_UNKNOWN,
     });
     let geometry = TerminalGeometry::from_cell_size(desc.cols.max(1), desc.rows.max(1), desc.cell_width_px, desc.cell_height_px);
     let backend = match provider.backend {
@@ -984,6 +1221,160 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         last_snapshot: None,
         last_render_update: None,
     }))
+}
+
+/// Attach to an existing daemon session by id instead of creating one. The
+/// session must already exist in the daemon's directory; if it does not, the
+/// daemon reports an error on the channel and the session surfaces
+/// `CLEAT_SESSION_CLOSED`. Only `id`, `cols`, `rows`, `cell_width_px`, and
+/// `cell_height_px` of the desc are honored.
+///
+/// # Safety
+///
+/// `provider` must be a valid provider pointer opened with the daemon
+/// backend. `desc` must point to a valid `CleatSessionDesc` with a non-empty
+/// id.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_attach(provider: *mut CleatProvider, desc: *const CleatSessionDesc) -> *mut CleatSession {
+    let provider = match unsafe { provider.as_ref() } {
+        Some(provider) => provider,
+        None => return ptr::null_mut(),
+    };
+    if provider.backend != ProviderBackend::Daemon {
+        return ptr::null_mut();
+    }
+    let desc = match unsafe { desc.as_ref() } {
+        Some(desc) => *desc,
+        None => return ptr::null_mut(),
+    };
+    let geometry = TerminalGeometry::from_cell_size(desc.cols.max(1), desc.rows.max(1), desc.cell_width_px, desc.cell_height_px);
+    let backend = match attach_daemon_session(provider, desc) {
+        Ok(session) => SessionBackend::Daemon(session),
+        Err(_) => return ptr::null_mut(),
+    };
+    Box::into_raw(Box::new(CleatSession {
+        backend,
+        geometry,
+        next_input_sequence: 1,
+        wake: provider.wake.clone(),
+        last_snapshot: None,
+        last_render_update: None,
+    }))
+}
+
+/// Daemon session id (the identity used for attach-by-id and shown in the
+/// directory). False for in-process and mock sessions, which have no daemon
+/// identity.
+///
+/// # Safety
+///
+/// `session` must be a valid session pointer. `out` must point to writable
+/// `CleatStr` storage. The returned pointer borrows from the session and stays
+/// valid until the session is destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_id(session: *const CleatSession, out: *mut CleatStr) -> bool {
+    let session = match unsafe { session.as_ref() } {
+        Some(session) => session,
+        None => return false,
+    };
+    let out = match unsafe { out.as_mut() } {
+        Some(out) => out,
+        None => return false,
+    };
+    match &session.backend {
+        SessionBackend::Mock(_) | SessionBackend::InProcess(_) => false,
+        SessionBackend::Daemon(daemon) => {
+            *out = CleatStr { ptr: daemon.id.as_ptr(), len: daemon.id.len() };
+            true
+        }
+    }
+}
+
+/// Granted attachment role (CLEAT_ROLE_*). In-process and mock sessions are
+/// their own controllers. Daemon sessions report CLEAT_ROLE_UNKNOWN until the
+/// daemon's grant arrives, then the granted role — which may change later
+/// (another client can take control; the wake callback fires on the change).
+///
+/// # Safety
+///
+/// `session` must be a valid session pointer.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_role(session: *const CleatSession) -> u32 {
+    let session = match unsafe { session.as_ref() } {
+        Some(session) => session,
+        None => return CLEAT_ROLE_UNKNOWN,
+    };
+    match &session.backend {
+        SessionBackend::Mock(_) | SessionBackend::InProcess(_) => CLEAT_ROLE_CONTROLLER,
+        SessionBackend::Daemon(daemon) => match daemon.slot.lock().ok().and_then(|slot| slot.granted_role) {
+            Some(crate::packet::ChannelRole::Controller) => CLEAT_ROLE_CONTROLLER,
+            Some(crate::packet::ChannelRole::Watcher) => CLEAT_ROLE_WATCHER,
+            None => CLEAT_ROLE_UNKNOWN,
+        },
+    }
+}
+
+/// Request the controller role, preempting another packet controller if one
+/// holds the session (a legacy stream controller is never preempted). The
+/// grant lands asynchronously: poll `cleat_session_role` after the wake
+/// callback fires. Returns false if the request could not be sent.
+///
+/// # Safety
+///
+/// `session` must be a valid session pointer.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_take_control(session: *mut CleatSession) -> bool {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    match &session.backend {
+        SessionBackend::Mock(_) | SessionBackend::InProcess(_) => true,
+        SessionBackend::Daemon(daemon) => {
+            daemon.connection.request_role(daemon.channel, crate::packet::ChannelRole::Controller, true).is_ok()
+        }
+    }
+}
+
+/// Connection state of the session's transport. In-process and mock sessions
+/// are always `CLEAT_SESSION_STREAMING`. Daemon sessions report
+/// `CLEAT_SESSION_CONNECTING` until the first render packet arrives,
+/// `CLEAT_SESSION_DISCONNECTED` while the daemon connection is down (it
+/// reconnects with backoff and recovers the stream), and
+/// `CLEAT_SESSION_CLOSED` once the daemon reported the session gone.
+///
+/// # Safety
+///
+/// `session` must be a valid session pointer.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_connection_state(session: *const CleatSession) -> u32 {
+    let session = match unsafe { session.as_ref() } {
+        Some(session) => session,
+        None => return CLEAT_SESSION_CLOSED,
+    };
+    match &session.backend {
+        SessionBackend::Mock(_) | SessionBackend::InProcess(_) => CLEAT_SESSION_STREAMING,
+        SessionBackend::Daemon(daemon) => {
+            // Copy the slot fields before checking connectivity:
+            // is_connected() takes the connection-state lock, and the reader
+            // thread takes connection-state -> slot (install_connection,
+            // request_role), so holding the slot across it would invert the
+            // lock order and deadlock the connection.
+            let (closed, streaming) = match daemon.slot.lock() {
+                Ok(slot) => (slot.closed.is_some(), slot.pending.is_some() || slot.last.render_generation > 0),
+                Err(_) => return CLEAT_SESSION_CLOSED,
+            };
+            if closed {
+                CLEAT_SESSION_CLOSED
+            } else if !daemon.connection.is_connected() {
+                CLEAT_SESSION_DISCONNECTED
+            } else if streaming {
+                CLEAT_SESSION_STREAMING
+            } else {
+                CLEAT_SESSION_CONNECTING
+            }
+        }
+    }
 }
 
 /// # Safety
@@ -1017,11 +1408,14 @@ pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: 
             in_process.actor.request_result(|reply| SessionCommand::Resize { cols: cols.max(1), rows: rows.max(1), reply }).is_ok()
         }
         SessionBackend::Daemon(daemon) => {
-            if daemon_resize(daemon, cols.max(1), rows.max(1)).is_err() {
-                return false;
+            let (cols, rows) = (cols.max(1), rows.max(1));
+            if let Ok(mut slot) = daemon.slot.lock() {
+                slot.desired_cols = cols;
+                slot.desired_rows = rows;
             }
-            daemon.rows = rows.max(1);
-            mark_full_and_wake(&mut daemon.observation, rows.max(1), &session.wake);
+            // Best-effort while connected; the desired size is re-asserted on
+            // every reconnect, so a send failure is not a caller error.
+            let _ = daemon.connection.send_resize(daemon.channel, cols, rows);
             true
         }
     }
@@ -1056,9 +1450,9 @@ pub unsafe extern "C" fn cleat_session_update_geometry(session: *mut CleatSessio
             }
             session.geometry = geometry;
         }
-        SessionBackend::Daemon(daemon) => {
+        SessionBackend::Daemon(_) => {
             session.geometry = geometry;
-            mark_full_and_wake(&mut daemon.observation, 1, &session.wake);
+            notify_wake(&session.wake);
         }
     }
     true
@@ -1172,9 +1566,9 @@ fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> Opti
             Ok(None) => Some(0),
             Err(_) => None,
         },
-        SessionBackend::Daemon(daemon) => match daemon_input_request(event) {
+        SessionBackend::Daemon(daemon) => match packet_input_event(event) {
             Ok(Some(input)) => {
-                if daemon_send_input(daemon, input).is_err() {
+                if daemon.connection.send_input(daemon.channel, input).is_err() {
                     return None;
                 }
                 Some(1)
@@ -1311,10 +1705,7 @@ pub unsafe extern "C" fn cleat_session_write_bytes(session: *mut CleatSession, b
             in_process.actor.request_result(|reply| SessionCommand::WriteInput { bytes: bytes.to_vec(), reply }).is_ok()
         }
         SessionBackend::Daemon(daemon) => {
-            if daemon_write_bytes(daemon, bytes).is_err() {
-                return false;
-            }
-            true
+            daemon.connection.send_input(daemon.channel, TerminalInputEvent::RawBytes(bytes.to_vec())).is_ok()
         }
     }
 }
@@ -1334,7 +1725,7 @@ pub unsafe extern "C" fn cleat_session_poll(session: *mut CleatSession) -> Cleat
     match &mut session.backend {
         SessionBackend::Mock(mock) => mock.observation.dirty().into(),
         SessionBackend::InProcess(in_process) => in_process.actor.observation().dirty().into(),
-        SessionBackend::Daemon(daemon) => daemon.observation.dirty().into(),
+        SessionBackend::Daemon(daemon) => daemon_slot_dirty(daemon).into(),
     }
 }
 
@@ -1349,9 +1740,13 @@ pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> Cl
         .map(|session| match &session.backend {
             SessionBackend::Mock(mock) => mock.observation.dirty().into(),
             SessionBackend::InProcess(in_process) => in_process.actor.observation().dirty().into(),
-            SessionBackend::Daemon(daemon) => daemon.observation.dirty().into(),
+            SessionBackend::Daemon(daemon) => daemon_slot_dirty(daemon).into(),
         })
         .unwrap_or(CleatDirtyState::Full)
+}
+
+fn daemon_slot_dirty(daemon: &DaemonSession) -> DirtyState {
+    daemon.slot.lock().map(|slot| slot.dirty()).unwrap_or(DirtyState::Clean)
 }
 
 /// # Safety
@@ -1369,7 +1764,9 @@ pub unsafe extern "C" fn cleat_session_mark_observed(session: *mut CleatSession,
         SessionBackend::InProcess(in_process) => {
             in_process.actor.request(|reply| SessionCommand::MarkObserved { generation, reply }, false)
         }
-        SessionBackend::Daemon(daemon) => daemon.observation.mark_observed(generation),
+        // Daemon renders are acked (and thereby marked observed daemon-side)
+        // when the pending packet is consumed by cleat_session_render_update.
+        SessionBackend::Daemon(_) => true,
     }
 }
 
@@ -1440,6 +1837,11 @@ pub unsafe extern "C" fn cleat_session_scroll_viewport(
     true
 }
 
+/// Always returns false for daemon-backed sessions: they are fed by render
+/// updates rather than snapshots, and no full-grid state is held client-side.
+/// Use `cleat_session_render_update` instead; the first update after a channel
+/// opens is full-dirty and carries the complete grid.
+///
 /// # Safety
 ///
 /// `session` must be a valid session pointer. `out` must point to writable
@@ -1468,13 +1870,9 @@ pub unsafe extern "C" fn cleat_session_snapshot(session: *mut CleatSession, out:
             Ok(snapshot) => snapshot,
             Err(_) => return false,
         },
-        SessionBackend::Daemon(daemon) => match daemon_snapshot(daemon) {
-            Ok(mut snapshot) => {
-                daemon.observation.annotate_snapshot(&mut snapshot);
-                snapshot
-            }
-            Err(_) => return false,
-        },
+        // Daemon sessions are render-update-fed; there is no full-grid state
+        // FFI-side to serve a snapshot from.
+        SessionBackend::Daemon(_) => return false,
     };
     snapshot.geometry = session.geometry;
     snapshot.scrollbar = session_scrollbar_state(session);
@@ -1512,13 +1910,33 @@ pub unsafe extern "C" fn cleat_session_render_update(session: *mut CleatSession,
             Ok(update) => update,
             Err(_) => return false,
         },
-        SessionBackend::Daemon(daemon) => match daemon_snapshot(daemon) {
-            Ok(mut snapshot) => {
-                daemon.observation.annotate_snapshot(&mut snapshot);
-                TerminalRenderUpdate::from_snapshot(snapshot)
+        SessionBackend::Daemon(daemon) => {
+            let taken = {
+                let mut slot = match daemon.slot.lock() {
+                    Ok(slot) => slot,
+                    Err(_) => return false,
+                };
+                match slot.pending.take() {
+                    Some(update) => {
+                        slot.last.absorb(&update);
+                        Some(update)
+                    }
+                    None => None,
+                }
+            };
+            match taken {
+                Some(update) => {
+                    // Consuming the packet is the observation; ack it so the
+                    // daemon may send the next one (one-un-acked backpressure).
+                    let _ = daemon.connection.send_ack(daemon.channel, update.render_generation);
+                    update
+                }
+                None => match daemon.slot.lock() {
+                    Ok(slot) => slot.last.clean_update(),
+                    Err(_) => return false,
+                },
             }
-            Err(_) => return false,
-        },
+        }
     };
     update.geometry = session.geometry;
     update.scrollbar = session_scrollbar_state(session);
@@ -1600,9 +2018,15 @@ fn session_scrollback_extent(session: &mut CleatSession) -> TerminalScrollbackEx
                 alternate_screen: false,
             })
         }
-        SessionBackend::Daemon(daemon) => {
-            TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: daemon.rows, alternate_screen: false }
-        }
+        SessionBackend::Daemon(daemon) => daemon
+            .slot
+            .lock()
+            .map(|slot| TerminalScrollbackExtent {
+                normal_scrollback_rows: slot.last.scrollbar.total_rows.saturating_sub(u64::from(slot.last.rows)),
+                live_rows: slot.last.rows,
+                alternate_screen: slot.last.terminal_modes.active_alternate_screen,
+            })
+            .unwrap_or(TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: 0, alternate_screen: false }),
     }
 }
 
@@ -1612,7 +2036,11 @@ fn session_scrollbar_state(session: &mut CleatSession) -> TerminalScrollbarState
         SessionBackend::InProcess(in_process) => {
             in_process.actor.request(|reply| SessionCommand::ScrollbarState { reply }, TerminalScrollbarState::default())
         }
-        SessionBackend::Daemon(daemon) => TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, daemon.rows),
+        SessionBackend::Daemon(daemon) => daemon
+            .slot
+            .lock()
+            .map(|slot| slot.last.scrollbar)
+            .unwrap_or_else(|_| TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, 0)),
     }
 }
 
@@ -1621,7 +2049,7 @@ fn session_scroll_viewport(session: &mut CleatSession, command: Option<ViewportC
         return ViewportCommandOutcome::Unsupported;
     };
     match &mut session.backend {
-        SessionBackend::Mock(_) | SessionBackend::Daemon(_) => match command {
+        SessionBackend::Mock(_) => match command {
             ViewportCommand::Top | ViewportCommand::Bottom | ViewportCommand::DeltaRows(_) => ViewportCommandOutcome::NoOp,
         },
         SessionBackend::InProcess(in_process) => {
@@ -1630,6 +2058,13 @@ fn session_scroll_viewport(session: &mut CleatSession, command: Option<ViewportC
                 Err(_) => ViewportCommandOutcome::Unsupported,
             }
         }
+        // Fire-and-forget over the packet connection: the true outcome shows
+        // up as viewport/scrollbar state in the next render packet, so report
+        // Moved optimistically on send.
+        SessionBackend::Daemon(daemon) => match daemon.connection.send_viewport(daemon.channel, command) {
+            Ok(()) => ViewportCommandOutcome::Moved,
+            Err(_) => ViewportCommandOutcome::NoOp,
+        },
     }
 }
 
@@ -1717,7 +2152,7 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
 }
 
 fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
-    let layout = RuntimeLayout::new(provider.runtime_root.clone());
+    let connection = provider.daemon.as_ref().ok_or_else(|| "provider has no daemon connection".to_string())?;
     let vt_engine = vt_engine_from_tag(desc.vt_engine)?;
     let colors = session_colors_from_desc(desc);
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
@@ -1725,16 +2160,33 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let id = read_optional_utf8(desc.id, desc.id_len).map_err(|err| format!("id is not valid UTF-8: {err}"))?;
     let cols = desc.cols.max(1);
     let rows = desc.rows.max(1);
-    let metadata = ensure_session_started(&layout, id, Some(vt_engine), cwd, cmd, SessionStartOptions {
+    let tags = read_selector_strings(desc.tags, desc.tag_count).map_err(|err| format!("tag is not valid UTF-8: {err}"))?;
+    let metadata = ensure_session_started(connection.layout(), id, Some(vt_engine), cwd, cmd, SessionStartOptions {
         record: desc.record,
         initial_size: TerminalSize { cols, rows },
         colors,
-        tags: Vec::new(),
+        tags,
     })?;
-    let mut session =
-        DaemonSession { id: metadata.id, runtime_root: provider.runtime_root.clone(), rows, observation: ObservationState::new(rows) };
-    daemon_resize(&mut session, cols, rows)?;
-    Ok(session)
+    let (channel, slot) = connection.open_session_channel(metadata.id.clone(), cols, rows, channel_role_from_ffi(desc.role)?);
+    Ok(DaemonSession { id: metadata.id, connection: Arc::clone(connection), channel, slot })
+}
+
+fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
+    let connection = provider.daemon.as_ref().ok_or_else(|| "provider has no daemon connection".to_string())?;
+    let id = read_optional_utf8(desc.id, desc.id_len)
+        .map_err(|err| format!("id is not valid UTF-8: {err}"))?
+        .ok_or_else(|| "attach requires a session id".to_string())?;
+    let (channel, slot) =
+        connection.open_session_channel(id.clone(), desc.cols.max(1), desc.rows.max(1), channel_role_from_ffi(desc.role)?);
+    Ok(DaemonSession { id, connection: Arc::clone(connection), channel, slot })
+}
+
+fn channel_role_from_ffi(role: u32) -> Result<crate::packet::ChannelRole, String> {
+    match role {
+        CLEAT_ROLE_UNKNOWN | CLEAT_ROLE_CONTROLLER => Ok(crate::packet::ChannelRole::Controller),
+        CLEAT_ROLE_WATCHER => Ok(crate::packet::ChannelRole::Watcher),
+        other => Err(format!("unsupported role tag {other}")),
+    }
 }
 
 fn vt_engine_from_tag(tag: u32) -> Result<VtEngineKind, String> {
@@ -1764,200 +2216,64 @@ fn rgb_from_ffi(rgb: CleatRgb) -> Rgb {
     Rgb { r: rgb.r, g: rgb.g, b: rgb.b }
 }
 
-fn daemon_resize(session: &mut DaemonSession, cols: u16, rows: u16) -> Result<(), String> {
-    let body =
-        serde_json::to_vec(&serde_json::json!({ "cols": cols, "rows": rows })).map_err(|err| format!("serialize resize request: {err}"))?;
-    let response = daemon_request(session, Method::POST, &format!("/sessions/{}/resize", session.id), &body)?;
-    expect_status(response, StatusCode::NO_CONTENT, "resize")?;
-    session.rows = rows;
-    Ok(())
-}
-
-fn daemon_write_bytes(session: &mut DaemonSession, bytes: &[u8]) -> Result<(), String> {
-    let body = serde_json::to_vec(&serde_json::json!({ "bytes": bytes })).map_err(|err| format!("serialize keys request: {err}"))?;
-    let response = daemon_request(session, Method::POST, &format!("/sessions/{}/keys", session.id), &body)?;
-    expect_status(response, StatusCode::NO_CONTENT, "keys")
-}
-
-fn daemon_send_input(session: &mut DaemonSession, input: http_uds::InputRequest) -> Result<(), String> {
-    let body = serde_json::to_vec(&input).map_err(|err| format!("serialize input request: {err}"))?;
-    let response = daemon_request(session, Method::POST, &format!("/sessions/{}/input", session.id), &body)?;
-    expect_status(response, StatusCode::NO_CONTENT, "input")
-}
-
-fn daemon_snapshot(session: &mut DaemonSession) -> Result<TerminalSnapshot, String> {
-    let response = daemon_request(session, Method::GET, &format!("/sessions/{}/snapshot", session.id), &[])?;
-    if response.status != StatusCode::OK {
-        return Err(format!("snapshot returned {}", response.status));
-    }
-    let snapshot: http_uds::SnapshotResponse =
-        serde_json::from_slice(&response.body).map_err(|err| format!("parse snapshot response: {err}"))?;
-    terminal_snapshot_from_http(snapshot)
-}
-
-fn daemon_request(session: &DaemonSession, method: Method, path: &str, body: &[u8]) -> Result<http_uds::HttpResponse, String> {
-    let socket_path = RuntimeLayout::new(session.runtime_root.clone()).socket_path();
-    let mut stream = connect_session_stream(&socket_path)?;
-    http_uds::write_request(&mut stream, method, path, body).map_err(|err| format!("write HTTP request: {err}"))?;
-    http_uds::read_response(&mut stream).map_err(|err| format!("read HTTP response: {err}"))
-}
-
-fn expect_status(response: http_uds::HttpResponse, expected: StatusCode, operation: &str) -> Result<(), String> {
-    if response.status == expected {
-        Ok(())
-    } else {
-        Err(format!("{operation} returned {}", response.status))
-    }
-}
-
-fn terminal_snapshot_from_http(snapshot: http_uds::SnapshotResponse) -> Result<TerminalSnapshot, String> {
-    Ok(TerminalSnapshot {
-        cols: snapshot.cols,
-        rows: snapshot.rows,
-        geometry: geometry_from_http(snapshot.geometry),
-        viewport_kind: viewport_kind_from_name(&snapshot.viewport_kind)?,
-        scrollback_offset_rows: snapshot.scrollback_offset_rows,
-        scrollbar: scrollbar_from_http(snapshot.scrollbar)?,
-        terminal_modes: terminal_modes_from_http(snapshot.terminal_modes)?,
-        render_generation: 0,
-        cells: snapshot
-            .cells
-            .into_iter()
-            .map(|cell| {
-                Ok(TerminalCell {
-                    graphemes: cell.graphemes,
-                    fg: TerminalRgb { r: cell.fg.r, g: cell.fg.g, b: cell.fg.b },
-                    bg: TerminalRgb { r: cell.bg.r, g: cell.bg.g, b: cell.bg.b },
-                    flags: TerminalCellFlags::from_bits_truncate(cell.flags),
-                    width: cell_width_from_name(&cell.width)?,
-                    ..TerminalCell::default()
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-        cursor: TerminalCursor {
-            col: snapshot.cursor.col,
-            row: snapshot.cursor.row,
-            visible: snapshot.cursor.visible,
-            style: cursor_style_from_name(&snapshot.cursor.style)?,
-            blink: snapshot.cursor.blink,
-            wide_tail: snapshot.cursor.wide_tail,
-        },
-        dirty: dirty_from_name(&snapshot.dirty)?,
-        dirty_rows: Vec::new(),
-    })
-}
-
-fn scrollbar_from_http(scrollbar: http_uds::ScrollbarResponse) -> Result<TerminalScrollbarState, String> {
-    Ok(TerminalScrollbarState::new(
-        viewport_kind_from_name(&scrollbar.viewport_kind)?,
-        scrollbar.total_rows,
-        scrollbar.viewport_rows,
-        scrollbar.viewport_top_row,
-    ))
-}
-
-fn geometry_from_http(geometry: http_uds::GeometryResponse) -> TerminalGeometry {
-    TerminalGeometry {
-        cell_width_px: geometry.cell_width_px,
-        cell_height_px: geometry.cell_height_px,
-        content_x_px: geometry.content_x_px,
-        content_y_px: geometry.content_y_px,
-        content_width_px: geometry.content_width_px,
-        content_height_px: geometry.content_height_px,
-    }
-    .sanitized()
-}
-
-fn terminal_modes_from_http(modes: http_uds::TerminalModeResponse) -> Result<vt::TerminalModeState, String> {
-    let mouse_tracking_mode = mouse_tracking_mode_from_name(&modes.mouse_tracking_mode)?;
-    let mouse_report_format = mouse_report_format_from_name(&modes.mouse_report_format)?;
-    Ok(vt::TerminalModeState {
-        active_alternate_screen: modes.active_alternate_screen,
-        application_cursor_keys: modes.application_cursor_keys,
-        alternate_scroll: modes.alternate_scroll,
-        mouse_tracking: modes.mouse_tracking,
-        mouse_tracking_mode,
-        mouse_report_format,
-        mouse_sgr: modes.mouse_sgr,
-        mouse_sgr_pixels: modes.mouse_sgr_pixels,
-    })
-}
-
-fn dirty_from_name(name: &str) -> Result<DirtyState, String> {
-    match name {
-        "clean" => Ok(DirtyState::Clean),
-        "partial" => Ok(DirtyState::Partial),
-        "full" => Ok(DirtyState::Full),
-        other => Err(format!("unknown dirty state {other}")),
-    }
-}
-
-fn cell_width_from_name(name: &str) -> Result<TerminalCellWidth, String> {
-    match name {
-        "narrow" => Ok(TerminalCellWidth::Narrow),
-        "wide" => Ok(TerminalCellWidth::Wide),
-        "spacer_tail" => Ok(TerminalCellWidth::SpacerTail),
-        "spacer_head" => Ok(TerminalCellWidth::SpacerHead),
-        other => Err(format!("unknown cell width {other}")),
-    }
-}
-
-fn cursor_style_from_name(name: &str) -> Result<TerminalCursorStyle, String> {
-    match name {
-        "bar" => Ok(TerminalCursorStyle::Bar),
-        "block" => Ok(TerminalCursorStyle::Block),
-        "underline" => Ok(TerminalCursorStyle::Underline),
-        "block_hollow" => Ok(TerminalCursorStyle::BlockHollow),
-        other => Err(format!("unknown cursor style {other}")),
-    }
-}
-
-fn viewport_kind_from_name(name: &str) -> Result<TerminalViewportKind, String> {
-    match name {
-        "live_normal" => Ok(TerminalViewportKind::LiveNormal),
-        "live_alternate" => Ok(TerminalViewportKind::LiveAlternate),
-        "normal_scrollback" => Ok(TerminalViewportKind::NormalScrollback),
-        other => Err(format!("unknown viewport kind {other}")),
-    }
-}
-
-fn mouse_tracking_mode_from_name(name: &str) -> Result<vt::MouseTrackingMode, String> {
-    match name {
-        "none" => Ok(vt::MouseTrackingMode::None),
-        "x10" => Ok(vt::MouseTrackingMode::X10),
-        "normal" => Ok(vt::MouseTrackingMode::Normal),
-        "button" => Ok(vt::MouseTrackingMode::Button),
-        "any" => Ok(vt::MouseTrackingMode::Any),
-        other => Err(format!("unknown mouse tracking mode {other}")),
-    }
-}
-
-fn mouse_report_format_from_name(name: &str) -> Result<vt::MouseReportFormat, String> {
-    match name {
-        "legacy" => Ok(vt::MouseReportFormat::Legacy),
-        "sgr" => Ok(vt::MouseReportFormat::Sgr),
-        "sgr_pixels" => Ok(vt::MouseReportFormat::SgrPixels),
-        other => Err(format!("unknown mouse report format {other}")),
-    }
-}
-
-fn daemon_input_request(event: &CleatInputEvent) -> Result<Option<http_uds::InputRequest>, Utf8Error> {
-    match event.kind {
-        CLEAT_INPUT_TEXT => read_event_text(event).map(|text| Some(http_uds::InputRequest::Text { text })),
-        CLEAT_INPUT_PASTE => read_event_text(event).map(|text| Some(http_uds::InputRequest::Paste { text })),
-        CLEAT_INPUT_KEY => key_event_bytes(event).map(|bytes| bytes.map(|bytes| http_uds::InputRequest::RawBytes { bytes })),
-        CLEAT_INPUT_RESIZE => Ok(Some(http_uds::InputRequest::Resize { cols: event.cell_col.max(1), rows: event.cell_row.max(1) })),
-        CLEAT_INPUT_MOUSE | CLEAT_INPUT_FOCUS => Ok(None),
-        _ => Ok(None),
-    }
-}
-
 fn read_optional_utf8(ptr: *const u8, len: usize) -> Result<Option<String>, Utf8Error> {
     if ptr.is_null() || len == 0 {
         return Ok(None);
     }
     let bytes = unsafe { slice::from_raw_parts(ptr, len) };
     std::str::from_utf8(bytes).map(|value| Some(value.to_string()))
+}
+
+/// Map an FFI input event onto the packet-transported `TerminalInputEvent`.
+/// Key events are encoded to bytes locally (matching the in-process path) so
+/// both backends share one key-encoding implementation; mouse and paste events
+/// stay structured because their encoding is terminal-mode-dependent and the
+/// session actor resolves them daemon-side.
+fn packet_input_event(event: &CleatInputEvent) -> Result<Option<TerminalInputEvent>, Utf8Error> {
+    match event.kind {
+        CLEAT_INPUT_TEXT => read_event_text(event).map(|text| Some(TerminalInputEvent::Text(TerminalTextEvent { text }))),
+        CLEAT_INPUT_PASTE => read_event_text(event).map(|text| Some(TerminalInputEvent::Paste(TerminalPasteEvent { text }))),
+        CLEAT_INPUT_KEY => key_event_bytes(event).map(|bytes| bytes.map(TerminalInputEvent::RawBytes)),
+        CLEAT_INPUT_MOUSE => Ok(packet_mouse_event(event)),
+        CLEAT_INPUT_FOCUS => Ok(Some(TerminalInputEvent::Focus(TerminalFocusEvent { focused: event.focused }))),
+        CLEAT_INPUT_RESIZE => Ok(Some(TerminalInputEvent::Resize(crate::provider::TerminalResizeEvent {
+            cols: event.cell_col.max(1),
+            rows: event.cell_row.max(1),
+            cell_width_px: event.x_px,
+            cell_height_px: event.y_px,
+        }))),
+        _ => Ok(None),
+    }
+}
+
+fn packet_mouse_event(event: &CleatInputEvent) -> Option<TerminalInputEvent> {
+    let kind = match event.mouse_kind {
+        CLEAT_MOUSE_PRESS => TerminalMouseEventKind::Press,
+        CLEAT_MOUSE_RELEASE => TerminalMouseEventKind::Release,
+        CLEAT_MOUSE_MOVE => TerminalMouseEventKind::Move,
+        CLEAT_MOUSE_WHEEL => TerminalMouseEventKind::Wheel,
+        _ => return None,
+    };
+    let button = match event.mouse_button {
+        CLEAT_MOUSE_BUTTON_LEFT => Some(crate::provider::TerminalMouseButton::Left),
+        CLEAT_MOUSE_BUTTON_MIDDLE => Some(crate::provider::TerminalMouseButton::Middle),
+        CLEAT_MOUSE_BUTTON_RIGHT => Some(crate::provider::TerminalMouseButton::Right),
+        CLEAT_MOUSE_BUTTON_BACK => Some(crate::provider::TerminalMouseButton::Back),
+        CLEAT_MOUSE_BUTTON_FORWARD => Some(crate::provider::TerminalMouseButton::Forward),
+        _ => None,
+    };
+    Some(TerminalInputEvent::Mouse(TerminalMouseEvent {
+        kind,
+        button,
+        buttons: TerminalMouseButtons::from_bits_truncate(event.mouse_buttons),
+        modifiers: TerminalModifiers::from_bits_truncate(event.modifiers),
+        cell_col: event.cell_col,
+        cell_row: event.cell_row,
+        x_px: event.x_px,
+        y_px: event.y_px,
+        wheel_delta_x: event.wheel_delta_x,
+        wheel_delta_y: event.wheel_delta_y,
+    }))
 }
 
 fn input_event_bytes(event: &CleatInputEvent) -> Result<Option<Vec<u8>>, Utf8Error> {
@@ -2733,18 +3049,37 @@ mod tests {
     }
 
     #[test]
-    fn daemon_input_request_maps_ffi_text_and_named_key_events() {
+    fn packet_input_event_maps_ffi_text_named_key_and_mouse_events() {
         let text = b"hello";
         let text_event =
             CleatInputEvent { kind: CLEAT_INPUT_TEXT, text: text.as_ptr(), text_len: text.len(), ..CleatInputEvent::default() };
         assert_eq!(
-            daemon_input_request(&text_event).expect("text input"),
-            Some(http_uds::InputRequest::Text { text: "hello".to_string() })
+            packet_input_event(&text_event).expect("text input"),
+            Some(TerminalInputEvent::Text(TerminalTextEvent { text: "hello".to_string() }))
         );
 
         let key_event =
             CleatInputEvent { kind: CLEAT_INPUT_KEY, key_kind: CLEAT_KEY_NAMED, key_code: CLEAT_KEY_ENTER, ..CleatInputEvent::default() };
-        assert_eq!(daemon_input_request(&key_event).expect("key input"), Some(http_uds::InputRequest::RawBytes { bytes: b"\r".to_vec() }));
+        assert_eq!(packet_input_event(&key_event).expect("key input"), Some(TerminalInputEvent::RawBytes(b"\r".to_vec())));
+
+        let wheel_event = CleatInputEvent {
+            kind: CLEAT_INPUT_MOUSE,
+            mouse_kind: CLEAT_MOUSE_WHEEL,
+            modifiers: CLEAT_MOD_SHIFT,
+            cell_col: 3,
+            cell_row: 4,
+            wheel_delta_y: -2.5,
+            ..CleatInputEvent::default()
+        };
+        match packet_input_event(&wheel_event).expect("wheel input") {
+            Some(TerminalInputEvent::Mouse(mouse)) => {
+                assert_eq!(mouse.kind, TerminalMouseEventKind::Wheel);
+                assert_eq!(mouse.modifiers, TerminalModifiers::SHIFT);
+                assert_eq!((mouse.cell_col, mouse.cell_row), (3, 4));
+                assert_eq!(mouse.wheel_delta_y, -2.5);
+            }
+            other => panic!("expected mouse event, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2871,7 +3206,6 @@ mod tests {
             ..CleatInputEvent::default()
         };
         assert_eq!(input_event_bytes(&event).expect("mouse input"), None);
-        assert_eq!(daemon_input_request(&event).expect("mouse daemon input"), None);
 
         unsafe {
             let provider = cleat_provider_open(ptr::null());
@@ -2976,6 +3310,7 @@ mod tests {
                 backend: CLEAT_PROVIDER_BACKEND_IN_PROCESS,
                 runtime_root: root.as_ptr(),
                 runtime_root_len: root.len(),
+                ..CleatProviderDesc::default()
             });
             assert!(!provider.is_null());
             cleat_provider_set_wake_callback(provider, Some(count_wake), &wake_count as *const AtomicUsize as *mut c_void);
@@ -3073,6 +3408,7 @@ mod tests {
                 backend: CLEAT_PROVIDER_BACKEND_IN_PROCESS,
                 runtime_root: root.as_ptr(),
                 runtime_root_len: root.len(),
+                ..CleatProviderDesc::default()
             });
             assert!(!provider.is_null());
 

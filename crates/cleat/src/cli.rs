@@ -1077,7 +1077,8 @@ fn run_packets_command(service: &SessionService, id: &str, count: usize) -> Resu
         return Err(format!("session {id} was not present in packet directory"));
     }
     const DEBUG_CHANNEL: u32 = 1;
-    client.open_channel(DEBUG_CHANNEL, id).map_err(|err| format!("open packet channel: {err}"))?;
+    // read-only probe: never steals input/resize authority from a real client
+    client.open_channel(DEBUG_CHANNEL, id, crate::packet::ChannelRole::Watcher).map_err(|err| format!("open packet channel: {err}"))?;
 
     let mut lines = Vec::with_capacity(count);
     let mut previous_modes = None;

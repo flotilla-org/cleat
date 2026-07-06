@@ -524,3 +524,216 @@ pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]
     let directory = directory.decode::<DirectorySnapshot>().map_err(|err| format!("decode packet directory: {err}"))?;
     Ok((stream, directory))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        io::Read,
+        os::unix::net::{UnixListener, UnixStream},
+        sync::atomic::AtomicUsize,
+        time::Instant,
+    };
+
+    use super::*;
+    use crate::packet::{Ack, Input, Resize};
+
+    fn test_layout() -> (tempfile::TempDir, RuntimeLayout) {
+        let temp = tempfile::Builder::new().prefix("cleat-pd-").tempdir_in("/tmp").expect("tempdir");
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        layout.ensure_daemon_dirs().expect("daemon dirs");
+        (temp, layout)
+    }
+
+    struct FakeDaemon {
+        listener: UnixListener,
+    }
+
+    impl FakeDaemon {
+        fn bind(layout: &RuntimeLayout) -> Self {
+            let _ = std::fs::remove_file(layout.socket_path());
+            Self { listener: UnixListener::bind(layout.socket_path()).expect("bind fake daemon socket") }
+        }
+
+        /// Accept a connection and drive the server half of the upgrade.
+        fn accept(&self, sessions: Vec<DirectoryEntry>) -> UnixStream {
+            let (mut stream, _) = self.listener.accept().expect("accept");
+            // Consume the upgrade request: head, then Content-Length body.
+            let mut buffer = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 1024];
+                let n = stream.read(&mut chunk).expect("read upgrade request");
+                assert!(n > 0, "client hung up during upgrade");
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+            assert!(head.contains("Upgrade: cleat-packet/1"), "missing upgrade token in: {head}");
+            let content_length: usize = head
+                .lines()
+                .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|value| value.trim().parse().unwrap()))
+                .expect("content-length header");
+            while buffer.len() < header_end + content_length {
+                let mut chunk = [0u8; 1024];
+                let n = stream.read(&mut chunk).expect("read upgrade body");
+                assert!(n > 0);
+                buffer.extend_from_slice(&chunk[..n]);
+            }
+            stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n").expect("write 101");
+            PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_HELLO, &ControlHello::current())
+                .expect("hello frame")
+                .write(&mut stream)
+                .expect("write hello");
+            PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, &DirectorySnapshot { sessions })
+                .expect("snapshot frame")
+                .write(&mut stream)
+                .expect("write snapshot");
+            stream
+        }
+    }
+
+    fn directory_entry(session_id: &str) -> DirectoryEntry {
+        DirectoryEntry {
+            session_id: session_id.to_string(),
+            tags: vec!["project=uishell".to_string()],
+            state: "running".to_string(),
+            controller_count: 0,
+            watcher_count: 0,
+            recreatable: false,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    fn render_update(generation: u64) -> TerminalRenderUpdate {
+        TerminalRenderUpdate { render_generation: generation, cols: 80, rows: 24, dirty: DirtyState::Full, ..Default::default() }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition not met within deadline");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn connection_opens_channels_streams_renders_and_acks_on_consumption() {
+        let (_temp, layout) = test_layout();
+        let daemon = FakeDaemon::bind(&layout);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_count = Arc::clone(&wakes);
+        let connection = DaemonConnection::open(
+            layout,
+            Vec::new(),
+            Arc::new(move || {
+                wake_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        assert_eq!(connection.with_directory(|directory| directory.entries.len()), 1);
+
+        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 100, 40);
+        let open = PacketFrame::read(&mut server).expect("open frame");
+        assert_eq!((open.channel, open.msg_type), (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL));
+        assert_eq!(open.decode::<OpenChannel>().expect("open payload"), OpenChannel { channel, session_id: "alpha".to_string() });
+        let resize = PacketFrame::read(&mut server).expect("resize frame");
+        assert_eq!((resize.channel, resize.msg_type), (channel, MSG_SESSION_RESIZE));
+        assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 100, rows: 40 });
+
+        PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket { update: render_update(7) })
+            .expect("render frame")
+            .write(&mut server)
+            .expect("write render");
+        wait_until(|| slot.lock().expect("slot").pending.is_some());
+        assert_eq!(slot.lock().expect("slot").dirty(), DirtyState::Full);
+
+        // Consume like the FFI does: take pending, absorb, ack.
+        let update = slot.lock().expect("slot").pending.take().expect("pending update");
+        slot.lock().expect("slot").last.absorb(&update);
+        connection.send_ack(channel, update.render_generation).expect("ack");
+        let ack = PacketFrame::read(&mut server).expect("ack frame");
+        assert_eq!((ack.channel, ack.msg_type), (channel, MSG_SESSION_ACK));
+        assert_eq!(ack.decode::<Ack>().expect("ack payload"), Ack { generation: 7 });
+
+        connection.shutdown();
+    }
+
+    #[test]
+    fn reconnect_reopens_channels_reasserts_size_and_flushes_queued_input() {
+        let (_temp, layout) = test_layout();
+        let daemon = FakeDaemon::bind(&layout);
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 80, 24);
+        let _open = PacketFrame::read(&mut server).expect("open frame");
+        let _resize = PacketFrame::read(&mut server).expect("resize frame");
+
+        // Daemon connection drops (e.g. lid close); input typed while down is
+        // queued, and a resize records the new desired size.
+        drop(server);
+        wait_until(|| !connection.is_connected());
+        if let Ok(mut slot) = slot.lock() {
+            slot.desired_cols = 120;
+            slot.desired_rows = 50;
+        }
+        connection.send_input(channel, TerminalInputEvent::RawBytes(b"queued".to_vec())).expect("queue input while down");
+
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let open = PacketFrame::read(&mut server).expect("reopen frame");
+        assert_eq!(open.decode::<OpenChannel>().expect("reopen payload"), OpenChannel { channel, session_id: "alpha".to_string() });
+        let resize = PacketFrame::read(&mut server).expect("resize frame");
+        assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 120, rows: 50 });
+        let input = PacketFrame::read(&mut server).expect("queued input frame");
+        assert_eq!((input.channel, input.msg_type), (channel, MSG_SESSION_INPUT));
+        assert_eq!(input.decode::<Input>().expect("input payload"), Input { event: TerminalInputEvent::RawBytes(b"queued".to_vec()) });
+
+        connection.shutdown();
+    }
+
+    #[test]
+    fn directory_deltas_apply_and_bump_generation() {
+        let (_temp, layout) = test_layout();
+        let daemon = FakeDaemon::bind(&layout);
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let first_generation = connection.with_directory(|directory| directory.generation);
+
+        let mut retagged = directory_entry("alpha");
+        retagged.tags = vec!["project=uishell".to_string(), "purpose=test".to_string()];
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+            upserted: vec![retagged, directory_entry("beta")],
+            removed_session_ids: Vec::new(),
+        })
+        .expect("delta frame")
+        .write(&mut server)
+        .expect("write delta");
+
+        wait_until(|| connection.with_directory(|directory| directory.generation > first_generation));
+        connection.with_directory(|directory| {
+            assert_eq!(directory.entries.len(), 2);
+            assert_eq!(directory.entries["alpha"].tags.len(), 2);
+        });
+
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+            upserted: Vec::new(),
+            removed_session_ids: vec!["alpha".to_string()],
+        })
+        .expect("remove delta")
+        .write(&mut server)
+        .expect("write remove delta");
+
+        wait_until(|| connection.with_directory(|directory| !directory.entries.contains_key("alpha")));
+        assert_eq!(connection.with_directory(|directory| directory.entries.len()), 1);
+
+        connection.shutdown();
+    }
+}

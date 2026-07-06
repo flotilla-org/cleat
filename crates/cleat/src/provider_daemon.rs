@@ -27,9 +27,10 @@ use http::StatusCode;
 use crate::{
     http_uds,
     packet::{
-        ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, OpenChannel, PacketFrame, RenderPacket,
+        ChannelRole, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, OpenChannel, PacketFrame, RenderPacket,
         CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO,
-        MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, PROTOCOL_VERSION,
+        MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE,
+        PROTOCOL_VERSION,
     },
     platform::ipc::{try_connect_session_stream, SessionStream},
     provider::{
@@ -119,6 +120,11 @@ pub(crate) struct ChannelSlot {
     /// Size the caller wants; re-asserted after every reconnect.
     pub desired_cols: u16,
     pub desired_rows: u16,
+    /// Role the caller wants; requested on every (re)open with take=false —
+    /// control lost across a disconnect is re-taken explicitly, not silently.
+    pub desired_role: ChannelRole,
+    /// Role the daemon granted (None until the first RoleState arrives).
+    pub granted_role: Option<ChannelRole>,
     /// Set when the daemon reported an error for this channel (e.g. the
     /// session went away).
     pub closed: Option<String>,
@@ -237,14 +243,22 @@ impl DaemonConnection {
 
     /// Register a session channel. The open frame is sent immediately when
     /// connected; otherwise (and after every reconnect) the reader thread
-    /// replays it, and the daemon answers with a full render packet.
-    pub(crate) fn open_session_channel(&self, session_id: String, cols: u16, rows: u16) -> (u32, Arc<Mutex<ChannelSlot>>) {
+    /// replays it, and the daemon answers with a role grant + full render.
+    pub(crate) fn open_session_channel(
+        &self,
+        session_id: String,
+        cols: u16,
+        rows: u16,
+        role: ChannelRole,
+    ) -> (u32, Arc<Mutex<ChannelSlot>>) {
         let slot = Arc::new(Mutex::new(ChannelSlot {
             session_id: session_id.clone(),
             pending: None,
             last: LastKnown::new(cols, rows),
             desired_cols: cols,
             desired_rows: rows,
+            desired_role: role,
+            granted_role: None,
             closed: None,
         }));
         let (channel, connected) = {
@@ -255,13 +269,25 @@ impl DaemonConnection {
             (channel, state.connected)
         };
         if connected {
-            let _ = self.send_open_frame(channel, &session_id, cols, rows);
+            let _ = self.send_open_frame(channel, &session_id, cols, rows, role);
         } else {
             // The caller may have just spawned the daemon (session create);
             // cut the reconnect backoff short.
             self.retry_now.store(true, Ordering::SeqCst);
         }
         (channel, slot)
+    }
+
+    /// Request a role change on an open channel (take=true preempts another
+    /// packet controller). The grant arrives asynchronously as a RoleState.
+    pub(crate) fn request_role(&self, channel: u32, role: ChannelRole, take: bool) -> Result<(), String> {
+        {
+            let state = self.state.lock().expect("connection state lock");
+            if let Some(slot) = state.channels.get(&channel) {
+                slot.lock().expect("channel slot lock").desired_role = role;
+            }
+        }
+        self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_ROLE, &crate::packet::RoleRequest { role, take }))
     }
 
     pub(crate) fn close_session_channel(&self, channel: u32) {
@@ -301,17 +327,24 @@ impl DaemonConnection {
         self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_RESIZE, &crate::packet::Resize { cols, rows }))
     }
 
+    pub(crate) fn send_viewport(&self, channel: u32, command: crate::provider::ViewportCommand) -> Result<(), String> {
+        self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_VIEWPORT, &crate::packet::Viewport { command }))
+    }
+
     pub(crate) fn send_ack(&self, channel: u32, generation: u64) -> Result<(), String> {
         self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_ACK, &crate::packet::Ack { generation }))
     }
 
-    fn send_open_frame(&self, channel: u32, session_id: &str, cols: u16, rows: u16) -> Result<(), String> {
+    fn send_open_frame(&self, channel: u32, session_id: &str, cols: u16, rows: u16, role: ChannelRole) -> Result<(), String> {
         self.send_frame_result(PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
             channel,
             session_id: session_id.to_string(),
+            role,
+            take: false,
         }))?;
         // The daemon does not resize on channel open; assert the size this
         // client wants so a session created detached comes up at view size.
+        // (A watcher's resize is dropped daemon-side, which is the intent.)
         self.send_resize(channel, cols, rows)
     }
 
@@ -380,18 +413,20 @@ impl DaemonConnection {
             let mut state = self.state.lock().expect("connection state lock");
             state.connected = true;
             state.directory.replace(snapshot);
-            let reopen: Vec<(u32, String, u16, u16)> = state
+            let reopen: Vec<(u32, String, u16, u16, ChannelRole)> = state
                 .channels
                 .iter()
                 .map(|(channel, slot)| {
-                    let slot = slot.lock().expect("channel slot lock");
-                    (*channel, slot.session_id.clone(), slot.desired_cols, slot.desired_rows)
+                    let mut slot = slot.lock().expect("channel slot lock");
+                    // the old grant died with the connection
+                    slot.granted_role = None;
+                    (*channel, slot.session_id.clone(), slot.desired_cols, slot.desired_rows, slot.desired_role)
                 })
                 .collect();
             (reopen, std::mem::take(&mut state.queued_input))
         };
-        for (channel, session_id, cols, rows) in reopen {
-            let _ = self.send_open_frame(channel, &session_id, cols, rows);
+        for (channel, session_id, cols, rows, role) in reopen {
+            let _ = self.send_open_frame(channel, &session_id, cols, rows, role);
         }
         for frame in queued_input {
             let _ = self.send_frame_result(Ok(frame));
@@ -452,6 +487,18 @@ impl DaemonConnection {
                         let mut slot = slot.lock().expect("channel slot lock");
                         slot.pending = Some(packet.update);
                         drop(slot);
+                        (self.wake)();
+                    }
+                }
+            }
+            (channel, MSG_SESSION_ROLE) if channel != CHANNEL_CONTROL => {
+                if let Ok(role_state) = frame.decode::<crate::packet::RoleState>() {
+                    let slot = {
+                        let state = self.state.lock().expect("connection state lock");
+                        state.channels.get(&channel).cloned()
+                    };
+                    if let Some(slot) = slot {
+                        slot.lock().expect("channel slot lock").granted_role = Some(role_state.role);
                         (self.wake)();
                     }
                 }
@@ -636,10 +683,15 @@ mod tests {
         wait_until(|| connection.is_connected());
         assert_eq!(connection.with_directory(|directory| directory.entries.len()), 1);
 
-        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 100, 40);
+        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 100, 40, ChannelRole::Controller);
         let open = PacketFrame::read(&mut server).expect("open frame");
         assert_eq!((open.channel, open.msg_type), (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL));
-        assert_eq!(open.decode::<OpenChannel>().expect("open payload"), OpenChannel { channel, session_id: "alpha".to_string() });
+        assert_eq!(open.decode::<OpenChannel>().expect("open payload"), OpenChannel {
+            channel,
+            session_id: "alpha".to_string(),
+            role: ChannelRole::Controller,
+            take: false
+        });
         let resize = PacketFrame::read(&mut server).expect("resize frame");
         assert_eq!((resize.channel, resize.msg_type), (channel, MSG_SESSION_RESIZE));
         assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 100, rows: 40 });
@@ -659,6 +711,13 @@ mod tests {
         assert_eq!((ack.channel, ack.msg_type), (channel, MSG_SESSION_ACK));
         assert_eq!(ack.decode::<Ack>().expect("ack payload"), Ack { generation: 7 });
 
+        connection.send_viewport(channel, crate::provider::ViewportCommand::DeltaRows(-12)).expect("viewport");
+        let viewport = PacketFrame::read(&mut server).expect("viewport frame");
+        assert_eq!((viewport.channel, viewport.msg_type), (channel, crate::packet::MSG_SESSION_VIEWPORT));
+        assert_eq!(viewport.decode::<crate::packet::Viewport>().expect("viewport payload"), crate::packet::Viewport {
+            command: crate::provider::ViewportCommand::DeltaRows(-12)
+        });
+
         connection.shutdown();
     }
 
@@ -670,7 +729,7 @@ mod tests {
 
         let mut server = daemon.accept(vec![directory_entry("alpha")]);
         wait_until(|| connection.is_connected());
-        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 80, 24);
+        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller);
         let _open = PacketFrame::read(&mut server).expect("open frame");
         let _resize = PacketFrame::read(&mut server).expect("resize frame");
 
@@ -687,7 +746,12 @@ mod tests {
         let mut server = daemon.accept(vec![directory_entry("alpha")]);
         wait_until(|| connection.is_connected());
         let open = PacketFrame::read(&mut server).expect("reopen frame");
-        assert_eq!(open.decode::<OpenChannel>().expect("reopen payload"), OpenChannel { channel, session_id: "alpha".to_string() });
+        assert_eq!(open.decode::<OpenChannel>().expect("reopen payload"), OpenChannel {
+            channel,
+            session_id: "alpha".to_string(),
+            role: ChannelRole::Controller,
+            take: false
+        });
         let resize = PacketFrame::read(&mut server).expect("resize frame");
         assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 120, rows: 50 });
         let input = PacketFrame::read(&mut server).expect("queued input frame");

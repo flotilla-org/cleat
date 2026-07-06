@@ -21,6 +21,10 @@ extern "C" {
 #define CLEAT_SESSION_STREAMING 1u
 #define CLEAT_SESSION_DISCONNECTED 2u
 #define CLEAT_SESSION_CLOSED 3u
+/* Attachment role (cleat_session_role / cleat_session_desc.role). */
+#define CLEAT_ROLE_UNKNOWN 0u
+#define CLEAT_ROLE_WATCHER 1u
+#define CLEAT_ROLE_CONTROLLER 2u
 #define CLEAT_INPUT_KEY 1u
 #define CLEAT_INPUT_TEXT 2u
 #define CLEAT_INPUT_MOUSE 3u
@@ -191,6 +195,13 @@ typedef struct cleat_session_desc {
      */
     const cleat_str *tags;
     size_t tag_count;
+    /*
+     * Daemon-backend only: requested attachment role. CLEAT_ROLE_UNKNOWN and
+     * CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
+     * another controller holds the session); CLEAT_ROLE_WATCHER attaches
+     * read-only. The granted role is reported by cleat_session_role.
+     */
+    uint32_t role;
 } cleat_session_desc;
 
 /*
@@ -518,6 +529,20 @@ bool cleat_session_id(const cleat_session *session, cleat_str *out);
  * recovers on its own), and CLOSED once the daemon reported the session gone.
  */
 uint32_t cleat_session_connection_state(const cleat_session *session);
+/*
+ * Granted attachment role (CLEAT_ROLE_*). In-process sessions are their own
+ * controllers. Daemon sessions report UNKNOWN until the daemon's grant
+ * arrives; the role can change later (another client may take control — the
+ * wake callback fires on the change). Watcher input, resize, and viewport
+ * commands are dropped daemon-side.
+ */
+uint32_t cleat_session_role(const cleat_session *session);
+/*
+ * Request the controller role, preempting another packet client's control if
+ * needed (a legacy `cleat attach` stream controller is never preempted). The
+ * grant lands asynchronously; poll cleat_session_role after wake.
+ */
+bool cleat_session_take_control(cleat_session *session);
 
 /* Updates row/column terminal size. Pixel geometry is updated separately. */
 bool cleat_session_resize(cleat_session *session, uint16_t cols, uint16_t rows);

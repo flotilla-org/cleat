@@ -35,6 +35,9 @@ pub const CLEAT_SESSION_CONNECTING: u32 = 0;
 pub const CLEAT_SESSION_STREAMING: u32 = 1;
 pub const CLEAT_SESSION_DISCONNECTED: u32 = 2;
 pub const CLEAT_SESSION_CLOSED: u32 = 3;
+pub const CLEAT_ROLE_UNKNOWN: u32 = 0;
+pub const CLEAT_ROLE_WATCHER: u32 = 1;
+pub const CLEAT_ROLE_CONTROLLER: u32 = 2;
 pub const CLEAT_INPUT_KEY: u32 = 1;
 pub const CLEAT_INPUT_TEXT: u32 = 2;
 pub const CLEAT_INPUT_MOUSE: u32 = 3;
@@ -193,6 +196,11 @@ pub struct CleatSessionDesc {
     pub colors: *const CleatSessionColors,
     pub tags: *const CleatStr,
     pub tag_count: usize,
+    /// Requested attachment role for daemon sessions: CLEAT_ROLE_UNKNOWN /
+    /// CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
+    /// another controller holds the session); CLEAT_ROLE_WATCHER attaches
+    /// read-only. Ignored by other backends.
+    pub role: u32,
 }
 
 #[repr(C)]
@@ -1188,6 +1196,7 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         colors: ptr::null(),
         tags: ptr::null(),
         tag_count: 0,
+        role: CLEAT_ROLE_UNKNOWN,
     });
     let geometry = TerminalGeometry::from_cell_size(desc.cols.max(1), desc.rows.max(1), desc.cell_width_px, desc.cell_height_px);
     let backend = match provider.backend {
@@ -1277,6 +1286,52 @@ pub unsafe extern "C" fn cleat_session_id(session: *const CleatSession, out: *mu
         SessionBackend::Daemon(daemon) => {
             *out = CleatStr { ptr: daemon.id.as_ptr(), len: daemon.id.len() };
             true
+        }
+    }
+}
+
+/// Granted attachment role (CLEAT_ROLE_*). In-process and mock sessions are
+/// their own controllers. Daemon sessions report CLEAT_ROLE_UNKNOWN until the
+/// daemon's grant arrives, then the granted role — which may change later
+/// (another client can take control; the wake callback fires on the change).
+///
+/// # Safety
+///
+/// `session` must be a valid session pointer.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_role(session: *const CleatSession) -> u32 {
+    let session = match unsafe { session.as_ref() } {
+        Some(session) => session,
+        None => return CLEAT_ROLE_UNKNOWN,
+    };
+    match &session.backend {
+        SessionBackend::Mock(_) | SessionBackend::InProcess(_) => CLEAT_ROLE_CONTROLLER,
+        SessionBackend::Daemon(daemon) => match daemon.slot.lock().ok().and_then(|slot| slot.granted_role) {
+            Some(crate::packet::ChannelRole::Controller) => CLEAT_ROLE_CONTROLLER,
+            Some(crate::packet::ChannelRole::Watcher) => CLEAT_ROLE_WATCHER,
+            None => CLEAT_ROLE_UNKNOWN,
+        },
+    }
+}
+
+/// Request the controller role, preempting another packet controller if one
+/// holds the session (a legacy stream controller is never preempted). The
+/// grant lands asynchronously: poll `cleat_session_role` after the wake
+/// callback fires. Returns false if the request could not be sent.
+///
+/// # Safety
+///
+/// `session` must be a valid session pointer.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_take_control(session: *mut CleatSession) -> bool {
+    let session = match unsafe { session.as_mut() } {
+        Some(session) => session,
+        None => return false,
+    };
+    match &session.backend {
+        SessionBackend::Mock(_) | SessionBackend::InProcess(_) => true,
+        SessionBackend::Daemon(daemon) => {
+            daemon.connection.request_role(daemon.channel, crate::packet::ChannelRole::Controller, true).is_ok()
         }
     }
 }
@@ -1984,7 +2039,7 @@ fn session_scroll_viewport(session: &mut CleatSession, command: Option<ViewportC
         return ViewportCommandOutcome::Unsupported;
     };
     match &mut session.backend {
-        SessionBackend::Mock(_) | SessionBackend::Daemon(_) => match command {
+        SessionBackend::Mock(_) => match command {
             ViewportCommand::Top | ViewportCommand::Bottom | ViewportCommand::DeltaRows(_) => ViewportCommandOutcome::NoOp,
         },
         SessionBackend::InProcess(in_process) => {
@@ -1993,6 +2048,13 @@ fn session_scroll_viewport(session: &mut CleatSession, command: Option<ViewportC
                 Err(_) => ViewportCommandOutcome::Unsupported,
             }
         }
+        // Fire-and-forget over the packet connection: the true outcome shows
+        // up as viewport/scrollbar state in the next render packet, so report
+        // Moved optimistically on send.
+        SessionBackend::Daemon(daemon) => match daemon.connection.send_viewport(daemon.channel, command) {
+            Ok(()) => ViewportCommandOutcome::Moved,
+            Err(_) => ViewportCommandOutcome::NoOp,
+        },
     }
 }
 
@@ -2095,7 +2157,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         colors,
         tags,
     })?;
-    let (channel, slot) = connection.open_session_channel(metadata.id.clone(), cols, rows);
+    let (channel, slot) = connection.open_session_channel(metadata.id.clone(), cols, rows, channel_role_from_ffi(desc.role)?);
     Ok(DaemonSession { id: metadata.id, connection: Arc::clone(connection), channel, slot })
 }
 
@@ -2104,8 +2166,17 @@ fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let id = read_optional_utf8(desc.id, desc.id_len)
         .map_err(|err| format!("id is not valid UTF-8: {err}"))?
         .ok_or_else(|| "attach requires a session id".to_string())?;
-    let (channel, slot) = connection.open_session_channel(id.clone(), desc.cols.max(1), desc.rows.max(1));
+    let (channel, slot) =
+        connection.open_session_channel(id.clone(), desc.cols.max(1), desc.rows.max(1), channel_role_from_ffi(desc.role)?);
     Ok(DaemonSession { id, connection: Arc::clone(connection), channel, slot })
+}
+
+fn channel_role_from_ffi(role: u32) -> Result<crate::packet::ChannelRole, String> {
+    match role {
+        CLEAT_ROLE_UNKNOWN | CLEAT_ROLE_CONTROLLER => Ok(crate::packet::ChannelRole::Controller),
+        CLEAT_ROLE_WATCHER => Ok(crate::packet::ChannelRole::Watcher),
+        other => Err(format!("unsupported role tag {other}")),
+    }
 }
 
 fn vt_engine_from_tag(tag: u32) -> Result<VtEngineKind, String> {

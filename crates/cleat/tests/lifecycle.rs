@@ -33,7 +33,10 @@ use cleat::{
 };
 #[cfg(feature = "ghostty-vt")]
 use cleat::{
-    packet::{Ack, Input, OpenChannel, RenderPacket, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER},
+    packet::{
+        Ack, ChannelRole, Input, OpenChannel, RenderPacket, RoleRequest, RoleState, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK,
+        MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_ROLE,
+    },
     provider::{TerminalInputEvent, TerminalPasteEvent, TerminalRenderUpdate, TerminalTextEvent},
 };
 
@@ -115,7 +118,87 @@ fn packet_write<T: serde::Serialize>(stream: &mut UnixStream, channel: u32, msg_
 
 #[cfg(feature = "ghostty-vt")]
 fn packet_open_channel(stream: &mut UnixStream, channel: u32, session_id: &str) {
-    packet_write(stream, CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel { channel, session_id: session_id.to_string() });
+    packet_open_channel_role(stream, channel, session_id, ChannelRole::Controller, false);
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn packet_open_channel_role(stream: &mut UnixStream, channel: u32, session_id: &str, role: ChannelRole, take: bool) {
+    packet_write(stream, CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
+        channel,
+        session_id: session_id.to_string(),
+        role,
+        take,
+    });
+}
+
+/// Frame reader with a persistent buffer. The free-standing read helpers each
+/// use a private buffer and silently drop any frame that arrived in the same
+/// chunk as the one they return; when consecutive frames matter (role state
+/// followed by a render), reads must share one buffer.
+#[cfg(feature = "ghostty-vt")]
+struct PacketReader<'a> {
+    stream: &'a mut UnixStream,
+    buffer: Vec<u8>,
+}
+
+#[cfg(feature = "ghostty-vt")]
+impl<'a> PacketReader<'a> {
+    fn new(stream: &'a mut UnixStream) -> Self {
+        stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+        Self { stream, buffer: Vec::new() }
+    }
+
+    fn next_matching(&mut self, timeout: Duration, mut keep: impl FnMut(&PacketFrame) -> bool, label: &str) -> PacketFrame {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            while let Some(frame) = PacketFrame::read_from_buffer(&mut self.buffer).expect("parse packet buffer") {
+                if keep(&frame) {
+                    return frame;
+                }
+            }
+            let mut chunk = [0; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => panic!("packet stream closed while waiting for {label}"),
+                Ok(n) => self.buffer.extend_from_slice(&chunk[..n]),
+                Err(err) if packet_read_would_wait(&err) => {}
+                Err(err) => panic!("read packet frame: {err}"),
+            }
+        }
+        panic!("timed out waiting for {label}");
+    }
+
+    fn role(&mut self, channel: u32, timeout: Duration) -> ChannelRole {
+        self.next_matching(timeout, |frame| frame.channel == channel && frame.msg_type == MSG_SESSION_ROLE, "role state packet")
+            .decode::<RoleState>()
+            .expect("decode role state packet")
+            .role
+    }
+
+    fn render(&mut self, channel: u32, timeout: Duration) -> TerminalRenderUpdate {
+        self.next_matching(timeout, |frame| frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER, "render packet")
+            .decode::<RenderPacket>()
+            .expect("decode render packet")
+            .update
+    }
+
+    fn expect_no_render(&mut self, channel: u32, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            while let Some(frame) = PacketFrame::read_from_buffer(&mut self.buffer).expect("parse packet buffer") {
+                assert!(
+                    !(frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER),
+                    "unexpected render packet on channel {channel}"
+                );
+            }
+            let mut chunk = [0; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => self.buffer.extend_from_slice(&chunk[..n]),
+                Err(err) if packet_read_would_wait(&err) => {}
+                Err(err) => panic!("read packet frame: {err}"),
+            }
+        }
+    }
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -129,12 +212,11 @@ fn packet_input(stream: &mut UnixStream, channel: u32, event: TerminalInputEvent
 }
 
 #[cfg(feature = "ghostty-vt")]
-fn read_packet_render(stream: &mut UnixStream, channel: u32, timeout: Duration) -> TerminalRenderUpdate {
+fn read_packet_render(stream: &mut UnixStream, buffer: &mut Vec<u8>, channel: u32, timeout: Duration) -> TerminalRenderUpdate {
     stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
     let deadline = Instant::now() + timeout;
-    let mut buffer = Vec::new();
     while Instant::now() < deadline {
-        while let Some(frame) = PacketFrame::read_from_buffer(&mut buffer).expect("parse packet buffer") {
+        while let Some(frame) = PacketFrame::read_from_buffer(buffer).expect("parse packet buffer") {
             if frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER {
                 return frame.decode::<RenderPacket>().expect("decode render packet").update;
             }
@@ -150,12 +232,11 @@ fn read_packet_render(stream: &mut UnixStream, channel: u32, timeout: Duration) 
     panic!("timed out waiting for render packet on channel {channel}");
 }
 
-fn read_directory_delta_named(stream: &mut UnixStream, timeout: Duration, label: &str) -> DirectoryDelta {
+fn read_directory_delta_named(stream: &mut UnixStream, buffer: &mut Vec<u8>, timeout: Duration, label: &str) -> DirectoryDelta {
     stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
     let deadline = Instant::now() + timeout;
-    let mut buffer = Vec::new();
     while Instant::now() < deadline {
-        while let Some(frame) = PacketFrame::read_from_buffer(&mut buffer).expect("parse packet buffer") {
+        while let Some(frame) = PacketFrame::read_from_buffer(buffer).expect("parse packet buffer") {
             if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_DIRECTORY_DELTA {
                 return frame.decode::<DirectoryDelta>().expect("decode directory delta");
             }
@@ -171,11 +252,11 @@ fn read_directory_delta_named(stream: &mut UnixStream, timeout: Duration, label:
     panic!("timed out waiting for {label}");
 }
 
-fn read_until_directory_remove(stream: &mut UnixStream, session_id: &str, timeout: Duration) -> DirectoryDelta {
+fn read_until_directory_remove(stream: &mut UnixStream, buffer: &mut Vec<u8>, session_id: &str, timeout: Duration) -> DirectoryDelta {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let delta = read_directory_delta_named(stream, remaining, &format!("remove delta for {session_id}"));
+        let delta = read_directory_delta_named(stream, buffer, remaining, &format!("remove delta for {session_id}"));
         if delta.removed_session_ids.iter().any(|id| id == session_id) {
             return delta;
         }
@@ -184,13 +265,12 @@ fn read_until_directory_remove(stream: &mut UnixStream, session_id: &str, timeou
 }
 
 #[cfg(feature = "ghostty-vt")]
-fn expect_no_packet(stream: &mut UnixStream, timeout: Duration) {
+fn expect_no_render(stream: &mut UnixStream, buffer: &mut Vec<u8>, timeout: Duration) {
     stream.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
     let deadline = Instant::now() + timeout;
-    let mut buffer = Vec::new();
     while Instant::now() < deadline {
-        if let Some(frame) = PacketFrame::read_from_buffer(&mut buffer).expect("parse packet buffer") {
-            panic!("unexpected packet frame: {frame:?}");
+        if let Some(frame) = PacketFrame::read_from_buffer(buffer).expect("parse packet buffer") {
+            assert!(frame.msg_type != MSG_SESSION_RENDER, "unexpected render packet frame: {frame:?}");
         }
         let mut chunk = [0; 4096];
         match stream.read(&mut chunk) {
@@ -566,6 +646,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
         )
         .expect("create alpha");
     let mut stream = http_packet_stream_with_selectors(temp.path(), "alpha", std::slice::from_ref(&selector));
+    let mut buffer = Vec::new();
     stream.set_read_timeout(Some(Duration::from_secs(2))).expect("set read timeout");
     let hello_frame = PacketFrame::read(&mut stream).expect("read hello");
     let directory_frame = PacketFrame::read(&mut stream).expect("read directory");
@@ -591,17 +672,17 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
             },
         )
         .expect("create gamma");
-    let delta = read_directory_delta_named(&mut stream, Duration::from_secs(30), "gamma create delta");
+    let delta = read_directory_delta_named(&mut stream, &mut buffer, Duration::from_secs(30), "gamma create delta");
     assert_eq!(delta.removed_session_ids, Vec::<String>::new());
     assert_eq!(delta.upserted.iter().map(|entry| entry.session_id.as_str()).collect::<Vec<_>>(), vec!["gamma"]);
 
     service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
     service.update_tags("beta", vec![selector.clone()], Vec::new()).expect("tag beta");
-    let delta = read_directory_delta_named(&mut stream, Duration::from_secs(30), "beta retag delta");
+    let delta = read_directory_delta_named(&mut stream, &mut buffer, Duration::from_secs(30), "beta retag delta");
     assert_eq!(delta.upserted.iter().map(|entry| entry.session_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
 
     let (_info, attach) = service.attach(Some("beta".into()), None, None, None, true).expect("attach beta");
-    let delta = read_directory_delta_named(&mut stream, Duration::from_secs(30), "beta attach delta");
+    let delta = read_directory_delta_named(&mut stream, &mut buffer, Duration::from_secs(30), "beta attach delta");
     assert_eq!(delta.upserted[0].session_id, "beta");
     assert_eq!(delta.upserted[0].controller_count, 1);
     drop(attach);
@@ -620,11 +701,11 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
             },
         )
         .expect("create short");
-    let delta = read_until_directory_remove(&mut stream, "short", Duration::from_secs(30));
+    let delta = read_until_directory_remove(&mut stream, &mut buffer, "short", Duration::from_secs(30));
     assert_eq!(delta.removed_session_ids, vec!["short"]);
 
     service.update_tags("alpha", Vec::new(), vec![selector]).expect("untag alpha");
-    let delta = read_until_directory_remove(&mut stream, "alpha", Duration::from_secs(30));
+    let delta = read_until_directory_remove(&mut stream, &mut buffer, "alpha", Duration::from_secs(30));
     assert_eq!(delta.removed_session_ids, vec!["alpha"]);
 }
 
@@ -975,20 +1056,89 @@ fn packet_channel_initial_render_and_packet_input_flow() {
         .expect("create alpha");
 
     let mut stream = http_packet_stream(temp.path(), "alpha");
+    let mut buffer = Vec::new();
     let _hello = PacketFrame::read(&mut stream).expect("read hello");
     let _directory = PacketFrame::read(&mut stream).expect("read directory");
 
     packet_open_channel(&mut stream, 1, "alpha");
-    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    let initial = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
     assert_eq!(initial.dirty, cleat::provider::DirtyState::Full);
     assert!(!initial.ops.is_empty());
     packet_ack(&mut stream, 1, initial.render_generation);
 
     std::thread::sleep(Duration::from_millis(500));
     packet_input(&mut stream, 1, TerminalInputEvent::Paste(TerminalPasteEvent { text: "packet paste".to_string() }));
-    let update = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    let update = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
     assert!(update.render_generation > initial.render_generation);
     assert!(!update.ops.is_empty());
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_roles_gate_input_and_take_control_demotes() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    // first client requests and receives control
+    let mut controller_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut controller_stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut controller_stream).expect("read directory");
+    packet_open_channel_role(&mut controller_stream, 1, "alpha", ChannelRole::Controller, false);
+    let mut controller = PacketReader::new(&mut controller_stream);
+    assert_eq!(controller.role(1, Duration::from_secs(2)), ChannelRole::Controller);
+    let initial = controller.render(1, Duration::from_secs(2));
+    packet_write(controller.stream, 1, MSG_SESSION_ACK, &Ack { generation: initial.render_generation });
+    std::thread::sleep(Duration::from_millis(500));
+
+    // second client also asks for control without take: granted watcher
+    let mut watcher_stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut watcher_stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut watcher_stream).expect("read directory");
+    packet_open_channel_role(&mut watcher_stream, 1, "alpha", ChannelRole::Controller, false);
+    let mut watcher = PacketReader::new(&mut watcher_stream);
+    assert_eq!(watcher.role(1, Duration::from_secs(2)), ChannelRole::Watcher);
+    let watcher_initial = watcher.render(1, Duration::from_secs(2));
+    packet_write(watcher.stream, 1, MSG_SESSION_ACK, &Ack { generation: watcher_initial.render_generation });
+
+    // watcher input is dropped: the raw-mode cat would echo it back as output
+    packet_write(watcher.stream, 1, MSG_SESSION_INPUT, &Input {
+        event: TerminalInputEvent::Paste(TerminalPasteEvent { text: "blocked".to_string() }),
+    });
+    watcher.expect_no_render(1, Duration::from_millis(700));
+
+    // a fresh subscriber sees both attachments in the directory counts
+    {
+        let mut observer = http_packet_stream(temp.path(), "alpha");
+        let _hello = PacketFrame::read(&mut observer).expect("read hello");
+        let directory = PacketFrame::read(&mut observer).expect("read directory");
+        let directory = directory.decode::<DirectorySnapshot>().expect("decode directory snapshot");
+        let alpha = directory.sessions.iter().find(|entry| entry.session_id == "alpha").expect("alpha in directory");
+        assert_eq!((alpha.controller_count, alpha.watcher_count), (1, 1));
+    }
+
+    // take-control: the requester is granted controller, the old controller
+    // is demoted and told so
+    packet_write(watcher.stream, 1, MSG_SESSION_ROLE, &RoleRequest { role: ChannelRole::Controller, take: true });
+    assert_eq!(watcher.role(1, Duration::from_secs(2)), ChannelRole::Controller);
+    assert_eq!(controller.role(1, Duration::from_secs(2)), ChannelRole::Watcher);
+
+    // input from the new controller flows
+    packet_write(watcher.stream, 1, MSG_SESSION_INPUT, &Input {
+        event: TerminalInputEvent::Paste(TerminalPasteEvent { text: "allowed".to_string() }),
+    });
+    let update = watcher.render(1, Duration::from_secs(2));
+    assert!(update.render_generation > watcher_initial.render_generation);
+
+    // ...and input from the demoted client no longer does
+    packet_write(watcher.stream, 1, MSG_SESSION_ACK, &Ack { generation: update.render_generation });
+    packet_write(controller.stream, 1, MSG_SESSION_INPUT, &Input {
+        event: TerminalInputEvent::Paste(TerminalPasteEvent { text: "stale".to_string() }),
+    });
+    watcher.expect_no_render(1, Duration::from_millis(700));
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -1008,13 +1158,14 @@ fn packet_mode_only_change_produces_zero_row_ops() {
         .expect("create alpha");
 
     let mut stream = http_packet_stream(temp.path(), "alpha");
+    let mut buffer = Vec::new();
     let _hello = PacketFrame::read(&mut stream).expect("read hello");
     let _directory = PacketFrame::read(&mut stream).expect("read directory");
     packet_open_channel(&mut stream, 1, "alpha");
-    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    let initial = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
     packet_ack(&mut stream, 1, initial.render_generation);
 
-    let update = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    let update = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
 
     assert!(update.terminal_modes.mouse_tracking);
     assert_eq!(update.terminal_modes.mouse_tracking_mode, vt::MouseTrackingMode::Any);
@@ -1032,24 +1183,25 @@ fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
         .expect("create alpha");
 
     let mut stream = http_packet_stream(temp.path(), "alpha");
+    let mut buffer = Vec::new();
     let _hello = PacketFrame::read(&mut stream).expect("read hello");
     let _directory = PacketFrame::read(&mut stream).expect("read directory");
     packet_open_channel(&mut stream, 1, "alpha");
-    let initial = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    let initial = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
     packet_ack(&mut stream, 1, initial.render_generation);
 
     std::thread::sleep(Duration::from_millis(500));
     packet_input(&mut stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "a".to_string() }));
-    let first = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    let first = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
     packet_ack(&mut stream, 1, initial.render_generation);
     packet_input(&mut stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "b".to_string() }));
-    expect_no_packet(&mut stream, Duration::from_millis(120));
+    expect_no_render(&mut stream, &mut buffer, Duration::from_millis(120));
 
     packet_ack(&mut stream, 1, first.render_generation);
-    let coalesced = read_packet_render(&mut stream, 1, Duration::from_secs(2));
+    let coalesced = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
     assert!(coalesced.render_generation > first.render_generation);
     packet_ack(&mut stream, 1, coalesced.render_generation);
-    expect_no_packet(&mut stream, Duration::from_millis(120));
+    expect_no_render(&mut stream, &mut buffer, Duration::from_millis(120));
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -1063,23 +1215,25 @@ fn packet_concurrent_channels_receive_same_dirty_generation() {
         .expect("create alpha");
 
     let mut first_stream = http_packet_stream(temp.path(), "alpha");
+    let mut first_buffer = Vec::new();
     let _hello = PacketFrame::read(&mut first_stream).expect("read first hello");
     let _directory = PacketFrame::read(&mut first_stream).expect("read first directory");
     packet_open_channel(&mut first_stream, 1, "alpha");
-    let first_initial = read_packet_render(&mut first_stream, 1, Duration::from_secs(2));
+    let first_initial = read_packet_render(&mut first_stream, &mut first_buffer, 1, Duration::from_secs(2));
     packet_ack(&mut first_stream, 1, first_initial.render_generation);
 
     let mut second_stream = http_packet_stream(temp.path(), "alpha");
+    let mut second_buffer = Vec::new();
     let _hello = PacketFrame::read(&mut second_stream).expect("read second hello");
     let _directory = PacketFrame::read(&mut second_stream).expect("read second directory");
     packet_open_channel(&mut second_stream, 1, "alpha");
-    let second_initial = read_packet_render(&mut second_stream, 1, Duration::from_secs(2));
+    let second_initial = read_packet_render(&mut second_stream, &mut second_buffer, 1, Duration::from_secs(2));
     packet_ack(&mut second_stream, 1, second_initial.render_generation);
 
     std::thread::sleep(Duration::from_millis(500));
     packet_input(&mut first_stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "x".to_string() }));
-    let first_update = read_packet_render(&mut first_stream, 1, Duration::from_secs(2));
-    let second_update = read_packet_render(&mut second_stream, 1, Duration::from_secs(2));
+    let first_update = read_packet_render(&mut first_stream, &mut first_buffer, 1, Duration::from_secs(2));
+    let second_update = read_packet_render(&mut second_stream, &mut second_buffer, 1, Duration::from_secs(2));
 
     assert_eq!(first_update.render_generation, second_update.render_generation);
     assert!(!first_update.ops.is_empty(), "first viewer should receive row content");
@@ -1097,22 +1251,24 @@ fn packet_lagging_channel_receives_cached_generation_after_session_goes_clean() 
         .expect("create alpha");
 
     let mut fast_stream = http_packet_stream(temp.path(), "alpha");
+    let mut fast_buffer = Vec::new();
     let _hello = PacketFrame::read(&mut fast_stream).expect("read fast hello");
     let _directory = PacketFrame::read(&mut fast_stream).expect("read fast directory");
     packet_open_channel(&mut fast_stream, 1, "alpha");
-    let fast_initial = read_packet_render(&mut fast_stream, 1, Duration::from_secs(2));
+    let fast_initial = read_packet_render(&mut fast_stream, &mut fast_buffer, 1, Duration::from_secs(2));
     packet_ack(&mut fast_stream, 1, fast_initial.render_generation);
 
     let mut slow_stream = http_packet_stream(temp.path(), "alpha");
+    let mut slow_buffer = Vec::new();
     let _hello = PacketFrame::read(&mut slow_stream).expect("read slow hello");
     let _directory = PacketFrame::read(&mut slow_stream).expect("read slow directory");
     packet_open_channel(&mut slow_stream, 1, "alpha");
-    let slow_initial = read_packet_render(&mut slow_stream, 1, Duration::from_secs(2));
+    let slow_initial = read_packet_render(&mut slow_stream, &mut slow_buffer, 1, Duration::from_secs(2));
 
     std::thread::sleep(Duration::from_millis(500));
     packet_input(&mut fast_stream, 1, TerminalInputEvent::Text(TerminalTextEvent { text: "y".to_string() }));
     let fast_update = loop {
-        let update = read_packet_render(&mut fast_stream, 1, Duration::from_secs(2));
+        let update = read_packet_render(&mut fast_stream, &mut fast_buffer, 1, Duration::from_secs(2));
         if !update.ops.is_empty() {
             break update;
         }
@@ -1121,7 +1277,7 @@ fn packet_lagging_channel_receives_cached_generation_after_session_goes_clean() 
     packet_ack(&mut fast_stream, 1, fast_update.render_generation);
 
     packet_ack(&mut slow_stream, 1, slow_initial.render_generation);
-    let slow_update = read_packet_render(&mut slow_stream, 1, Duration::from_secs(2));
+    let slow_update = read_packet_render(&mut slow_stream, &mut slow_buffer, 1, Duration::from_secs(2));
 
     assert_eq!(slow_update.render_generation, fast_update.render_generation);
     assert!(!slow_update.ops.is_empty(), "lagging viewer should receive cached row content after fast ack");
@@ -1731,6 +1887,36 @@ fn stale_foreground_file_does_not_block_attach() {
     std::fs::write(foreground_path(temp.path(), "alpha"), b"999999").expect("write stale foreground marker");
 
     let (_session, _attach) = service.attach(Some("alpha".into()), None, None, None, false).expect("attach with stale foreground marker");
+}
+
+#[test]
+fn daemon_exits_when_runtime_root_is_removed() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("cat".into()), false).expect("create alpha");
+
+    let pid: i32 =
+        std::fs::read_to_string(daemon_pid_path(temp.path(), "alpha")).expect("read daemon pid").trim().parse().expect("parse daemon pid");
+
+    // Delete the runtime root out from under the daemon, exactly as a dropped
+    // test tempdir would. The hosted `cat` never exits on its own, so only
+    // the root watchdog can reap this daemon.
+    std::fs::remove_dir_all(temp.path()).expect("remove runtime root");
+
+    // The daemon is our direct child, so poll with waitpid rather than
+    // kill(pid, 0): an exited-but-unreaped zombie still answers signals.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut status: libc::c_int = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid {
+            break;
+        }
+        assert!(rc == 0, "waitpid on session daemon failed: {rc}");
+        assert!(Instant::now() < deadline, "daemon should exit after its runtime root is removed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]

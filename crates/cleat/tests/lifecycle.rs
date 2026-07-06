@@ -790,6 +790,7 @@ fn daemon_provider_keeps_session_alive_after_provider_close() {
             backend: CLEAT_PROVIDER_BACKEND_DAEMON,
             runtime_root: root.as_ptr(),
             runtime_root_len: root.len(),
+            ..CleatProviderDesc::default()
         });
         assert!(!provider.is_null());
 
@@ -829,6 +830,7 @@ fn daemon_provider_uses_client_supplied_id() {
             backend: CLEAT_PROVIDER_BACKEND_DAEMON,
             runtime_root: root.as_ptr(),
             runtime_root_len: root.len(),
+            ..CleatProviderDesc::default()
         });
         assert!(!provider.is_null());
 

@@ -189,6 +189,31 @@ impl<'a> PacketReader<'a> {
             "render packet",
         );
     }
+
+    /// Drain (and ack) renders until the channel has been quiet for `quiet`.
+    /// Use before a negative render assertion: late startup output (e.g. a
+    /// `stty raw` mode change) or the tail of a split echo would otherwise
+    /// race into the no-render window on a slow machine.
+    fn settle_renders(&mut self, channel: u32, quiet: Duration, max: Duration) {
+        let deadline = Instant::now() + max;
+        let mut last_render = Instant::now();
+        while Instant::now() < deadline && last_render.elapsed() < quiet {
+            while let Some(frame) = PacketFrame::read_from_buffer(&mut self.buffer).expect("parse packet buffer") {
+                if frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER {
+                    let update = frame.decode::<RenderPacket>().expect("decode render packet").update;
+                    packet_write(self.stream, channel, MSG_SESSION_ACK, &Ack { generation: update.render_generation });
+                    last_render = Instant::now();
+                }
+            }
+            let mut chunk = [0; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => self.buffer.extend_from_slice(&chunk[..n]),
+                Err(err) if packet_read_would_wait(&err) => {}
+                Err(err) => panic!("read packet frame: {err}"),
+            }
+        }
+    }
 }
 
 /// The single read/parse/timeout loop behind every packet-frame test helper.
@@ -1207,6 +1232,34 @@ fn contained_session_panic_does_not_stop_sibling_session() {
     service.kill("beta").expect("kill sibling session");
 }
 
+// An actor worker thread that dies without recording an exit (VT engine
+// panic, readiness-poll failure) must fault its one session — via the failed
+// actor request or the worker_finished backstop — and leave the daemon
+// serving.
+#[test]
+fn actor_worker_death_faults_the_session_and_daemon_survives() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _panic = EnvVarGuard::set("CLEAT_TEST_PANIC_ACTOR", "doomed");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+
+    // Silent command: creation completes cleanly (the hook only fires on
+    // pumps that read output). PTY echo of the sent keys then arms it.
+    service.create(Some("doomed".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create doomed");
+    service.send_keys("doomed", b"boom\n").expect("send keys to doomed");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while service.inspect("doomed").is_ok() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(service.inspect("doomed").is_err(), "worker-dead session should be faulted, not wedge the daemon");
+
+    service
+        .create(Some("survivor".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("daemon should still serve after a worker death");
+    service.kill("survivor").expect("kill survivor");
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn packet_channel_initial_render_and_packet_input_flow() {
@@ -1266,6 +1319,10 @@ fn packet_roles_gate_input_and_take_control_demotes() {
     let watcher_initial = watcher.render(1, Duration::from_secs(2));
     packet_write(watcher.stream, 1, MSG_SESSION_ACK, &Ack { generation: watcher_initial.render_generation });
 
+    // Let late startup output (the `stty raw` mode change) settle before the
+    // negative assertion below.
+    watcher.settle_renders(1, Duration::from_millis(300), Duration::from_secs(2));
+
     // watcher input is dropped: the raw-mode cat would echo it back as output
     packet_write(watcher.stream, 1, MSG_SESSION_INPUT, &Input {
         event: TerminalInputEvent::Paste(TerminalPasteEvent { text: "blocked".to_string() }),
@@ -1295,8 +1352,11 @@ fn packet_roles_gate_input_and_take_control_demotes() {
     let update = watcher.render(1, Duration::from_secs(2));
     assert!(update.render_generation > watcher_initial.render_generation);
 
-    // ...and input from the demoted client no longer does
+    // ...and input from the demoted client no longer does. Settle first: the
+    // "allowed" echo may split across renders, and its tail would race into
+    // the no-render window.
     packet_write(watcher.stream, 1, MSG_SESSION_ACK, &Ack { generation: update.render_generation });
+    watcher.settle_renders(1, Duration::from_millis(300), Duration::from_secs(2));
     packet_write(controller.stream, 1, MSG_SESSION_INPUT, &Input {
         event: TerminalInputEvent::Paste(TerminalPasteEvent { text: "stale".to_string() }),
     });
@@ -2049,6 +2109,51 @@ fn stale_foreground_file_does_not_block_attach() {
     std::fs::write(foreground_path(temp.path(), "alpha"), b"999999").expect("write stale foreground marker");
 
     let (_session, _attach) = service.attach(Some("alpha".into()), None, None, None, false).expect("attach with stale foreground marker");
+}
+
+// A session flooding output at PTY saturation (`yes`) must not starve the
+// daemon's control plane: the actor's pump slice is budgeted so commands
+// keep draining, and the serve loop's actor requests carry a deadline
+// (ADR 0004: the servicing side is never blocked). Probes use a raw
+// socket with a read timeout because the CLI client would hang forever
+// in the failure mode this guards against.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn control_socket_answers_while_a_session_floods_output() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    // The delay lets the create response escape before the flood begins.
+    service.create(Some("flood".into()), None, None, Some("sh -c 'sleep 0.3; exec yes'".into()), false).expect("create flood session");
+    std::thread::sleep(Duration::from_millis(700));
+
+    for probe in 0..5 {
+        let start = Instant::now();
+        let socket = session_socket_path(temp.path(), "flood");
+        let mut stream = UnixStream::connect(&socket).expect("connect control socket");
+        stream.set_read_timeout(Some(Duration::from_secs(2))).expect("set read timeout");
+        stream.write_all(b"GET /sessions HTTP/1.1\r\nHost: cleat\r\n\r\n").expect("write list request");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => panic!("probe {probe}: daemon closed the control socket"),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    panic!("probe {probe}: control plane starved by output flood after {:?}: {err}", start.elapsed())
+                }
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(2), "probe {probe}: control response took {:?} under output flood", start.elapsed());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    service.kill("flood").expect("kill flood session");
 }
 
 #[test]

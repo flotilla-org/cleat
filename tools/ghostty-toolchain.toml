@@ -15,4 +15,7 @@ version = "0.15.2"
 [ghostty]
 repo = "https://github.com/rjwittams/ghostty.git"
 ref = "64daa599c531e6938bc4c52d9198a91f1e6ce8cf"
-build_step = "-Demit-lib-vt=true -Dsimd=true"
+# -Doptimize matters: zig defaults to Debug, and a Debug libghostty-vt feeds
+# scroll-heavy output at ~KB/s — slow enough to wedge session actors behind
+# PTY floods. ReleaseSafe keeps bounds checks on untrusted terminal input.
+build_step = "-Demit-lib-vt=true -Dsimd=true -Doptimize=ReleaseSafe"

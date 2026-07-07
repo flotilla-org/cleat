@@ -31,5 +31,10 @@ raw terminal escapes.
 - Tags are opaque strings, `key=value` by convention; never set
   `vessel=…` (reserved for flotilla).
 - Humans can `cleat watch <id>` read-only while you drive.
+- Remote work: host ssh in a local session — `cleat launch <id> --cmd
+  "ssh -t <host> '<agent>'"` — every verb works on the local grid. The
+  remote end is bare: recording lives locally, connection drop SIGHUPs
+  the remote process, and relaunching replays history but starts a fresh
+  ssh (use the hosted agent's own resume to recover).
 
 Full guide: `docs/skills/cleat-sessions/README.md` in the cleat repo.

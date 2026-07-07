@@ -123,6 +123,62 @@ Approval-churn tip: when the hosted agent offers "don't ask again for
 commands starting with …", prefer prefixes that will recur; ask the agent
 to put one-off probe scripts in a file so a single prefix covers them.
 
+## Remote work today (ssh inside a session)
+
+The zero-install way to work on another host: a **local** session whose
+command is ssh. Nothing cleat-aware runs on the remote — ssh is just bytes
+in the middle, and every verb above works unchanged on the local grid.
+
+Worked example (real: the porthole agent driving codex on paneer):
+
+```sh
+cleat launch codex-paneer --tag project=porthole --tag purpose=agent \
+    --size 200x50 --cmd "ssh -t paneer 'cd ~/dev/porthole && exec codex'"
+cleat wait codex-paneer --text "OpenAI Codex" --timeout 30
+cleat send codex-paneer --submit "<task brief>"
+# ... same supervise loop as any hosted agent; watch/capture/transcript all local
+```
+
+`-t` matters: it forces PTY allocation so the remote agent gets a real
+terminal.
+
+**Caveats — know what you're not getting:**
+
+- **The remote end is bare.** Recording, capture, wait, recreation — all of
+  it lives on the *local* host. There is no session, no recording, no
+  cleat on the remote; if you need artifacts there, make the remote command
+  produce them.
+- **Lifetime is chained to the local host and the ssh connection.** Local
+  daemon death, local reboot, or a dropped connection kills the child ssh —
+  and the remote agent gets SIGHUP with it. Remote host reboot likewise
+  ends the session's child. Contrast: a *native* session survives client
+  death because the daemon owns it; here the daemon is on the wrong side
+  of the wire for that guarantee to cover the remote process.
+- **Recreation replays history; it does not resurrect.** Relaunching the
+  id replays the recorded scrollback, then runs a *fresh* `ssh … codex`.
+  The old remote process is gone; the hosted agent's own resume mechanism
+  (e.g. codex session resume) is your recovery path, not cleat's.
+- **Signals stop at the local ssh client.** `signal --target tree` reaches
+  the local process tree (i.e. ssh); it cannot signal the remote tree.
+  `interrupt <id>` works — Ctrl-C travels as bytes over ssh like any
+  keystroke.
+- The grid lags by network RTT; `wait`/`capture` themselves stay local and
+  fast.
+
+Dogfood record: the porthole agent ran this pattern for real (codex on
+paneer, 2026-07-06/07) — the skill's "real task by a non-cleat agent"
+criterion — and the friction it surfaced is filed: daemon starvation under
+TUI output floods (**fixed**, cleat#123), version-skew detectability
+(cleat#113 — the probe above stays until it lands), watcher shimmer
+flicker (cleat#108).
+
+These caveats are not accidents; they are the shape of the fallback. The
+accepted **Delegated Environments v0 contract** (project-map: `specs/
+delegated-environments-v0-provider-contract.md`) exists to remove them —
+`cleat launch --aboard <ref>` puts the daemon *on* the target so the
+session, recording, and lifetime live there. Until that ships, this
+section is the honest way to work remotely.
+
 ## Gotchas
 
 - **Detached capability synthesis**: with no attached client, the child's

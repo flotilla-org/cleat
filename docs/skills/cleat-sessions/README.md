@@ -54,7 +54,7 @@ cleat kill build                     # ends it; recording survives
 | Structured state | `inspect <id>` — size, leader pid, **foreground pgid** (`fg_pgid != leader_pid` ⇒ a command is running), attachments, recording |
 | Recorded output since a point | `mark <id> name` … `transcript <id> --since-marker name` ; `expect <id> "text"` blocks on recorded output |
 | Interactive use (human) | `attach <id>` (controller), `watch <id>` (read-only) |
-| Signals | `interrupt <id>` (byte Ctrl-C) vs `signal <id> INT` (real signal, `--target foreground|leader|tree`) |
+| Signals | `interrupt <id>` (byte Ctrl-C) vs `signal <id> INT` (real signal, `--target foreground|leader`; `tree` not yet implemented) |
 | End it | `kill <id>` — **recording is preserved**; `kill --purge` discards |
 | Enumerate | `list [--selector k=v]... [--watch] [--all]` |
 
@@ -158,10 +158,11 @@ terminal.
   id replays the recorded scrollback, then runs a *fresh* `ssh … codex`.
   The old remote process is gone; the hosted agent's own resume mechanism
   (e.g. codex session resume) is your recovery path, not cleat's.
-- **Signals stop at the local ssh client.** `signal --target tree` reaches
-  the local process tree (i.e. ssh); it cannot signal the remote tree.
+- **Signals stop at the local ssh client.** `signal --target
+  foreground|leader` hits the local process (i.e. ssh), never the remote
+  tree (`--target tree` is not yet implemented at all — cleat#120).
   `interrupt <id>` works — Ctrl-C travels as bytes over ssh like any
-  keystroke.
+  keystroke, so it *does* reach the remote program.
 - The grid lags by network RTT; `wait`/`capture` themselves stay local and
   fast.
 

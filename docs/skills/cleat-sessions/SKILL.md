@@ -81,9 +81,10 @@ cleat launch codex-paneer --tag purpose=agent --size 200x50 \
 Know the limits: the remote end is bare (recording and all verbs live
 locally); local daemon death or a dropped connection SIGHUPs the remote
 agent; recreation replays history but runs a **fresh** ssh — the hosted
-agent's own resume is the recovery path; `signal --target tree` stops at
-the local ssh client (`interrupt` travels as bytes and works). Full caveat
-list: README §"Remote work today".
+agent's own resume is the recovery path; `signal` hits the local ssh
+client only (and `--target tree` is not yet implemented) — `interrupt`
+travels as bytes and reaches the remote program. Full caveat list: README
+§"Remote work today".
 
 ## Gotchas
 

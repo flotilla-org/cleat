@@ -40,3 +40,16 @@ if [[ ! -f "$GHOSTTY_PREFIX/lib/libghostty-vt.a" ]]; then
 fi
 
 echo "Installed cleat to $BIN_DIR/cleat"
+
+# Install the cleat-sessions agent-skill adapter to both skill locations:
+# ~/.claude/skills (Claude Code) and ~/.agents/skills (the agentskills.io
+# shared dir that pi and codex read). The repo copy is canonical; this
+# owns sync from here (decision log 2026-07-06).
+SKILL_SRC="$REPO_ROOT/docs/skills/cleat-sessions/SKILL.md"
+if [[ -f "$SKILL_SRC" ]]; then
+  for SKILLS_DIR in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+    mkdir -p "$SKILLS_DIR/cleat-sessions"
+    cp "$SKILL_SRC" "$SKILLS_DIR/cleat-sessions/SKILL.md"
+    echo "Installed cleat-sessions skill to $SKILLS_DIR/cleat-sessions/"
+  done
+fi

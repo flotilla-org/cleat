@@ -32,7 +32,7 @@ use cleat::{
         CLEAT_PROVIDER_BACKEND_DAEMON, CLEAT_PROVIDER_VT_PASSTHROUGH, CLEAT_SESSION_CLOSED,
     },
     recording::{SessionRecorder, CAST_FILE_NAME},
-    runtime::{RuntimeLayout, TerminalSize},
+    runtime::{RuntimeLayout, TerminalSize, DEFAULT_DAEMON_NAME},
     server::{EndBound, SessionService, StartBound},
     session::{daemon_pid_path, session_socket_path},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
@@ -2211,7 +2211,7 @@ fn auto_started_daemon_survives_launcher_process_group_cleanup() {
     assert_eq!(inspected.session.id, "alpha");
 
     service.kill("alpha").expect("kill test session");
-    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), "default");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
 }
 
 #[test]

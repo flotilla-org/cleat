@@ -2165,6 +2165,7 @@ const DAEMON_LAUNCHER_ROOT: &str = "CLEAT_TEST_DAEMON_LAUNCHER_ROOT";
 #[test]
 #[ignore = "helper process for auto_started_daemon_survives_launcher_process_group_cleanup"]
 fn daemon_process_group_launcher_helper() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let Some(root) = std::env::var_os(DAEMON_LAUNCHER_ROOT) else {
         return;
     };
@@ -2180,6 +2181,7 @@ fn daemon_process_group_launcher_helper() {
 
 #[test]
 fn auto_started_daemon_survives_launcher_process_group_cleanup() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let mut launcher = Command::new(std::env::current_exe().expect("current lifecycle test executable"));
     launcher

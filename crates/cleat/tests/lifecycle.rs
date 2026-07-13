@@ -1,11 +1,15 @@
 #![cfg(unix)]
 
 #[cfg(feature = "ghostty-vt")]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::{
     io::{Read, Write},
-    os::unix::net::UnixStream,
+    os::unix::{
+        net::UnixStream,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::PathBuf,
+    process::Command,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -2154,6 +2158,58 @@ fn control_socket_answers_while_a_session_floods_output() {
     }
 
     service.kill("flood").expect("kill flood session");
+}
+
+const DAEMON_LAUNCHER_ROOT: &str = "CLEAT_TEST_DAEMON_LAUNCHER_ROOT";
+
+#[test]
+#[ignore = "helper process for auto_started_daemon_survives_launcher_process_group_cleanup"]
+fn daemon_process_group_launcher_helper() {
+    let Some(root) = std::env::var_os(DAEMON_LAUNCHER_ROOT) else {
+        return;
+    };
+    let service = service_for(std::path::Path::new(&root));
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create session from launcher process");
+    std::fs::write(std::path::Path::new(&root).join("launcher.ready"), b"").expect("write launcher readiness marker");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn auto_started_daemon_survives_launcher_process_group_cleanup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut launcher = Command::new(std::env::current_exe().expect("current lifecycle test executable"));
+    launcher
+        .args(["--ignored", "--exact", "daemon_process_group_launcher_helper", "--nocapture"])
+        .env(DAEMON_LAUNCHER_ROOT, temp.path())
+        .process_group(0);
+    let mut launcher = launcher.spawn().expect("spawn isolated daemon launcher");
+    let launcher_process_group = launcher.id() as i32;
+    let ready_path = temp.path().join("launcher.ready");
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    while !ready_path.exists() {
+        if let Some(status) = launcher.try_wait().expect("poll daemon launcher") {
+            panic!("daemon launcher exited before reporting readiness: {status:?}");
+        }
+        assert!(Instant::now() < ready_deadline, "timed out waiting for daemon launcher readiness");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let kill_result = unsafe { libc::killpg(launcher_process_group, libc::SIGKILL) };
+    assert_eq!(kill_result, 0, "kill launcher process group: {}", std::io::Error::last_os_error());
+    let status = launcher.wait().expect("reap daemon launcher");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "daemon launcher should be killed with its process group");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let service = service_for(temp.path());
+    let inspected = service.inspect("alpha").expect("auto-started daemon should survive cleanup of the launcher process group");
+    assert_eq!(inspected.session.id, "alpha");
+
+    service.kill("alpha").expect("kill test session");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), "default");
 }
 
 #[test]

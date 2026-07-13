@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -19,6 +21,14 @@ pub fn spawn_daemon_process(root: &Path, daemon_name: &str) -> Result<(), String
     let mut command = Command::new(exe);
     command.arg("--runtime-root").arg(root).arg("--server").arg(daemon_name).arg("serve");
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    // The daemon must outlive launchers that clean up their whole process
+    // group (agent harnesses, CI runners, and similar supervisors).
+    // SAFETY: `setsid` is called in the child after fork and before exec; it
+    // does not access shared Rust state.
+    unsafe {
+        command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
     command.spawn().map_err(|err| format!("spawn daemon {daemon_name}: {err}"))?;
     Ok(())
 }

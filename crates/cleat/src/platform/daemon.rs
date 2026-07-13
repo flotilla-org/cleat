@@ -27,7 +27,7 @@ pub fn spawn_daemon_process(root: &Path, daemon_name: &str) -> Result<(), String
     // SAFETY: `setsid` is called in the child after fork and before exec; it
     // does not access shared Rust state.
     unsafe {
-        command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+        command.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::from));
     }
     command.spawn().map_err(|err| format!("spawn daemon {daemon_name}: {err}"))?;
     Ok(())

@@ -247,6 +247,10 @@ impl ObservationMirror {
             DirtyState::Clean
         }
     }
+
+    pub(crate) fn render_generation(&self) -> u64 {
+        self.render_generation.load(AtomicOrdering::SeqCst)
+    }
 }
 
 fn dirty_state_to_u8(dirty: DirtyState) -> u8 {

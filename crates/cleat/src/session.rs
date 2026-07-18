@@ -1473,14 +1473,13 @@ fn handle_http_request(
 
             let capabilities = attach_capabilities_from_http(body.capabilities);
             let replay = hosted.actor.apply_attach_state(body.cols, body.rows, capabilities)?;
-            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
             let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
-            #[cfg(unix)]
-            set_stream_nonblocking(&attach_stream, true).map_err(|err| format!("set HTTP attach stream nonblocking: {err}"))?;
-            let mut client = ActiveClient::new(attach_stream)?;
-            client.capabilities = capabilities;
+            let mut client = ActiveClient::new(attach_stream, capabilities)?;
             let replay_mode = if hosted.had_foreground_client { ReplayMode::ResetTerminal } else { ReplayMode::FreshTerminal };
             drain_raw_output_tap_before_client_install(state.layout, &id, hosted, &mut client, replay, replay_mode)?;
+            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
+            #[cfg(unix)]
+            set_stream_nonblocking(&client.stream, true).map_err(|err| format!("set HTTP attach stream nonblocking: {err}"))?;
             let _ = fs::write(state.layout.foreground_path(&id), b"1");
             hosted.active_client = Some(client);
             hosted.had_foreground_client = true;
@@ -1497,13 +1496,12 @@ fn handle_http_request(
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP watch request: {err}"))?;
             let capabilities = attach_capabilities_from_http(body.capabilities);
             let replay = hosted.actor.replay_payload(capabilities)?;
-            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
             let watch_stream = stream.try_clone().map_err(|err| format!("clone HTTP watch stream: {err}"))?;
-            #[cfg(unix)]
-            set_stream_nonblocking(&watch_stream, true).map_err(|err| format!("set HTTP watch stream nonblocking: {err}"))?;
-            let mut watcher = ActiveClient::new(watch_stream)?;
-            watcher.capabilities = capabilities;
+            let mut watcher = ActiveClient::new(watch_stream, capabilities)?;
             drain_raw_output_tap_before_client_install(state.layout, &id, hosted, &mut watcher, replay, ReplayMode::FreshTerminal)?;
+            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
+            #[cfg(unix)]
+            set_stream_nonblocking(&watcher.stream, true).map_err(|err| format!("set HTTP watch stream nonblocking: {err}"))?;
             hosted.watchers.push(watcher);
             broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             Ok(())
@@ -2483,15 +2481,9 @@ struct ActiveClient {
 }
 
 impl ActiveClient {
-    fn new(stream: SessionStream) -> Result<Self, String> {
+    fn new(stream: SessionStream, capabilities: vt::ClientCapabilities) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
-        Ok(Self {
-            stream,
-            pending_output: Vec::new(),
-            input_reader,
-            input_buffer: Vec::new(),
-            capabilities: vt::ClientCapabilities::conservative_fallback(),
-        })
+        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new(), capabilities })
     }
 
     fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>, timeout: Duration) -> Result<bool, std::io::Error> {
@@ -2772,7 +2764,8 @@ mod tests {
     #[test]
     fn active_client_rejects_unbounded_output_backlog() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
-        let mut client = super::ActiveClient::new(stream).expect("create active client");
+        let mut client =
+            super::ActiveClient::new(stream, crate::vt::ClientCapabilities::conservative_fallback()).expect("create active client");
         client.pending_output = vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1];
 
         let err = client.enqueue_frame(&super::Frame::Output(vec![1])).expect_err("backlog should overflow");

@@ -475,6 +475,32 @@ fn create_existing_session_returns_its_running_metadata() {
     service.kill("alpha").expect("kill session");
 }
 
+#[test]
+fn failures_after_protocol_upgrade_close_without_an_http_error() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for route in ["attach", "watch", "packet"] {
+        let _failure = EnvVarGuard::set("CLEAT_TEST_FAIL_AFTER_HTTP_UPGRADE", route);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = service_for(temp.path());
+        service
+            .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+            .expect("create session");
+
+        let mut stream = match route {
+            "attach" => http_attach_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback()),
+            "watch" => http_watch_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback()),
+            "packet" => http_packet_stream(temp.path(), "alpha"),
+            _ => unreachable!(),
+        };
+        let mut post_upgrade = Vec::new();
+        stream.read_to_end(&mut post_upgrade).expect("read upgraded stream to close");
+
+        assert!(post_upgrade.is_empty(), "HTTP bytes followed the {route} 101 response: {}", String::from_utf8_lossy(&post_upgrade));
+
+        service.kill("alpha").expect("kill session");
+    }
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn create_json_returns_structured_metadata() {

@@ -718,8 +718,12 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                         packet_clients: &mut packet_clients,
                         next_packet_client_id: &mut next_packet_client_id,
                     };
-                    if let Err(err) = handle_http_request(root, daemon_name, &mut stream, request, &mut http_state) {
-                        let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
+                    let mut response_committed = false;
+                    if let Err(err) = handle_http_request(root, daemon_name, &mut stream, request, &mut http_state, &mut response_committed)
+                    {
+                        if !response_committed {
+                            let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
+                        }
                     }
                     if !sessions.is_empty() {
                         idle_since = None;
@@ -945,6 +949,19 @@ fn maybe_panic_for_containment_test(session_id: &str) {
     if std::env::var("CLEAT_TEST_PANIC_SESSION_TICK").as_deref() == Ok(session_id) {
         panic!("test-requested panic for session {session_id}");
     }
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_fail_after_http_upgrade(_route: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn maybe_fail_after_http_upgrade(route: &str) -> Result<(), String> {
+    if std::env::var("CLEAT_TEST_FAIL_AFTER_HTTP_UPGRADE").as_deref() == Ok(route) {
+        return Err(format!("test-requested failure after {route} upgrade"));
+    }
+    Ok(())
 }
 
 fn cleanup_exited_session(layout: &RuntimeLayout, id: &str, should_keep_session_dir: bool) {
@@ -1195,6 +1212,7 @@ fn handle_http_request(
     stream: &mut SessionStream,
     request: http_uds::HttpRequest,
     state: &mut HttpRequestState<'_>,
+    response_committed: &mut bool,
 ) -> Result<(), String> {
     match http_uds::route(&request) {
         http_uds::Route::Root | http_uds::Route::Health => http_uds::write_json(
@@ -1257,15 +1275,17 @@ fn handle_http_request(
             let mut selectors = subscribe.selectors;
             crate::runtime::normalize_tags(&mut selectors);
             let directory = directory_snapshot_for_sessions(state.layout, state.sessions, state.packet_clients, &selectors)?;
-            http_uds::write_packet_switching_protocols(stream).map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
             let packet_stream = stream.try_clone().map_err(|err| format!("clone HTTP packet stream: {err}"))?;
             #[cfg(unix)]
             set_stream_nonblocking(&packet_stream, true).map_err(|err| format!("set HTTP packet stream nonblocking: {err}"))?;
             let client_id = *state.next_packet_client_id;
-            *state.next_packet_client_id += 1;
             let mut client = PacketClient::new(client_id, packet_stream, selectors, &directory)?;
             client.enqueue_control(MSG_CONTROL_HELLO, &ControlHello::current())?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
+            *response_committed = true;
+            http_uds::write_packet_switching_protocols(stream).map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
+            maybe_fail_after_http_upgrade("packet")?;
+            *state.next_packet_client_id += 1;
             state.packet_clients.push(client);
             Ok(())
         }
@@ -1298,7 +1318,6 @@ fn handle_http_request(
 
             let capabilities = attach_capabilities_from_http(body.capabilities);
             let replay = hosted.actor.apply_attach_state(body.cols, body.rows, capabilities)?;
-            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
             let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
             #[cfg(unix)]
             set_stream_nonblocking(&attach_stream, true).map_err(|err| format!("set HTTP attach stream nonblocking: {err}"))?;
@@ -1311,12 +1330,23 @@ fn handle_http_request(
                     client.enqueue_frame(&Frame::Output(payload))?;
                 }
             }
+            *response_committed = true;
+            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
+            maybe_fail_after_http_upgrade("attach")?;
             let _ = fs::write(state.layout.foreground_path(&id), b"1");
             hosted.active_client = Some(client);
             hosted.had_foreground_client = true;
-            hosted.actor.set_client_presence(true)?;
-            hosted.actor.record_attach()?;
-            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
+            let activation = (|| {
+                hosted.actor.set_client_presence(true)?;
+                hosted.actor.record_attach()?;
+                broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)
+            })();
+            if let Err(err) = activation {
+                hosted.active_client = None;
+                let _ = hosted.actor.set_client_presence(false);
+                let _ = fs::remove_file(state.layout.foreground_path(&id));
+                return Err(err);
+            }
             Ok(())
         }
         http_uds::Route::SessionWatch { id } => {
@@ -1327,7 +1357,6 @@ fn handle_http_request(
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP watch request: {err}"))?;
             let capabilities = attach_capabilities_from_http(body.capabilities);
             let replay = hosted.actor.replay_payload(capabilities)?;
-            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
             let watch_stream = stream.try_clone().map_err(|err| format!("clone HTTP watch stream: {err}"))?;
             #[cfg(unix)]
             set_stream_nonblocking(&watch_stream, true).map_err(|err| format!("set HTTP watch stream nonblocking: {err}"))?;
@@ -1337,8 +1366,17 @@ fn handle_http_request(
                     watcher.enqueue_frame(&Frame::Output(payload))?;
                 }
             }
+            *response_committed = true;
+            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
+            maybe_fail_after_http_upgrade("watch")?;
             hosted.watchers.push(watcher);
-            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
+            let activation = (|| {
+                broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)
+            })();
+            if let Err(err) = activation {
+                hosted.watchers.pop();
+                return Err(err);
+            }
             Ok(())
         }
         http_uds::Route::SessionDetach { id } => {

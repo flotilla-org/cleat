@@ -298,7 +298,7 @@ resolved through the live daemon socket. \n\
     Signal {
         id: String,
         signal: String,
-        #[arg(long, default_value = "foreground", help = "Signal target: foreground (default) or leader")]
+        #[arg(long, default_value = "foreground", help = "Signal target: foreground (default), leader, or tree")]
         target: String,
     },
     /// Enable output recording
@@ -1206,7 +1206,7 @@ fn parse_signal_target(target: &str) -> Result<crate::protocol::SignalTarget, St
     match target {
         "foreground" => Ok(crate::protocol::SignalTarget::Foreground),
         "leader" => Ok(crate::protocol::SignalTarget::Leader),
-        "tree" => Err("tree signal target is not yet implemented".to_string()),
+        "tree" => Ok(crate::protocol::SignalTarget::Tree),
         other => Err(format!("unknown signal target: {other}")),
     }
 }

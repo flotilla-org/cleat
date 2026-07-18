@@ -1275,7 +1275,7 @@ fn handle_http_request(
             let Some(hosted) = state.sessions.get(&id) else {
                 return write_http_not_found(stream);
             };
-            hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader)?;
+            hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Tree)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
         }
         http_uds::Route::SessionAttach { id } => 'attach: {

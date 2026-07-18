@@ -2524,6 +2524,42 @@ fn signal_term_to_leader_terminates_session() {
 }
 
 #[test]
+fn kill_terminates_background_children_in_leader_process_group() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let pid_file = temp.path().join("child.pid");
+    // Non-interactive sh has no job control, so the background sleep stays in
+    // the session leader's process group. Ignoring HUP before the fork makes the
+    // sleep survive the SIGHUP the kernel sends when the session leader exits,
+    // so only a signal aimed at the process group can take it down.
+    let cmd = format!("sh -c 'trap \"\" HUP; sleep 100 & echo $! > {}; wait'", pid_file.display());
+    let info = service.create(Some("tree".into()), None, None, Some(cmd), false).expect("create session");
+
+    let socket_path = session_socket_path(temp.path(), &info.id);
+    wait_for_socket(&socket_path);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let child_pid = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|contents| contents.trim().parse::<i32>().ok()) {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for background child pid file");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // SAFETY: signal 0 performs existence and permission checks only.
+    assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0, "background child should be alive before kill");
+
+    service.kill(&info.id).expect("kill session");
+
+    wait_until("background child to die after cleat kill", || {
+        // SAFETY: signal 0 performs existence and permission checks only.
+        let rc = unsafe { libc::kill(child_pid, 0) };
+        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    });
+}
+
+#[test]
 fn short_lived_session_reaps_its_directory_after_child_exit() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

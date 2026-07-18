@@ -50,13 +50,35 @@ pub(crate) type WakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 pub(crate) type ImageResourceDataCallback = Box<dyn FnMut(&[u8]) -> bool + Send>;
 
 pub(crate) struct RawOutputTap {
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<RawOutputChunk>,
 }
 
 impl RawOutputTap {
-    pub(crate) fn try_recv(&self) -> Result<Vec<u8>, mpsc::TryRecvError> {
+    pub(crate) fn try_recv(&self) -> Result<RawOutputChunk, mpsc::TryRecvError> {
         self.rx.try_recv()
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel(capacity: usize) -> (SyncSender<RawOutputChunk>, Self) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        (tx, Self { rx })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RawOutputChunk {
+    pub(crate) sequence: u64,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) struct RawOutputReplay {
+    pub(crate) payload: Option<Vec<u8>>,
+    pub(crate) through_sequence: u64,
+}
+
+pub(crate) struct RawOutputRecovery {
+    pub(crate) tap: RawOutputTap,
+    pub(crate) payloads: Vec<Option<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -303,8 +325,8 @@ pub(crate) enum SessionCommand {
     FullSnapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     ImageResourceData { image_id: u32, generation: u64, callback: ImageResourceDataCallback, reply: mpsc::Sender<Result<bool, String>> },
     Inspect { has_controller: bool, watcher_count: usize, reply: mpsc::Sender<Result<InspectResult, String>> },
-    ApplyAttachState { cols: u16, rows: u16, capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<Option<Vec<u8>>, String>> },
-    ReplayPayload { capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<Option<Vec<u8>>, String>> },
+    ApplyAttachState { cols: u16, rows: u16, capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<RawOutputReplay, String>> },
+    ReplayPayload { capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<RawOutputReplay, String>> },
     CaptureText { reply: mpsc::Sender<Result<String, String>> },
     ValidateTextMatching { reply: mpsc::Sender<Result<(), String>> },
     ScreenContains { text: String, reply: mpsc::Sender<Result<bool, String>> },
@@ -327,6 +349,7 @@ pub(crate) enum SessionCommand {
     ScrollbarState { reply: mpsc::Sender<TerminalScrollbarState> },
     SetClientPresence { active: bool, reply: mpsc::Sender<Result<(), String>> },
     SubscribeRawOutput { reply: mpsc::Sender<RawOutputTap> },
+    RecoverRawOutput { capabilities: Vec<vt::ClientCapabilities>, reply: mpsc::Sender<Result<RawOutputRecovery, String>> },
     Stop { terminate: bool },
 }
 
@@ -662,11 +685,15 @@ impl SessionActor {
         recv.recv().map_err(|_| "session actor did not reply".to_string())
     }
 
+    pub(crate) fn recover_raw_output(&self, capabilities: Vec<vt::ClientCapabilities>) -> Result<RawOutputRecovery, String> {
+        self.request_result(|reply| SessionCommand::RecoverRawOutput { capabilities, reply })
+    }
+
     pub(crate) fn inspect(&self, has_controller: bool, watcher_count: usize) -> Result<InspectResult, String> {
         self.request_result(|reply| SessionCommand::Inspect { has_controller, watcher_count, reply })
     }
 
-    pub(crate) fn apply_attach_state(&self, cols: u16, rows: u16, capabilities: vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+    pub(crate) fn apply_attach_state(&self, cols: u16, rows: u16, capabilities: vt::ClientCapabilities) -> Result<RawOutputReplay, String> {
         self.request_result(|reply| SessionCommand::ApplyAttachState { cols, rows, capabilities, reply })
     }
 
@@ -694,7 +721,7 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::Paste { text, reply })
     }
 
-    pub(crate) fn replay_payload(&self, capabilities: vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+    pub(crate) fn replay_payload(&self, capabilities: vt::ClientCapabilities) -> Result<RawOutputReplay, String> {
         self.request_result(|reply| SessionCommand::ReplayPayload { capabilities, reply })
     }
 
@@ -831,7 +858,8 @@ struct SessionActorLoopState {
     exited: bool,
     exit_code: Option<i32>,
     has_active_client: bool,
-    raw_output_taps: Vec<SyncSender<Vec<u8>>>,
+    raw_output_taps: Vec<SyncSender<RawOutputChunk>>,
+    last_raw_output_sequence: u64,
 }
 
 fn pump_session_runtime(
@@ -901,6 +929,7 @@ fn session_actor_loop(
         exit_code: None,
         has_active_client: false,
         raw_output_taps: Vec::new(),
+        last_raw_output_sequence: 0,
     };
     let _ = ready.send(Ok(()));
     #[cfg(unix)]
@@ -1048,13 +1077,19 @@ fn session_actor_handle_command(
         SessionCommand::ApplyAttachState { cols, rows, capabilities, reply } => {
             let cols = cols.max(1);
             let rows = rows.max(1);
-            let result = runtime.apply_attach_state(cols, rows, &capabilities).inspect(|_| {
-                mark_full_and_wake(&mut state.observation, rows, wake);
-            });
+            let result = runtime
+                .apply_attach_state(cols, rows, &capabilities)
+                .inspect(|_| {
+                    mark_full_and_wake(&mut state.observation, rows, wake);
+                })
+                .map(|payload| RawOutputReplay { payload, through_sequence: state.last_raw_output_sequence });
             let _ = reply.send(result);
         }
         SessionCommand::ReplayPayload { capabilities, reply } => {
-            let _ = reply.send(runtime.replay_payload(&capabilities));
+            let result = runtime
+                .replay_payload(&capabilities)
+                .map(|payload| RawOutputReplay { payload, through_sequence: state.last_raw_output_sequence });
+            let _ = reply.send(result);
         }
         SessionCommand::CaptureText { reply } => {
             let _ = reply.send(runtime.capture_text());
@@ -1137,6 +1172,16 @@ fn session_actor_handle_command(
             state.raw_output_taps.push(tx);
             let _ = reply.send(RawOutputTap { rx });
         }
+        SessionCommand::RecoverRawOutput { capabilities, reply } => {
+            let result = capabilities.iter().map(|capabilities| runtime.replay_payload(capabilities)).collect::<Result<Vec<_>, _>>().map(
+                |payloads| {
+                    let (tx, rx) = mpsc::sync_channel(RAW_OUTPUT_TAP_CHUNKS);
+                    state.raw_output_taps.push(tx);
+                    RawOutputRecovery { tap: RawOutputTap { rx }, payloads }
+                },
+            );
+            let _ = reply.send(result);
+        }
         SessionCommand::Stop { terminate } => {
             if terminate && !state.exited {
                 let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
@@ -1171,7 +1216,7 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
             if !result.chunks.is_empty() {
                 maybe_panic_actor_for_test(runtime.session_id());
             }
-            publish_raw_output(&mut state.raw_output_taps, &result.chunks);
+            publish_raw_output(&mut state.raw_output_taps, &mut state.last_raw_output_sequence, &result.chunks);
             // Flush actor-side after each pump slice: the servicing loop no
             // longer round-trips into the actor for it, and recording only
             // grows when the pump runs.
@@ -1200,18 +1245,12 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
     sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
 }
 
-fn publish_raw_output(taps: &mut Vec<SyncSender<Vec<u8>>>, chunks: &[Vec<u8>]) {
-    if chunks.is_empty() || taps.is_empty() {
-        return;
+fn publish_raw_output(taps: &mut Vec<SyncSender<RawOutputChunk>>, last_sequence: &mut u64, chunks: &[Vec<u8>]) {
+    for bytes in chunks {
+        *last_sequence = last_sequence.saturating_add(1);
+        let chunk = RawOutputChunk { sequence: *last_sequence, bytes: bytes.clone() };
+        taps.retain(|tap| tap.try_send(chunk.clone()).is_ok());
     }
-    taps.retain(|tap| {
-        for chunk in chunks {
-            if tap.try_send(chunk.clone()).is_err() {
-                return false;
-            }
-        }
-        true
-    });
 }
 
 fn route_paste_on_actor(runtime: &mut SessionRuntime, text: &[u8]) -> Result<usize, String> {

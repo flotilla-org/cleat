@@ -17,7 +17,7 @@ use std::{
 use http::StatusCode;
 
 use crate::{
-    host::actor::{RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
+    host::actor::{RawOutputRecovery, RawOutputReplay, RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
     http_uds,
     packet::{
         Ack, ChannelRole, CloseChannel, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel,
@@ -585,15 +585,195 @@ fn drain_raw_output_tap(
         match raw_output_tap.try_recv() {
             Ok(chunk) => {
                 drained = true;
-                enqueue_output_chunk(layout, id, actor, active_client, watchers, chunk);
+                enqueue_output_chunk(layout, id, actor, active_client, watchers, chunk.bytes);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(drained),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                *raw_output_tap = actor.subscribe_raw_output()?;
+                recover_raw_output_tap(layout, id, actor, raw_output_tap, active_client, watchers, None)?;
                 return Ok(drained);
             }
         }
     }
+}
+
+fn drain_raw_output_tap_before_client_install(
+    layout: &RuntimeLayout,
+    id: &str,
+    hosted: &mut HostedSession,
+    new_client: &mut ActiveClient,
+    replay: RawOutputReplay,
+    replay_mode: ReplayMode,
+) -> Result<(), String> {
+    let plan = plan_raw_output_client_install(&hosted.raw_output_tap, replay, replay_mode);
+    let existing_chunks = match &plan {
+        RawOutputClientInstallPlan::Complete { existing_chunks, .. } | RawOutputClientInstallPlan::Disconnected { existing_chunks } => {
+            existing_chunks
+        }
+    };
+    for chunk in existing_chunks {
+        enqueue_output_chunk(layout, id, &hosted.actor, &mut hosted.active_client, &mut hosted.watchers, chunk.clone());
+    }
+    match plan {
+        RawOutputClientInstallPlan::Complete { new_client_frames, .. } => {
+            enqueue_frames(new_client, &new_client_frames)?;
+        }
+        RawOutputClientInstallPlan::Disconnected { .. } => {
+            recover_raw_output_tap(
+                layout,
+                id,
+                &hosted.actor,
+                &mut hosted.raw_output_tap,
+                &mut hosted.active_client,
+                &mut hosted.watchers,
+                Some(NewRawOutputClient { client: new_client, replay_mode }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+enum RawOutputClientInstallPlan {
+    Complete { existing_chunks: Vec<Vec<u8>>, new_client_frames: Vec<Frame> },
+    Disconnected { existing_chunks: Vec<Vec<u8>> },
+}
+
+fn plan_raw_output_client_install(
+    raw_output_tap: &RawOutputTap,
+    replay: RawOutputReplay,
+    replay_mode: ReplayMode,
+) -> RawOutputClientInstallPlan {
+    let mut existing_chunks = Vec::new();
+    let mut live_after_replay = Vec::new();
+    loop {
+        match raw_output_tap.try_recv() {
+            Ok(chunk) => {
+                if chunk.sequence > replay.through_sequence {
+                    live_after_replay.push(chunk.bytes.clone());
+                }
+                existing_chunks.push(chunk.bytes);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let mut new_client_frames = replay_frames(replay.payload, replay_mode);
+                new_client_frames.extend(live_after_replay.into_iter().map(Frame::Output));
+                return RawOutputClientInstallPlan::Complete { existing_chunks, new_client_frames };
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return RawOutputClientInstallPlan::Disconnected { existing_chunks };
+            }
+        }
+    }
+}
+
+trait RawOutputRecoverySource {
+    fn recover_raw_output(&self, capabilities: Vec<vt::ClientCapabilities>) -> Result<RawOutputRecovery, String>;
+}
+
+impl RawOutputRecoverySource for SessionActor {
+    fn recover_raw_output(&self, capabilities: Vec<vt::ClientCapabilities>) -> Result<RawOutputRecovery, String> {
+        SessionActor::recover_raw_output(self, capabilities)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReplayMode {
+    FreshTerminal,
+    ResetTerminal,
+}
+
+impl ReplayMode {
+    fn resets_terminal(self) -> bool {
+        matches!(self, Self::ResetTerminal)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawOutputRecoveryRequest {
+    capabilities: vt::ClientCapabilities,
+    replay_mode: ReplayMode,
+}
+
+struct RawOutputRecoveryPlan {
+    tap: RawOutputTap,
+    recipient_frames: Vec<Vec<Frame>>,
+}
+
+fn plan_raw_output_recovery(
+    source: &impl RawOutputRecoverySource,
+    requests: &[RawOutputRecoveryRequest],
+) -> Result<RawOutputRecoveryPlan, String> {
+    let recovery = source.recover_raw_output(requests.iter().map(|request| request.capabilities).collect())?;
+    if recovery.payloads.len() != requests.len() {
+        return Err(format!("raw output recovery returned {} payloads for {} clients", recovery.payloads.len(), requests.len()));
+    }
+    let recipient_frames =
+        recovery.payloads.into_iter().zip(requests).map(|(payload, request)| replay_frames(payload, request.replay_mode)).collect();
+    Ok(RawOutputRecoveryPlan { tap: recovery.tap, recipient_frames })
+}
+
+fn replay_frames(payload: Option<Vec<u8>>, replay_mode: ReplayMode) -> Vec<Frame> {
+    let Some(payload) = payload.filter(|payload| !payload.is_empty()) else {
+        return Vec::new();
+    };
+    let mut frames = Vec::with_capacity(usize::from(replay_mode.resets_terminal()) + 1);
+    if replay_mode.resets_terminal() {
+        frames.push(Frame::Output(REATTACH_CLEAR_SEQUENCE.to_vec()));
+    }
+    frames.push(Frame::Output(payload));
+    frames
+}
+
+fn enqueue_frames(client: &mut ActiveClient, frames: &[Frame]) -> Result<(), String> {
+    for frame in frames {
+        client.enqueue_frame(frame)?;
+    }
+    Ok(())
+}
+
+struct NewRawOutputClient<'a> {
+    client: &'a mut ActiveClient,
+    replay_mode: ReplayMode,
+}
+
+fn recover_raw_output_tap(
+    layout: &RuntimeLayout,
+    id: &str,
+    actor: &SessionActor,
+    raw_output_tap: &mut RawOutputTap,
+    active_client: &mut Option<ActiveClient>,
+    watchers: &mut Vec<ActiveClient>,
+    new_client: Option<NewRawOutputClient<'_>>,
+) -> Result<(), String> {
+    let requests: Vec<_> = active_client
+        .iter()
+        .map(|client| RawOutputRecoveryRequest { capabilities: client.capabilities, replay_mode: ReplayMode::ResetTerminal })
+        .chain(
+            watchers
+                .iter()
+                .map(|watcher| RawOutputRecoveryRequest { capabilities: watcher.capabilities, replay_mode: ReplayMode::ResetTerminal }),
+        )
+        .chain(new_client.as_ref().map(|new_client| RawOutputRecoveryRequest {
+            capabilities: new_client.client.capabilities,
+            replay_mode: new_client.replay_mode,
+        }))
+        .collect();
+    let recovery = plan_raw_output_recovery(actor, &requests)?;
+    *raw_output_tap = recovery.tap;
+    let mut recipient_frames = recovery.recipient_frames.into_iter();
+    if let Some(client) = active_client.as_mut() {
+        if recipient_frames.next().is_some_and(|frames| enqueue_frames(client, &frames).is_err()) {
+            let _ = fs::remove_file(layout.foreground_path(id));
+            let _ = actor.record_detach();
+            let _ = actor.set_client_presence(false);
+            *active_client = None;
+        }
+    }
+    watchers.retain_mut(|watcher| recipient_frames.next().is_none_or(|frames| enqueue_frames(watcher, &frames).is_ok()));
+    if let Some(new_client) = new_client {
+        if let Some(frames) = recipient_frames.next() {
+            enqueue_frames(new_client.client, &frames)?;
+        }
+    }
+    Ok(())
 }
 
 fn drain_watcher_inputs(watchers: &mut Vec<ActiveClient>) {
@@ -1298,14 +1478,9 @@ fn handle_http_request(
             #[cfg(unix)]
             set_stream_nonblocking(&attach_stream, true).map_err(|err| format!("set HTTP attach stream nonblocking: {err}"))?;
             let mut client = ActiveClient::new(attach_stream)?;
-            if let Some(payload) = replay {
-                if !payload.is_empty() {
-                    if hosted.had_foreground_client {
-                        client.enqueue_frame(&Frame::Output(REATTACH_CLEAR_SEQUENCE.to_vec()))?;
-                    }
-                    client.enqueue_frame(&Frame::Output(payload))?;
-                }
-            }
+            client.capabilities = capabilities;
+            let replay_mode = if hosted.had_foreground_client { ReplayMode::ResetTerminal } else { ReplayMode::FreshTerminal };
+            drain_raw_output_tap_before_client_install(state.layout, &id, hosted, &mut client, replay, replay_mode)?;
             let _ = fs::write(state.layout.foreground_path(&id), b"1");
             hosted.active_client = Some(client);
             hosted.had_foreground_client = true;
@@ -1327,11 +1502,8 @@ fn handle_http_request(
             #[cfg(unix)]
             set_stream_nonblocking(&watch_stream, true).map_err(|err| format!("set HTTP watch stream nonblocking: {err}"))?;
             let mut watcher = ActiveClient::new(watch_stream)?;
-            if let Some(payload) = replay {
-                if !payload.is_empty() {
-                    watcher.enqueue_frame(&Frame::Output(payload))?;
-                }
-            }
+            watcher.capabilities = capabilities;
+            drain_raw_output_tap_before_client_install(state.layout, &id, hosted, &mut watcher, replay, ReplayMode::FreshTerminal)?;
             hosted.watchers.push(watcher);
             broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             Ok(())
@@ -2307,12 +2479,19 @@ struct ActiveClient {
     pending_output: Vec<u8>,
     input_reader: ActiveClientReader,
     input_buffer: Vec<u8>,
+    capabilities: vt::ClientCapabilities,
 }
 
 impl ActiveClient {
     fn new(stream: SessionStream) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
-        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new() })
+        Ok(Self {
+            stream,
+            pending_output: Vec::new(),
+            input_reader,
+            input_buffer: Vec::new(),
+            capabilities: vt::ClientCapabilities::conservative_fallback(),
+        })
     }
 
     fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>, timeout: Duration) -> Result<bool, std::io::Error> {
@@ -2454,6 +2633,7 @@ fn http_error_message(response: http_uds::HttpResponse) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -2718,6 +2898,74 @@ mod tests {
 
         assert_eq!(engine.size(), (100, 30));
         assert_eq!(replay, Some(b"Ansi256:true".to_vec()));
+    }
+
+    #[test]
+    fn client_install_plan_sends_snapshot_covered_chunks_only_to_existing_clients() {
+        let (tap_tx, tap) = crate::host::actor::RawOutputTap::test_channel(2);
+        tap_tx.send(crate::host::actor::RawOutputChunk { sequence: 1, bytes: b"line2\n".to_vec() }).expect("queue snapshot-covered output");
+        tap_tx.send(crate::host::actor::RawOutputChunk { sequence: 2, bytes: b"line3\n".to_vec() }).expect("queue post-snapshot output");
+
+        let plan = super::plan_raw_output_client_install(
+            &tap,
+            crate::host::actor::RawOutputReplay { payload: Some(b"line2\n".to_vec()), through_sequence: 1 },
+            super::ReplayMode::FreshTerminal,
+        );
+
+        let super::RawOutputClientInstallPlan::Complete { existing_chunks, new_client_frames } = plan else {
+            panic!("connected tap should produce a complete install plan");
+        };
+        assert_eq!(existing_chunks, vec![b"line2\n".to_vec(), b"line3\n".to_vec()]);
+        assert_eq!(new_client_frames, vec![
+            crate::protocol::Frame::Output(b"line2\n".to_vec()),
+            crate::protocol::Frame::Output(b"line3\n".to_vec())
+        ]);
+    }
+
+    struct FakeRawOutputRecoverySource {
+        seen_capabilities: RefCell<Vec<vt::ClientCapabilities>>,
+        payloads: Vec<Option<Vec<u8>>>,
+    }
+
+    impl super::RawOutputRecoverySource for FakeRawOutputRecoverySource {
+        fn recover_raw_output(&self, capabilities: Vec<vt::ClientCapabilities>) -> Result<crate::host::actor::RawOutputRecovery, String> {
+            self.seen_capabilities.replace(capabilities);
+            let (_tap_tx, tap) = crate::host::actor::RawOutputTap::test_channel(1);
+            Ok(crate::host::actor::RawOutputRecovery { tap, payloads: self.payloads.clone() })
+        }
+    }
+
+    #[test]
+    fn disconnected_tap_recovers_with_terminal_reset_and_fresh_replay() {
+        let (tap_tx, tap) = crate::host::actor::RawOutputTap::test_channel(1);
+        tap_tx.send(crate::host::actor::RawOutputChunk { sequence: 1, bytes: b"queued\n".to_vec() }).expect("queue output before overflow");
+        drop(tap_tx);
+        let install = super::plan_raw_output_client_install(
+            &tap,
+            crate::host::actor::RawOutputReplay { payload: Some(b"stale snapshot".to_vec()), through_sequence: 0 },
+            super::ReplayMode::FreshTerminal,
+        );
+        let super::RawOutputClientInstallPlan::Disconnected { existing_chunks } = install else {
+            panic!("dropped tap sender should require recovery");
+        };
+        assert_eq!(existing_chunks, vec![b"queued\n".to_vec()]);
+
+        let capabilities = vt::ClientCapabilities::new(vt::ColorLevel::Ansi256, true);
+        let source = FakeRawOutputRecoverySource {
+            seen_capabilities: RefCell::new(Vec::new()),
+            payloads: vec![Some(b"fresh snapshot with OVERFLOW_END".to_vec())],
+        };
+        let recovery = super::plan_raw_output_recovery(&source, &[super::RawOutputRecoveryRequest {
+            capabilities,
+            replay_mode: super::ReplayMode::ResetTerminal,
+        }])
+        .expect("plan recovery");
+
+        assert_eq!(*source.seen_capabilities.borrow(), vec![capabilities]);
+        assert_eq!(recovery.recipient_frames, vec![vec![
+            crate::protocol::Frame::Output(super::REATTACH_CLEAR_SEQUENCE.to_vec()),
+            crate::protocol::Frame::Output(b"fresh snapshot with OVERFLOW_END".to_vec())
+        ]]);
     }
 
     #[cfg(not(feature = "ghostty-vt"))]

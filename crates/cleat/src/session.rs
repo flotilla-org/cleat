@@ -511,6 +511,7 @@ struct PacketChannelRef {
 }
 
 struct HostedSession {
+    metadata: SessionMetadata,
     actor: SessionActor,
     raw_output_tap: RawOutputTap,
     active_client: Option<ActiveClient>,
@@ -527,6 +528,7 @@ struct HostedSession {
 
 impl HostedSession {
     fn spawn(session_dir: PathBuf, session: SessionMetadata) -> Result<Self, String> {
+        let should_keep_session_dir = session.record;
         let actor_session_dir = session_dir;
         let actor_session = session.clone();
         let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
@@ -534,6 +536,7 @@ impl HostedSession {
         })?;
         let raw_output_tap = actor.subscribe_raw_output()?;
         Ok(Self {
+            metadata: session,
             actor,
             raw_output_tap,
             active_client: None,
@@ -543,7 +546,7 @@ impl HostedSession {
             had_foreground_client: false,
             pending_waits: Vec::new(),
             pending_expects: Vec::new(),
-            should_keep_session_dir: session.record,
+            should_keep_session_dir,
         })
     }
 }
@@ -1234,6 +1237,8 @@ fn handle_http_request(
                     )?;
                 }
             }
+            let session =
+                state.sessions.get(&session.id).ok_or_else(|| "created session disappeared before response".to_string())?.metadata.clone();
             http_uds::write_json(stream, StatusCode::OK, &http_uds::CreateSessionResponse { session })
                 .map_err(|err| format!("write HTTP session create response: {err}"))
         }

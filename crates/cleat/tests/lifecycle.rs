@@ -34,7 +34,7 @@ use cleat::{
     recording::{SessionRecorder, CAST_FILE_NAME},
     runtime::{RuntimeLayout, TerminalSize, DEFAULT_DAEMON_NAME},
     server::{EndBound, SessionService, StartBound},
-    session::{daemon_pid_path, session_socket_path},
+    session::{daemon_pid_path, ensure_session_started, session_socket_path, SessionStartOptions},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
 #[cfg(feature = "ghostty-vt")]
@@ -438,6 +438,41 @@ fn create_makes_session_directory_and_returns_metadata() {
     let output = cli::execute(cli, &service).expect("execute create").expect("create output");
     assert_eq!(output, "alpha");
     assert!(service.session_dir("alpha").exists());
+}
+
+#[test]
+fn create_existing_session_returns_its_running_metadata() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let service = SessionService::new(layout.clone());
+    let first_cwd = temp.path().join("first");
+    let second_cwd = temp.path().join("second");
+    std::fs::create_dir_all(&first_cwd).expect("create first cwd");
+    std::fs::create_dir_all(&second_cwd).expect("create second cwd");
+
+    let first = ensure_session_started(
+        &layout,
+        Some("alpha".into()),
+        Some(VtEngineKind::Passthrough),
+        Some(first_cwd),
+        Some("sleep 30".into()),
+        SessionStartOptions::default(),
+    )
+    .expect("create first session");
+    let second = ensure_session_started(
+        &layout,
+        Some("alpha".into()),
+        Some(VtEngineKind::Passthrough),
+        Some(second_cwd),
+        Some("printf replacement".into()),
+        SessionStartOptions::default(),
+    )
+    .expect("ensure existing session");
+
+    assert_eq!(second, first);
+
+    service.kill("alpha").expect("kill session");
 }
 
 #[cfg(feature = "ghostty-vt")]

@@ -108,6 +108,10 @@ pub enum CursorStyle {
 pub struct CursorState {
     pub col: u16,
     pub row: u16,
+    /// True when the cursor should be drawn at (`col`, `row`) in this grid's
+    /// viewport. False both when the program hid the cursor (DECTCEM) and when
+    /// the cursor is scrolled out of the viewport — `col`/`row` are meaningless
+    /// in either case. DECTCEM mode itself is not recoverable from this flag.
     pub visible: bool,
     pub style: CursorStyle,
     pub blink: bool,

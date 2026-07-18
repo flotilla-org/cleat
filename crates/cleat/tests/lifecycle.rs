@@ -460,6 +460,8 @@ fn create_existing_session_returns_its_running_metadata() {
         SessionStartOptions::default(),
     )
     .expect("create first session");
+    let tags = service.update_tags("alpha", vec!["project=cleat".into()], Vec::new()).expect("tag running session");
+    assert_eq!(tags, ["project=cleat"]);
     let second = ensure_session_started(
         &layout,
         Some("alpha".into()),
@@ -470,7 +472,9 @@ fn create_existing_session_returns_its_running_metadata() {
     )
     .expect("ensure existing session");
 
-    assert_eq!(second, first);
+    let mut expected = first;
+    expected.tags = tags;
+    assert_eq!(second, expected);
 
     service.kill("alpha").expect("kill session");
 }

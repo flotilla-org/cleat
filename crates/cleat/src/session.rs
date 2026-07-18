@@ -1382,7 +1382,6 @@ fn handle_http_request(
             maybe_fail_after_http_upgrade("attach")?;
             let _ = fs::write(state.layout.foreground_path(&id), b"1");
             hosted.active_client = Some(client);
-            hosted.had_foreground_client = true;
             let activation = (|| {
                 hosted.actor.set_client_presence(true)?;
                 hosted.actor.record_attach()?;
@@ -1394,6 +1393,7 @@ fn handle_http_request(
                 let _ = fs::remove_file(state.layout.foreground_path(&id));
                 return Err(err);
             }
+            hosted.had_foreground_client = true;
             Ok(())
         }
         http_uds::Route::SessionWatch { id } => {
@@ -1544,21 +1544,23 @@ fn handle_http_request(
                 .map_err(|err| format!("write HTTP paste-with-mark response: {err}"))
         }
         http_uds::Route::SessionRecord { id } => {
-            let Some(hosted) = state.sessions.get(&id) else {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
                 return write_http_not_found(stream);
             };
             let body: http_uds::RecordRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP record request: {err}"))?;
             hosted.actor.set_recording(body.enable)?;
+            hosted.metadata.record = body.enable;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP record response: {err}"))
         }
         http_uds::Route::SessionTags { id } => {
-            let Some(hosted) = state.sessions.get(&id) else {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
                 return write_http_not_found(stream);
             };
             let body: http_uds::TagRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP tag request: {err}"))?;
             let tags = hosted.actor.update_tags(body.add, body.remove)?;
+            hosted.metadata.tags.clone_from(&tags);
             broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::TagResponse { tags })
                 .map_err(|err| format!("write HTTP tag response: {err}"))

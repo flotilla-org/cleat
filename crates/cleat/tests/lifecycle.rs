@@ -501,6 +501,35 @@ fn failures_after_protocol_upgrade_close_without_an_http_error() {
     }
 }
 
+#[test]
+fn partial_handshakes_do_not_block_ready_control_requests() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create session");
+
+    let socket_path = session_socket_path(temp.path(), "alpha");
+    let mut partials = Vec::new();
+    for _ in 0..4 {
+        let mut stream = UnixStream::connect(&socket_path).expect("connect partial request");
+        stream.write_all(b"GET /").expect("write partial request");
+        partials.push(stream);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    let start = Instant::now();
+    let mut ready = UnixStream::connect(&socket_path).expect("connect ready request");
+    ready.set_read_timeout(Some(Duration::from_secs(2))).expect("set ready response timeout");
+    ready.write_all(b"GET /healthz HTTP/1.1\r\nHost: cleat\r\n\r\n").expect("write ready request");
+    let response = read_http_response_head(&mut ready);
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(start.elapsed() < Duration::from_millis(700), "ready request waited behind partial handshakes: {:?}", start.elapsed());
+
+    drop(partials);
+    service.kill("alpha").expect("kill session");
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn create_json_returns_structured_metadata() {

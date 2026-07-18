@@ -28,8 +28,8 @@ use crate::{
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
         ipc::{
-            bind_session_listener, connect_session_stream, set_listener_nonblocking, set_stream_nonblocking, set_stream_read_timeout,
-            set_stream_write_timeout, shutdown_stream, try_connect_session_stream, SessionStream,
+            bind_session_listener, connect_session_stream, set_listener_nonblocking, set_stream_nonblocking, set_stream_write_timeout,
+            shutdown_stream, try_connect_session_stream, SessionStream,
         },
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
@@ -636,6 +636,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
 
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
+    let mut pending_http_handshakes: Vec<PendingHttpHandshake> = Vec::new();
     let mut next_packet_client_id: u64 = 1;
     let mut exited_session: Option<(String, bool)> = None;
     let mut faulted_session: Option<String> = None;
@@ -676,42 +677,31 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
 
         loop {
             match listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok((stream, _)) => {
                     did_work = true;
-                    // Accepted sockets inherit nonblocking mode from the listener on macOS/BSD.
-                    // Reset to blocking so the initial frame read works correctly.
-                    #[cfg(unix)]
-                    {
-                        set_stream_nonblocking(&stream, false).map_err(|err| format!("set accepted stream blocking: {err}"))?;
+                    if let Ok(pending) = PendingHttpHandshake::new(stream) {
+                        pending_http_handshakes.push(pending);
                     }
-                    #[cfg(windows)]
-                    {
-                        set_stream_nonblocking(&stream, true).map_err(|err| format!("set accepted stream nonblocking: {err}"))?;
-                    }
-                    let _ = set_stream_write_timeout(&stream, Some(SESSION_HTTP_RESPONSE_WRITE_DEADLINE));
-                    let request = {
-                        let mut reader = HttpHandshakeReader::new(&mut stream, SESSION_HTTP_HANDSHAKE_DEADLINE);
-                        let mut prefix = [0; 5];
-                        if let Err(err) = reader.read_exact(&mut prefix) {
-                            let _ = err;
-                            continue;
-                        }
-                        if !http_uds::looks_like_http_prefix(&prefix) {
-                            continue;
-                        }
-                        match http_uds::read_request_with_prefix(&mut reader, &prefix) {
-                            Ok(request) => request,
-                            Err(err) => {
-                                let _ = http_uds::write_error(
-                                    &mut stream,
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    &format!("read HTTP request: {err}"),
-                                );
-                                continue;
-                            }
-                        }
-                    };
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(format!("accept client: {err}")),
+            }
+        }
 
+        let mut handshake_index = 0;
+        while handshake_index < pending_http_handshakes.len() {
+            match pending_http_handshakes[handshake_index].poll() {
+                Ok(HttpHandshakePoll::Pending(handshake_did_work)) => {
+                    did_work |= handshake_did_work;
+                    handshake_index += 1;
+                }
+                Ok(HttpHandshakePoll::Ready(request)) => {
+                    did_work = true;
+                    let pending = pending_http_handshakes.swap_remove(handshake_index);
+                    let mut stream = pending.into_stream();
+                    if set_stream_nonblocking(&stream, false).is_err() {
+                        continue;
+                    }
                     let mut http_state = HttpRequestState {
                         layout: &layout,
                         sessions: &mut sessions,
@@ -719,7 +709,8 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                         next_packet_client_id: &mut next_packet_client_id,
                     };
                     let mut response_committed = false;
-                    if let Err(err) = handle_http_request(root, daemon_name, &mut stream, request, &mut http_state, &mut response_committed)
+                    if let Err(err) =
+                        handle_http_request(root, daemon_name, &mut stream, *request, &mut http_state, &mut response_committed)
                     {
                         if !response_committed {
                             let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
@@ -729,8 +720,15 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                         idle_since = None;
                     }
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(err) => return Err(format!("accept client: {err}")),
+                Err(err) => {
+                    did_work = true;
+                    let pending = pending_http_handshakes.swap_remove(handshake_index);
+                    if err.kind() == io::ErrorKind::InvalidData {
+                        let mut stream = pending.into_stream();
+                        let _ = set_stream_nonblocking(&stream, false);
+                        let _ = http_uds::write_error(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, &format!("read HTTP request: {err}"));
+                    }
+                }
             }
         }
 
@@ -1177,32 +1175,81 @@ struct HttpRequestState<'a> {
     next_packet_client_id: &'a mut u64,
 }
 
-struct HttpHandshakeReader<'a> {
-    stream: &'a mut SessionStream,
+#[cfg(any(unix, windows))]
+struct PendingHttpHandshake {
+    stream: SessionStream,
+    buffer: Vec<u8>,
     deadline: Instant,
+    #[cfg(windows)]
+    reader: crate::platform::ipc::OverlappedRead,
 }
 
-impl<'a> HttpHandshakeReader<'a> {
-    fn new(stream: &'a mut SessionStream, budget: Duration) -> Self {
-        Self { stream, deadline: Instant::now() + budget }
+enum HttpHandshakePoll {
+    Pending(bool),
+    Ready(Box<http_uds::HttpRequest>),
+}
+
+#[cfg(any(unix, windows))]
+impl PendingHttpHandshake {
+    fn new(stream: SessionStream) -> Result<Self, String> {
+        set_stream_nonblocking(&stream, true)?;
+        set_stream_write_timeout(&stream, Some(SESSION_HTTP_RESPONSE_WRITE_DEADLINE))?;
+        #[cfg(windows)]
+        let reader = stream.overlapped_reader(8192).map_err(|err| format!("create HTTP handshake reader: {err}"))?;
+        Ok(Self {
+            stream,
+            buffer: Vec::new(),
+            deadline: Instant::now() + SESSION_HTTP_HANDSHAKE_DEADLINE,
+            #[cfg(windows)]
+            reader,
+        })
     }
 
-    fn remaining_budget(&self) -> io::Result<Duration> {
-        let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP request handshake deadline exceeded"));
-        };
-        if remaining.is_zero() {
+    fn poll(&mut self) -> io::Result<HttpHandshakePoll> {
+        if Instant::now() >= self.deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP request handshake deadline exceeded"));
         }
-        Ok(remaining)
-    }
-}
 
-impl Read for HttpHandshakeReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let remaining = self.remaining_budget()?;
-        set_stream_read_timeout(self.stream, Some(remaining)).map_err(io::Error::other)?;
-        self.stream.read(buf)
+        let mut did_work = false;
+        loop {
+            if self.buffer.len() >= 5 && !http_uds::looks_like_http_prefix(&self.buffer[..5]) {
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection did not start with HTTP"));
+            }
+            if let Some(request) = http_uds::try_parse_request(&self.buffer)? {
+                return Ok(HttpHandshakePoll::Ready(Box::new(request)));
+            }
+
+            let Some(chunk) = self.read_available()? else {
+                return Ok(HttpHandshakePoll::Pending(did_work));
+            };
+            if chunk.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed before HTTP request completed"));
+            }
+            self.buffer.extend_from_slice(&chunk);
+            did_work = true;
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_available(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut chunk = vec![0; 8192];
+        match self.stream.read(&mut chunk) {
+            Ok(read) => {
+                chunk.truncate(read);
+                Ok(Some(chunk))
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(windows)]
+    fn read_available(&mut self) -> io::Result<Option<Vec<u8>>> {
+        self.reader.poll()
+    }
+
+    fn into_stream(self) -> SessionStream {
+        self.stream
     }
 }
 

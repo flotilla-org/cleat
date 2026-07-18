@@ -353,21 +353,28 @@ pub(crate) fn looks_like_http_prefix(prefix: &[u8]) -> bool {
         || prefix.starts_with(b"OPTIO")
 }
 
+#[cfg(test)]
 pub(crate) fn read_request_with_prefix(reader: &mut impl Read, prefix: &[u8]) -> std::io::Result<HttpRequest> {
     let mut bytes = prefix.to_vec();
-    let header_end = loop {
-        if let Some(header_end) = header_end_index(&bytes) {
-            break header_end;
-        }
-        if bytes.len() >= MAX_HEADER_BYTES {
-            return Err(Error::new(ErrorKind::InvalidData, "HTTP request headers exceeded maximum size"));
+    loop {
+        if let Some(request) = try_parse_request(&bytes)? {
+            return Ok(request);
         }
         let mut buf = [0; 1024];
         let n = reader.read(&mut buf)?;
         if n == 0 {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "connection closed before HTTP headers completed"));
+            return Err(Error::new(ErrorKind::UnexpectedEof, "connection closed before HTTP request completed"));
         }
         bytes.extend_from_slice(&buf[..n]);
+    }
+}
+
+pub(crate) fn try_parse_request(bytes: &[u8]) -> std::io::Result<Option<HttpRequest>> {
+    let Some(header_end) = header_end_index(bytes) else {
+        if bytes.len() >= MAX_HEADER_BYTES {
+            return Err(Error::new(ErrorKind::InvalidData, "HTTP request headers exceeded maximum size"));
+        }
+        return Ok(None);
     };
 
     let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -385,17 +392,10 @@ pub(crate) fn read_request_with_prefix(reader: &mut impl Read, prefix: &[u8]) ->
     }
 
     let body_start = header_end + 4;
-    let mut body = bytes[body_start..].to_vec();
-    while body.len() < content_length {
-        let remaining = content_length - body.len();
-        let mut buf = vec![0; remaining.min(8192)];
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "connection closed before HTTP body completed"));
-        }
-        body.extend_from_slice(&buf[..n]);
+    if bytes.len().saturating_sub(body_start) < content_length {
+        return Ok(None);
     }
-    body.truncate(content_length);
+    let body = bytes[body_start..body_start + content_length].to_vec();
 
     let mut builder = Request::builder()
         .method(Method::from_bytes(method.as_bytes()).map_err(|err| Error::new(ErrorKind::InvalidData, err))?)
@@ -411,7 +411,7 @@ pub(crate) fn read_request_with_prefix(reader: &mut impl Read, prefix: &[u8]) ->
             HeaderValue::from_bytes(header.value).map_err(|err| Error::new(ErrorKind::InvalidData, err))?,
         );
     }
-    builder.body(body).map_err(Error::other)
+    builder.body(body).map(Some).map_err(Error::other)
 }
 
 pub(crate) fn write_request(writer: &mut impl Write, method: Method, path: &str, body: &[u8]) -> std::io::Result<()> {

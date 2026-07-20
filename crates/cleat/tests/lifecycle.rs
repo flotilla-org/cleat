@@ -1526,7 +1526,7 @@ fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
-fn packet_concurrent_channels_receive_same_dirty_generation() {
+fn packet_concurrent_channels_each_progress_past_initial_generation() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());

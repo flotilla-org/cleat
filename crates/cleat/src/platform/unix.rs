@@ -40,10 +40,21 @@ pub struct PtyChild {
     pid: Pid,
 }
 
+/// Serializes `forkpty` + `FD_CLOEXEC` below: a concurrent spawn on another
+/// thread must not fork in the window where the new master fd exists without
+/// close-on-exec, or its child inherits a copy of this master past its exec
+/// and this master's close is never the PTY's last close. The daemon
+/// serializes session creates in practice, but `provider_ffi` embedders may
+/// spawn sessions from multiple threads.
+static SPAWN_CLOEXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl PtyChild {
     pub fn spawn(session: &SessionMetadata) -> Result<Self, String> {
         let exec_spec = ChildExecSpec::new(session)?;
         let winsize = Winsize { ws_row: session.initial_size.rows, ws_col: session.initial_size.cols, ws_xpixel: 0, ws_ypixel: 0 };
+        // The child never touches this lock (it only execs or exits), so
+        // inheriting it in a locked state across the fork is harmless.
+        let _spawn_guard = SPAWN_CLOEXEC_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // SAFETY: `forkpty` creates a child attached to a new PTY; parent receives the owned master fd.
         let result = unsafe { forkpty(&winsize, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
         match result {
@@ -134,9 +145,16 @@ impl Drop for PtyChild {
             // if the child has not called setsid yet.
             let _ = nix::sys::signal::kill(self.pid, Signal::SIGHUP);
             let pid = self.pid;
-            let _ = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name(format!("cleat-reap-{pid}"))
                 .spawn(move || while let Err(Errno::EINTR) = waitpid(pid, None) {});
+            if let Err(err) = spawned {
+                // A failed spawn (thread/resource exhaustion) leaves this child
+                // as a zombie until the daemon exits — plausible exactly under
+                // the pressure this Drop exists to relieve, so make it
+                // observable rather than silent.
+                eprintln!("cleat: failed to spawn reaper thread for pid {pid}: {err}");
+            }
         }
     }
 }

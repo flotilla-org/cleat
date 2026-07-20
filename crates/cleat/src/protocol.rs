@@ -118,12 +118,12 @@ pub enum Frame {
 
 impl Frame {
     pub fn read(reader: &mut impl Read) -> std::io::Result<Self> {
-        let mut header = [0u8; 5];
+        let mut header = [0u8; WIRE_HEADER_LEN];
         reader.read_exact(&mut header)?;
         Self::read_after_header(header, reader)
     }
 
-    pub(crate) fn read_after_header(header: [u8; 5], reader: &mut impl Read) -> std::io::Result<Self> {
+    pub(crate) fn read_after_header(header: [u8; WIRE_HEADER_LEN], reader: &mut impl Read) -> std::io::Result<Self> {
         let tag = header[0];
         let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
         let mut payload = vec![0u8; len];
@@ -132,16 +132,16 @@ impl Frame {
     }
 
     pub(crate) fn read_from_buffer(buffer: &mut Vec<u8>) -> std::io::Result<Option<Self>> {
-        if buffer.len() < 5 {
+        if buffer.len() < WIRE_HEADER_LEN {
             return Ok(None);
         }
         let tag = buffer[0];
         let len = u32::from_le_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
-        let frame_len = 5usize.checked_add(len).ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame length overflow"))?;
+        let frame_len = WIRE_HEADER_LEN.checked_add(len).ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame length overflow"))?;
         if buffer.len() < frame_len {
             return Ok(None);
         }
-        let payload = buffer[5..frame_len].to_vec();
+        let payload = buffer[WIRE_HEADER_LEN..frame_len].to_vec();
         buffer.drain(..frame_len);
         Self::decode(tag, payload).map(Some)
     }

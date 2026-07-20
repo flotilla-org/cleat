@@ -87,6 +87,8 @@ pub enum SignalTarget {
     Tree = 2,
 }
 
+pub(crate) const WIRE_HEADER_LEN: usize = 5;
+
 const TAG_INPUT: u8 = 2;
 const TAG_OUTPUT: u8 = 3;
 const TAG_RESIZE: u8 = 4;
@@ -145,26 +147,40 @@ impl Frame {
     }
 
     pub fn write(&self, writer: &mut impl Write) -> std::io::Result<()> {
-        let (tag, payload) = self.encode();
-        let mut header = [0u8; 5];
-        header[0] = tag;
-        header[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        writer.write_all(&header)?;
-        writer.write_all(&payload)
-    }
-
-    fn encode(&self) -> (u8, Vec<u8>) {
         match self {
             Frame::Resize { cols, rows } => {
-                let mut payload = Vec::with_capacity(4);
-                payload.extend_from_slice(&cols.to_le_bytes());
-                payload.extend_from_slice(&rows.to_le_bytes());
-                (TAG_RESIZE, payload)
+                let mut payload = [0u8; 4];
+                payload[..2].copy_from_slice(&cols.to_le_bytes());
+                payload[2..].copy_from_slice(&rows.to_le_bytes());
+                write_tagged(writer, TAG_RESIZE, &payload)
             }
-            Frame::Input(bytes) => (TAG_INPUT, bytes.clone()),
-            Frame::Output(bytes) => (TAG_OUTPUT, bytes.clone()),
-            Frame::Error(message) => (TAG_ERROR, message.clone().into_bytes()),
+            Frame::Input(bytes) => write_tagged(writer, TAG_INPUT, bytes),
+            Frame::Output(bytes) => write_tagged(writer, TAG_OUTPUT, bytes),
+            Frame::Error(message) => write_tagged(writer, TAG_ERROR, message.as_bytes()),
         }
+    }
+
+    /// Wire size of this frame (header plus payload), computed without
+    /// encoding anything.
+    pub(crate) fn encoded_len(&self) -> usize {
+        let payload_len = match self {
+            Frame::Resize { .. } => 4,
+            Frame::Input(bytes) | Frame::Output(bytes) => bytes.len(),
+            Frame::Error(message) => message.len(),
+        };
+        WIRE_HEADER_LEN + payload_len
+    }
+
+    /// Wire size of an `Output` frame carrying `payload_len` bytes.
+    pub(crate) fn output_encoded_len(payload_len: usize) -> usize {
+        WIRE_HEADER_LEN + payload_len
+    }
+
+    /// Frames `payload` as an `Output` frame without constructing a `Frame`,
+    /// so the fan-out hot path never copies the chunk into an owned payload
+    /// first. Byte-identical to `Frame::Output(payload.to_vec()).write(..)`.
+    pub(crate) fn write_output(writer: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
+        write_tagged(writer, TAG_OUTPUT, payload)
     }
 
     fn decode(tag: u8, payload: Vec<u8>) -> std::io::Result<Self> {
@@ -178,6 +194,14 @@ impl Frame {
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
     }
+}
+
+fn write_tagged(writer: &mut impl Write, tag: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut header = [0u8; WIRE_HEADER_LEN];
+    header[0] = tag;
+    header[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    writer.write_all(&header)?;
+    writer.write_all(payload)
 }
 
 fn decode_size_frame(payload: Vec<u8>) -> std::io::Result<(u16, u16)> {
@@ -227,6 +251,36 @@ mod tests {
         frame.write(&mut bytes).expect("write frame");
         let decoded = Frame::read(&mut bytes.as_slice()).expect("read frame");
         assert_eq!(decoded, frame);
+    }
+
+    /// Pins the wire format byte-for-byte: tag, u32 LE payload length,
+    /// payload. Guards the allocation-free `write` restructuring (issue
+    /// #135) against any framing drift.
+    #[test]
+    fn wire_format_is_tag_then_le_length_then_payload() {
+        let cases: Vec<(Frame, Vec<u8>)> = vec![
+            (Frame::Input(vec![0xDE, 0xAD]), vec![2, 2, 0, 0, 0, 0xDE, 0xAD]),
+            (Frame::Output(vec![1, 2, 3]), vec![3, 3, 0, 0, 0, 1, 2, 3]),
+            (Frame::Resize { cols: 0x0102, rows: 0x0304 }, vec![4, 4, 0, 0, 0, 0x02, 0x01, 0x04, 0x03]),
+            (Frame::Error("no".to_string()), vec![9, 2, 0, 0, 0, b'n', b'o']),
+        ];
+        for (frame, expected) in cases {
+            let mut bytes = Vec::new();
+            frame.write(&mut bytes).expect("write frame");
+            assert_eq!(bytes, expected, "wire bytes for {frame:?}");
+            assert_eq!(frame.encoded_len(), expected.len(), "encoded_len for {frame:?}");
+        }
+    }
+
+    #[test]
+    fn write_output_matches_output_frame_encoding() {
+        let payload = [0u8, 1, 2, 250, 255];
+        let mut direct = Vec::new();
+        Frame::write_output(&mut direct, &payload).expect("write output payload");
+        let mut via_frame = Vec::new();
+        Frame::Output(payload.to_vec()).write(&mut via_frame).expect("write output frame");
+        assert_eq!(direct, via_frame);
+        assert_eq!(Frame::output_encoded_len(payload.len()), direct.len());
     }
 
     #[test]

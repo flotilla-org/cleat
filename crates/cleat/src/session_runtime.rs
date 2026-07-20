@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -49,7 +50,9 @@ pub(crate) struct SessionRuntime {
 }
 
 pub(crate) struct PtyOutput {
-    pub chunks: Vec<Vec<u8>>,
+    /// Shared so publishing a chunk to each raw-output tap is a refcount
+    /// bump, not a payload copy (issue #135).
+    pub chunks: Vec<Arc<[u8]>>,
 }
 
 impl SessionRuntime {
@@ -433,7 +436,7 @@ impl SessionRuntime {
                     if !has_active_client {
                         self.write_detached_replies(bytes, &engine_reply)?;
                     }
-                    chunks.push(bytes.to_vec());
+                    chunks.push(Arc::from(bytes));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || (after_exit && is_pty_eof_after_exit(&err)) => break,
                 Err(err) if after_exit => return Err(format!("read pty output after exit: {err}")),

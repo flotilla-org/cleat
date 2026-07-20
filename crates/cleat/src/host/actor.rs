@@ -68,7 +68,10 @@ impl RawOutputTap {
 #[derive(Clone, Debug)]
 pub(crate) struct RawOutputChunk {
     pub(crate) sequence: u64,
-    pub(crate) bytes: Vec<u8>,
+    /// Shared with every other tap and the actor's pump result: cloning a
+    /// chunk to cross the actor→servicing channel is a refcount bump, not a
+    /// payload copy (issue #135).
+    pub(crate) bytes: Arc<[u8]>,
 }
 
 pub(crate) struct RawOutputReplay {
@@ -854,7 +857,7 @@ enum PumpOutcome {
 
 struct PumpResult {
     outcome: PumpOutcome,
-    chunks: Vec<Vec<u8>>,
+    chunks: Vec<Arc<[u8]>>,
 }
 
 struct SessionActorLoopState {
@@ -1249,10 +1252,10 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
     sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
 }
 
-fn publish_raw_output(taps: &mut Vec<SyncSender<RawOutputChunk>>, last_sequence: &mut u64, chunks: &[Vec<u8>]) {
+fn publish_raw_output(taps: &mut Vec<SyncSender<RawOutputChunk>>, last_sequence: &mut u64, chunks: &[Arc<[u8]>]) {
     for bytes in chunks {
         *last_sequence = last_sequence.saturating_add(1);
-        let chunk = RawOutputChunk { sequence: *last_sequence, bytes: bytes.clone() };
+        let chunk = RawOutputChunk { sequence: *last_sequence, bytes: Arc::clone(bytes) };
         taps.retain(|tap| tap.try_send(chunk.clone()).is_ok());
     }
 }

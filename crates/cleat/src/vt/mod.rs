@@ -33,6 +33,55 @@ impl ClientCapabilities {
     pub fn conservative_fallback() -> Self {
         Self::new(ColorLevel::Sixteen, false)
     }
+
+    /// Detect client capabilities from the real process environment.
+    ///
+    /// Environment-based detection is deliberate: the attach handshake happens
+    /// before raw mode, so query-based probing would add latency and failure
+    /// modes for little gain.
+    pub fn detect() -> Self {
+        Self::detect_from_env(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("COLORTERM").ok().as_deref(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var_os("ZELLIJ").is_some(),
+        )
+    }
+
+    /// Pure capability detection from environment values.
+    ///
+    /// Color level: `COLORTERM` containing `truecolor`/`24bit` wins, then
+    /// `TERM` containing `256color`, then a small allowlist of terminals known
+    /// to support truecolor via `TERM_PROGRAM`; otherwise the conservative
+    /// sixteen-color fallback.
+    ///
+    /// Kitty keyboard: conservative allowlist (kitty, Ghostty, WezTerm), and
+    /// forced off under multiplexers (`TERM` starting with `screen`/`tmux`, or
+    /// `ZELLIJ` set) which historically mangle the kitty protocol. Multiplexers
+    /// pass SGR through fine, so color detection stands.
+    pub fn detect_from_env(term: Option<&str>, colorterm: Option<&str>, term_program: Option<&str>, zellij: bool) -> Self {
+        let term = term.map(str::to_ascii_lowercase).unwrap_or_default();
+        let colorterm = colorterm.map(str::to_ascii_lowercase).unwrap_or_default();
+        let term_program = term_program.map(str::to_ascii_lowercase).unwrap_or_default();
+
+        let truecolor_program = matches!(term_program.as_str(), "iterm.app" | "ghostty" | "wezterm" | "vscode");
+        let color_level = if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+            ColorLevel::TrueColor
+        } else if term.contains("256color") {
+            ColorLevel::Ansi256
+        } else if truecolor_program {
+            ColorLevel::TrueColor
+        } else {
+            ColorLevel::Sixteen
+        };
+
+        let multiplexed = term.starts_with("screen") || term.starts_with("tmux") || zellij;
+        let kitty_program = matches!(term_program.as_str(), "ghostty" | "wezterm");
+        let kitty_term = matches!(term.as_str(), "xterm-kitty" | "xterm-ghostty");
+        let kitty_keyboard = !multiplexed && (kitty_term || kitty_program);
+
+        Self::new(color_level, kitty_keyboard)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -375,7 +424,60 @@ fn select_default_vt_engine_kind() -> VtEngineKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalColors, VtEngineKind};
+    use super::{ClientCapabilities, ColorLevel, TerminalColors, VtEngineKind};
+
+    #[test]
+    fn detect_truecolor_via_colorterm() {
+        let caps = ClientCapabilities::detect_from_env(Some("xterm-256color"), Some("truecolor"), None, false);
+        assert_eq!(caps.color_level, ColorLevel::TrueColor);
+        assert!(!caps.kitty_keyboard);
+
+        let caps = ClientCapabilities::detect_from_env(Some("xterm"), Some("24bit"), None, false);
+        assert_eq!(caps.color_level, ColorLevel::TrueColor);
+    }
+
+    #[test]
+    fn detect_ansi256_via_term() {
+        let caps = ClientCapabilities::detect_from_env(Some("xterm-256color"), None, None, false);
+        assert_eq!(caps.color_level, ColorLevel::Ansi256);
+        assert!(!caps.kitty_keyboard);
+    }
+
+    #[test]
+    fn detect_truecolor_via_term_program_allowlist() {
+        for program in ["iTerm.app", "ghostty", "WezTerm", "vscode"] {
+            let caps = ClientCapabilities::detect_from_env(Some("xterm"), None, Some(program), false);
+            assert_eq!(caps.color_level, ColorLevel::TrueColor, "TERM_PROGRAM={program}");
+        }
+    }
+
+    #[test]
+    fn detect_falls_back_to_sixteen_colors() {
+        let caps = ClientCapabilities::detect_from_env(Some("vt100"), None, None, false);
+        assert_eq!(caps, ClientCapabilities::conservative_fallback());
+
+        let caps = ClientCapabilities::detect_from_env(None, None, None, false);
+        assert_eq!(caps, ClientCapabilities::conservative_fallback());
+    }
+
+    #[test]
+    fn detect_kitty_keyboard_allowlist() {
+        assert!(ClientCapabilities::detect_from_env(Some("xterm-kitty"), None, None, false).kitty_keyboard);
+        assert!(ClientCapabilities::detect_from_env(Some("xterm-ghostty"), None, None, false).kitty_keyboard);
+        assert!(ClientCapabilities::detect_from_env(Some("xterm-256color"), None, Some("ghostty"), false).kitty_keyboard);
+        assert!(ClientCapabilities::detect_from_env(Some("xterm-256color"), None, Some("WezTerm"), false).kitty_keyboard);
+        assert!(!ClientCapabilities::detect_from_env(Some("xterm-256color"), Some("truecolor"), Some("iTerm.app"), false).kitty_keyboard);
+    }
+
+    #[test]
+    fn detect_kitty_keyboard_forced_off_under_multiplexers() {
+        let caps = ClientCapabilities::detect_from_env(Some("tmux-256color"), Some("truecolor"), Some("ghostty"), false);
+        assert!(!caps.kitty_keyboard);
+        assert_eq!(caps.color_level, ColorLevel::TrueColor, "multiplexers pass SGR through, color detection stands");
+
+        assert!(!ClientCapabilities::detect_from_env(Some("screen-256color"), None, Some("WezTerm"), false).kitty_keyboard);
+        assert!(!ClientCapabilities::detect_from_env(Some("xterm-kitty"), None, None, true).kitty_keyboard, "ZELLIJ set");
+    }
 
     #[cfg(feature = "ghostty-vt")]
     #[test]

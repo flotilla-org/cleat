@@ -16,7 +16,7 @@ use std::{
     io::Write,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     thread::JoinHandle,
     time::Duration,
@@ -49,6 +49,14 @@ const BACKOFF_POLL_STEP: Duration = Duration::from_millis(10);
 /// Input events queued while the connection is down (they flush after the
 /// session channels are re-opened). Beyond this the send reports failure.
 const MAX_QUEUED_INPUT_FRAMES: usize = 1024;
+
+/// A panic in one client callback must not turn every later provider call into
+/// another panic. The protected values use exception-safe standard collection
+/// operations, so retain their state and let the normal disconnected paths
+/// report transport failures.
+fn recover_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// State the last consumed render packet left behind. Used to answer
 /// scrollbar/extent queries between packets and to synthesize a clean update
@@ -228,7 +236,7 @@ impl DaemonConnection {
             .name(format!("cleat-daemon-io:{}", thread_connection.layout.daemon_name()))
             .spawn(move || thread_connection.reader_loop())
             .expect("spawn daemon connection reader thread");
-        *connection.reader.lock().expect("reader handle lock") = Some(handle);
+        *recover_lock(&connection.reader) = Some(handle);
         connection
     }
 
@@ -241,7 +249,7 @@ impl DaemonConnection {
     }
 
     pub(crate) fn with_directory<R>(&self, read: impl FnOnce(&DirectoryState) -> R) -> R {
-        let state = self.state.lock().expect("connection state lock");
+        let state = recover_lock(&self.state);
         read(&state.directory)
     }
 
@@ -266,7 +274,7 @@ impl DaemonConnection {
             closed: None,
         }));
         let (channel, connected) = {
-            let mut state = self.state.lock().expect("connection state lock");
+            let mut state = recover_lock(&self.state);
             let channel = state.next_channel;
             state.next_channel = state.next_channel.wrapping_add(1).max(1);
             state.channels.insert(channel, Arc::clone(&slot));
@@ -286,9 +294,9 @@ impl DaemonConnection {
     /// packet controller). The grant arrives asynchronously as a RoleState.
     pub(crate) fn request_role(&self, channel: u32, role: ChannelRole, take: bool) -> Result<(), String> {
         {
-            let state = self.state.lock().expect("connection state lock");
+            let state = recover_lock(&self.state);
             if let Some(slot) = state.channels.get(&channel) {
-                slot.lock().expect("channel slot lock").desired_role = role;
+                recover_lock(slot).desired_role = role;
             }
         }
         self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_ROLE, &crate::packet::RoleRequest { role, take }))
@@ -296,7 +304,7 @@ impl DaemonConnection {
 
     pub(crate) fn close_session_channel(&self, channel: u32) {
         let removed = {
-            let mut state = self.state.lock().expect("connection state lock");
+            let mut state = recover_lock(&self.state);
             state.channels.remove(&channel).is_some()
         };
         if removed {
@@ -315,7 +323,7 @@ impl DaemonConnection {
             // Queue while disconnected: the reader flushes the queue right
             // after it re-opens the session channels, so input typed across a
             // brief reconnect is not lost.
-            let mut state = self.state.lock().expect("connection state lock");
+            let mut state = recover_lock(&self.state);
             if !state.connected {
                 if state.queued_input.len() >= MAX_QUEUED_INPUT_FRAMES {
                     return Err("daemon connection is down and the input queue is full".to_string());
@@ -354,7 +362,7 @@ impl DaemonConnection {
 
     fn send_frame_result(&self, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
         let frame = frame.map_err(|err| format!("encode packet frame: {err}"))?;
-        let mut writer = self.writer.lock().expect("connection writer lock");
+        let mut writer = recover_lock(&self.writer);
         let Some(stream) = writer.as_mut() else {
             return Err("daemon connection is down".to_string());
         };
@@ -373,12 +381,10 @@ impl DaemonConnection {
 
     pub(crate) fn shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut writer) = self.writer.lock() {
-            if let Some(stream) = writer.take() {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-            }
+        if let Some(stream) = recover_lock(&self.writer).take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
-        let handle = self.reader.lock().ok().and_then(|mut reader| reader.take());
+        let handle = recover_lock(&self.reader).take();
         if let Some(handle) = handle {
             let _ = handle.join();
         }
@@ -410,18 +416,18 @@ impl DaemonConnection {
             Err(_) => return false,
         };
         {
-            let mut writer = self.writer.lock().expect("connection writer lock");
+            let mut writer = recover_lock(&self.writer);
             *writer = Some(writer_stream);
         }
         let (reopen, queued_input) = {
-            let mut state = self.state.lock().expect("connection state lock");
+            let mut state = recover_lock(&self.state);
             state.connected = true;
             state.directory.replace(snapshot);
             let reopen: Vec<(u32, String, u16, u16, ChannelRole)> = state
                 .channels
                 .iter()
                 .filter_map(|(channel, slot)| {
-                    let mut slot = slot.lock().expect("channel slot lock");
+                    let mut slot = recover_lock(slot);
                     // A closed channel (session gone) stays closed; reopening
                     // it would just re-error on every reconnect until the FFI
                     // caller destroys the session.
@@ -461,7 +467,7 @@ impl DaemonConnection {
         match (frame.channel, frame.msg_type) {
             (CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT) => {
                 if let Ok(snapshot) = frame.decode::<DirectorySnapshot>() {
-                    let mut state = self.state.lock().expect("connection state lock");
+                    let mut state = recover_lock(&self.state);
                     state.directory.replace(snapshot);
                     drop(state);
                     (self.wake)();
@@ -469,7 +475,7 @@ impl DaemonConnection {
             }
             (CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA) => {
                 if let Ok(delta) = frame.decode::<DirectoryDelta>() {
-                    let mut state = self.state.lock().expect("connection state lock");
+                    let mut state = recover_lock(&self.state);
                     state.directory.apply_delta(delta);
                     drop(state);
                     (self.wake)();
@@ -478,11 +484,11 @@ impl DaemonConnection {
             (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
                 if let Ok(error) = frame.decode::<ControlError>() {
                     let slot = {
-                        let state = self.state.lock().expect("connection state lock");
+                        let state = recover_lock(&self.state);
                         state.channels.get(&error.channel).cloned()
                     };
                     if let Some(slot) = slot {
-                        slot.lock().expect("channel slot lock").closed = Some(error.message);
+                        recover_lock(&slot).closed = Some(error.message);
                         (self.wake)();
                     }
                 }
@@ -490,11 +496,11 @@ impl DaemonConnection {
             (channel, MSG_SESSION_RENDER) if channel != CHANNEL_CONTROL => {
                 if let Ok(packet) = frame.decode::<RenderPacket>() {
                     let slot = {
-                        let state = self.state.lock().expect("connection state lock");
+                        let state = recover_lock(&self.state);
                         state.channels.get(&channel).cloned()
                     };
                     if let Some(slot) = slot {
-                        let mut slot = slot.lock().expect("channel slot lock");
+                        let mut slot = recover_lock(&slot);
                         slot.pending = Some(packet.update);
                         drop(slot);
                         (self.wake)();
@@ -504,11 +510,11 @@ impl DaemonConnection {
             (channel, MSG_SESSION_ROLE) if channel != CHANNEL_CONTROL => {
                 if let Ok(role_state) = frame.decode::<crate::packet::RoleState>() {
                     let slot = {
-                        let state = self.state.lock().expect("connection state lock");
+                        let state = recover_lock(&self.state);
                         state.channels.get(&channel).cloned()
                     };
                     if let Some(slot) = slot {
-                        slot.lock().expect("channel slot lock").granted_role = Some(role_state.role);
+                        recover_lock(&slot).granted_role = Some(role_state.role);
                         (self.wake)();
                     }
                 }
@@ -519,11 +525,11 @@ impl DaemonConnection {
 
     fn teardown_connection(&self) {
         {
-            let mut writer = self.writer.lock().expect("connection writer lock");
+            let mut writer = recover_lock(&self.writer);
             *writer = None;
         }
         {
-            let mut state = self.state.lock().expect("connection state lock");
+            let mut state = recover_lock(&self.state);
             state.connected = false;
         }
         (self.wake)();
@@ -856,6 +862,33 @@ mod tests {
 
         wait_until(|| connection.with_directory(|directory| !directory.entries.contains_key("alpha")));
         assert_eq!(connection.with_directory(|directory| directory.entries.len()), 1);
+
+        connection.shutdown();
+    }
+
+    #[test]
+    fn poisoned_client_mutexes_do_not_cascade_panics() {
+        let (_temp, layout) = test_layout();
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = connection.state.lock().expect("state lock");
+            panic!("poison state lock");
+        }));
+        assert_eq!(connection.with_directory(|directory| directory.entries.len()), 0);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = slot.lock().expect("slot lock");
+            panic!("poison channel slot lock");
+        }));
+        assert!(connection.request_role(channel, ChannelRole::Watcher, false).is_err());
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _writer = connection.writer.lock().expect("writer lock");
+            panic!("poison writer lock");
+        }));
+        assert!(connection.send_resize(channel, 100, 40).is_err());
 
         connection.shutdown();
     }

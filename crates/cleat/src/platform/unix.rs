@@ -3,7 +3,7 @@ use std::{
     ffi::{CString, OsStr, OsString},
     io,
     os::{
-        fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::{
     errno::Errno,
-    fcntl::{fcntl, FcntlArg, OFlag},
+    fcntl::{fcntl, FcntlArg, FdFlag, OFlag},
     poll::{poll, PollFd, PollFlags, PollTimeout},
     pty::{forkpty, ForkptyResult, Winsize},
     sys::{
@@ -35,18 +35,39 @@ const STRIP_ENV_VARS: &[&str] = &["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"];
 const PTY_WRITE_READY_TIMEOUT_MS: i32 = 250;
 
 pub struct PtyChild {
-    master_fd: RawFd,
+    /// Owned PTY master: dropping `PtyChild` closes it automatically.
+    master_fd: OwnedFd,
     pid: Pid,
 }
+
+/// Serializes `forkpty` + `FD_CLOEXEC` below: a concurrent spawn on another
+/// thread must not fork in the window where the new master fd exists without
+/// close-on-exec, or its child inherits a copy of this master past its exec
+/// and this master's close is never the PTY's last close. The daemon
+/// serializes session creates in practice, but `provider_ffi` embedders may
+/// spawn sessions from multiple threads.
+static SPAWN_CLOEXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl PtyChild {
     pub fn spawn(session: &SessionMetadata) -> Result<Self, String> {
         let exec_spec = ChildExecSpec::new(session)?;
         let winsize = Winsize { ws_row: session.initial_size.rows, ws_col: session.initial_size.cols, ws_xpixel: 0, ws_ypixel: 0 };
+        // The child never touches this lock (it only execs or exits), so
+        // inheriting it in a locked state across the fork is harmless.
+        let _spawn_guard = SPAWN_CLOEXEC_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // SAFETY: `forkpty` creates a child attached to a new PTY; parent receives the owned master fd.
         let result = unsafe { forkpty(&winsize, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
         match result {
-            ForkptyResult::Parent { master, child } => Ok(Self { master_fd: master.into_raw_fd(), pid: child }),
+            ForkptyResult::Parent { master, child } => {
+                let pty = Self { master_fd: master, pid: child };
+                // Mark the master close-on-exec: without this, every child forked
+                // afterwards (other sessions' shells) inherits a copy of this
+                // master, so closing ours on teardown is not the last close and
+                // the PTY never hangs up (no SIGHUP reaches the session).
+                fcntl(pty.master_fd.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+                    .map_err(|err| format!("set FD_CLOEXEC on pty master: {err}"))?;
+                Ok(pty)
+            }
             ForkptyResult::Child => {
                 exec_child_or_exit(&exec_spec);
             }
@@ -54,23 +75,23 @@ impl PtyChild {
     }
 
     pub fn master_fd(&self) -> RawFd {
-        self.master_fd
+        self.master_fd.as_raw_fd()
     }
 
     pub fn set_nonblocking(&self) -> Result<(), String> {
-        set_nonblocking(self.master_fd)
+        set_nonblocking(self.master_fd.as_raw_fd())
     }
 
     pub fn read_output(&self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        read_fd(self.master_fd, buf)
+        read_fd(self.master_fd.as_raw_fd(), buf)
     }
 
     pub fn write_all(&self, bytes: &[u8]) -> Result<(), String> {
-        write_fd_all(self.master_fd, bytes)
+        write_fd_all(self.master_fd.as_raw_fd(), bytes)
     }
 
     pub fn resize(&self, cols: u16, rows: u16, width_px: u32, height_px: u32) -> Result<(), String> {
-        resize_pty(self.master_fd, cols, rows, width_px, height_px)
+        resize_pty(self.master_fd.as_raw_fd(), cols, rows, width_px, height_px)
     }
 
     pub fn exited(&self) -> Result<Option<WaitStatus>, String> {
@@ -82,7 +103,7 @@ impl PtyChild {
     }
 
     pub fn foreground_pgid(&self) -> Option<u32> {
-        tcgetpgrp(borrow_raw(self.master_fd)).ok().map(|pid| pid.as_raw() as u32)
+        tcgetpgrp(self.master_fd.as_fd()).ok().map(|pid| pid.as_raw() as u32)
     }
 
     pub fn leader_cwd(&self) -> Option<PathBuf> {
@@ -98,11 +119,42 @@ impl PtyChild {
 
         match target {
             SignalTarget::Foreground => {
-                let fg_pgid = tcgetpgrp(borrow_raw(self.master_fd)).map_err(|err| format!("tcgetpgrp: {err}"))?;
+                let fg_pgid = tcgetpgrp(self.master_fd.as_fd()).map_err(|err| format!("tcgetpgrp: {err}"))?;
                 killpg(fg_pgid, signal).map_err(|err| format!("killpg: {err}"))
             }
             SignalTarget::Leader => nix::sys::signal::kill(self.pid, signal).map_err(|err| format!("kill: {err}")),
             SignalTarget::Tree => Err("tree signal target is not yet implemented".to_string()),
+        }
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        // The owned master fd closes automatically after this runs, hanging up
+        // the PTY (which nudges a still-running child to exit via SIGHUP). The
+        // daemon must never block on session teardown, so reap opportunistically
+        // with WNOHANG; if the child has not exited yet, hand the blocking
+        // `waitpid` to a detached reaper thread so the zombie is eventually
+        // collected without stalling the caller.
+        if matches!(waitpid(self.pid, Some(WaitPidFlag::WNOHANG)), Ok(WaitStatus::StillAlive)) {
+            // Deliver the hangup ourselves instead of relying on the master
+            // close: if the master closes before the child finishes acquiring
+            // the controlling tty, the kernel never generates SIGHUP and the
+            // child can wedge forever (observed on macOS, blocked in
+            // open("/dev/tty")). Signaling the leader pid directly is safe even
+            // if the child has not called setsid yet.
+            let _ = nix::sys::signal::kill(self.pid, Signal::SIGHUP);
+            let pid = self.pid;
+            let spawned = std::thread::Builder::new()
+                .name(format!("cleat-reap-{pid}"))
+                .spawn(move || while let Err(Errno::EINTR) = waitpid(pid, None) {});
+            if let Err(err) = spawned {
+                // A failed spawn (thread/resource exhaustion) leaves this child
+                // as a zombie until the daemon exits — plausible exactly under
+                // the pressure this Drop exists to relieve, so make it
+                // observable rather than silent.
+                eprintln!("cleat: failed to spawn reaper thread for pid {pid}: {err}");
+            }
         }
     }
 }
@@ -596,6 +648,48 @@ mod tests {
                 return;
             }
             assert!(Instant::now() < deadline, "timed out waiting for PTY readiness");
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn drop_closes_master_fd_and_reaps_live_child() {
+        let session = SessionMetadata {
+            id: "pty-drop".to_string(),
+            vt_engine: VtEngineKind::Passthrough,
+            cwd: None,
+            cmd: Some("sleep 5".to_string()),
+            tags: Vec::new(),
+            record: false,
+            initial_size: TerminalSize::default(),
+            colors: TerminalColors::default(),
+        };
+        let pty_child = super::PtyChild::spawn(&session).expect("spawn pty child");
+        let master_fd = pty_child.master_fd();
+        let pid = pty_child.leader_pid() as libc::pid_t;
+
+        // Dropping while the child is still running must close the master fd and
+        // hand the reap off to the detached reaper thread.
+        drop(pty_child);
+
+        // SAFETY: fcntl with F_GETFD only queries flags for the given fd number.
+        let rc = unsafe { libc::fcntl(master_fd, libc::F_GETFD) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(rc, -1, "master fd should be closed after drop");
+        assert_eq!(errno, Some(libc::EBADF), "closed master fd should report EBADF");
+
+        // A zombie still answers kill(pid, 0), so ESRCH proves the child was
+        // actually reaped (the PTY hangup terminates it well before the sleep
+        // deadline; the 10s bound also covers the sleep expiring on its own).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // SAFETY: kill with signal 0 only performs an existence check.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "dropped PtyChild left an unreaped child (pid {pid})");
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 

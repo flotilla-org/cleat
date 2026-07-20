@@ -34,7 +34,7 @@ use cleat::{
     recording::{SessionRecorder, CAST_FILE_NAME},
     runtime::{RuntimeLayout, TerminalSize, DEFAULT_DAEMON_NAME},
     server::{EndBound, SessionService, StartBound},
-    session::{daemon_pid_path, session_socket_path},
+    session::{daemon_pid_path, ensure_session_started, session_socket_path, SessionStartOptions},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
 #[cfg(feature = "ghostty-vt")]
@@ -438,6 +438,100 @@ fn create_makes_session_directory_and_returns_metadata() {
     let output = cli::execute(cli, &service).expect("execute create").expect("create output");
     assert_eq!(output, "alpha");
     assert!(service.session_dir("alpha").exists());
+}
+
+#[test]
+fn create_existing_session_returns_its_running_metadata() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let service = SessionService::new(layout.clone());
+    let first_cwd = temp.path().join("first");
+    let second_cwd = temp.path().join("second");
+    std::fs::create_dir_all(&first_cwd).expect("create first cwd");
+    std::fs::create_dir_all(&second_cwd).expect("create second cwd");
+
+    let first = ensure_session_started(
+        &layout,
+        Some("alpha".into()),
+        Some(VtEngineKind::Passthrough),
+        Some(first_cwd),
+        Some("sleep 30".into()),
+        SessionStartOptions::default(),
+    )
+    .expect("create first session");
+    let tags = service.update_tags("alpha", vec!["project=cleat".into()], Vec::new()).expect("tag running session");
+    assert_eq!(tags, ["project=cleat"]);
+    let second = ensure_session_started(
+        &layout,
+        Some("alpha".into()),
+        Some(VtEngineKind::Passthrough),
+        Some(second_cwd),
+        Some("printf replacement".into()),
+        SessionStartOptions::default(),
+    )
+    .expect("ensure existing session");
+
+    let mut expected = first;
+    expected.tags = tags;
+    assert_eq!(second, expected);
+
+    service.kill("alpha").expect("kill session");
+}
+
+#[test]
+fn failures_after_protocol_upgrade_close_without_an_http_error() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for route in ["attach", "watch", "packet"] {
+        let _failure = EnvVarGuard::set("CLEAT_TEST_FAIL_AFTER_HTTP_UPGRADE", route);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = service_for(temp.path());
+        service
+            .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+            .expect("create session");
+
+        let mut stream = match route {
+            "attach" => http_attach_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback()),
+            "watch" => http_watch_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback()),
+            "packet" => http_packet_stream(temp.path(), "alpha"),
+            _ => unreachable!(),
+        };
+        let mut post_upgrade = Vec::new();
+        stream.read_to_end(&mut post_upgrade).expect("read upgraded stream to close");
+
+        assert!(post_upgrade.is_empty(), "HTTP bytes followed the {route} 101 response: {}", String::from_utf8_lossy(&post_upgrade));
+
+        service.kill("alpha").expect("kill session");
+    }
+}
+
+#[test]
+fn partial_handshakes_do_not_block_ready_control_requests() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create session");
+
+    let socket_path = session_socket_path(temp.path(), "alpha");
+    let mut partials = Vec::new();
+    for _ in 0..4 {
+        let mut stream = UnixStream::connect(&socket_path).expect("connect partial request");
+        stream.write_all(b"GET /").expect("write partial request");
+        partials.push(stream);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    let start = Instant::now();
+    let mut ready = UnixStream::connect(&socket_path).expect("connect ready request");
+    ready.set_read_timeout(Some(Duration::from_secs(2))).expect("set ready response timeout");
+    ready.write_all(b"GET /healthz HTTP/1.1\r\nHost: cleat\r\n\r\n").expect("write ready request");
+    let response = read_http_response_head(&mut ready);
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(start.elapsed() < Duration::from_millis(700), "ready request waited behind partial handshakes: {:?}", start.elapsed());
+
+    drop(partials);
+    service.kill("alpha").expect("kill session");
 }
 
 #[cfg(feature = "ghostty-vt")]

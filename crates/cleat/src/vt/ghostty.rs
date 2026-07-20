@@ -100,7 +100,10 @@ impl GhosttyVtEngine {
         let in_viewport = self.render_state.get_cursor_viewport_has_value()?;
 
         if !visible || !in_viewport {
-            return Ok(CursorState { visible, ..CursorState::default() });
+            // A cursor scrolled out of the viewport has no drawable position in
+            // this grid; report it hidden rather than visible at a defaulted
+            // (0,0), which renderers would paint as a phantom cursor.
+            return Ok(CursorState { visible: false, ..CursorState::default() });
         }
 
         let col = self.render_state.get_cursor_viewport_x()?;

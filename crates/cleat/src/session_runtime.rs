@@ -62,6 +62,12 @@ impl SessionRuntime {
         let recreating = crate::recreate::session_is_recreatable(&session_dir);
         if recreating {
             crate::recreate::seed_engine_from_cast(&mut *vt_engine, &cast_path)?;
+            // Seeded history can contain queries from the prior activation
+            // (DSR/CPR, DA, DECRQM, ...) which the engine answers synchronously
+            // into its reply buffer. Those answers belong to a program that no
+            // longer exists — discard them so the first detached pump doesn't
+            // write them to the new child's stdin as phantom input.
+            let _ = vt_engine.drain_replies();
         }
 
         let pty_child = PtyChild::spawn(session)?;
@@ -645,5 +651,44 @@ mod tests {
         // The recording continues in the same cast across the activation boundary.
         let raw = std::fs::read_to_string(session_dir.join(crate::recording::CAST_FILE_NAME)).expect("read cast");
         assert!(raw.contains("session-recreated"), "activation boundary marker recorded");
+    }
+
+    #[cfg(all(unix, feature = "ghostty-vt"))]
+    #[test]
+    fn recreation_discards_stale_query_replies_from_seeded_history() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().to_path_buf();
+        let colors = crate::vt::TerminalColors::default();
+
+        // A prior activation whose recorded output contains a CPR query
+        // (\x1b[6n): the dead program asked for the cursor position.
+        let mut recorder = crate::recording::SessionRecorder::new(&session_dir, 80, 24, "ghostty").expect("recorder");
+        recorder.output(b"hello\x1b[6n", Duration::from_millis(10));
+        recorder.flush();
+        drop(recorder);
+
+        // Precondition: seeding this history really does buffer a reply, so the
+        // assertion below cannot pass vacuously.
+        let mut probe = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).expect("probe engine");
+        crate::recreate::seed_engine_from_cast(&mut *probe, &session_dir.join(crate::recording::CAST_FILE_NAME))
+            .expect("seed probe engine");
+        assert!(!probe.drain_replies().is_empty(), "seeded query should buffer a reply in the engine");
+
+        let session = SessionMetadata {
+            id: "recreate-replies".to_string(),
+            vt_engine: VtEngineKind::Ghostty,
+            cwd: None,
+            cmd: Some("sleep 30".to_string()),
+            tags: Vec::new(),
+            record: false,
+            initial_size: crate::runtime::TerminalSize::default(),
+            colors,
+        };
+        let engine = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).expect("engine");
+        let mut rt = SessionRuntime::spawn(session_dir, &session, engine).expect("spawn recreation");
+
+        // The stale answer belongs to the dead program: it must not be pending
+        // where the first detached pump would write it to the new child's stdin.
+        assert!(rt.vt_engine.drain_replies().is_empty(), "stale replies must be discarded during spawn");
     }
 }

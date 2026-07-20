@@ -123,8 +123,26 @@ impl PtyChild {
                 killpg(fg_pgid, signal).map_err(|err| format!("killpg: {err}"))
             }
             SignalTarget::Leader => nix::sys::signal::kill(self.pid, signal).map_err(|err| format!("kill: {err}")),
-            SignalTarget::Tree => Err("tree signal target is not yet implemented".to_string()),
+            SignalTarget::Tree => {
+                // The forkpty child is a session leader, so its pid doubles as its
+                // process-group id. Children stay in that group unless they setsid.
+                let leader_pgid = self.pid;
+                killpg_ignoring_dead(leader_pgid, signal)?;
+                if let Ok(fg_pgid) = tcgetpgrp(self.master_fd.as_fd()) {
+                    if fg_pgid != leader_pgid {
+                        killpg_ignoring_dead(fg_pgid, signal)?;
+                    }
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+fn killpg_ignoring_dead(pgid: Pid, signal: Signal) -> Result<(), String> {
+    match killpg(pgid, signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(err) => Err(format!("killpg: {err}")),
     }
 }
 

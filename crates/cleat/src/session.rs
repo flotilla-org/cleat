@@ -848,7 +848,10 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             };
             if !registered && registration_was_lost {
                 for hosted in sessions.values() {
-                    let _ = hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader);
+                    // Tree, not Leader: this path has the same orphaned-child
+                    // problem as SessionDelete — a background child in the
+                    // leader's process group must not outlive the fenced daemon.
+                    let _ = hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Tree);
                 }
                 // Deliberately leave the socket and pid file alone on this
                 // path: they are either already gone or owned by a successor.
@@ -1551,7 +1554,7 @@ fn handle_http_request(
             let Some(hosted) = state.sessions.get(&id) else {
                 return write_http_not_found(stream);
             };
-            hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Leader)?;
+            hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Tree)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
         }
         http_uds::Route::SessionAttach { id } => 'attach: {

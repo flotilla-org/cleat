@@ -523,6 +523,9 @@ struct HostedSession {
     had_foreground_client: bool,
     pending_waits: Vec<PendingWait>,
     pending_expects: Vec<PendingExpect>,
+    /// Render generation at the last screen-stable fingerprint snapshot; lets
+    /// the servicing loop skip full-grid snapshots while nothing has rendered.
+    screen_stable_snapshot_generation: Option<u64>,
     should_keep_session_dir: bool,
 }
 
@@ -546,6 +549,7 @@ impl HostedSession {
             had_foreground_client: false,
             pending_waits: Vec::new(),
             pending_expects: Vec::new(),
+            screen_stable_snapshot_generation: None,
             should_keep_session_dir,
         })
     }
@@ -1217,7 +1221,7 @@ fn service_hosted_session(
         broadcast_directory_upsert(directory_entry_for_session(layout, hosted, packet_clients)?, packet_clients)?;
     }
 
-    service_pending_waits(&hosted.actor, &mut hosted.pending_waits);
+    service_pending_waits(&hosted.actor, &mut hosted.pending_waits, &mut hosted.screen_stable_snapshot_generation);
     service_pending_expects(layout, id, &hosted.actor, &mut hosted.pending_expects)?;
     // Recording flush happens actor-side after each pump slice; no per-tick
     // round-trip here (ADR 0004: the servicing side is never blocked).
@@ -1225,10 +1229,30 @@ fn service_hosted_session(
     Ok(did_work)
 }
 
-fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWait>) {
+/// Whether a screen-stable wait needs a fresh full-grid fingerprint. An
+/// unchanged render generation means the actor has fed nothing to the engine
+/// since the last fingerprint, so the screen cannot have changed and the
+/// existing stability window simply keeps aging without a snapshot.
+fn screen_stable_needs_snapshot(current_generation: u64, last_snapshot_generation: Option<u64>) -> bool {
+    last_snapshot_generation != Some(current_generation)
+}
+
+fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWait>, last_snapshot_generation: &mut Option<u64>) {
     let screen_stable_fingerprint = if pending_waits.iter().any(|wait| wait.screen_stable.is_some()) {
-        actor.full_snapshot().ok().map(ScreenStableFingerprint::from_snapshot)
+        // Read the generation before snapshotting: a pump landing in between
+        // costs one redundant snapshot next tick instead of a missed change.
+        let generation = actor.observation().render_generation();
+        if screen_stable_needs_snapshot(generation, *last_snapshot_generation) {
+            let fingerprint = actor.full_snapshot().ok().map(ScreenStableFingerprint::from_snapshot);
+            if fingerprint.is_some() {
+                *last_snapshot_generation = Some(generation);
+            }
+            fingerprint
+        } else {
+            None
+        }
     } else {
+        *last_snapshot_generation = None;
         None
     };
     let now = Instant::now();
@@ -1837,8 +1861,16 @@ fn handle_http_request(
             }
             let registered_at = Instant::now();
             let screen_stable = if has_screen_stable {
+                // Read the generation before snapshotting (same conservative
+                // ordering as service_pending_waits) and seed the snapshot
+                // memo, so the next servicing tick doesn't immediately take a
+                // second full-grid snapshot right after this one.
+                let generation = hosted.actor.observation().render_generation();
                 match hosted.actor.full_snapshot() {
-                    Ok(snapshot) => Some(ScreenStableState::new(ScreenStableFingerprint::from_snapshot(snapshot), registered_at)),
+                    Ok(snapshot) => {
+                        hosted.screen_stable_snapshot_generation = Some(generation);
+                        Some(ScreenStableState::new(ScreenStableFingerprint::from_snapshot(snapshot), registered_at))
+                    }
                     Err(err) => {
                         http_uds::write_error(stream, StatusCode::CONFLICT, &format!("screen stability not supported: {err}"))
                             .map_err(|err| format!("write HTTP wait error: {err}"))?;
@@ -2972,6 +3004,17 @@ mod tests {
         let reset_at = original_stable_since + Duration::from_millis(200);
         state.observe(screen_stable_fingerprint_with_cells(80, SCREEN_STABLE_CHANGED_CELL_TOLERANCE + 1), reset_at);
         assert_eq!(state.stable_since, reset_at);
+    }
+
+    #[test]
+    fn screen_stable_snapshot_gating_tracks_render_generation() {
+        // No fingerprint taken yet: always snapshot.
+        assert!(super::screen_stable_needs_snapshot(0, None));
+        // Nothing rendered since the last fingerprint: the screen cannot have
+        // changed, skip the snapshot and let the stability window age.
+        assert!(!super::screen_stable_needs_snapshot(7, Some(7)));
+        // A pump advanced the generation: re-fingerprint.
+        assert!(super::screen_stable_needs_snapshot(8, Some(7)));
     }
 
     #[test]

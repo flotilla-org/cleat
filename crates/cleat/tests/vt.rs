@@ -292,6 +292,60 @@ fn vt_ghostty_scrollbar_and_viewport_commands_track_scrollback() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_cursor_hidden_while_scrolled_out_of_viewport() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
+    for line in 0..8 {
+        engine.feed(format!("line {line}\r\n").as_bytes()).expect("feed line");
+    }
+
+    let live = engine.screen_grid().expect("live grid");
+    assert!(live.cursor.visible);
+    let live_cursor = live.cursor;
+
+    engine.scroll_viewport(ViewportCommand::Top).expect("scroll to top");
+    let scrolled = engine.screen_grid().expect("scrolled grid");
+    assert!(!scrolled.cursor.visible, "cursor scrolled out of the viewport must not be drawable: {:?}", scrolled.cursor);
+
+    engine.scroll_viewport(ViewportCommand::Bottom).expect("scroll back to bottom");
+    let restored = engine.screen_grid().expect("restored grid");
+    assert_eq!(restored.cursor, live_cursor, "returning to the live viewport restores the cursor");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_cursor_clamps_to_last_column_while_wrap_pending() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(10, 3);
+
+    engine.feed(b"0123456789").expect("fill first row exactly");
+    let pending = engine.screen_grid().expect("wrap-pending grid");
+    assert!(pending.cursor.visible);
+    assert_eq!((pending.cursor.col, pending.cursor.row), (9, 0), "wrap-pending cursor reports the last column");
+
+    engine.feed(b"a").expect("write past the wrap");
+    let wrapped = engine.screen_grid().expect("wrapped grid");
+    assert_eq!((wrapped.cursor.col, wrapped.cursor.row), (1, 1), "next write lands on the second row");
+    assert_eq!(wrapped.row_text(1).trim_end(), "a");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_cursor_reports_wide_tail_on_wide_glyph_tail_cell() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(10, 3);
+
+    engine.feed("字".as_bytes()).expect("feed wide glyph");
+    let after = engine.screen_grid().expect("grid after wide glyph");
+    assert_eq!(after.cursor.col, 2, "cursor advances past both cells of a wide glyph");
+    assert!(!after.cursor.wide_tail);
+
+    // Park the cursor on the tail (spacer) cell of the wide glyph (1-based col 2).
+    engine.feed(b"\x1b[1;2H").expect("move onto tail cell");
+    let tail = engine.screen_grid().expect("grid on tail cell");
+    assert_eq!(tail.cursor.col, 1);
+    assert!(tail.cursor.wide_tail, "cursor on the spacer tail of a wide glyph reports wide_tail");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_screen_grid_updates_after_new_input() {
     let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 3);
 

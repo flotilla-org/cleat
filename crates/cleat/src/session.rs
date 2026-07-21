@@ -394,7 +394,7 @@ fn record_pty_output(engine: &mut dyn VtEngine, bytes: &[u8]) -> Result<(), Stri
 }
 
 fn attach_init_capabilities() -> vt::ClientCapabilities {
-    vt::ClientCapabilities::conservative_fallback()
+    vt::ClientCapabilities::detect()
 }
 
 fn attach_capabilities_to_http(capabilities: vt::ClientCapabilities) -> http_uds::AttachCapabilitiesRequest {
@@ -2798,7 +2798,11 @@ mod tests {
         assert!(request.starts_with("POST /sessions/alpha/attach HTTP/1.1\r\n"), "{request}");
         assert!(request.contains("Connection: Upgrade\r\n"), "{request}");
         assert!(request.contains("Upgrade: cleat-attach/1\r\n"), "{request}");
-        assert!(request.ends_with(r#""capabilities":{"color_level":"sixteen","kitty_keyboard":false}}"#), "{request}");
+        // Capabilities are detected from the ambient environment, so compare
+        // against the serialization of whatever detection currently reports.
+        let expected_capabilities =
+            serde_json::to_string(&super::attach_capabilities_to_http(attach_init_capabilities())).expect("serialize capabilities");
+        assert!(request.ends_with(&format!(r#""capabilities":{expected_capabilities}}}"#)), "{request}");
     }
 
     #[test]
@@ -2950,8 +2954,11 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_attach_init_capabilities_use_conservative_terminal_assumptions() {
-        assert_eq!(attach_init_capabilities(), vt::ClientCapabilities::conservative_fallback());
+    fn lifecycle_attach_init_capabilities_detect_from_environment() {
+        // Detection reads the ambient environment, so assert the wiring rather
+        // than a specific level; the pure detection logic is unit-tested in
+        // `vt::tests`.
+        assert_eq!(attach_init_capabilities(), vt::ClientCapabilities::detect());
     }
 
     fn screen_stable_fingerprint_with_cells(cell_count: usize, changed_prefix: usize) -> ScreenStableFingerprint {

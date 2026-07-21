@@ -799,9 +799,9 @@ fn flush_watchers(watchers: &mut Vec<ActiveClient>) {
 #[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> {
     let layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(daemon_name.to_string())?;
-    layout.ensure_daemon_dirs()?;
     let socket_path = layout.socket_path();
     validate_session_socket_path(&socket_path)?;
+    layout.ensure_daemon_dirs()?;
     let listener = match bind_session_listener(&socket_path) {
         Ok(listener) => listener,
         Err(first_err) => {

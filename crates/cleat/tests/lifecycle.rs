@@ -34,7 +34,7 @@ use cleat::{
     recording::{SessionRecorder, CAST_FILE_NAME},
     runtime::{RuntimeLayout, TerminalSize, DEFAULT_DAEMON_NAME},
     server::{EndBound, SessionService, StartBound},
-    session::{daemon_pid_path, ensure_session_started, session_socket_path, SessionStartOptions},
+    session::{daemon_pid_path, ensure_session_started, run_session_daemon, session_socket_path, SessionStartOptions},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
 #[cfg(feature = "ghostty-vt")]
@@ -2373,6 +2373,17 @@ fn overlong_daemon_socket_path_is_rejected_before_spawn() {
     assert!(started.elapsed() < Duration::from_secs(1), "socket path validation should fail before spawning a daemon");
     assert!(err.contains("Unix socket path"), "{err}");
     assert!(err.contains("CLEAT_RUNTIME_DIR"), "{err}");
+}
+
+#[test]
+fn direct_daemon_serve_rejects_overlong_socket_path_before_creating_directories() {
+    let temp = tempfile::Builder::new().prefix("cleat-socket-").tempdir_in("/tmp").expect("short-path tempdir");
+    let root = temp.path().join("x".repeat(120));
+
+    let err = run_session_daemon(&root, DEFAULT_DAEMON_NAME).expect_err("overlong daemon socket path should be rejected");
+
+    assert!(err.contains("Unix socket path"), "{err}");
+    assert!(!root.exists(), "socket validation should run before creating daemon directories");
 }
 
 #[cfg(feature = "ghostty-vt")]

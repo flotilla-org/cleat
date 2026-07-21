@@ -612,21 +612,25 @@ fn vt_ghostty_screen_grid_resolves_explicit_fg_and_bg_colors() {
 fn vt_ghostty_snapshot_and_render_update_resolve_background_only_cells() {
     use cleat::vt::Rgb;
 
-    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(4, 2);
-    engine.feed(b"\x1b[48;5;42m\x1b[2K").expect("erase row with palette background");
+    fn assert_background_only_cell(input: &[u8], expected: Rgb) {
+        let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(4, 2);
+        engine.feed(input).expect("erase row with configured background");
 
-    let expected = Rgb { r: 0, g: 215, b: 135 };
-    let grid = engine.screen_grid().expect("screen grid");
-    let grid_cell = grid.cell(0, 0).expect("background-only grid cell");
-    assert!(grid_cell.graphemes.is_empty());
-    assert_eq!(grid_cell.bg, expected);
+        let grid = engine.screen_grid().expect("screen grid");
+        let grid_cell = grid.cell(0, 0).expect("background-only grid cell");
+        assert!(grid_cell.graphemes.is_empty());
+        assert_eq!(grid_cell.bg, expected);
 
-    let update = engine.render_update(DirtyState::Full).expect("full render update");
-    let render_cell = &update.ops[0].rows[0].cells[0];
-    assert!(render_cell.graphemes.is_empty());
-    assert_eq!(render_cell.style.resolved_bg.r, expected.r);
-    assert_eq!(render_cell.style.resolved_bg.g, expected.g);
-    assert_eq!(render_cell.style.resolved_bg.b, expected.b);
+        let update = engine.render_update(DirtyState::Full).expect("full render update");
+        let render_cell = &update.ops[0].rows[0].cells[0];
+        assert!(render_cell.graphemes.is_empty());
+        assert_eq!(render_cell.style.resolved_bg.r, expected.r);
+        assert_eq!(render_cell.style.resolved_bg.g, expected.g);
+        assert_eq!(render_cell.style.resolved_bg.b, expected.b);
+    }
+
+    assert_background_only_cell(b"\x1b[48;5;42m\x1b[2K", Rgb { r: 0, g: 215, b: 135 });
+    assert_background_only_cell(b"\x1b[48;2;17;34;51m\x1b[2K", Rgb { r: 17, g: 34, b: 51 });
 }
 
 #[cfg(feature = "ghostty-vt")]

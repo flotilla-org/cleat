@@ -1526,7 +1526,7 @@ fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
-fn packet_concurrent_channels_receive_same_dirty_generation() {
+fn packet_concurrent_channels_each_progress_past_initial_generation() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
@@ -1555,7 +1555,14 @@ fn packet_concurrent_channels_receive_same_dirty_generation() {
     let first_update = read_packet_render(&mut first_stream, &mut first_buffer, 1, Duration::from_secs(2));
     let second_update = read_packet_render(&mut second_stream, &mut second_buffer, 1, Duration::from_secs(2));
 
-    assert_eq!(first_update.render_generation, second_update.render_generation);
+    // Not exact equality: the session is live, so an extra pump (echo split
+    // across reads, terminal-mode sync) can advance the generation between the
+    // two reads. Each viewer must have progressed past its initial render.
+    assert!(first_update.render_generation > first_initial.render_generation, "first viewer should progress past its initial generation");
+    assert!(
+        second_update.render_generation > second_initial.render_generation,
+        "second viewer should progress past its initial generation"
+    );
     assert!(!first_update.ops.is_empty(), "first viewer should receive row content");
     assert!(!second_update.ops.is_empty(), "second viewer should receive row content");
 }
@@ -1599,7 +1606,16 @@ fn packet_lagging_channel_receives_cached_generation_after_session_goes_clean() 
     packet_ack(&mut slow_stream, 1, slow_initial.render_generation);
     let slow_update = read_packet_render(&mut slow_stream, &mut slow_buffer, 1, Duration::from_secs(2));
 
-    assert_eq!(slow_update.render_generation, fast_update.render_generation);
+    // Not exact equality: the session is live, so an extra pump between the
+    // fast viewer's read and the slow viewer's read can advance the generation
+    // (issue #149). The lagging viewer must catch up to at least the
+    // generation the fast viewer acked.
+    assert!(
+        slow_update.render_generation >= fast_update.render_generation,
+        "lagging viewer (gen {}) should catch up to the fast viewer's acked generation ({})",
+        slow_update.render_generation,
+        fast_update.render_generation
+    );
     assert!(!slow_update.ops.is_empty(), "lagging viewer should receive cached row content after fast ack");
 }
 

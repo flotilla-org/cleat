@@ -1,12 +1,12 @@
 use super::{
     ghostty_ffi::{
-        self, GhosttyCellContentTag, GhosttyCellSemanticContent, GhosttyCellWide, GhosttyFormatterFormat, GhosttyFormatterTerminalOptions,
-        GhosttyMods, GhosttyMouseAction, GhosttyMouseButton, GhosttyRenderStateCursorVisualStyle, GhosttyRenderStateDirty, GhosttyRowData,
-        GhosttyRowSemanticPrompt, GhosttyStyle, GhosttyStyleColor, GhosttyStyleColorTag, GhosttyTerminalScreen,
-        GhosttyTerminalScrollViewport, MouseEncodeEvent, MouseEncoder, RenderStateHandle, RowCellsHandle, RowIteratorHandle,
-        TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_BRACKETED_PASTE, GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_MOUSE_ANY,
-        GHOSTTY_MODE_MOUSE_BUTTON, GHOSTTY_MODE_MOUSE_NORMAL, GHOSTTY_MODE_MOUSE_X10, GHOSTTY_MODE_SGR_MOUSE,
-        GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
+        self, GhosttyCellContentTag, GhosttyCellSemanticContent, GhosttyCellSnapshot, GhosttyCellWide, GhosttyFormatterFormat,
+        GhosttyFormatterTerminalOptions, GhosttyMods, GhosttyMouseAction, GhosttyMouseButton, GhosttyRenderStateColors,
+        GhosttyRenderStateCursorVisualStyle, GhosttyRenderStateDirty, GhosttyRowData, GhosttyRowSemanticPrompt, GhosttyStyle,
+        GhosttyStyleColor, GhosttyStyleColorTag, GhosttyTerminalScreen, GhosttyTerminalScrollViewport, MouseEncodeEvent, MouseEncoder,
+        RenderStateHandle, RowCellsHandle, RowIteratorHandle, TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_BRACKETED_PASTE,
+        GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_MOUSE_ANY, GHOSTTY_MODE_MOUSE_BUTTON, GHOSTTY_MODE_MOUSE_NORMAL, GHOSTTY_MODE_MOUSE_X10,
+        GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
     },
     CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, MouseAction, MouseButton, MouseModifiers,
     MouseReportFormat, MouseTrackingMode, ResolvedCell, Rgb, ScreenGrid, TerminalColors, TerminalModeState, VtEngine,
@@ -126,95 +126,66 @@ impl GhosttyVtEngine {
         row: u16,
         cols: u16,
         raw_row: ghostty_ffi::GhosttyRow,
-        default_fg: Rgb,
-        default_bg: Rgb,
+        colors: &GhosttyRenderStateColors,
         dirty: bool,
-    ) -> Result<(TerminalRenderRow, Vec<ResolvedCell>), String> {
+        cached_cells: &mut [ResolvedCell],
+    ) -> Result<TerminalRenderRow, String> {
         self.row_iter.populate_cells(&mut self.row_cells)?;
 
         let mut render_cells = Vec::with_capacity(cols as usize);
-        let mut resolved_cells = Vec::with_capacity(cols as usize);
+        let mut col_idx = 0;
         while self.row_cells.next() {
-            let graphemes_len = self.row_cells.get_graphemes_len()?;
-            let graphemes = if graphemes_len > 0 {
-                let mut buf = vec![0u32; graphemes_len as usize];
-                self.row_cells.get_graphemes_buf(&mut buf)?;
-                buf
-            } else {
-                Vec::new()
-            };
-
-            let resolved_fg = self.row_cells.get_fg_color()?.map(rgb_from_ghostty).unwrap_or(default_fg);
-            let resolved_bg = self.row_cells.get_bg_color()?.map(rgb_from_ghostty).unwrap_or(default_bg);
-            let style = self.row_cells.get_style()?;
-            let flags = flags_from_ghostty_style(&style);
-            let underline_style = u32::try_from(style.underline).unwrap_or(0);
-            let underline_color = rgb_from_ghostty_style_color(style.underline_color);
-            let protected = self.row_cells.get_protected()?;
-            let has_hyperlink = self.row_cells.get_has_hyperlink()?;
-            let semantic = semantic_from_ghostty(self.row_cells.get_semantic_content()?);
-            let width = cell_width_from_ghostty(self.row_cells.get_wide()?);
-
-            resolved_cells.push(ResolvedCell {
-                graphemes: graphemes.clone(),
-                fg: resolved_fg,
-                bg: resolved_bg,
-                underline_color,
-                flags,
-                underline_style,
-                width,
-                protected,
-                semantic,
-                has_hyperlink,
-            });
+            let resolved_cell =
+                cached_cells.get_mut(col_idx).ok_or_else(|| format!("ghostty returned more than {cols} cells for render row {row}"))?;
+            let cell = self.row_cells.read_cell_into(&mut resolved_cell.graphemes)?;
+            apply_ghostty_cell_snapshot(resolved_cell, &cell, colors);
+            let style = cell.style;
 
             render_cells.push(TerminalRenderCell {
-                graphemes,
+                graphemes: resolved_cell.graphemes.clone(),
                 style: TerminalRenderStyle {
-                    flags: terminal_cell_flags_from_vt(flags),
-                    width: terminal_cell_width_from_vt(width),
-                    resolved_fg: terminal_rgb_from_rgb(resolved_fg),
-                    resolved_bg: terminal_rgb_from_rgb(resolved_bg),
+                    flags: terminal_cell_flags_from_vt(resolved_cell.flags),
+                    width: terminal_cell_width_from_vt(resolved_cell.width),
+                    resolved_fg: terminal_rgb_from_rgb(resolved_cell.fg),
+                    resolved_bg: terminal_rgb_from_rgb(resolved_cell.bg),
                     fg_color: terminal_style_color_from_ghostty(style.fg_color),
                     bg_color: terminal_style_color_from_ghostty(style.bg_color),
-                    underline_style,
+                    underline_style: resolved_cell.underline_style,
                     underline_color: terminal_style_color_from_ghostty(style.underline_color),
-                    protected,
-                    semantic,
-                    has_hyperlink,
+                    protected: cell.protected,
+                    semantic: resolved_cell.semantic,
+                    has_hyperlink: cell.has_hyperlink,
                     hyperlink_id: 0,
-                    content_tag: content_tag_from_ghostty(self.row_cells.get_content_tag()?),
-                    has_text: self.row_cells.get_has_text()?,
-                    has_styling: self.row_cells.get_has_styling()?,
-                    style_id: self.row_cells.get_style_id()?,
+                    content_tag: content_tag_from_ghostty(cell.content_tag),
+                    has_text: cell.has_text,
+                    has_styling: cell.has_styling,
+                    style_id: cell.style_id,
                 },
             });
+            col_idx += 1;
         }
 
-        Ok((
-            TerminalRenderRow {
-                row,
-                col_count: cols,
-                cells: render_cells,
-                wrap: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::Wrap, "ghostty_row_get(Wrap)")?,
-                wrap_continuation: ghostty_ffi::row_get_bool(
-                    raw_row,
-                    GhosttyRowData::WrapContinuation,
-                    "ghostty_row_get(WrapContinuation)",
-                )?,
-                has_graphemes: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::Grapheme, "ghostty_row_get(Grapheme)")?,
-                has_styling: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::Styled, "ghostty_row_get(Styled)")?,
-                has_hyperlink: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::Hyperlink, "ghostty_row_get(Hyperlink)")?,
-                semantic_prompt: row_semantic_prompt_from_ghostty(ghostty_ffi::row_get_semantic_prompt(raw_row)?),
-                has_kitty_virtual_placeholder: ghostty_ffi::row_get_bool(
-                    raw_row,
-                    GhosttyRowData::KittyVirtualPlaceholder,
-                    "ghostty_row_get(KittyVirtualPlaceholder)",
-                )?,
-                dirty,
-            },
-            resolved_cells,
-        ))
+        if col_idx != cached_cells.len() {
+            return Err(format!("ghostty returned {col_idx} cells for {cols}-column render row {row}"));
+        }
+
+        Ok(TerminalRenderRow {
+            row,
+            col_count: cols,
+            cells: render_cells,
+            wrap: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::Wrap, "ghostty_row_get(Wrap)")?,
+            wrap_continuation: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::WrapContinuation, "ghostty_row_get(WrapContinuation)")?,
+            has_graphemes: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::Grapheme, "ghostty_row_get(Grapheme)")?,
+            has_styling: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::Styled, "ghostty_row_get(Styled)")?,
+            has_hyperlink: ghostty_ffi::row_get_bool(raw_row, GhosttyRowData::Hyperlink, "ghostty_row_get(Hyperlink)")?,
+            semantic_prompt: row_semantic_prompt_from_ghostty(ghostty_ffi::row_get_semantic_prompt(raw_row)?),
+            has_kitty_virtual_placeholder: ghostty_ffi::row_get_bool(
+                raw_row,
+                GhosttyRowData::KittyVirtualPlaceholder,
+                "ghostty_row_get(KittyVirtualPlaceholder)",
+            )?,
+            dirty,
+        })
     }
 }
 
@@ -330,11 +301,10 @@ impl VtEngine for GhosttyVtEngine {
 
         let dirty = self.render_state.get_dirty()?;
         if dirty == GhosttyRenderStateDirty::False {
-            if let Some(ref cached) = self.cached_grid {
-                let mut grid = cached.clone();
-                grid.cursor = self.read_cursor_state()?;
-                self.cached_grid = Some(grid.clone());
-                return Ok(grid);
+            let cursor = self.read_cursor_state()?;
+            if let Some(cached) = self.cached_grid.as_mut() {
+                cached.cursor = cursor;
+                return Ok(cached.clone());
             }
         }
 
@@ -342,19 +312,17 @@ impl VtEngine for GhosttyVtEngine {
         let rows = self.render_state.get_rows()?;
         let colors = self.render_state.get_colors()?;
 
-        let default_fg = Rgb { r: colors.foreground.r, g: colors.foreground.g, b: colors.foreground.b };
-        let default_bg = Rgb { r: colors.background.r, g: colors.background.g, b: colors.background.b };
-
         let mut partial = dirty == GhosttyRenderStateDirty::Partial;
         let row_stride = cols as usize;
+        let expected_cell_count = row_stride * rows as usize;
 
-        // Reuse the cached cell vec when doing a partial update.
-        let mut cells = if partial { self.cached_grid.take().map(|g| g.cells).unwrap_or_default() } else { Vec::new() };
-        if cells.len() != row_stride * (rows as usize) {
+        // Reuse per-cell grapheme allocations on both partial and full redraws.
+        let mut cells = self.cached_grid.take().map(|g| g.cells).unwrap_or_default();
+        if cells.len() != expected_cell_count {
             // Dimensions changed or no cache — force a full rebuild.
             partial = false;
             cells.clear();
-            cells.reserve(row_stride * (rows as usize));
+            cells.resize_with(expected_cell_count, ResolvedCell::default);
         }
 
         self.render_state.populate_row_iterator(&mut self.row_iter)?;
@@ -375,52 +343,15 @@ impl VtEngine for GhosttyVtEngine {
             let row_start = row_idx * row_stride;
             let mut col_idx: usize = 0;
             while self.row_cells.next() {
-                let graphemes_len = self.row_cells.get_graphemes_len()?;
-                let graphemes = if graphemes_len > 0 {
-                    let mut buf = vec![0u32; graphemes_len as usize];
-                    self.row_cells.get_graphemes_buf(&mut buf)?;
-                    buf
-                } else {
-                    Vec::new()
-                };
-
-                let fg = match self.row_cells.get_fg_color()? {
-                    Some(c) => Rgb { r: c.r, g: c.g, b: c.b },
-                    None => default_fg,
-                };
-                let bg = match self.row_cells.get_bg_color()? {
-                    Some(c) => Rgb { r: c.r, g: c.g, b: c.b },
-                    None => default_bg,
-                };
-
-                let style = self.row_cells.get_style()?;
-                let flags = flags_from_ghostty_style(&style);
-                let underline_style = u32::try_from(style.underline).unwrap_or(0);
-                let underline_color = rgb_from_ghostty_style_color(style.underline_color);
-                let protected = self.row_cells.get_protected()?;
-                let has_hyperlink = self.row_cells.get_has_hyperlink()?;
-                let semantic = match self.row_cells.get_semantic_content()? {
-                    GhosttyCellSemanticContent::Output => 0,
-                    GhosttyCellSemanticContent::Input => 1,
-                    GhosttyCellSemanticContent::Prompt => 2,
-                };
-
-                let width = match self.row_cells.get_wide()? {
-                    GhosttyCellWide::Narrow => CellWidth::Narrow,
-                    GhosttyCellWide::Wide => CellWidth::Wide,
-                    GhosttyCellWide::SpacerTail => CellWidth::SpacerTail,
-                    GhosttyCellWide::SpacerHead => CellWidth::SpacerHead,
-                };
-
-                let cell =
-                    ResolvedCell { graphemes, fg, bg, underline_color, flags, underline_style, width, protected, semantic, has_hyperlink };
                 let idx = row_start + col_idx;
-                if idx < cells.len() {
-                    cells[idx] = cell;
-                } else {
-                    cells.push(cell);
-                }
+                let resolved_cell =
+                    cells.get_mut(idx).ok_or_else(|| format!("ghostty returned too many cells for {cols}x{rows} screen grid"))?;
+                let cell = self.row_cells.read_cell_into(&mut resolved_cell.graphemes)?;
+                apply_ghostty_cell_snapshot(resolved_cell, &cell, &colors);
                 col_idx += 1;
+            }
+            if col_idx != row_stride {
+                return Err(format!("ghostty returned {col_idx} cells for {cols}-column screen-grid row {row_idx}"));
             }
             self.row_iter.set_dirty(false)?;
             row_idx += 1;
@@ -442,8 +373,6 @@ impl VtEngine for GhosttyVtEngine {
         let cols = self.render_state.get_cols()?;
         let rows = self.render_state.get_rows()?;
         let colors = self.render_state.get_colors()?;
-        let default_fg = rgb_from_ghostty(colors.foreground);
-        let default_bg = rgb_from_ghostty(colors.background);
         let had_cache = self.cached_grid.is_some();
         let effective_dirty = effective_render_dirty(dirty, render_dirty, had_cache);
         let row_stride = cols as usize;
@@ -469,14 +398,12 @@ impl VtEngine for GhosttyVtEngine {
                 if include_row {
                     let row = u16::try_from(row_idx).unwrap_or(u16::MAX);
                     let raw_row = self.row_iter.get_raw_row()?;
-                    let (render_row, resolved_cells) = self.read_render_row(row, cols, raw_row, default_fg, default_bg, row_dirty)?;
                     let row_start = row_idx * row_stride;
-                    for (offset, cell) in resolved_cells.into_iter().enumerate() {
-                        let idx = row_start + offset;
-                        if idx < cached_cells.len() {
-                            cached_cells[idx] = cell;
-                        }
-                    }
+                    let row_end = row_start + row_stride;
+                    let cached_row = cached_cells
+                        .get_mut(row_start..row_end)
+                        .ok_or_else(|| format!("render row {row} was outside the {cols}x{rows} cell cache"))?;
+                    let render_row = self.read_render_row(row, cols, raw_row, &colors, row_dirty, cached_row)?;
                     if effective_dirty == DirtyState::Partial {
                         dirty_rows.push(row);
                     }
@@ -711,6 +638,41 @@ fn effective_render_dirty(requested: DirtyState, render_dirty: GhosttyRenderStat
 
 fn rgb_from_ghostty(rgb: ghostty_ffi::GhosttyColorRgb) -> Rgb {
     Rgb { r: rgb.r, g: rgb.g, b: rgb.b }
+}
+
+fn resolved_style_color(
+    color: GhosttyStyleColor,
+    default: ghostty_ffi::GhosttyColorRgb,
+    palette: &[ghostty_ffi::GhosttyColorRgb; 256],
+) -> Rgb {
+    match color.tag {
+        GhosttyStyleColorTag::None => rgb_from_ghostty(default),
+        GhosttyStyleColorTag::Palette => rgb_from_ghostty(palette[usize::from(unsafe { color.value.palette })]),
+        GhosttyStyleColorTag::Rgb => rgb_from_ghostty(unsafe { color.value.rgb }),
+    }
+}
+
+fn resolved_cell_background(cell: &GhosttyCellSnapshot, colors: &GhosttyRenderStateColors) -> Rgb {
+    match cell.content_tag {
+        GhosttyCellContentTag::BgColorPalette => rgb_from_ghostty(colors.palette[usize::from(cell.color_palette)]),
+        GhosttyCellContentTag::BgColorRgb => rgb_from_ghostty(cell.color_rgb),
+        GhosttyCellContentTag::Codepoint | GhosttyCellContentTag::CodepointGrapheme => {
+            resolved_style_color(cell.style.bg_color, colors.background, &colors.palette)
+        }
+    }
+}
+
+fn apply_ghostty_cell_snapshot(target: &mut ResolvedCell, source: &GhosttyCellSnapshot, colors: &GhosttyRenderStateColors) {
+    let style = source.style;
+    target.fg = resolved_style_color(style.fg_color, colors.foreground, &colors.palette);
+    target.bg = resolved_cell_background(source, colors);
+    target.underline_color = rgb_from_ghostty_style_color(style.underline_color);
+    target.flags = flags_from_ghostty_style(&style);
+    target.underline_style = u32::try_from(style.underline).unwrap_or(0);
+    target.width = cell_width_from_ghostty(source.wide);
+    target.protected = source.protected;
+    target.semantic = semantic_from_ghostty(source.semantic_content);
+    target.has_hyperlink = source.has_hyperlink;
 }
 
 fn terminal_rgb_from_rgb(rgb: Rgb) -> TerminalRgb {

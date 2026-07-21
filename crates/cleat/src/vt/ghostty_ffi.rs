@@ -335,6 +335,9 @@ pub enum GhosttyRenderStateRowCellsData {
     GraphemesBuf = 4,
     BgColor = 5,
     FgColor = 6,
+    Selected = 7,
+    HasStyling = 8,
+    GraphemesUtf8 = 9,
 }
 
 pub type GhosttyCell = u64;
@@ -417,6 +420,14 @@ pub struct GhosttyColorRgb {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyBuffer {
+    pub ptr: *mut u8,
+    pub cap: usize,
+    pub len: usize,
 }
 
 #[allow(dead_code)]
@@ -583,6 +594,7 @@ const _: () = assert!(std::mem::size_of::<GhosttyDeviceAttributes>() == 160);
 const _: () = assert!(std::mem::size_of::<GhosttyStyleColor>() == 16);
 const _: () = assert!(std::mem::size_of::<GhosttyStyle>() == 72);
 const _: () = assert!(std::mem::size_of::<GhosttyColorRgb>() == 3);
+const _: () = assert!(std::mem::size_of::<GhosttyBuffer>() == 24);
 const _: () = assert!(std::mem::size_of::<GhosttyRenderStateColors>() == 792);
 const _: () = assert!(std::mem::size_of::<GhosttyTerminalScrollViewport>() == 24);
 const _: () = assert!(std::mem::size_of::<GhosttyTerminalScrollbar>() == 24);
@@ -864,14 +876,22 @@ unsafe extern "C" {
     fn ghostty_render_state_row_cells_next(cells: GhosttyRenderStateRowCells) -> bool;
     #[allow(dead_code)]
     fn ghostty_render_state_row_cells_select(cells: GhosttyRenderStateRowCells, x: u16) -> GhosttyResult;
-    fn ghostty_render_state_row_cells_get(
+    fn ghostty_render_state_row_cells_get_multi(
         cells: GhosttyRenderStateRowCells,
-        data: GhosttyRenderStateRowCellsData,
-        out: *mut c_void,
+        count: usize,
+        keys: *const GhosttyRenderStateRowCellsData,
+        values: *mut *mut c_void,
+        out_written: *mut usize,
     ) -> GhosttyResult;
 
     // --- Cell data ---
-    fn ghostty_cell_get(cell: GhosttyCell, data: GhosttyCellData, out: *mut c_void) -> GhosttyResult;
+    fn ghostty_cell_get_multi(
+        cell: GhosttyCell,
+        count: usize,
+        keys: *const GhosttyCellData,
+        values: *mut *mut c_void,
+        out_written: *mut usize,
+    ) -> GhosttyResult;
     fn ghostty_row_get(row: GhosttyRow, data: GhosttyRowData, out: *mut c_void) -> GhosttyResult;
 }
 
@@ -1938,8 +1958,26 @@ impl Drop for RowIteratorHandle {
     }
 }
 
+const INLINE_GRAPHEME_UTF8_CAPACITY: usize = 64;
+
+pub struct GhosttyCellSnapshot {
+    pub style: GhosttyStyle,
+    pub content_tag: GhosttyCellContentTag,
+    pub wide: GhosttyCellWide,
+    pub has_text: bool,
+    pub has_styling: bool,
+    pub style_id: u16,
+    pub has_hyperlink: bool,
+    pub protected: bool,
+    pub semantic_content: GhosttyCellSemanticContent,
+    pub color_palette: u8,
+    pub color_rgb: GhosttyColorRgb,
+}
+
 pub struct RowCellsHandle {
     raw: GhosttyRenderStateRowCells,
+    inline_grapheme_utf8: [u8; INLINE_GRAPHEME_UTF8_CAPACITY],
+    overflow_grapheme_utf8: Vec<u8>,
 }
 
 impl RowCellsHandle {
@@ -1947,147 +1985,122 @@ impl RowCellsHandle {
         let mut raw = ptr::null_mut();
         let result = unsafe { ghostty_render_state_row_cells_new(ptr::null(), &mut raw) };
         check_result(result, "ghostty_render_state_row_cells_new")?;
-        Ok(Self { raw })
+        Ok(Self { raw, inline_grapheme_utf8: [0; INLINE_GRAPHEME_UTF8_CAPACITY], overflow_grapheme_utf8: Vec::new() })
     }
 
     pub fn next(&mut self) -> bool {
         unsafe { ghostty_render_state_row_cells_next(self.raw) }
     }
 
-    pub fn get_graphemes_len(&self) -> Result<u32, String> {
-        let mut len: u32 = 0;
-        let result = unsafe {
-            ghostty_render_state_row_cells_get(self.raw, GhosttyRenderStateRowCellsData::GraphemesLen, &mut len as *mut u32 as *mut c_void)
-        };
-        check_result(result, "ghostty_render_state_row_cells_get(GraphemesLen)")?;
-        Ok(len)
-    }
-
-    pub fn get_graphemes_buf(&self, buf: &mut [u32]) -> Result<(), String> {
-        let result = unsafe {
-            ghostty_render_state_row_cells_get(self.raw, GhosttyRenderStateRowCellsData::GraphemesBuf, buf.as_mut_ptr() as *mut c_void)
-        };
-        check_result(result, "ghostty_render_state_row_cells_get(GraphemesBuf)")
-    }
-
-    pub fn get_style(&self) -> Result<GhosttyStyle, String> {
-        let mut style = GhosttyStyle::init();
-        let result = unsafe {
-            ghostty_render_state_row_cells_get(
-                self.raw,
-                GhosttyRenderStateRowCellsData::Style,
-                &mut style as *mut GhosttyStyle as *mut c_void,
-            )
-        };
-        check_result(result, "ghostty_render_state_row_cells_get(Style)")?;
-        Ok(style)
-    }
-
-    pub fn get_bg_color(&self) -> Result<Option<GhosttyColorRgb>, String> {
-        let mut color = GhosttyColorRgb::default();
-        let result = unsafe {
-            ghostty_render_state_row_cells_get(
-                self.raw,
-                GhosttyRenderStateRowCellsData::BgColor,
-                &mut color as *mut GhosttyColorRgb as *mut c_void,
-            )
-        };
-        match result {
-            GhosttyResult::Success => Ok(Some(color)),
-            GhosttyResult::InvalidValue => Ok(None),
-            other => check_result(other, "ghostty_render_state_row_cells_get(BgColor)").map(|_| None),
-        }
-    }
-
-    pub fn get_fg_color(&self) -> Result<Option<GhosttyColorRgb>, String> {
-        let mut color = GhosttyColorRgb::default();
-        let result = unsafe {
-            ghostty_render_state_row_cells_get(
-                self.raw,
-                GhosttyRenderStateRowCellsData::FgColor,
-                &mut color as *mut GhosttyColorRgb as *mut c_void,
-            )
-        };
-        match result {
-            GhosttyResult::Success => Ok(Some(color)),
-            GhosttyResult::InvalidValue => Ok(None),
-            other => check_result(other, "ghostty_render_state_row_cells_get(FgColor)").map(|_| None),
-        }
-    }
-
-    pub fn get_raw_cell(&self) -> Result<GhosttyCell, String> {
+    pub fn read_cell_into(&mut self, graphemes: &mut Vec<u32>) -> Result<GhosttyCellSnapshot, String> {
         let mut cell: GhosttyCell = 0;
-        let result = unsafe {
-            ghostty_render_state_row_cells_get(self.raw, GhosttyRenderStateRowCellsData::Raw, &mut cell as *mut GhosttyCell as *mut c_void)
+        let mut style = GhosttyStyle::init();
+        let raw = self.raw;
+        let grapheme_len = match fetch_row_cell(raw, &mut self.inline_grapheme_utf8, &mut cell, &mut style) {
+            Ok(len) => len,
+            Err((GhosttyResult::OutOfSpace, 2, required)) => {
+                self.overflow_grapheme_utf8.resize(required, 0);
+                fetch_row_cell(raw, &mut self.overflow_grapheme_utf8, &mut cell, &mut style).map_err(|(result, written, _)| {
+                    format!("ghostty_render_state_row_cells_get_multi failed after {written} values: {result:?}")
+                })?
+            }
+            Err((result, written, _)) => {
+                return Err(format!("ghostty_render_state_row_cells_get_multi failed after {written} values: {result:?}"));
+            }
         };
-        check_result(result, "ghostty_render_state_row_cells_get(Raw)")?;
-        Ok(cell)
-    }
 
-    pub fn get_wide(&self) -> Result<GhosttyCellWide, String> {
-        let cell = self.get_raw_cell()?;
+        let grapheme_bytes = if grapheme_len <= self.inline_grapheme_utf8.len() {
+            &self.inline_grapheme_utf8[..grapheme_len]
+        } else {
+            &self.overflow_grapheme_utf8[..grapheme_len]
+        };
+        let grapheme_text =
+            std::str::from_utf8(grapheme_bytes).map_err(|err| format!("ghostty render-state grapheme was not valid utf-8: {err}"))?;
+        graphemes.clear();
+        graphemes.extend(grapheme_text.chars().map(u32::from));
+
+        let mut content_tag = GhosttyCellContentTag::Codepoint;
         let mut wide = GhosttyCellWide::Narrow;
-        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::Wide, &mut wide as *mut GhosttyCellWide as *mut c_void) };
-        check_result(result, "ghostty_cell_get(Wide)")?;
-        Ok(wide)
-    }
-
-    pub fn get_content_tag(&self) -> Result<GhosttyCellContentTag, String> {
-        let cell = self.get_raw_cell()?;
-        let mut tag = GhosttyCellContentTag::Codepoint;
-        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::ContentTag, &mut tag as *mut GhosttyCellContentTag as *mut c_void) };
-        check_result(result, "ghostty_cell_get(ContentTag)")?;
-        Ok(tag)
-    }
-
-    pub fn get_has_text(&self) -> Result<bool, String> {
-        let cell = self.get_raw_cell()?;
         let mut has_text = false;
-        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::HasText, &mut has_text as *mut bool as *mut c_void) };
-        check_result(result, "ghostty_cell_get(HasText)")?;
-        Ok(has_text)
-    }
-
-    pub fn get_has_styling(&self) -> Result<bool, String> {
-        let cell = self.get_raw_cell()?;
         let mut has_styling = false;
-        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::HasStyling, &mut has_styling as *mut bool as *mut c_void) };
-        check_result(result, "ghostty_cell_get(HasStyling)")?;
-        Ok(has_styling)
-    }
-
-    pub fn get_style_id(&self) -> Result<u16, String> {
-        let cell = self.get_raw_cell()?;
-        let mut style_id = 0;
-        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::StyleId, &mut style_id as *mut u16 as *mut c_void) };
-        check_result(result, "ghostty_cell_get(StyleId)")?;
-        Ok(style_id)
-    }
-
-    pub fn get_protected(&self) -> Result<bool, String> {
-        let cell = self.get_raw_cell()?;
-        let mut protected = false;
-        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::Protected, &mut protected as *mut bool as *mut c_void) };
-        check_result(result, "ghostty_cell_get(Protected)")?;
-        Ok(protected)
-    }
-
-    pub fn get_has_hyperlink(&self) -> Result<bool, String> {
-        let cell = self.get_raw_cell()?;
+        let mut style_id: u16 = 0;
         let mut has_hyperlink = false;
-        let result = unsafe { ghostty_cell_get(cell, GhosttyCellData::HasHyperlink, &mut has_hyperlink as *mut bool as *mut c_void) };
-        check_result(result, "ghostty_cell_get(HasHyperlink)")?;
-        Ok(has_hyperlink)
-    }
+        let mut protected = false;
+        let mut semantic_content = GhosttyCellSemanticContent::Output;
+        let mut color_palette: u8 = 0;
+        let mut color_rgb = GhosttyColorRgb::default();
+        let keys = [
+            GhosttyCellData::ContentTag,
+            GhosttyCellData::Wide,
+            GhosttyCellData::HasText,
+            GhosttyCellData::HasStyling,
+            GhosttyCellData::StyleId,
+            GhosttyCellData::HasHyperlink,
+            GhosttyCellData::Protected,
+            GhosttyCellData::SemanticContent,
+            GhosttyCellData::ColorPalette,
+            GhosttyCellData::ColorRgb,
+        ];
+        let mut values = [
+            (&mut content_tag as *mut GhosttyCellContentTag).cast::<c_void>(),
+            (&mut wide as *mut GhosttyCellWide).cast::<c_void>(),
+            (&mut has_text as *mut bool).cast::<c_void>(),
+            (&mut has_styling as *mut bool).cast::<c_void>(),
+            (&mut style_id as *mut u16).cast::<c_void>(),
+            (&mut has_hyperlink as *mut bool).cast::<c_void>(),
+            (&mut protected as *mut bool).cast::<c_void>(),
+            (&mut semantic_content as *mut GhosttyCellSemanticContent).cast::<c_void>(),
+            (&mut color_palette as *mut u8).cast::<c_void>(),
+            (&mut color_rgb as *mut GhosttyColorRgb).cast::<c_void>(),
+        ];
+        let mut written = 0;
+        let result = unsafe { ghostty_cell_get_multi(cell, keys.len(), keys.as_ptr(), values.as_mut_ptr(), &mut written) };
+        check_multi_result(result, written, keys.len(), "ghostty_cell_get_multi")?;
 
-    pub fn get_semantic_content(&self) -> Result<GhosttyCellSemanticContent, String> {
-        let cell = self.get_raw_cell()?;
-        let mut semantic = GhosttyCellSemanticContent::Output;
-        let result = unsafe {
-            ghostty_cell_get(cell, GhosttyCellData::SemanticContent, &mut semantic as *mut GhosttyCellSemanticContent as *mut c_void)
-        };
-        check_result(result, "ghostty_cell_get(SemanticContent)")?;
-        Ok(semantic)
+        Ok(GhosttyCellSnapshot {
+            style,
+            content_tag,
+            wide,
+            has_text,
+            has_styling,
+            style_id,
+            has_hyperlink,
+            protected,
+            semantic_content,
+            color_palette,
+            color_rgb,
+        })
+    }
+}
+
+fn fetch_row_cell(
+    cells: GhosttyRenderStateRowCells,
+    storage: &mut [u8],
+    cell: &mut GhosttyCell,
+    style: &mut GhosttyStyle,
+) -> Result<usize, (GhosttyResult, usize, usize)> {
+    let mut graphemes = GhosttyBuffer { ptr: storage.as_mut_ptr(), cap: storage.len(), len: 0 };
+    let keys = [GhosttyRenderStateRowCellsData::Raw, GhosttyRenderStateRowCellsData::Style, GhosttyRenderStateRowCellsData::GraphemesUtf8];
+    let mut values = [
+        (cell as *mut GhosttyCell).cast::<c_void>(),
+        (style as *mut GhosttyStyle).cast::<c_void>(),
+        (&mut graphemes as *mut GhosttyBuffer).cast::<c_void>(),
+    ];
+    let mut written = 0;
+    let result = unsafe { ghostty_render_state_row_cells_get_multi(cells, keys.len(), keys.as_ptr(), values.as_mut_ptr(), &mut written) };
+    if result == GhosttyResult::Success && written == keys.len() {
+        Ok(graphemes.len)
+    } else {
+        Err((result, written, graphemes.len))
+    }
+}
+
+fn check_multi_result(result: GhosttyResult, written: usize, expected: usize, label: &'static str) -> Result<(), String> {
+    check_result(result, label)?;
+    if written == expected {
+        Ok(())
+    } else {
+        Err(format!("{label} wrote {written} of {expected} values"))
     }
 }
 

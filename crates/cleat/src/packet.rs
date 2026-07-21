@@ -167,6 +167,12 @@ impl PacketFrame {
         postcard::from_bytes(&self.payload).map_err(|err| Error::new(ErrorKind::InvalidData, err))
     }
 
+    /// Wire size of this frame (header plus payload), computed without
+    /// encoding anything.
+    pub fn encoded_len(&self) -> usize {
+        HEADER_LEN + self.payload.len()
+    }
+
     pub fn write(&self, writer: &mut impl Write) -> std::io::Result<()> {
         let len =
             u32::try_from(self.payload.len()).map_err(|_| Error::new(ErrorKind::InvalidInput, "packet payload exceeds u32 length"))?;

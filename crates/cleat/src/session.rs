@@ -565,18 +565,17 @@ fn enqueue_output_chunk(
     actor: &SessionActor,
     active_client: &mut Option<ActiveClient>,
     watchers: &mut Vec<ActiveClient>,
-    chunk: Vec<u8>,
+    chunk: &[u8],
 ) {
-    let frame = Frame::Output(chunk);
     if let Some(client) = active_client.as_mut() {
-        if client.enqueue_frame(&frame).is_err() {
+        if client.enqueue_output(chunk).is_err() {
             let _ = fs::remove_file(layout.foreground_path(id));
             let _ = actor.record_detach();
             let _ = actor.set_client_presence(false);
             *active_client = None;
         }
     }
-    watchers.retain_mut(|watcher| watcher.enqueue_frame(&frame).is_ok());
+    watchers.retain_mut(|watcher| watcher.enqueue_output(chunk).is_ok());
 }
 
 fn drain_raw_output_tap(
@@ -592,7 +591,7 @@ fn drain_raw_output_tap(
         match raw_output_tap.try_recv() {
             Ok(chunk) => {
                 drained = true;
-                enqueue_output_chunk(layout, id, actor, active_client, watchers, chunk.bytes);
+                enqueue_output_chunk(layout, id, actor, active_client, watchers, &chunk.bytes);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(drained),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -618,7 +617,7 @@ fn drain_raw_output_tap_before_client_install(
         }
     };
     for chunk in existing_chunks {
-        enqueue_output_chunk(layout, id, &hosted.actor, &mut hosted.active_client, &mut hosted.watchers, chunk.clone());
+        enqueue_output_chunk(layout, id, &hosted.actor, &mut hosted.active_client, &mut hosted.watchers, chunk);
     }
     match plan {
         RawOutputClientInstallPlan::Complete { new_client_frames, .. } => {
@@ -640,8 +639,8 @@ fn drain_raw_output_tap_before_client_install(
 }
 
 enum RawOutputClientInstallPlan {
-    Complete { existing_chunks: Vec<Vec<u8>>, new_client_frames: Vec<Frame> },
-    Disconnected { existing_chunks: Vec<Vec<u8>> },
+    Complete { existing_chunks: Vec<Arc<[u8]>>, new_client_frames: Vec<Frame> },
+    Disconnected { existing_chunks: Vec<Arc<[u8]>> },
 }
 
 fn plan_raw_output_client_install(
@@ -655,13 +654,15 @@ fn plan_raw_output_client_install(
         match raw_output_tap.try_recv() {
             Ok(chunk) => {
                 if chunk.sequence > replay.through_sequence {
-                    live_after_replay.push(chunk.bytes.clone());
+                    live_after_replay.push(Arc::clone(&chunk.bytes));
                 }
                 existing_chunks.push(chunk.bytes);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 let mut new_client_frames = replay_frames(replay.payload, replay_mode);
-                new_client_frames.extend(live_after_replay.into_iter().map(Frame::Output));
+                // Install-time only (never the per-byte path), so copying the
+                // few live chunks into owned `Frame` payloads is fine.
+                new_client_frames.extend(live_after_replay.into_iter().map(|bytes| Frame::Output(bytes.to_vec())));
                 return RawOutputClientInstallPlan::Complete { existing_chunks, new_client_frames };
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1975,7 +1976,7 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 struct PacketClient {
     id: u64,
     stream: SessionStream,
-    pending_output: Vec<u8>,
+    pending_output: PendingOutput,
     input_reader: ActiveClientReader,
     input_buffer: Vec<u8>,
     channels: HashMap<u32, PacketSessionChannel>,
@@ -2019,7 +2020,7 @@ impl PacketClient {
         Ok(Self {
             id,
             stream,
-            pending_output: Vec::new(),
+            pending_output: PendingOutput::new(),
             input_reader,
             input_buffer: Vec::new(),
             channels: HashMap::new(),
@@ -2042,15 +2043,12 @@ impl PacketClient {
         if self.dead {
             return Ok(());
         }
-        let mut encoded = Vec::new();
-        frame.write(&mut encoded).map_err(|err| format!("buffer packet frame: {err}"))?;
-        if self.pending_output.len().saturating_add(encoded.len()) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
+        if self.pending_output.len().saturating_add(frame.encoded_len()) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
             self.dead = true;
-            self.pending_output = Vec::new();
+            self.pending_output = PendingOutput::new();
             return Ok(());
         }
-        self.pending_output.extend_from_slice(&encoded);
-        Ok(())
+        frame.write(&mut self.pending_output).map_err(|err| format!("buffer packet frame: {err}"))
     }
 
     fn drain_input_frames(&mut self, pending: &mut VecDeque<PacketFrame>, timeout: Duration) -> Result<bool, std::io::Error> {
@@ -2077,10 +2075,10 @@ impl PacketClient {
 
     fn flush_pending_output(&mut self) -> Result<bool, String> {
         while !self.pending_output.is_empty() {
-            match self.stream.write(&self.pending_output) {
+            match self.stream.write(self.pending_output.as_slice()) {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
-                    self.pending_output.drain(..n);
+                    self.pending_output.consume(n);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(err) if is_graceful_socket_shutdown(&err) => return Ok(false),
@@ -2599,9 +2597,78 @@ fn flush_packet_clients(packet_clients: &mut [PacketClient]) {
     }
 }
 
+/// Bytes queued for a client socket, consumed from the front on partial
+/// writes. A start cursor makes consumption O(1) instead of `Vec::drain`'s
+/// per-write memmove of the whole backlog (issue #135). The consumed prefix
+/// is compacted away once it outgrows the live remainder, so total memmove
+/// work is bounded by total bytes queued (amortized O(1) per byte).
+struct PendingOutput {
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl PendingOutput {
+    fn new() -> Self {
+        Self { buf: Vec::new(), start: 0 }
+    }
+
+    /// Bytes not yet written to the socket — the quantity capped by
+    /// `MAX_PENDING_CLIENT_OUTPUT_BYTES`, exactly what `Vec::len` measured
+    /// before the cursor existed.
+    fn len(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.start += n;
+        debug_assert!(self.start <= self.buf.len());
+        if self.start >= self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        } else if self.start > self.len() {
+            // The dead prefix outgrew the live remainder: one memmove that
+            // touches fewer bytes than were consumed since the last
+            // compaction keeps append targets (and memory) bounded.
+            self.buf.copy_within(self.start.., 0);
+            let remaining = self.buf.len() - self.start;
+            self.buf.truncate(remaining);
+            self.start = 0;
+        }
+    }
+}
+
+/// Frames append their wire encoding straight into the backlog through
+/// `io::Write`, so enqueueing copies each payload exactly once — no
+/// intermediate encode buffer.
+impl Write for PendingOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<u8>> for PendingOutput {
+    fn from(buf: Vec<u8>) -> Self {
+        Self { buf, start: 0 }
+    }
+}
+
 struct ActiveClient {
     stream: SessionStream,
-    pending_output: Vec<u8>,
+    pending_output: PendingOutput,
     input_reader: ActiveClientReader,
     input_buffer: Vec<u8>,
     capabilities: vt::ClientCapabilities,
@@ -2610,7 +2677,7 @@ struct ActiveClient {
 impl ActiveClient {
     fn new(stream: SessionStream, capabilities: vt::ClientCapabilities) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
-        Ok(Self { stream, pending_output: Vec::new(), input_reader, input_buffer: Vec::new(), capabilities })
+        Ok(Self { stream, pending_output: PendingOutput::new(), input_reader, input_buffer: Vec::new(), capabilities })
     }
 
     fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>, timeout: Duration) -> Result<bool, std::io::Error> {
@@ -2636,21 +2703,28 @@ impl ActiveClient {
     }
 
     fn enqueue_frame(&mut self, frame: &Frame) -> Result<(), String> {
-        let mut encoded = Vec::new();
-        frame.write(&mut encoded).map_err(|err| format!("buffer client frame: {err}"))?;
-        if self.pending_output.len().saturating_add(encoded.len()) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
+        if self.pending_output.len().saturating_add(frame.encoded_len()) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
             return Err(format!("client output backlog exceeded {} bytes", MAX_PENDING_CLIENT_OUTPUT_BYTES));
         }
-        self.pending_output.extend_from_slice(&encoded);
-        Ok(())
+        frame.write(&mut self.pending_output).map_err(|err| format!("buffer client frame: {err}"))
+    }
+
+    /// Frames a raw PTY output chunk straight into the backlog — header plus
+    /// one payload copy, with no intermediate `Frame` allocation. This is the
+    /// per-byte fan-out hot path (issue #135).
+    fn enqueue_output(&mut self, payload: &[u8]) -> Result<(), String> {
+        if self.pending_output.len().saturating_add(Frame::output_encoded_len(payload.len())) > MAX_PENDING_CLIENT_OUTPUT_BYTES {
+            return Err(format!("client output backlog exceeded {} bytes", MAX_PENDING_CLIENT_OUTPUT_BYTES));
+        }
+        Frame::write_output(&mut self.pending_output, payload).map_err(|err| format!("buffer client frame: {err}"))
     }
 
     fn flush_pending_output(&mut self) -> Result<bool, String> {
         while !self.pending_output.is_empty() {
-            match self.stream.write(&self.pending_output) {
+            match self.stream.write(self.pending_output.as_slice()) {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
-                    self.pending_output.drain(..n);
+                    self.pending_output.consume(n);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(err) if is_graceful_socket_shutdown(&err) => return Ok(false),
@@ -2753,6 +2827,7 @@ fn http_error_message(response: http_uds::HttpResponse) -> String {
 mod tests {
     use std::{
         cell::RefCell,
+        io::Write,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -2855,7 +2930,7 @@ mod tests {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
         let mut client = super::PacketClient::new(1, stream, Vec::new(), &crate::packet::DirectorySnapshot { sessions: Vec::new() })
             .expect("create packet client");
-        client.pending_output = vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1];
+        client.pending_output = super::PendingOutput::from(vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1]);
 
         let frame = crate::packet::PacketFrame { channel: 1, msg_type: 0, payload: vec![0; 64] };
         client.enqueue_frame(&frame).expect("overflow must not surface as a daemon-level error");
@@ -2891,16 +2966,60 @@ mod tests {
         assert_eq!(ok, Some(7));
     }
 
+    #[test]
+    fn pending_output_partial_consumes_preserve_byte_order_without_upfront_memmove() {
+        let mut pending = super::PendingOutput::new();
+        pending.write_all(b"abcdefgh").expect("queue bytes");
+
+        pending.consume(3);
+        assert_eq!(pending.as_slice(), b"defgh");
+        assert_eq!(pending.len(), 5);
+        // Consumed less than remains: the cursor advances, nothing moves yet.
+        assert_eq!(pending.start, 3);
+
+        pending.write_all(b"ij").expect("queue more bytes");
+        assert_eq!(pending.as_slice(), b"defghij");
+
+        // Dead prefix (7) now exceeds the remainder (3): compaction fires.
+        pending.consume(4);
+        assert_eq!(pending.as_slice(), b"hij");
+        assert_eq!(pending.start, 0);
+
+        pending.consume(3);
+        assert!(pending.is_empty());
+        assert_eq!(pending.start, 0);
+    }
+
+    /// The zero-copy output path must produce byte-identical backlogs to the
+    /// generic `Frame` path it replaces (issue #135).
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_output_frames_bytes_identically_to_enqueue_frame() {
+        let (stream_a, _peer_a) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
+        let (stream_b, _peer_b) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
+        let capabilities = crate::vt::ClientCapabilities::conservative_fallback();
+        let mut via_output = super::ActiveClient::new(stream_a, capabilities).expect("create active client");
+        let mut via_frame = super::ActiveClient::new(stream_b, capabilities).expect("create active client");
+
+        let payload = b"\x1b[1mchunk\x00\xff";
+        via_output.enqueue_output(payload).expect("enqueue output payload");
+        via_frame.enqueue_frame(&super::Frame::Output(payload.to_vec())).expect("enqueue output frame");
+
+        assert_eq!(via_output.pending_output.as_slice(), via_frame.pending_output.as_slice());
+    }
+
     #[cfg(unix)]
     #[test]
     fn active_client_rejects_unbounded_output_backlog() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
         let mut client =
             super::ActiveClient::new(stream, crate::vt::ClientCapabilities::conservative_fallback()).expect("create active client");
-        client.pending_output = vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1];
+        client.pending_output = super::PendingOutput::from(vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1]);
 
         let err = client.enqueue_frame(&super::Frame::Output(vec![1])).expect_err("backlog should overflow");
+        assert!(err.contains("client output backlog exceeded"));
 
+        let err = client.enqueue_output(&[1]).expect_err("zero-copy path enforces the same backlog cap");
         assert!(err.contains("client output backlog exceeded"));
     }
 
@@ -3041,8 +3160,12 @@ mod tests {
     #[test]
     fn client_install_plan_sends_snapshot_covered_chunks_only_to_existing_clients() {
         let (tap_tx, tap) = crate::host::actor::RawOutputTap::test_channel(2);
-        tap_tx.send(crate::host::actor::RawOutputChunk { sequence: 1, bytes: b"line2\n".to_vec() }).expect("queue snapshot-covered output");
-        tap_tx.send(crate::host::actor::RawOutputChunk { sequence: 2, bytes: b"line3\n".to_vec() }).expect("queue post-snapshot output");
+        tap_tx
+            .send(crate::host::actor::RawOutputChunk { sequence: 1, bytes: b"line2\n".to_vec().into() })
+            .expect("queue snapshot-covered output");
+        tap_tx
+            .send(crate::host::actor::RawOutputChunk { sequence: 2, bytes: b"line3\n".to_vec().into() })
+            .expect("queue post-snapshot output");
 
         let plan = super::plan_raw_output_client_install(
             &tap,
@@ -3053,7 +3176,7 @@ mod tests {
         let super::RawOutputClientInstallPlan::Complete { existing_chunks, new_client_frames } = plan else {
             panic!("connected tap should produce a complete install plan");
         };
-        assert_eq!(existing_chunks, vec![b"line2\n".to_vec(), b"line3\n".to_vec()]);
+        assert_eq!(existing_chunks, vec![Arc::from(&b"line2\n"[..]), Arc::from(&b"line3\n"[..])]);
         assert_eq!(new_client_frames, vec![
             crate::protocol::Frame::Output(b"line2\n".to_vec()),
             crate::protocol::Frame::Output(b"line3\n".to_vec())
@@ -3076,7 +3199,9 @@ mod tests {
     #[test]
     fn disconnected_tap_recovers_with_terminal_reset_and_fresh_replay() {
         let (tap_tx, tap) = crate::host::actor::RawOutputTap::test_channel(1);
-        tap_tx.send(crate::host::actor::RawOutputChunk { sequence: 1, bytes: b"queued\n".to_vec() }).expect("queue output before overflow");
+        tap_tx
+            .send(crate::host::actor::RawOutputChunk { sequence: 1, bytes: b"queued\n".to_vec().into() })
+            .expect("queue output before overflow");
         drop(tap_tx);
         let install = super::plan_raw_output_client_install(
             &tap,
@@ -3086,7 +3211,7 @@ mod tests {
         let super::RawOutputClientInstallPlan::Disconnected { existing_chunks } = install else {
             panic!("dropped tap sender should require recovery");
         };
-        assert_eq!(existing_chunks, vec![b"queued\n".to_vec()]);
+        assert_eq!(existing_chunks, vec![Arc::from(&b"queued\n"[..])]);
 
         let capabilities = vt::ClientCapabilities::new(vt::ColorLevel::Ansi256, true);
         let source = FakeRawOutputRecoverySource {

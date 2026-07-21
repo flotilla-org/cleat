@@ -67,17 +67,18 @@ find .tools/ghostty-install -maxdepth 3 | sort
 
 **Tags.** Sessions may carry flat, opaque tags. Add them at launch with repeated `--tag TAG`, mutate them with `cleat tag <id> +TAG -TAG`, and filter directory reads with repeated `--selector TAG`. Selectors are exact whole-tag matches and are ANDed when repeated. `key=value` is only a client convention; cleat does not interpret tag keys, values, hierarchy, or globs.
 
-**Runtime directory.** Discovered in priority order:
+**State directory.** The daemon registration, control socket, session state, and recordings share one root, discovered in priority order:
 
 1. `$CLEAT_RUNTIME_DIR` (if set)
-2. `$XDG_RUNTIME_DIR/cleat` (if `XDG_RUNTIME_DIR` is set)
-3. `$TMPDIR/cleat-<uid>`
-4. `/tmp/cleat-<uid>`
+2. `$XDG_STATE_HOME/cleat` (if `XDG_STATE_HOME` is an absolute path)
+3. `$HOME/.local/state/cleat` on Unix, or `%LOCALAPPDATA%\cleat` on Windows
+
+Discovery fails with an actionable error when no persistent state directory is available; cleat never implicitly stores daemon state or recordings in a temporary directory. `CLEAT_RUNTIME_DIR` retains its historical name as the explicit whole-layout override. Use a short persistent path for this override if the discovered Unix socket path exceeds the platform limit; cleat rejects an unusable socket path before starting a daemon.
 
 Runtime layout v2 is daemon-scoped:
 
 ```text
-<runtime-root>/
+<state-root>/
   <daemon-name>/
     socket
     daemon.pid
@@ -89,7 +90,7 @@ Runtime layout v2 is daemon-scoped:
 
 `socket` and `daemon.pid` belong to the daemon, not to an individual session. Session directories live under `sessions/`. `session.cast` is the asciicast v3 recording when recording is active. `foreground` is a transient attachment marker.
 
-**Liveness and discovery.** Session liveness is daemon state, not a per-session socket stat. `cleat list` queries the selected daemon. `cleat list --all` enumerates every daemon directory under the runtime root and queries or sweeps each daemon independently. If a daemon is definitively stale, cleat performs a daemon-scoped sweep: sessions with a non-empty recording are preserved as recreatable, and sessions without a recording are removed.
+**Liveness and discovery.** Session liveness is daemon state, not a per-session socket stat. `cleat list` queries the selected daemon. `cleat list --all` enumerates every daemon directory under the state root and queries or sweeps each daemon independently. If a daemon is definitively stale, cleat performs a daemon-scoped sweep: sessions with a non-empty recording are preserved as recreatable, and sessions without a recording are removed.
 
 **Linger and cleanup.** A daemon starts on first use of its name. When it has no live sessions, it lingers for 120 seconds before exiting so a burst of commands does not repeatedly bounce the daemon. When a child process exits, its session is removed unless it has a recording that makes it recreatable.
 
@@ -116,7 +117,7 @@ Four surfaces cooperate during a session. Knowing which surface is authoritative
 | `attach` / `detach` | host terminal + daemon | While attached, host terminal is authoritative for query replies |
 | `watch` | host terminal + daemon | Read-only live view; does not take foreground control |
 | `list [--selector TAG]...` | daemon directory state | One-shot read of the selected daemon's directory |
-| `list --all` | daemon directory state | Enumerates every daemon directory under the runtime root |
+| `list --all` | daemon directory state | Enumerates every daemon directory under the state root |
 | `list --watch [--selector TAG]...` | packet directory subscription | Prints a snapshot, then one line per directory delta |
 | `packets` | packet protocol | Opens the structured multiplexed probe surface |
 | `inspect`, `kill`, `signal` | daemon state | No VT / recording involvement |

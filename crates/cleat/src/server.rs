@@ -72,8 +72,8 @@ impl SessionService {
         Self { layout }
     }
 
-    pub fn discover() -> Self {
-        Self::new(RuntimeLayout::discover())
+    pub fn discover() -> Result<Self, String> {
+        Ok(Self::new(RuntimeLayout::discover()?))
     }
 
     pub fn with_daemon(&self, daemon_name: String) -> Result<Self, String> {

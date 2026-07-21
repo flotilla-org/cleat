@@ -51,16 +51,11 @@ pub struct RuntimeLayout {
 }
 
 impl RuntimeLayout {
-    pub fn discover() -> Self {
-        Self {
-            root: discover_runtime_root(
-                env::var_os("CLEAT_RUNTIME_DIR"),
-                env::var_os("XDG_RUNTIME_DIR"),
-                env::var_os("TMPDIR"),
-                env::temp_dir(),
-            ),
+    pub fn discover() -> Result<Self, String> {
+        Ok(Self {
+            root: discover_runtime_root(env::var_os("CLEAT_RUNTIME_DIR"), env::var_os("XDG_STATE_HOME"), platform_state_dir())?,
             daemon_name: DEFAULT_DAEMON_NAME.to_string(),
-        }
+        })
     }
 
     pub fn new(root: PathBuf) -> Self {
@@ -172,30 +167,29 @@ pub fn normalize_tags(tags: &mut Vec<String>) {
 
 fn discover_runtime_root(
     explicit_root: Option<std::ffi::OsString>,
-    xdg_runtime_dir: Option<std::ffi::OsString>,
-    tmpdir: Option<std::ffi::OsString>,
-    default_tmp: PathBuf,
-) -> PathBuf {
+    xdg_state_home: Option<std::ffi::OsString>,
+    platform_state_dir: Option<PathBuf>,
+) -> Result<PathBuf, String> {
     if let Some(explicit_root) = explicit_root {
-        return PathBuf::from(explicit_root);
+        return Ok(PathBuf::from(explicit_root));
     }
-    if let Some(xdg_runtime_dir) = xdg_runtime_dir {
-        return PathBuf::from(xdg_runtime_dir).join(SESSION_ROOT_DIR);
+    if let Some(xdg_state_home) = xdg_state_home.map(PathBuf::from).filter(|path| path.is_absolute()) {
+        return Ok(xdg_state_home.join(SESSION_ROOT_DIR));
     }
-    if let Some(tmpdir) = tmpdir {
-        return PathBuf::from(tmpdir).join(format!("{SESSION_ROOT_DIR}-{}", current_uid()));
+    if let Some(platform_state_dir) = platform_state_dir {
+        return Ok(platform_state_dir.join(SESSION_ROOT_DIR));
     }
-    default_tmp.join(format!("{SESSION_ROOT_DIR}-{}", current_uid()))
+    Err("unable to discover a persistent cleat state directory; set CLEAT_RUNTIME_DIR or an absolute XDG_STATE_HOME".to_string())
 }
 
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    unsafe { libc::geteuid() }
+#[cfg(windows)]
+fn platform_state_dir() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA").map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
-#[cfg(not(unix))]
-fn current_uid() -> u32 {
-    0
+#[cfg(not(windows))]
+fn platform_state_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(PathBuf::from).filter(|path| path.is_absolute()).map(|home| home.join(".local/state"))
 }
 
 #[cfg(test)]
@@ -208,17 +202,38 @@ mod tests {
     fn discover_runtime_root_prefers_explicit_root() {
         let root = discover_runtime_root(
             Some(OsString::from("/custom/root")),
-            Some(OsString::from("/xdg/runtime")),
-            Some(OsString::from("/tmpdir")),
-            PathBuf::from("/tmp"),
-        );
+            Some(OsString::from("/xdg/state")),
+            Some(PathBuf::from("/home/test/.local/state")),
+        )
+        .expect("discover explicit root");
         assert_eq!(root, PathBuf::from("/custom/root"));
     }
 
     #[test]
-    fn discover_runtime_root_prefers_xdg_before_tmpdir() {
+    fn discover_runtime_root_prefers_xdg_state_home() {
+        let root = discover_runtime_root(None, Some(OsString::from("/xdg/state")), Some(PathBuf::from("/home/test/.local/state")))
+            .expect("discover XDG state home");
+        assert_eq!(root, PathBuf::from("/xdg/state/cleat"));
+    }
+
+    #[test]
+    fn discover_runtime_root_uses_platform_state_directory() {
         let root =
-            discover_runtime_root(None, Some(OsString::from("/xdg/runtime")), Some(OsString::from("/tmpdir")), PathBuf::from("/tmp"));
-        assert_eq!(root, PathBuf::from("/xdg/runtime/cleat"));
+            discover_runtime_root(None, None, Some(PathBuf::from("/home/test/.local/state"))).expect("discover platform state directory");
+        assert_eq!(root, PathBuf::from("/home/test/.local/state/cleat"));
+    }
+
+    #[test]
+    fn discover_runtime_root_ignores_relative_xdg_state_home() {
+        let root = discover_runtime_root(None, Some(OsString::from("relative/state")), Some(PathBuf::from("/home/test/.local/state")))
+            .expect("fall back from relative XDG state home");
+        assert_eq!(root, PathBuf::from("/home/test/.local/state/cleat"));
+    }
+
+    #[test]
+    fn discover_runtime_root_requires_a_persistent_state_directory() {
+        let err = discover_runtime_root(None, None, None).expect_err("discovery must not place daemon state in a temporary directory");
+        assert!(err.contains("CLEAT_RUNTIME_DIR"), "{err}");
+        assert!(err.contains("XDG_STATE_HOME"), "{err}");
     }
 }

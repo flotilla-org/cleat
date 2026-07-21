@@ -110,6 +110,10 @@ pub fn connect_session_stream(socket_path: &Path) -> Result<SessionStream, Strin
     try_connect_session_stream(socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))
 }
 
+pub fn validate_session_socket_path(_socket_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 pub fn try_connect_session_stream(socket_path: &Path) -> io::Result<SessionStream> {
     let pipe_name = pipe_name_from_marker_file(socket_path)?;
     let handle = open_pipe(&pipe_name)?;

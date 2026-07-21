@@ -29,7 +29,7 @@ use crate::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
         ipc::{
             bind_session_listener, connect_session_stream, set_listener_nonblocking, set_stream_nonblocking, set_stream_write_timeout,
-            shutdown_stream, try_connect_session_stream, SessionStream,
+            shutdown_stream, try_connect_session_stream, validate_session_socket_path, SessionStream,
         },
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
@@ -801,6 +801,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     let layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(daemon_name.to_string())?;
     layout.ensure_daemon_dirs()?;
     let socket_path = layout.socket_path();
+    validate_session_socket_path(&socket_path)?;
     let listener = match bind_session_listener(&socket_path) {
         Ok(listener) => listener,
         Err(first_err) => {
@@ -2797,6 +2798,7 @@ fn wait_for_socket(path: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String> {
+    validate_session_socket_path(&layout.socket_path())?;
     if try_connect_session_stream(&layout.socket_path()).is_ok() && is_session_daemon_alive(layout.root(), layout.daemon_name()) {
         return Ok(());
     }

@@ -3,6 +3,15 @@ use std::{io, net::Shutdown, path::Path, time::Duration};
 pub type SessionStream = std::os::unix::net::UnixStream;
 pub type SessionListener = std::os::unix::net::UnixListener;
 
+pub fn validate_session_socket_path(socket_path: &Path) -> Result<(), String> {
+    std::os::unix::net::SocketAddr::from_pathname(socket_path).map(|_| ()).map_err(|err| {
+        format!(
+            "Unix socket path {} is too long or otherwise unusable: {err}; set CLEAT_RUNTIME_DIR to a shorter persistent path",
+            socket_path.display()
+        )
+    })
+}
+
 pub fn connect_session_stream(socket_path: &Path) -> Result<SessionStream, String> {
     try_connect_session_stream(socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))
 }

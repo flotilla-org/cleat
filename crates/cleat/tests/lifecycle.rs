@@ -2359,6 +2359,71 @@ fn daemon_exits_when_pid_file_names_another_process() {
     wait_for_daemon_exit(pid, "daemon should exit after losing its pid-file registration");
 }
 
+#[test]
+fn overlong_daemon_socket_path_is_rejected_before_spawn() {
+    let temp = tempfile::Builder::new().prefix("cleat-socket-").tempdir_in("/tmp").expect("short-path tempdir");
+    let root = temp.path().join("x".repeat(120));
+    let service = service_for(&root);
+
+    let started = Instant::now();
+    let err = service
+        .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("cat".into()), false)
+        .expect_err("overlong daemon socket path should be rejected");
+
+    assert!(started.elapsed() < Duration::from_secs(1), "socket path validation should fail before spawning a daemon");
+    assert!(err.contains("Unix socket path"), "{err}");
+    assert!(err.contains("CLEAT_RUNTIME_DIR"), "{err}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn isolated_discovery_command(cleat_bin: &str, home: &std::path::Path, tmpdir: &std::path::Path) -> Command {
+    let mut command = Command::new(cleat_bin);
+    command
+        .env("HOME", home)
+        .env("TMPDIR", tmpdir)
+        .env_remove("CLEAT_RUNTIME_DIR")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME");
+    command
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn discovered_state_root_survives_legacy_tmpdir_registration_purge() {
+    let temp = tempfile::Builder::new().prefix("cleat-154-").tempdir_in("/tmp").expect("short-path tempdir");
+    let home = temp.path().join("home");
+    let tmpdir = temp.path().join("tmp");
+    std::fs::create_dir_all(&home).expect("create isolated home");
+    std::fs::create_dir_all(&tmpdir).expect("create isolated tmpdir");
+
+    let cleat_bin = std::env::var("CARGO_BIN_EXE_cleat").expect("cleat bin");
+    let mut command = isolated_discovery_command(&cleat_bin, &home, &tmpdir);
+    command.args(["--server", "issue154-state-root", "launch", "alpha", "--vt", "ghostty", "--cmd", "cat", "--record", "--json"]);
+    let output = command.output().expect("launch through discovered runtime root");
+    assert!(output.status.success(), "launch failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let state_daemon_dir = home.join(".local/state/cleat/issue154-state-root");
+    assert!(state_daemon_dir.join("daemon.pid").exists(), "daemon registration should live in persistent state");
+    assert!(state_daemon_dir.join("sessions/alpha/session.cast").exists(), "recording should live in persistent state");
+
+    let legacy_root = tmpdir.join(format!("cleat-{}", unsafe { libc::geteuid() }));
+    if legacy_root.exists() {
+        std::fs::remove_dir_all(&legacy_root).expect("simulate purging the legacy TMPDIR runtime root");
+    }
+
+    std::thread::sleep(Duration::from_millis(2_500));
+
+    let mut inspect = isolated_discovery_command(&cleat_bin, &home, &tmpdir);
+    inspect.args(["--server", "issue154-state-root", "inspect", "alpha", "--json"]);
+    let output = inspect.output().expect("inspect session after legacy TMPDIR purge");
+    assert!(output.status.success(), "session did not survive legacy TMPDIR purge: {}", String::from_utf8_lossy(&output.stderr));
+
+    let mut kill = isolated_discovery_command(&cleat_bin, &home, &tmpdir);
+    kill.args(["--server", "issue154-state-root", "kill", "alpha"]);
+    let output = kill.output().expect("kill surviving test session");
+    assert!(output.status.success(), "kill failed: {}", String::from_utf8_lossy(&output.stderr));
+}
+
 /// The daemon is our direct child, so poll with waitpid rather than
 /// kill(pid, 0): an exited-but-unreaped zombie still answers signals.
 fn wait_for_daemon_exit(pid: i32, message: &str) {

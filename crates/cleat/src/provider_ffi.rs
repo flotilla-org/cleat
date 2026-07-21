@@ -1029,7 +1029,10 @@ pub unsafe extern "C" fn cleat_provider_open(desc: *const CleatProviderDesc) -> 
     };
     let runtime_root = match read_optional_utf8(requested.runtime_root, requested.runtime_root_len) {
         Ok(Some(path)) => PathBuf::from(path),
-        Ok(None) => RuntimeLayout::discover().root().to_path_buf(),
+        Ok(None) => match RuntimeLayout::discover() {
+            Ok(layout) => layout.root().to_path_buf(),
+            Err(_) => return ptr::null_mut(),
+        },
         Err(_) => return ptr::null_mut(),
     };
     let daemon_name = match read_optional_utf8(requested.daemon_name, requested.daemon_name_len) {

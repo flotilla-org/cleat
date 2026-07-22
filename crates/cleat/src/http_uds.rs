@@ -232,7 +232,7 @@ pub(crate) struct CreateSessionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CreateSiblingRequest {
-    pub name: Option<String>,
+    pub id: Option<String>,
     pub cmd: Option<String>,
     pub record: bool,
 }

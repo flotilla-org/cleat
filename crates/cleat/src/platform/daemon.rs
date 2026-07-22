@@ -38,7 +38,6 @@ pub fn spawn_daemon_process(root: &Path, daemon_name: &str) -> Result<(), String
 
 #[cfg(unix)]
 pub fn spawn_transfer_daemon_process(root: &Path, daemon_name: &str) -> Result<(UnixStream, std::process::Child), String> {
-    const BOOTSTRAP_FD: i32 = 3;
     let (parent_stream, child_stream) = UnixStream::pair().map_err(|err| format!("create daemon transfer socketpair: {err}"))?;
     let transfer_fd = child_stream.as_raw_fd();
     let exe = resolve_cleat_executable()?;
@@ -50,16 +49,13 @@ pub fn spawn_transfer_daemon_process(root: &Path, daemon_name: &str) -> Result<(
         .arg(daemon_name)
         .arg("serve")
         .arg("--bootstrap-fd")
-        .arg(BOOTSTRAP_FD.to_string());
+        .arg(transfer_fd.to_string());
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // SAFETY: the child side of the socketpair is valid through `spawn`; the
     // pre-exec hook only invokes async-signal-safe syscalls before exec.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(transfer_fd, BOOTSTRAP_FD) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fcntl(BOOTSTRAP_FD, libc::F_SETFD, 0) == -1 {
+            if libc::fcntl(transfer_fd, libc::F_SETFD, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::from)

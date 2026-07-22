@@ -642,11 +642,11 @@ fn list_reports_existing_sessions() {
 
     assert_eq!(lines, vec![
         format!(
-            "alpha\tdetached\t{} ({})\t/repo",
+            "alpha\tdaemon=default\tdetached\t{} ({})\t/repo",
             vt::default_vt_engine_kind().as_str(),
             vt::vt_engine_status(vt::default_vt_engine_kind())
         ),
-        format!("beta\tdetached\tpassthrough ({})\tzsh", vt::vt_engine_status(VtEngineKind::Passthrough)),
+        format!("beta\tdaemon=default\tdetached\tpassthrough ({})\tzsh", vt::vt_engine_status(VtEngineKind::Passthrough)),
     ]);
 }
 
@@ -854,22 +854,29 @@ fn sibling_session_runs_in_its_own_daemon_without_affecting_parent() {
 
     let cli = Cli::try_parse_from(["cleat", "create", "--from", "parent", "--name", "helper", "--cmd", "sleep 30", "--no-record"])
         .expect("parse sibling create command");
-    assert_eq!(cli::execute(cli, &service).expect("execute sibling create").as_deref(), Some("helper"));
+    let create_output = cli::execute(cli, &service).expect("execute sibling create").expect("sibling create output");
+    assert!(create_output.starts_with("helper (server sibling-"), "{create_output}");
 
-    let helper = service.with_daemon("helper".to_string()).expect("helper daemon service");
+    let all_sessions = service.list_all_with_selectors(&[]).expect("list all");
+    let sibling = all_sessions.iter().find(|session| session.id == "helper").expect("listed sibling");
+    assert_ne!(sibling.daemon, "default");
+    let list_cli = Cli::try_parse_from(["cleat", "list", "--all"]).expect("parse global list");
+    let list_output = cli::execute(list_cli, &service).expect("execute global list").expect("global list output");
+    assert!(list_output.contains(&format!("helper\tdaemon={}", sibling.daemon)), "{list_output}");
+    let helper = service.with_daemon(sibling.daemon.clone()).expect("helper daemon service");
     let helper_pid = std::fs::read_to_string(
-        RuntimeLayout::new(temp.path().to_path_buf()).with_daemon("helper".to_string()).expect("helper layout").daemon_pid_path(),
+        RuntimeLayout::new(temp.path().to_path_buf()).with_daemon(sibling.daemon.clone()).expect("helper layout").daemon_pid_path(),
     )
     .expect("read helper daemon pid");
     assert_ne!(parent_pid.trim(), helper_pid.trim(), "sibling must be hosted by a distinct daemon process");
     assert_eq!(helper.inspect("helper").expect("inspect helper").session.id, "helper");
-    assert!(service.list_all_with_selectors(&[]).expect("list all").iter().any(|session| session.id == "helper"));
+    assert!(sibling.daemon.starts_with("sibling-"));
 
     helper.kill("helper").expect("kill sibling");
     assert_eq!(service.inspect("parent").expect("parent survives sibling teardown").session.id, "parent");
 
     service.kill("parent").expect("kill parent");
-    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), "helper");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), &sibling.daemon);
 }
 
 #[test]
@@ -883,7 +890,8 @@ fn sibling_child_inherits_source_daemon_cwd_and_environment() {
     daemon
         .args(["--runtime-root", temp.path().to_str().expect("utf8 temp path"), "--server", "context-source", "serve"])
         .current_dir(&context_dir)
-        .env("CLEAT_SIBLING_CONTEXT", "inherited-from-daemon");
+        .env("CLEAT_SIBLING_CONTEXT", "inherited-from-daemon")
+        .env("SSH_CLIENT", "preserved-for-sibling");
     let mut daemon = daemon.spawn().expect("spawn controlled source daemon");
     wait_for_socket(&layout.socket_path());
 
@@ -893,13 +901,21 @@ fn sibling_child_inherits_source_daemon_cwd_and_environment() {
         .create_sibling(
             "parent",
             Some("context-helper".into()),
-            Some("printf '%s' \"$CLEAT_SIBLING_CONTEXT\" > inherited-env; pwd > inherited-cwd; sleep 30".into()),
+            Some(
+                "printf '%s' \"$CLEAT_SIBLING_CONTEXT\" > inherited-env; printf '%s' \"$SSH_CLIENT\" > inherited-ssh-client; pwd > inherited-cwd; sleep 30"
+                    .into(),
+            ),
             false,
         )
         .expect("create sibling");
 
-    wait_until("sibling context files", || context_dir.join("inherited-env").exists() && context_dir.join("inherited-cwd").exists());
+    wait_until("sibling context files", || {
+        context_dir.join("inherited-env").exists()
+            && context_dir.join("inherited-ssh-client").exists()
+            && context_dir.join("inherited-cwd").exists()
+    });
     assert_eq!(std::fs::read_to_string(context_dir.join("inherited-env")).expect("read inherited env"), "inherited-from-daemon");
+    assert_eq!(std::fs::read_to_string(context_dir.join("inherited-ssh-client")).expect("read inherited SSH env"), "preserved-for-sibling");
     let inherited_cwd = PathBuf::from(std::fs::read_to_string(context_dir.join("inherited-cwd")).expect("read inherited cwd").trim());
     assert_eq!(
         inherited_cwd.canonicalize().expect("canonicalize inherited cwd"),

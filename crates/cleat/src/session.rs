@@ -541,12 +541,16 @@ struct HostedSession {
 
 impl HostedSession {
     fn spawn(session_dir: PathBuf, session: SessionMetadata) -> Result<Self, String> {
-        let should_keep_session_dir = session.record;
         let actor_session_dir = session_dir;
         let actor_session = session.clone();
         let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
             crate::session_runtime::SessionRuntime::spawn(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?)
         })?;
+        Self::from_actor(session, actor)
+    }
+
+    fn from_actor(session: SessionMetadata, actor: SessionActor) -> Result<Self, String> {
+        let should_keep_session_dir = session.record;
         let raw_output_tap = actor.subscribe_raw_output()?;
         Ok(Self {
             metadata: session,
@@ -566,27 +570,12 @@ impl HostedSession {
 
     #[cfg(unix)]
     fn adopt(session_dir: PathBuf, session: SessionMetadata, pty_child: crate::platform::pty::PtyChild) -> Result<Self, String> {
-        let should_keep_session_dir = session.record;
         let actor_session_dir = session_dir;
         let actor_session = session.clone();
         let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
             crate::session_runtime::SessionRuntime::adopt(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?, pty_child)
         })?;
-        let raw_output_tap = actor.subscribe_raw_output()?;
-        Ok(Self {
-            metadata: session,
-            actor,
-            raw_output_tap,
-            active_client: None,
-            watchers: Vec::new(),
-            packet_controller: None,
-            packet_render_cache: PacketRenderCache::default(),
-            had_foreground_client: false,
-            pending_waits: Vec::new(),
-            pending_expects: Vec::new(),
-            screen_stable_snapshot_generation: None,
-            should_keep_session_dir,
-        })
+        Self::from_actor(session, actor)
     }
 
     fn activity_session(&self, stable_threshold_ms: u64) -> ActivitySession {
@@ -896,25 +885,28 @@ fn run_session_daemon_inner(root: &Path, daemon_name: &str, bootstrap_fd: Option
         if manifest.version != 1 {
             return Err(format!("unsupported FD transfer manifest version {}", manifest.version));
         }
-        if manifest.operation != "sibling" {
-            return Err(format!("unsupported FD transfer operation {}", manifest.operation));
+        if manifest.operation != crate::fd_transfer::FdTransferOperation::Sibling {
+            return Err(format!("unsupported FD transfer operation {:?}", manifest.operation));
         }
         if manifest.target_daemon != daemon_name {
             return Err(format!("FD transfer target daemon {} does not match bootstrap daemon {daemon_name}", manifest.target_daemon));
         }
         let mut fds: Vec<_> = bootstrap.fds.into_iter().map(Some).collect();
-        let take_role = |role: &str, fds: &mut Vec<Option<std::os::fd::OwnedFd>>| -> Result<std::os::fd::OwnedFd, String> {
-            let entry =
-                manifest.fds.iter().find(|entry| entry.role == role).ok_or_else(|| format!("FD transfer manifest is missing {role}"))?;
-            fds.get_mut(entry.index)
-                .and_then(Option::take)
-                .ok_or_else(|| format!("FD transfer descriptor {} for {role} is unavailable", entry.index))
-        };
-        let pty_master = take_role("pty_master", &mut fds)?;
-        let child_status = take_role("child_status", &mut fds)?;
-        if fds.iter().any(Option::is_some) {
-            return Err("FD transfer carried descriptors with unsupported roles".to_string());
-        }
+        let take_role =
+            |role: &crate::fd_transfer::FdRole, fds: &mut Vec<Option<std::os::fd::OwnedFd>>| -> Result<std::os::fd::OwnedFd, String> {
+                let entry = manifest
+                    .fds
+                    .iter()
+                    .find(|entry| &entry.role == role)
+                    .ok_or_else(|| format!("FD transfer manifest is missing {}", role.as_str()))?;
+                fds.get_mut(entry.index)
+                    .and_then(Option::take)
+                    .ok_or_else(|| format!("FD transfer descriptor {} for {} is unavailable", entry.index, role.as_str()))
+            };
+        let pty_master = take_role(&crate::fd_transfer::FdRole::pty_master(), &mut fds)?;
+        let child_status = take_role(&crate::fd_transfer::FdRole::child_status(), &mut fds)?;
+        // Unrecognized roles are intentionally ignored. The manifest's indexed
+        // role map is the extension point for future transfer operations.
         crate::runtime::validate_runtime_name(&manifest.session.id)?;
         manifest.session.vt_engine.ensure_available()?;
         let session_dir = layout.session_dir(&manifest.session.id);
@@ -2125,7 +2117,10 @@ fn create_sibling_session(
     sessions: &HashMap<String, HostedSession>,
 ) -> Result<http_uds::CreateSiblingResponse, String> {
     let source = sessions.get(source_session).ok_or_else(|| format!("missing session {source_session}"))?;
-    let target_daemon = request.name.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
+    let session_id = request.id.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
+    crate::runtime::validate_runtime_name(&session_id)?;
+    let daemon_nonce = uuid::Uuid::new_v4().simple().to_string();
+    let target_daemon = format!("sibling-{}", &daemon_nonce[..12]);
     crate::runtime::validate_runtime_name(&target_daemon)?;
     if target_daemon == source_daemon {
         return Err(format!("sibling daemon {target_daemon} must differ from source daemon"));
@@ -2134,37 +2129,42 @@ fn create_sibling_session(
     if target_layout.daemon_dir().exists() {
         return Err(format!("sibling daemon {target_daemon} already exists"));
     }
+    validate_session_socket_path(&target_layout.socket_path())?;
 
     let mut session = source.metadata.clone();
-    session.id = target_daemon.clone();
+    session.id = session_id;
     session.cwd = Some(std::env::current_dir().map_err(|err| format!("read source daemon working directory: {err}"))?);
     session.cmd = request.cmd;
     session.tags.clear();
     session.record = request.record;
 
-    let pty_child = crate::platform::pty::PtyChild::spawn(&session)?;
+    let pty_child = crate::platform::pty::PtyChild::spawn_preserving_environment(&session)?;
     let transfer = pty_child.into_transfer()?;
     let (mut transfer_stream, mut daemon_process) = crate::platform::daemon::spawn_transfer_daemon_process(root, &target_daemon)?;
-    transfer_stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .map_err(|err| format!("set FD transfer acknowledgement timeout: {err}"))?;
-    transfer_stream.set_write_timeout(Some(Duration::from_secs(15))).map_err(|err| format!("set FD transfer send timeout: {err}"))?;
     let manifest = crate::fd_transfer::FdTransferManifest {
         version: 1,
-        operation: "sibling".to_string(),
-        fds: vec![crate::fd_transfer::FdManifestEntry { index: 0, role: "pty_master".to_string() }, crate::fd_transfer::FdManifestEntry {
-            index: 1,
-            role: "child_status".to_string(),
-        }],
+        operation: crate::fd_transfer::FdTransferOperation::Sibling,
+        fds: vec![
+            crate::fd_transfer::FdManifestEntry { index: 0, role: crate::fd_transfer::FdRole::pty_master() },
+            crate::fd_transfer::FdManifestEntry { index: 1, role: crate::fd_transfer::FdRole::child_status() },
+        ],
         session: session.clone(),
         source_session: source_session.to_string(),
         target_daemon: target_daemon.clone(),
         child_pid: transfer.child_pid(),
     };
-    let transfer_result = crate::fd_transfer::send(&mut transfer_stream, &manifest, &transfer.fds())
-        .and_then(|()| crate::fd_transfer::receive_ack(&mut transfer_stream));
+    let transfer_result = (|| {
+        transfer_stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .map_err(|err| format!("set FD transfer acknowledgement timeout: {err}"))?;
+        transfer_stream.set_write_timeout(Some(Duration::from_secs(15))).map_err(|err| format!("set FD transfer send timeout: {err}"))?;
+        crate::fd_transfer::send(&mut transfer_stream, &manifest, &transfer.fds())?;
+        crate::fd_transfer::receive_ack(&mut transfer_stream)
+    })();
     if let Err(err) = transfer_result {
         let _ = daemon_process.kill();
+        let _ = daemon_process.wait();
+        let _ = fs::remove_dir_all(target_layout.daemon_dir());
         return Err(err);
     }
     transfer.commit();

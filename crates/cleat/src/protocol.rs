@@ -11,6 +11,9 @@ use crate::vt::VtEngineKind;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
+    /// Daemon that owns this session.
+    #[serde(default)]
+    pub daemon: String,
     pub vt_engine: VtEngineKind,
     pub vt_engine_status: String,
     pub functional_vt_available: bool,

@@ -19,16 +19,44 @@ const TRANSFER_ACK: u8 = 1;
 const MAX_TRANSFER_FDS: usize = 16;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FdRole(String);
+
+impl FdRole {
+    pub fn new(role: impl Into<String>) -> Self {
+        Self(role.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn pty_master() -> Self {
+        Self::new("pty_master")
+    }
+
+    pub fn child_status() -> Self {
+        Self::new("child_status")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FdTransferOperation {
+    Sibling,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FdManifestEntry {
     pub index: usize,
-    pub role: String,
+    pub role: FdRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FdTransferManifest {
     pub version: u16,
-    pub operation: String,
+    pub operation: FdTransferOperation,
     pub fds: Vec<FdManifestEntry>,
     pub session: SessionMetadata,
     pub source_session: String,
@@ -132,8 +160,12 @@ fn validate_fd_manifest(entries: &[FdManifestEntry], fd_count: usize) -> Result<
     if indexes != (0..fd_count).collect::<Vec<_>>() {
         return Err("FD transfer manifest indexes must be unique and contiguous from zero".to_string());
     }
-    if entries.iter().any(|entry| entry.role.is_empty()) {
+    if entries.iter().any(|entry| entry.role.as_str().is_empty()) {
         return Err("FD transfer manifest roles must not be empty".to_string());
+    }
+    let roles: std::collections::HashSet<_> = entries.iter().map(|entry| &entry.role).collect();
+    if roles.len() != entries.len() {
+        return Err("FD transfer manifest roles must be unique".to_string());
     }
     Ok(())
 }

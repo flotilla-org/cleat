@@ -112,7 +112,7 @@ fn launch_command_parses() {
     assert_eq!(cli.command, Command::Launch {
         id: None,
         from: None,
-        name: None,
+        sibling_id: None,
         json: false,
         size: None,
         vt: None,
@@ -131,7 +131,7 @@ fn create_from_parses_sibling_session_options() {
     assert_eq!(cli.command, Command::Launch {
         id: None,
         from: Some("parent".into()),
-        name: Some("helper".into()),
+        sibling_id: Some("helper".into()),
         json: false,
         size: None,
         vt: None,
@@ -181,7 +181,7 @@ fn launch_command_parses_positional_name() {
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         from: None,
-        name: None,
+        sibling_id: None,
         json: false,
         size: None,
         vt: None,
@@ -211,7 +211,7 @@ fn launch_command_parses_json() {
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         from: None,
-        name: None,
+        sibling_id: None,
         json: true,
         size: None,
         vt: None,
@@ -228,7 +228,7 @@ fn launch_command_parses_vt() {
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
         from: None,
-        name: None,
+        sibling_id: None,
         json: false,
         size: None,
         vt: Some(VtEngineKind::Ghostty),
@@ -245,7 +245,7 @@ fn create_alias_still_parses_as_launch() {
     assert_eq!(cli.command, Command::Launch {
         id: None,
         from: None,
-        name: None,
+        sibling_id: None,
         json: false,
         size: None,
         vt: None,

@@ -136,9 +136,9 @@ pub enum Command {
         /// Spawn the new session from the selected source session's daemon context
         #[arg(long, value_name = "SESSION", conflicts_with_all = ["id", "size", "vt", "cwd", "tags"])]
         from: Option<String>,
-        /// Name the sibling session and its new daemon
-        #[arg(long, value_name = "NAME", requires = "from")]
-        name: Option<String>,
+        /// Set the sibling session ID
+        #[arg(long = "name", value_name = "ID", requires = "from")]
+        sibling_id: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(long, value_name = "COLSxROWS", value_parser = parse_terminal_size, help = "Initial terminal size, e.g. 120x40")]
@@ -535,7 +535,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, from, name, json, size, vt, cwd, cmd, tags, record } => {
+        Command::Launch { id, from, sibling_id, json, size, vt, cwd, cmd, tags, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -543,7 +543,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
             }
             if let Some(source) = from {
-                let created = match service.create_sibling(&source, name, cmd, record.enabled()) {
+                let created = match service.create_sibling(&source, sibling_id, cmd, record.enabled()) {
                     Ok(created) => created,
                     Err(err) => return ExecResult::Err(err),
                 };
@@ -553,7 +553,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                         Err(err) => ExecResult::Err(format!("serialize sibling create result: {err}")),
                     }
                 } else {
-                    ExecResult::Ok(Some(created.session.id))
+                    ExecResult::Ok(Some(format!("{} (server {})", created.session.id, created.daemon)))
                 };
             }
             let tags = match normalize_cli_tags(tags) {
@@ -977,8 +977,12 @@ fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
     if let Some(ref err) = session.error {
         return format!("{}\t<inspect failed: {}>", session.id, err);
     }
-    let mut fields =
-        vec![session.id.clone(), format_session_status(&session.status).to_string(), crate::vt::vt_engine_label(session.vt_engine)];
+    let mut fields = vec![
+        session.id.clone(),
+        format!("daemon={}", session.daemon),
+        format_session_status(&session.status).to_string(),
+        crate::vt::vt_engine_label(session.vt_engine),
+    ];
     if let Some(cwd) = &session.cwd {
         fields.push(cwd.display().to_string());
     } else if let Some(cmd) = &session.cmd {

@@ -60,7 +60,17 @@ static SPAWN_CLOEXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl PtyChild {
     pub fn spawn(session: &SessionMetadata) -> Result<Self, String> {
-        let exec_spec = ChildExecSpec::new(session)?;
+        Self::spawn_with_environment(session, false)
+    }
+
+    /// Spawn in the daemon's exact environment. Sibling creation uses this
+    /// path because the source daemon's process context is part of the API.
+    pub fn spawn_preserving_environment(session: &SessionMetadata) -> Result<Self, String> {
+        Self::spawn_with_environment(session, true)
+    }
+
+    fn spawn_with_environment(session: &SessionMetadata, preserve_ssh_environment: bool) -> Result<Self, String> {
+        let exec_spec = ChildExecSpec::new(session, preserve_ssh_environment)?;
         let winsize = Winsize { ws_row: session.initial_size.rows, ws_col: session.initial_size.cols, ws_xpixel: 0, ws_ypixel: 0 };
         // The child never touches this lock (it only execs or exits), so
         // inheriting it in a locked state across the fork is harmless.
@@ -472,7 +482,7 @@ struct ChildExecSpec {
 }
 
 impl ChildExecSpec {
-    fn new(session: &SessionMetadata) -> Result<Self, String> {
+    fn new(session: &SessionMetadata, preserve_ssh_environment: bool) -> Result<Self, String> {
         let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
         let program = cstring_from_os(resolve_shell_program(&shell).as_os_str(), "shell path contains interior nul")?;
         let mut argv = vec![cstring_from_os(&shell, "shell contains interior nul")?];
@@ -480,7 +490,7 @@ impl ChildExecSpec {
             argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
             argv.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
         }
-        let envp = filtered_envp_from(env::vars_os())?;
+        let envp = if preserve_ssh_environment { envp_from(env::vars_os())? } else { filtered_envp_from(env::vars_os())? };
         let cwd = session.cwd.as_ref().map(|cwd| cstring_from_os(cwd.as_os_str(), "cwd contains interior nul")).transpose()?;
         let argv_ptrs = null_terminated_ptrs(&argv);
         let envp_ptrs = null_terminated_ptrs(&envp);
@@ -529,11 +539,12 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 fn filtered_envp_from(env: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Vec<CString>, String> {
+    envp_from(env.into_iter().filter(|(key, _)| !STRIP_ENV_VARS.iter().any(|strip| key == OsStr::new(strip))))
+}
+
+fn envp_from(env: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Vec<CString>, String> {
     let mut envp = Vec::new();
     for (key, value) in env {
-        if STRIP_ENV_VARS.iter().any(|strip| key == OsStr::new(strip)) {
-            continue;
-        }
         let mut entry = Vec::with_capacity(key.as_bytes().len() + 1 + value.as_bytes().len());
         entry.extend_from_slice(key.as_bytes());
         entry.push(b'=');

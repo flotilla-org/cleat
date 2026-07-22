@@ -127,10 +127,11 @@ impl SessionService {
         let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, options)?;
         // If the daemon was already running, get real config via inspect.
         if let Ok(result) = self.inspect(&session.id) {
-            return Ok(session_info_from_inspect(result, SessionStatus::Detached));
+            return Ok(session_info_from_inspect(result, self.layout.daemon_name(), SessionStatus::Detached));
         }
         Ok(SessionInfo {
             id: session.id,
+            daemon: self.layout.daemon_name().to_string(),
             vt_engine: session.vt_engine,
             vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
             functional_vt_available: crate::vt::functional_vt_available(),
@@ -148,7 +149,7 @@ impl SessionService {
     pub fn create_sibling(
         &self,
         source_session: &str,
-        name: Option<String>,
+        id: Option<String>,
         cmd: Option<String>,
         record: bool,
     ) -> Result<SiblingSessionInfo, String> {
@@ -159,13 +160,14 @@ impl SessionService {
             source_session,
             Method::POST,
             &format!("/sessions/{source_session}/siblings"),
-            &http_uds::CreateSiblingRequest { name, cmd, record },
+            &http_uds::CreateSiblingRequest { id, cmd, record },
         )?;
         let target = self.with_daemon(response.daemon.clone())?;
         let session = match target.inspect(&response.session.id) {
-            Ok(inspect) => session_info_from_inspect(inspect, SessionStatus::Detached),
+            Ok(inspect) => session_info_from_inspect(inspect, &response.daemon, SessionStatus::Detached),
             Err(_) => SessionInfo {
                 id: response.session.id,
+                daemon: response.daemon.clone(),
                 vt_engine: response.session.vt_engine,
                 vt_engine_status: crate::vt::vt_engine_status(response.session.vt_engine).to_string(),
                 functional_vt_available: crate::vt::functional_vt_available(),
@@ -254,6 +256,7 @@ impl SessionService {
                         if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
                     let info = SessionInfo {
                         id: result.session.id,
+                        daemon: self.layout.daemon_name().to_string(),
                         vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
                         vt_engine_status: result.session.vt_engine_status,
                         functional_vt_available: result.session.functional_vt_available,
@@ -494,10 +497,11 @@ impl SessionService {
         };
         // Get real config from the daemon before attaching (which takes the foreground slot).
         let info = if let Ok(result) = self.inspect(&session.id) {
-            session_info_from_inspect(result, SessionStatus::Attached)
+            session_info_from_inspect(result, self.layout.daemon_name(), SessionStatus::Attached)
         } else {
             SessionInfo {
                 id: session.id.clone(),
+                daemon: self.layout.daemon_name().to_string(),
                 vt_engine: session.vt_engine,
                 vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
                 functional_vt_available: crate::vt::functional_vt_available(),
@@ -850,6 +854,7 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
         let _ = std::fs::remove_file(layout.foreground_path(&id));
         sessions.push(SessionInfo {
             id,
+            daemon: layout.daemon_name().to_string(),
             vt_engine: crate::vt::default_vt_engine_kind(),
             vt_engine_status: String::new(),
             functional_vt_available: false,
@@ -923,9 +928,10 @@ fn parse_vt_engine_kind(s: &str) -> VtEngineKind {
     }
 }
 
-fn session_info_from_inspect(result: crate::protocol::InspectResult, status: SessionStatus) -> SessionInfo {
+fn session_info_from_inspect(result: crate::protocol::InspectResult, daemon: &str, status: SessionStatus) -> SessionInfo {
     SessionInfo {
         id: result.session.id,
+        daemon: daemon.to_string(),
         vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
         vt_engine_status: result.session.vt_engine_status,
         functional_vt_available: result.session.functional_vt_available,

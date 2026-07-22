@@ -6,7 +6,7 @@ use std::{
 };
 
 use cleat::{
-    fd_transfer::{self, FdManifestEntry, FdTransferManifest},
+    fd_transfer::{self, FdManifestEntry, FdRole, FdTransferManifest, FdTransferOperation},
     runtime::{SessionMetadata, TerminalSize},
     vt::{TerminalColors, VtEngineKind},
 };
@@ -14,8 +14,8 @@ use cleat::{
 fn manifest() -> FdTransferManifest {
     FdTransferManifest {
         version: 1,
-        operation: "sibling".to_string(),
-        fds: vec![FdManifestEntry { index: 0, role: "pty_master".to_string() }],
+        operation: FdTransferOperation::Sibling,
+        fds: vec![FdManifestEntry { index: 0, role: FdRole::pty_master() }],
         session: SessionMetadata {
             id: "helper".to_string(),
             vt_engine: VtEngineKind::Passthrough,

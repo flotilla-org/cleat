@@ -64,6 +64,18 @@ pub struct SessionService {
     layout: RuntimeLayout,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonInstance {
+    name: String,
+    pid: u32,
+}
+
+impl DaemonInstance {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ListScope {
     Current,
@@ -133,13 +145,17 @@ impl SessionService {
 
     pub fn create_with_options_in_running_daemon(
         &self,
+        daemon: &DaemonInstance,
         name: Option<String>,
         vt_engine: Option<VtEngineKind>,
         cwd: Option<std::path::PathBuf>,
         cmd: Option<String>,
         options: SessionStartOptions,
     ) -> Result<SessionInfo, String> {
-        let session = start_session_in_running_daemon(&self.layout, name, vt_engine, cwd, cmd, options)?;
+        if self.layout.daemon_name() != daemon.name {
+            return Err(format!("daemon instance {} does not match target {}", daemon.name, self.layout.daemon_name()));
+        }
+        let session = start_session_in_running_daemon(&self.layout, daemon.pid, name, vt_engine, cwd, cmd, options)?;
         Ok(self.session_info_after_create(session))
     }
 
@@ -176,7 +192,7 @@ impl SessionService {
         self.list_daemons(selectors, ListScope::All)
     }
 
-    pub fn daemon_owning_session(&self, id: &str) -> Result<String, String> {
+    pub fn daemon_owning_session(&self, id: &str) -> Result<DaemonInstance, String> {
         if !self.layout.root().exists() {
             return Err(format!("missing session {id}"));
         }
@@ -187,8 +203,13 @@ impl SessionService {
             if !daemon_service.session_dir(id).is_dir() {
                 continue;
             }
+            let pid_before = daemon_service.registered_daemon_pid();
             match daemon_service.inspect(id) {
-                Ok(_) => owners.push(daemon_name),
+                Ok(_) => match (pid_before, daemon_service.registered_daemon_pid()) {
+                    (Ok(before), Ok(after)) if before == after => owners.push(DaemonInstance { name: daemon_name, pid: after }),
+                    (Ok(_), Ok(_)) => candidate_errors.push(format!("{daemon_name}: daemon changed while resolving session")),
+                    (_, Err(err)) | (Err(err), _) => candidate_errors.push(format!("{daemon_name}: {err}")),
+                },
                 Err(err) => candidate_errors.push(format!("{daemon_name}: {err}")),
             }
         }
@@ -196,12 +217,18 @@ impl SessionService {
         match owners.as_slice() {
             [] if candidate_errors.is_empty() => Err(format!("missing session {id}")),
             [] => Err(format!("unable to resolve session {id}: {}", candidate_errors.join("; "))),
-            [daemon_name] => Ok(daemon_name.clone()),
+            [daemon] => Ok(daemon.clone()),
             _ => Err(format!(
                 "session {id} exists in multiple daemons ({}); use --server to select the target daemon instead",
-                owners.join(", ")
+                owners.iter().map(|daemon| daemon.name.as_str()).collect::<Vec<_>>().join(", ")
             )),
         }
+    }
+
+    fn registered_daemon_pid(&self) -> Result<u32, String> {
+        let path = self.layout.daemon_pid_path();
+        let value = std::fs::read_to_string(&path).map_err(|err| format!("read daemon registration {}: {err}", path.display()))?;
+        value.trim().parse().map_err(|err| format!("parse daemon registration {}: {err}", path.display()))
     }
 
     fn list_daemons(&self, selectors: &[String], scope: ListScope) -> Result<Vec<SessionInfo>, String> {

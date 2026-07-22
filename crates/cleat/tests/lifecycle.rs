@@ -577,22 +577,39 @@ fn create_existing_session_returns_its_running_metadata() {
 }
 
 #[test]
-fn create_in_running_daemon_does_not_start_a_missing_daemon() {
+fn create_in_running_daemon_rejects_a_replacement_daemon() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
-    let service = service_for(temp.path()).with_daemon("gone".to_string()).expect("named daemon service");
+    let service = service_for(temp.path());
+    let source_daemon = service.with_daemon("source-daemon".to_string()).expect("named daemon service");
+    source_daemon
+        .create(Some("source".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create source");
+    let resolved = service.daemon_owning_session("source").expect("resolve source daemon instance");
 
-    let err = service
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), "source-daemon");
+    let socket_path = temp.path().join("source-daemon/socket");
+    wait_until("source daemon exit", || UnixStream::connect(&socket_path).is_err());
+    source_daemon
+        .create(Some("replacement".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("start replacement daemon");
+
+    let err = source_daemon
         .create_with_options_in_running_daemon(
+            &resolved,
             Some("sibling".into()),
             Some(VtEngineKind::Passthrough),
             None,
             Some("sleep 30".into()),
             SessionStartOptions::default(),
         )
-        .expect_err("missing source daemon must not be started");
+        .expect_err("replacement daemon must reject sibling launch");
 
-    assert!(err.contains("source daemon gone is no longer running"), "{err}");
-    assert!(!temp.path().join("gone").exists(), "failed sibling launch must not create a daemon directory");
+    assert!(err.contains("source daemon instance changed"), "{err}");
+    assert_eq!(source_daemon.list().expect("list replacement daemon").iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec![
+        "replacement"
+    ]);
+    source_daemon.kill("replacement").expect("kill replacement");
 }
 
 #[test]

@@ -7,7 +7,7 @@ use crate::{
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
     runtime::{TerminalSize, DEFAULT_DAEMON_NAME},
-    server::{EndBound, FallbackReason, SessionService, StartBound},
+    server::{DaemonInstance, EndBound, FallbackReason, SessionService, StartBound},
     vt::VtEngineKind,
 };
 
@@ -501,11 +501,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     if cli.server.is_some() && matches!(&cli.command, Command::Launch { from: Some(_), .. }) {
         return ExecResult::Err("--server cannot be used with --from".to_string());
     }
-    let daemon_name = match resolve_daemon_target(&cli, service) {
-        Ok(daemon_name) => daemon_name,
+    let daemon_target = match resolve_daemon_target(&cli, service) {
+        Ok(daemon_target) => daemon_target,
         Err(err) => return ExecResult::Err(err),
     };
-    let service = match service.with_daemon(daemon_name) {
+    let service = match service.with_daemon(daemon_target.name().to_string()) {
         Ok(service) => service,
         Err(err) => return ExecResult::Err(err),
     };
@@ -558,7 +558,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, from, json, size, vt, cwd, cmd, tags, record } => {
+        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -575,11 +575,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 colors: crate::vt::TerminalColors::default(),
                 tags,
             };
-            let created = match if from.is_some() {
-                service.create_with_options_in_running_daemon(id, vt, cwd, cmd, options)
-            } else {
-                service.create_with_options(id, vt, cwd, cmd, options)
-            } {
+            let create_result = match &daemon_target {
+                DaemonTarget::Running(daemon) => service.create_with_options_in_running_daemon(daemon, id, vt, cwd, cmd, options),
+                DaemonTarget::AutoStart(_) => service.create_with_options(id, vt, cwd, cmd, options),
+            };
+            let created = match create_result {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
@@ -851,16 +851,30 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     }
 }
 
-fn resolve_daemon_target(cli: &Cli, service: &SessionService) -> Result<String, String> {
+enum DaemonTarget {
+    AutoStart(String),
+    Running(DaemonInstance),
+}
+
+impl DaemonTarget {
+    fn name(&self) -> &str {
+        match self {
+            Self::AutoStart(name) => name,
+            Self::Running(daemon) => daemon.name(),
+        }
+    }
+}
+
+fn resolve_daemon_target(cli: &Cli, service: &SessionService) -> Result<DaemonTarget, String> {
     if let Some(daemon_name) = &cli.server {
-        return Ok(daemon_name.clone());
+        return Ok(DaemonTarget::AutoStart(daemon_name.clone()));
     }
 
     let Command::Launch { from: Some(source), .. } = &cli.command else {
-        return Ok(DEFAULT_DAEMON_NAME.to_string());
+        return Ok(DaemonTarget::AutoStart(DEFAULT_DAEMON_NAME.to_string()));
     };
 
-    service.daemon_owning_session(source)
+    service.daemon_owning_session(source).map(DaemonTarget::Running)
 }
 
 fn execute_wait(

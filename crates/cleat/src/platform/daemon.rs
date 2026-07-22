@@ -1,9 +1,12 @@
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+};
+#[cfg(unix)]
+use std::{
+    os::unix::net::UnixStream,
+    os::{fd::AsRawFd, unix::process::CommandExt},
 };
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -31,6 +34,40 @@ pub fn spawn_daemon_process(root: &Path, daemon_name: &str) -> Result<(), String
     }
     command.spawn().map_err(|err| format!("spawn daemon {daemon_name}: {err}"))?;
     Ok(())
+}
+
+#[cfg(unix)]
+pub fn spawn_transfer_daemon_process(root: &Path, daemon_name: &str) -> Result<(UnixStream, std::process::Child), String> {
+    const BOOTSTRAP_FD: i32 = 3;
+    let (parent_stream, child_stream) = UnixStream::pair().map_err(|err| format!("create daemon transfer socketpair: {err}"))?;
+    let transfer_fd = child_stream.as_raw_fd();
+    let exe = resolve_cleat_executable()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("--runtime-root")
+        .arg(root)
+        .arg("--server")
+        .arg(daemon_name)
+        .arg("serve")
+        .arg("--bootstrap-fd")
+        .arg(BOOTSTRAP_FD.to_string());
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // SAFETY: the child side of the socketpair is valid through `spawn`; the
+    // pre-exec hook only invokes async-signal-safe syscalls before exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(transfer_fd, BOOTSTRAP_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(BOOTSTRAP_FD, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::from)
+        });
+    }
+    let child = command.spawn().map_err(|err| format!("spawn transfer daemon {daemon_name}: {err}"))?;
+    drop(child_stream);
+    Ok((parent_stream, child))
 }
 
 /// Returns true if the daemon is alive, or if no PID file exists yet because

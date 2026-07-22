@@ -131,8 +131,14 @@ pub enum Command {
         after_long_help = "Tip: launch a shell (e.g. zsh) and use `send` to run commands.\nSessions exit when the launched process exits."
     )]
     Launch {
-        #[arg(value_name = "ID")]
+        #[arg(value_name = "ID", conflicts_with = "from")]
         id: Option<String>,
+        /// Spawn the new session from the selected source session's daemon context
+        #[arg(long, value_name = "SESSION", conflicts_with_all = ["id", "size", "vt", "cwd", "tags"])]
+        from: Option<String>,
+        /// Name the sibling session and its new daemon
+        #[arg(long, value_name = "NAME", requires = "from")]
+        name: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(long, value_name = "COLSxROWS", value_parser = parse_terminal_size, help = "Initial terminal size, e.g. 120x40")]
@@ -422,7 +428,10 @@ resolved through the live daemon socket. \n\
         json: bool,
     },
     #[command(hide = true)]
-    Serve,
+    Serve {
+        #[arg(long, hide = true)]
+        bootstrap_fd: Option<i32>,
+    },
 }
 
 /// Uses `command()` instead of `Cli::parse()` so --help renders the workflow
@@ -526,12 +535,26 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, json, size, vt, cwd, cmd, tags, record } => {
+        Command::Launch { id, from, name, json, size, vt, cwd, cmd, tags, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
-            if !crate::vt::functional_vt_available() {
+            if from.is_none() && !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
+            }
+            if let Some(source) = from {
+                let created = match service.create_sibling(&source, name, cmd, record.enabled()) {
+                    Ok(created) => created,
+                    Err(err) => return ExecResult::Err(err),
+                };
+                return if json {
+                    match serde_json::to_string(&created) {
+                        Ok(output) => ExecResult::Ok(Some(output)),
+                        Err(err) => ExecResult::Err(format!("serialize sibling create result: {err}")),
+                    }
+                } else {
+                    ExecResult::Ok(Some(created.session.id))
+                };
             }
             let tags = match normalize_cli_tags(tags) {
                 Ok(tags) => tags,
@@ -807,7 +830,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
         }
-        Command::Serve => match service.serve() {
+        Command::Serve { bootstrap_fd } => match service.serve_with_bootstrap(bootstrap_fd) {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },

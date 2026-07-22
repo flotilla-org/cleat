@@ -3,6 +3,8 @@ pub mod cast_reader;
 pub mod cli;
 pub mod da;
 pub mod duration_parser;
+#[cfg(unix)]
+pub mod fd_transfer;
 mod host;
 mod http_uds;
 pub mod keys;

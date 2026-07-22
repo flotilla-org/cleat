@@ -26,6 +26,7 @@ pub(crate) enum Route {
     PacketConnect,
     Sessions,
     SessionCreate,
+    SessionSiblingCreate { id: String },
     SessionDelete { id: String },
     SessionAttach { id: String },
     SessionWatch { id: String },
@@ -226,6 +227,19 @@ pub(crate) struct PacketSubscribeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CreateSessionResponse {
+    pub session: crate::runtime::SessionMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CreateSiblingRequest {
+    pub name: Option<String>,
+    pub cmd: Option<String>,
+    pub record: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CreateSiblingResponse {
+    pub daemon: String,
     pub session: crate::runtime::SessionMetadata,
 }
 
@@ -523,6 +537,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::GET, Some("snapshot"), None) => Route::SessionSnapshot { id: id.to_string() },
                 (&Method::POST, Some("tags"), None) => Route::SessionTags { id: id.to_string() },
                 (&Method::POST, Some("wait"), None) => Route::SessionWait { id: id.to_string() },
+                (&Method::POST, Some("siblings"), None) => Route::SessionSiblingCreate { id: id.to_string() },
                 _ => Route::NotFound,
             }
         }
@@ -779,6 +794,7 @@ mod tests {
             ("GET", "/sessions/alpha/snapshot", Route::SessionSnapshot { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/tags", Route::SessionTags { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/wait", Route::SessionWait { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/siblings", Route::SessionSiblingCreate { id: "alpha".to_string() }),
         ];
 
         for (method, path, expected) in cases {

@@ -111,6 +111,8 @@ fn launch_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--cmd", "bash"]).expect("launch parses");
     assert_eq!(cli.command, Command::Launch {
         id: None,
+        from: None,
+        name: None,
         json: false,
         size: None,
         vt: None,
@@ -119,6 +121,39 @@ fn launch_command_parses() {
         tags: Vec::new(),
         record: RecordFlags::default()
     });
+}
+
+#[test]
+fn create_from_parses_sibling_session_options() {
+    let cli = Cli::try_parse_from(["cleat", "create", "--from", "parent", "--name", "helper", "--cmd", "cargo test"])
+        .expect("create --from parses");
+
+    assert_eq!(cli.command, Command::Launch {
+        id: None,
+        from: Some("parent".into()),
+        name: Some("helper".into()),
+        json: false,
+        size: None,
+        vt: None,
+        cwd: None,
+        cmd: Some("cargo test".into()),
+        tags: Vec::new(),
+        record: RecordFlags::default(),
+    });
+}
+
+#[test]
+fn create_from_rejects_regular_launch_placement_options() {
+    assert!(Cli::try_parse_from(["cleat", "create", "child", "--from", "parent"]).is_err());
+    assert!(Cli::try_parse_from(["cleat", "create", "--from", "parent", "--cwd", "/tmp"]).is_err());
+    assert!(Cli::try_parse_from(["cleat", "create", "--from", "parent", "--size", "120x40"]).is_err());
+    assert!(Cli::try_parse_from(["cleat", "create", "--from", "parent", "--vt", "passthrough"]).is_err());
+    assert!(Cli::try_parse_from(["cleat", "create", "--from", "parent", "--tag", "helper"]).is_err());
+}
+
+#[test]
+fn name_requires_create_from() {
+    assert!(Cli::try_parse_from(["cleat", "launch", "--name", "helper"]).is_err());
 }
 
 #[test]
@@ -145,6 +180,8 @@ fn launch_command_parses_positional_name() {
     let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--cmd", "bash"]).expect("launch positional parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
+        name: None,
         json: false,
         size: None,
         vt: None,
@@ -173,6 +210,8 @@ fn launch_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
+        name: None,
         json: true,
         size: None,
         vt: None,
@@ -188,6 +227,8 @@ fn launch_command_parses_vt() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--vt", "ghostty", "demo"]).expect("launch --vt parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
+        name: None,
         json: false,
         size: None,
         vt: Some(VtEngineKind::Ghostty),
@@ -203,6 +244,8 @@ fn create_alias_still_parses_as_launch() {
     let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create alias parses");
     assert_eq!(cli.command, Command::Launch {
         id: None,
+        from: None,
+        name: None,
         json: false,
         size: None,
         vt: None,
@@ -406,7 +449,7 @@ fn record_flags_explicit_record_enables() {
 fn serve_parses_as_daemon_scoped_command() {
     let cli = Cli::try_parse_from(["cleat", "--server", "alternate", "serve"]).expect("parse serve");
     assert_eq!(cli.server, "alternate");
-    assert!(matches!(cli.command, Command::Serve));
+    assert!(matches!(cli.command, Command::Serve { bootstrap_fd: None }));
 }
 
 #[test]

@@ -1,5 +1,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -562,6 +564,31 @@ impl HostedSession {
         })
     }
 
+    #[cfg(unix)]
+    fn adopt(session_dir: PathBuf, session: SessionMetadata, pty_child: crate::platform::pty::PtyChild) -> Result<Self, String> {
+        let should_keep_session_dir = session.record;
+        let actor_session_dir = session_dir;
+        let actor_session = session.clone();
+        let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
+            crate::session_runtime::SessionRuntime::adopt(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?, pty_child)
+        })?;
+        let raw_output_tap = actor.subscribe_raw_output()?;
+        Ok(Self {
+            metadata: session,
+            actor,
+            raw_output_tap,
+            active_client: None,
+            watchers: Vec::new(),
+            packet_controller: None,
+            packet_render_cache: PacketRenderCache::default(),
+            had_foreground_client: false,
+            pending_waits: Vec::new(),
+            pending_expects: Vec::new(),
+            screen_stable_snapshot_generation: None,
+            should_keep_session_dir,
+        })
+    }
+
     fn activity_session(&self, stable_threshold_ms: u64) -> ActivitySession {
         let activity = self.actor.screen_activity().snapshot(Instant::now(), Duration::from_millis(stable_threshold_ms));
         ActivitySession {
@@ -817,6 +844,29 @@ fn flush_watchers(watchers: &mut Vec<ActiveClient>) {
 
 #[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> {
+    run_session_daemon_inner(root, daemon_name, None)
+}
+
+#[cfg(unix)]
+pub fn run_session_daemon_from_transfer(root: &Path, daemon_name: &str, bootstrap_fd: i32) -> Result<(), String> {
+    run_session_daemon_inner(root, daemon_name, Some(bootstrap_fd))
+}
+
+#[cfg(any(unix, windows))]
+fn run_session_daemon_inner(root: &Path, daemon_name: &str, bootstrap_fd: Option<i32>) -> Result<(), String> {
+    #[cfg(windows)]
+    if bootstrap_fd.is_some() {
+        return Err("FD transfer bootstrap is only supported on Unix".to_string());
+    }
+    #[cfg(unix)]
+    let mut bootstrap_stream = bootstrap_fd.map(|fd| {
+        // SAFETY: the internal `serve --bootstrap-fd` command receives sole
+        // ownership of the inherited socketpair descriptor.
+        unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) }
+    });
+    #[cfg(unix)]
+    let bootstrap = bootstrap_stream.as_mut().map(crate::fd_transfer::receive).transpose()?;
+
     let layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(daemon_name.to_string())?;
     let socket_path = layout.socket_path();
     validate_session_socket_path(&socket_path)?;
@@ -840,12 +890,46 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     fs::write(layout.daemon_pid_path(), &daemon_pid).map_err(|err| format!("write daemon pid: {err}"))?;
 
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
+    #[cfg(unix)]
+    if let Some(bootstrap) = bootstrap {
+        let manifest = bootstrap.manifest;
+        if manifest.version != 1 {
+            return Err(format!("unsupported FD transfer manifest version {}", manifest.version));
+        }
+        if manifest.operation != "sibling" {
+            return Err(format!("unsupported FD transfer operation {}", manifest.operation));
+        }
+        if manifest.target_daemon != daemon_name {
+            return Err(format!("FD transfer target daemon {} does not match bootstrap daemon {daemon_name}", manifest.target_daemon));
+        }
+        let mut fds: Vec<_> = bootstrap.fds.into_iter().map(Some).collect();
+        let take_role = |role: &str, fds: &mut Vec<Option<std::os::fd::OwnedFd>>| -> Result<std::os::fd::OwnedFd, String> {
+            let entry =
+                manifest.fds.iter().find(|entry| entry.role == role).ok_or_else(|| format!("FD transfer manifest is missing {role}"))?;
+            fds.get_mut(entry.index)
+                .and_then(Option::take)
+                .ok_or_else(|| format!("FD transfer descriptor {} for {role} is unavailable", entry.index))
+        };
+        let pty_master = take_role("pty_master", &mut fds)?;
+        let child_status = take_role("child_status", &mut fds)?;
+        if fds.iter().any(Option::is_some) {
+            return Err("FD transfer carried descriptors with unsupported roles".to_string());
+        }
+        crate::runtime::validate_runtime_name(&manifest.session.id)?;
+        manifest.session.vt_engine.ensure_available()?;
+        let session_dir = layout.session_dir(&manifest.session.id);
+        fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
+        let pty_child = crate::platform::pty::PtyChild::from_transferred(pty_master, child_status, manifest.child_pid)?;
+        let hosted = HostedSession::adopt(session_dir, manifest.session.clone(), pty_child)?;
+        sessions.insert(manifest.session.id.clone(), hosted);
+        crate::fd_transfer::send_ack(bootstrap_stream.as_mut().expect("bootstrap stream exists with bootstrap manifest"))?;
+    }
     let mut packet_clients: Vec<PacketClient> = Vec::new();
     let mut pending_http_handshakes: Vec<PendingHttpHandshake> = Vec::new();
     let mut next_packet_client_id: u64 = 1;
     let mut exited_session: Option<(String, bool)> = None;
     let mut faulted_session: Option<String> = None;
-    let mut idle_since = Some(Instant::now());
+    let mut idle_since = sessions.is_empty().then(Instant::now);
     let mut last_registration_check = Instant::now();
     let mut registration_was_lost = false;
 
@@ -1555,7 +1639,7 @@ impl PendingHttpHandshake {
 }
 
 fn handle_http_request(
-    _root: &Path,
+    root: &Path,
     daemon_id: &str,
     stream: &mut SessionStream,
     request: http_uds::HttpRequest,
@@ -1607,6 +1691,12 @@ fn handle_http_request(
                 state.sessions.get(&session.id).ok_or_else(|| "created session disappeared before response".to_string())?.metadata.clone();
             http_uds::write_json(stream, StatusCode::OK, &http_uds::CreateSessionResponse { session })
                 .map_err(|err| format!("write HTTP session create response: {err}"))
+        }
+        http_uds::Route::SessionSiblingCreate { id } => {
+            let request: http_uds::CreateSiblingRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP sibling create request: {err}"))?;
+            let response = create_sibling_session(root, daemon_id, &id, request, state.sessions)?;
+            http_uds::write_json(stream, StatusCode::OK, &response).map_err(|err| format!("write HTTP sibling create response: {err}"))
         }
         http_uds::Route::PacketConnect => {
             if !http_uds::request_has_upgrade_token(&request, "cleat-packet/1") {
@@ -2024,6 +2114,72 @@ fn handle_http_request(
             http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
         }
     }
+}
+
+#[cfg(unix)]
+fn create_sibling_session(
+    root: &Path,
+    source_daemon: &str,
+    source_session: &str,
+    request: http_uds::CreateSiblingRequest,
+    sessions: &HashMap<String, HostedSession>,
+) -> Result<http_uds::CreateSiblingResponse, String> {
+    let source = sessions.get(source_session).ok_or_else(|| format!("missing session {source_session}"))?;
+    let target_daemon = request.name.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
+    crate::runtime::validate_runtime_name(&target_daemon)?;
+    if target_daemon == source_daemon {
+        return Err(format!("sibling daemon {target_daemon} must differ from source daemon"));
+    }
+    let target_layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(target_daemon.clone())?;
+    if target_layout.daemon_dir().exists() {
+        return Err(format!("sibling daemon {target_daemon} already exists"));
+    }
+
+    let mut session = source.metadata.clone();
+    session.id = target_daemon.clone();
+    session.cwd = Some(std::env::current_dir().map_err(|err| format!("read source daemon working directory: {err}"))?);
+    session.cmd = request.cmd;
+    session.tags.clear();
+    session.record = request.record;
+
+    let pty_child = crate::platform::pty::PtyChild::spawn(&session)?;
+    let transfer = pty_child.into_transfer()?;
+    let (mut transfer_stream, mut daemon_process) = crate::platform::daemon::spawn_transfer_daemon_process(root, &target_daemon)?;
+    transfer_stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|err| format!("set FD transfer acknowledgement timeout: {err}"))?;
+    transfer_stream.set_write_timeout(Some(Duration::from_secs(15))).map_err(|err| format!("set FD transfer send timeout: {err}"))?;
+    let manifest = crate::fd_transfer::FdTransferManifest {
+        version: 1,
+        operation: "sibling".to_string(),
+        fds: vec![crate::fd_transfer::FdManifestEntry { index: 0, role: "pty_master".to_string() }, crate::fd_transfer::FdManifestEntry {
+            index: 1,
+            role: "child_status".to_string(),
+        }],
+        session: session.clone(),
+        source_session: source_session.to_string(),
+        target_daemon: target_daemon.clone(),
+        child_pid: transfer.child_pid(),
+    };
+    let transfer_result = crate::fd_transfer::send(&mut transfer_stream, &manifest, &transfer.fds())
+        .and_then(|()| crate::fd_transfer::receive_ack(&mut transfer_stream));
+    if let Err(err) = transfer_result {
+        let _ = daemon_process.kill();
+        return Err(err);
+    }
+    transfer.commit();
+    Ok(http_uds::CreateSiblingResponse { daemon: target_daemon, session })
+}
+
+#[cfg(not(unix))]
+fn create_sibling_session(
+    _root: &Path,
+    _source_daemon: &str,
+    _source_session: &str,
+    _request: http_uds::CreateSiblingRequest,
+    _sessions: &HashMap<String, HostedSession>,
+) -> Result<http_uds::CreateSiblingResponse, String> {
+    Err("sibling session FD transfer is only supported on Unix".to_string())
 }
 
 fn write_http_not_found(stream: &mut SessionStream) -> Result<(), String> {

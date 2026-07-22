@@ -65,6 +65,8 @@ find .tools/ghostty-install -maxdepth 3 | sort
 
 **Session IDs.** You choose the ID (`cleat launch my-session`) or let cleat generate one (`session-<uuid>`). IDs are directory names under their daemon's `sessions/` directory, so use filesystem-safe characters. Launching with an ID that already has a live session in the selected daemon reuses that session; it does not create a duplicate.
 
+**Sibling sessions.** On Unix, `cleat create --from PARENT [--name NAME] [--cmd COMMAND]` asks the selected daemon to spawn a child in its own cwd, environment, container, and namespace context. It then transfers the new PTY master with `SCM_RIGHTS` to a new daemon. The sibling's daemon and session ID both use `NAME` (or the generated `session-<uuid>`), so address it as `cleat --server NAME … NAME`; use `cleat list --all` to include these independently hosted siblings.
+
 **Tags.** Sessions may carry flat, opaque tags. Add them at launch with repeated `--tag TAG`, mutate them with `cleat tag <id> +TAG -TAG`, and filter directory reads with repeated `--selector TAG`. Selectors are exact whole-tag matches and are ANDed when repeated. `key=value` is only a client convention; cleat does not interpret tag keys, values, hierarchy, or globs.
 
 **State directory.** The daemon registration, control socket, session state, and recordings share one root, discovered in priority order:
@@ -117,6 +119,7 @@ This subscription contract starts with packet protocol v4. Version 3 used raw PT
 |---|---|---|
 | `--server NAME` | daemon selection | Selects the named daemon for the command; default is `default` |
 | `launch [--tag TAG]... [--record|--no-record]` | daemon + VT engine + recording | Creates or reuses a session in the selected daemon |
+| `create --from ID [--name NAME] [--cmd COMMAND]` | source daemon + FD transfer | Unix only; spawns in the source daemon context and gives the new PTY to an independent daemon |
 | `tag <id> +TAG -TAG` | daemon directory state | Mutates opaque tags; tags are not interpreted by cleat |
 | `attach` / `detach` | host terminal + daemon | While attached, host terminal is authoritative for query replies |
 | `watch` | host terminal + daemon | Read-only live view; does not take foreground control |

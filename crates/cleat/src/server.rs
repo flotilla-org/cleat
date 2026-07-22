@@ -14,7 +14,7 @@ use crate::{
         daemon::is_session_daemon_alive,
         ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
-    protocol::{SessionInfo, SessionStatus},
+    protocol::{SessionInfo, SessionStatus, SiblingSessionInfo},
     runtime::{RuntimeLayout, TerminalSize},
     session::{attach_foreground, ensure_session_started, run_session_daemon, watch_foreground, ForegroundAttach, SessionStartOptions},
     vt::VtEngineKind,
@@ -143,6 +143,43 @@ impl SessionService {
             last_output_at: None,
             error: None,
         })
+    }
+
+    pub fn create_sibling(
+        &self,
+        source_session: &str,
+        name: Option<String>,
+        cmd: Option<String>,
+        record: bool,
+    ) -> Result<SiblingSessionInfo, String> {
+        if !self.layout.session_dir(source_session).exists() {
+            return Err(format!("missing session {source_session}"));
+        }
+        let response: http_uds::CreateSiblingResponse = self.http_json(
+            source_session,
+            Method::POST,
+            &format!("/sessions/{source_session}/siblings"),
+            &http_uds::CreateSiblingRequest { name, cmd, record },
+        )?;
+        let target = self.with_daemon(response.daemon.clone())?;
+        let session = match target.inspect(&response.session.id) {
+            Ok(inspect) => session_info_from_inspect(inspect, SessionStatus::Detached),
+            Err(_) => SessionInfo {
+                id: response.session.id,
+                vt_engine: response.session.vt_engine,
+                vt_engine_status: crate::vt::vt_engine_status(response.session.vt_engine).to_string(),
+                functional_vt_available: crate::vt::functional_vt_available(),
+                cwd: response.session.cwd,
+                cmd: response.session.cmd,
+                tags: response.session.tags,
+                status: SessionStatus::Detached,
+                screen_activity: crate::protocol::ScreenActivity::Stable,
+                stable_since: None,
+                last_output_at: None,
+                error: None,
+            },
+        };
+        Ok(SiblingSessionInfo { daemon: response.daemon, session })
     }
 
     pub fn list(&self) -> Result<Vec<SessionInfo>, String> {
@@ -688,6 +725,23 @@ impl SessionService {
 
     pub fn serve(&self) -> Result<(), String> {
         run_session_daemon(self.layout.root(), self.layout.daemon_name())
+    }
+
+    pub fn serve_with_bootstrap(&self, bootstrap_fd: Option<i32>) -> Result<(), String> {
+        match bootstrap_fd {
+            None => self.serve(),
+            Some(fd) => {
+                #[cfg(unix)]
+                {
+                    crate::session::run_session_daemon_from_transfer(self.layout.root(), self.layout.daemon_name(), fd)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = fd;
+                    Err("FD transfer bootstrap is only supported on Unix".to_string())
+                }
+            }
+        }
     }
 
     fn http_json<T: serde::Serialize, R: DeserializeOwned>(&self, id: &str, method: Method, path: &str, body: &T) -> Result<R, String> {

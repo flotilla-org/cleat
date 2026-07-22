@@ -33,6 +33,12 @@ pub struct SessionInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiblingSessionInfo {
+    pub daemon: String,
+    pub session: SessionInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionStatus {
     Attached,
     Detached,

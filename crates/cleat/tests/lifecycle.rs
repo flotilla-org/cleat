@@ -844,6 +844,93 @@ fn list_defaults_to_selected_daemon_and_all_enumerates_every_daemon() {
 }
 
 #[test]
+fn sibling_session_runs_in_its_own_daemon_without_affecting_parent() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("parent".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create parent");
+    let parent_pid =
+        std::fs::read_to_string(RuntimeLayout::new(temp.path().to_path_buf()).daemon_pid_path()).expect("read parent daemon pid");
+
+    let cli = Cli::try_parse_from(["cleat", "create", "--from", "parent", "--name", "helper", "--cmd", "sleep 30", "--no-record"])
+        .expect("parse sibling create command");
+    assert_eq!(cli::execute(cli, &service).expect("execute sibling create").as_deref(), Some("helper"));
+
+    let helper = service.with_daemon("helper".to_string()).expect("helper daemon service");
+    let helper_pid = std::fs::read_to_string(
+        RuntimeLayout::new(temp.path().to_path_buf()).with_daemon("helper".to_string()).expect("helper layout").daemon_pid_path(),
+    )
+    .expect("read helper daemon pid");
+    assert_ne!(parent_pid.trim(), helper_pid.trim(), "sibling must be hosted by a distinct daemon process");
+    assert_eq!(helper.inspect("helper").expect("inspect helper").session.id, "helper");
+    assert!(service.list_all_with_selectors(&[]).expect("list all").iter().any(|session| session.id == "helper"));
+
+    helper.kill("helper").expect("kill sibling");
+    assert_eq!(service.inspect("parent").expect("parent survives sibling teardown").session.id, "parent");
+
+    service.kill("parent").expect("kill parent");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), "helper");
+}
+
+#[test]
+fn sibling_child_inherits_source_daemon_cwd_and_environment() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let context_dir = temp.path().join("context");
+    std::fs::create_dir(&context_dir).expect("create context dir");
+    let layout = RuntimeLayout::new(temp.path().to_path_buf()).with_daemon("context-source".to_string()).expect("source layout");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_cleat"));
+    daemon
+        .args(["--runtime-root", temp.path().to_str().expect("utf8 temp path"), "--server", "context-source", "serve"])
+        .current_dir(&context_dir)
+        .env("CLEAT_SIBLING_CONTEXT", "inherited-from-daemon");
+    let mut daemon = daemon.spawn().expect("spawn controlled source daemon");
+    wait_for_socket(&layout.socket_path());
+
+    let service = service_for(temp.path()).with_daemon("context-source".to_string()).expect("source service");
+    service.create(Some("parent".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create parent");
+    let sibling = service
+        .create_sibling(
+            "parent",
+            Some("context-helper".into()),
+            Some("printf '%s' \"$CLEAT_SIBLING_CONTEXT\" > inherited-env; pwd > inherited-cwd; sleep 30".into()),
+            false,
+        )
+        .expect("create sibling");
+
+    wait_until("sibling context files", || context_dir.join("inherited-env").exists() && context_dir.join("inherited-cwd").exists());
+    assert_eq!(std::fs::read_to_string(context_dir.join("inherited-env")).expect("read inherited env"), "inherited-from-daemon");
+    let inherited_cwd = PathBuf::from(std::fs::read_to_string(context_dir.join("inherited-cwd")).expect("read inherited cwd").trim());
+    assert_eq!(
+        inherited_cwd.canonicalize().expect("canonicalize inherited cwd"),
+        context_dir.canonicalize().expect("canonicalize expected cwd")
+    );
+
+    service.with_daemon(sibling.daemon.clone()).expect("helper service").kill(&sibling.session.id).expect("kill sibling");
+    service.kill("parent").expect("kill parent");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), &sibling.daemon);
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), "context-source");
+    let _ = daemon.wait();
+}
+
+#[test]
+fn transferred_sibling_exit_is_observed_without_affecting_parent() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("parent".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create parent");
+
+    let sibling =
+        service.create_sibling("parent", Some("short-helper".into()), Some("sleep 0.1".into()), false).expect("create short-lived sibling");
+    let helper = service.with_daemon(sibling.daemon.clone()).expect("helper service");
+    wait_until("transferred sibling exit", || helper.inspect(&sibling.session.id).is_err());
+
+    assert_eq!(service.inspect("parent").expect("parent survives sibling exit").session.id, "parent");
+    service.kill("parent").expect("kill parent");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), &sibling.daemon);
+}
+
+#[test]
 fn tag_command_adds_and_removes_opaque_tags() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

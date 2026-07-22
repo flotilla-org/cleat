@@ -22,7 +22,7 @@ use nix::{
         signal::{killpg, Signal},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{read as nix_read, tcgetpgrp, write as nix_write, Pid},
+    unistd::{pipe, read as nix_read, tcgetpgrp, write as nix_write, Pid},
 };
 
 use crate::{
@@ -36,8 +36,18 @@ const PTY_WRITE_READY_TIMEOUT_MS: i32 = 250;
 
 pub struct PtyChild {
     /// Owned PTY master: dropping `PtyChild` closes it automatically.
-    master_fd: OwnedFd,
+    master_fd: Option<OwnedFd>,
     pid: Pid,
+    exit_status_fd: Option<OwnedFd>,
+    reaps_child: bool,
+    terminate_on_drop: bool,
+}
+
+pub struct PtyTransfer {
+    master_fd: OwnedFd,
+    exit_status_fd: OwnedFd,
+    pid: Pid,
+    committed: bool,
 }
 
 /// Serializes `forkpty` + `FD_CLOEXEC` below: a concurrent spawn on another
@@ -59,12 +69,12 @@ impl PtyChild {
         let result = unsafe { forkpty(&winsize, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
         match result {
             ForkptyResult::Parent { master, child } => {
-                let pty = Self { master_fd: master, pid: child };
+                let pty = Self { master_fd: Some(master), pid: child, exit_status_fd: None, reaps_child: true, terminate_on_drop: true };
                 // Mark the master close-on-exec: without this, every child forked
                 // afterwards (other sessions' shells) inherits a copy of this
                 // master, so closing ours on teardown is not the last close and
                 // the PTY never hangs up (no SIGHUP reaches the session).
-                fcntl(pty.master_fd.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+                fcntl(pty.master().as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
                     .map_err(|err| format!("set FD_CLOEXEC on pty master: {err}"))?;
                 Ok(pty)
             }
@@ -75,26 +85,29 @@ impl PtyChild {
     }
 
     pub fn master_fd(&self) -> RawFd {
-        self.master_fd.as_raw_fd()
+        self.master().as_raw_fd()
     }
 
     pub fn set_nonblocking(&self) -> Result<(), String> {
-        set_nonblocking(self.master_fd.as_raw_fd())
+        set_nonblocking(self.master_fd())
     }
 
     pub fn read_output(&self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        read_fd(self.master_fd.as_raw_fd(), buf)
+        read_fd(self.master_fd(), buf)
     }
 
     pub fn write_all(&self, bytes: &[u8]) -> Result<(), String> {
-        write_fd_all(self.master_fd.as_raw_fd(), bytes)
+        write_fd_all(self.master_fd(), bytes)
     }
 
     pub fn resize(&self, cols: u16, rows: u16, width_px: u32, height_px: u32) -> Result<(), String> {
-        resize_pty(self.master_fd.as_raw_fd(), cols, rows, width_px, height_px)
+        resize_pty(self.master_fd(), cols, rows, width_px, height_px)
     }
 
     pub fn exited(&self) -> Result<Option<WaitStatus>, String> {
+        if let Some(status_fd) = &self.exit_status_fd {
+            return transferred_child_exited(status_fd, self.pid);
+        }
         child_exited(self.pid)
     }
 
@@ -103,7 +116,7 @@ impl PtyChild {
     }
 
     pub fn foreground_pgid(&self) -> Option<u32> {
-        tcgetpgrp(self.master_fd.as_fd()).ok().map(|pid| pid.as_raw() as u32)
+        tcgetpgrp(self.master().as_fd()).ok().map(|pid| pid.as_raw() as u32)
     }
 
     pub fn leader_cwd(&self) -> Option<PathBuf> {
@@ -119,7 +132,7 @@ impl PtyChild {
 
         match target {
             SignalTarget::Foreground => {
-                let fg_pgid = tcgetpgrp(self.master_fd.as_fd()).map_err(|err| format!("tcgetpgrp: {err}"))?;
+                let fg_pgid = tcgetpgrp(self.master().as_fd()).map_err(|err| format!("tcgetpgrp: {err}"))?;
                 killpg(fg_pgid, signal).map_err(|err| format!("killpg: {err}"))
             }
             SignalTarget::Leader => nix::sys::signal::kill(self.pid, signal).map_err(|err| format!("kill: {err}")),
@@ -128,13 +141,74 @@ impl PtyChild {
                 // process-group id. Children stay in that group unless they setsid.
                 let leader_pgid = self.pid;
                 killpg_ignoring_dead(leader_pgid, signal)?;
-                if let Ok(fg_pgid) = tcgetpgrp(self.master_fd.as_fd()) {
+                if let Ok(fg_pgid) = tcgetpgrp(self.master().as_fd()) {
                     if fg_pgid != leader_pgid {
                         killpg_ignoring_dead(fg_pgid, signal)?;
                     }
                 }
                 Ok(())
             }
+        }
+    }
+
+    pub fn into_transfer(mut self) -> Result<PtyTransfer, String> {
+        let (exit_status_fd, status_writer) = pipe().map_err(|err| format!("create child status pipe: {err}"))?;
+        fcntl(exit_status_fd.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            .map_err(|err| format!("set close-on-exec on child status reader: {err}"))?;
+        fcntl(status_writer.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            .map_err(|err| format!("set close-on-exec on child status writer: {err}"))?;
+        set_nonblocking(exit_status_fd.as_raw_fd())?;
+        let pid = self.pid;
+        std::thread::Builder::new()
+            .name(format!("cleat-transfer-reap-{pid}"))
+            .spawn(move || {
+                let status = loop {
+                    match waitpid(pid, None) {
+                        Ok(status) => break exit_code_from_wait_status(&status),
+                        Err(Errno::EINTR) => continue,
+                        Err(_) => break 1,
+                    }
+                };
+                let _ = write_fd_all(status_writer.as_raw_fd(), &status.to_be_bytes());
+            })
+            .map_err(|err| format!("spawn transferred child reaper: {err}"))?;
+        self.reaps_child = false;
+        self.terminate_on_drop = false;
+        let master_fd = self.master_fd.take().ok_or_else(|| "PTY master was already transferred".to_string())?;
+        Ok(PtyTransfer { master_fd, exit_status_fd, pid, committed: false })
+    }
+
+    pub fn from_transferred(master_fd: OwnedFd, exit_status_fd: OwnedFd, child_pid: u32) -> Result<Self, String> {
+        let pid = i32::try_from(child_pid).map(Pid::from_raw).map_err(|_| format!("invalid transferred child pid {child_pid}"))?;
+        let pty =
+            Self { master_fd: Some(master_fd), pid, exit_status_fd: Some(exit_status_fd), reaps_child: false, terminate_on_drop: true };
+        pty.set_nonblocking()?;
+        Ok(pty)
+    }
+
+    fn master(&self) -> &OwnedFd {
+        self.master_fd.as_ref().expect("PTY master remains owned until transfer")
+    }
+}
+
+impl PtyTransfer {
+    pub fn child_pid(&self) -> u32 {
+        self.pid.as_raw() as u32
+    }
+
+    pub fn fds(&self) -> [BorrowedFd<'_>; 2] {
+        [self.master_fd.as_fd(), self.exit_status_fd.as_fd()]
+    }
+
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PtyTransfer {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = nix::sys::signal::kill(self.pid, Signal::SIGHUP);
         }
     }
 }
@@ -148,6 +222,13 @@ fn killpg_ignoring_dead(pgid: Pid, signal: Signal) -> Result<(), String> {
 
 impl Drop for PtyChild {
     fn drop(&mut self) {
+        if !self.terminate_on_drop {
+            return;
+        }
+        if !self.reaps_child {
+            let _ = nix::sys::signal::kill(self.pid, Signal::SIGHUP);
+            return;
+        }
         // The owned master fd closes automatically after this runs, hanging up
         // the PTY (which nudges a still-running child to exit via SIGHUP). The
         // daemon must never block on session teardown, so reap opportunistically
@@ -543,6 +624,22 @@ fn child_exited(child_pid: Pid) -> Result<Option<WaitStatus>, String> {
         Ok(status) => Ok(Some(status)),
         Err(Errno::ECHILD) => Ok(None),
         Err(err) => Err(format!("waitpid failed: {err}")),
+    }
+}
+
+fn transferred_child_exited(status_fd: &OwnedFd, child_pid: Pid) -> Result<Option<WaitStatus>, String> {
+    let mut bytes = [0u8; 4];
+    match nix_read(status_fd, &mut bytes) {
+        Ok(4) => Ok(Some(WaitStatus::Exited(child_pid, i32::from_be_bytes(bytes)))),
+        Ok(0) => match nix::sys::signal::kill(child_pid, None) {
+            Ok(()) | Err(Errno::EPERM) => Ok(None),
+            Err(Errno::ESRCH) => Ok(Some(WaitStatus::Exited(child_pid, 1))),
+            Err(err) => Err(format!("check transferred child process: {err}")),
+        },
+        Ok(count) => Err(format!("short transferred child status: read {count} of {} bytes", bytes.len())),
+        Err(Errno::EAGAIN) => Ok(None),
+        Err(Errno::EINTR) => Ok(None),
+        Err(err) => Err(format!("read transferred child status: {err}")),
     }
 }
 

@@ -37,6 +37,8 @@ pub struct GhosttyVtEngine {
     mouse_encoder: MouseEncoder,
     saw_output: bool,
     cached_grid: Option<ScreenGrid>,
+    deferred_render_dirty: GhosttyRenderStateDirty,
+    deferred_render_dirty_rows: Vec<u16>,
 }
 
 impl GhosttyVtEngine {
@@ -70,6 +72,8 @@ impl GhosttyVtEngine {
             mouse_encoder,
             saw_output: false,
             cached_grid: None,
+            deferred_render_dirty: GhosttyRenderStateDirty::False,
+            deferred_render_dirty_rows: Vec::new(),
         }
     }
 
@@ -187,6 +191,54 @@ impl GhosttyVtEngine {
             dirty,
         })
     }
+
+    fn capture_activity_damage(&mut self) -> Result<bool, String> {
+        self.render_state.update(&self.terminal)?;
+        let dirty = self.render_state.get_dirty()?;
+        if dirty == GhosttyRenderStateDirty::False {
+            return Ok(false);
+        }
+
+        if dirty == GhosttyRenderStateDirty::Full {
+            self.deferred_render_dirty = GhosttyRenderStateDirty::Full;
+            self.deferred_render_dirty_rows.clear();
+        } else if self.deferred_render_dirty != GhosttyRenderStateDirty::Full {
+            self.deferred_render_dirty = GhosttyRenderStateDirty::Partial;
+        }
+
+        self.render_state.populate_row_iterator(&mut self.row_iter)?;
+        let mut row_idx = 0u16;
+        while self.row_iter.next() {
+            if dirty == GhosttyRenderStateDirty::Partial
+                && self.deferred_render_dirty != GhosttyRenderStateDirty::Full
+                && self.row_iter.get_dirty().unwrap_or(true)
+                && !self.deferred_render_dirty_rows.contains(&row_idx)
+            {
+                self.deferred_render_dirty_rows.push(row_idx);
+            }
+            self.row_iter.set_dirty(false)?;
+            row_idx = row_idx.saturating_add(1);
+        }
+        self.render_state.set_dirty(GhosttyRenderStateDirty::False)?;
+        Ok(true)
+    }
+
+    fn deferred_render_damage(&self) -> (GhosttyRenderStateDirty, Vec<u16>) {
+        (self.deferred_render_dirty, self.deferred_render_dirty_rows.clone())
+    }
+
+    fn clear_deferred_render_damage(&mut self) {
+        self.deferred_render_dirty = GhosttyRenderStateDirty::False;
+        self.deferred_render_dirty_rows.clear();
+    }
+}
+
+fn combined_render_dirty(left: GhosttyRenderStateDirty, right: GhosttyRenderStateDirty) -> GhosttyRenderStateDirty {
+    match (left, right) {
+        (GhosttyRenderStateDirty::Full, _) | (_, GhosttyRenderStateDirty::Full) => GhosttyRenderStateDirty::Full,
+        (GhosttyRenderStateDirty::Partial, _) | (_, GhosttyRenderStateDirty::Partial) => GhosttyRenderStateDirty::Partial,
+        _ => GhosttyRenderStateDirty::False,
+    }
 }
 
 fn apply_colors(terminal: &mut TerminalHandle, colors: TerminalColors) -> Result<(), String> {
@@ -207,6 +259,10 @@ impl VtEngine for GhosttyVtEngine {
             self.saw_output = true;
         }
         Ok(())
+    }
+
+    fn screen_activity_changed(&mut self) -> Result<Option<bool>, String> {
+        self.capture_activity_damage().map(Some)
     }
 
     fn drain_replies(&mut self) -> Vec<u8> {
@@ -299,7 +355,9 @@ impl VtEngine for GhosttyVtEngine {
     fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
         self.render_state.update(&self.terminal)?;
 
-        let dirty = self.render_state.get_dirty()?;
+        let live_dirty = self.render_state.get_dirty()?;
+        let (deferred_dirty, deferred_dirty_rows) = self.deferred_render_damage();
+        let dirty = combined_render_dirty(live_dirty, deferred_dirty);
         if dirty == GhosttyRenderStateDirty::False {
             let cursor = self.read_cursor_state()?;
             if let Some(cached) = self.cached_grid.as_mut() {
@@ -330,7 +388,9 @@ impl VtEngine for GhosttyVtEngine {
         let mut row_idx: usize = 0;
         let mut dirty_rows = Vec::new();
         while self.row_iter.next() {
-            let skip = partial && !self.row_iter.get_dirty().unwrap_or(true);
+            let row = u16::try_from(row_idx).unwrap_or(u16::MAX);
+            let row_dirty = self.row_iter.get_dirty().unwrap_or(true) || deferred_dirty_rows.contains(&row);
+            let skip = partial && !row_dirty;
             if skip {
                 row_idx += 1;
                 continue;
@@ -360,6 +420,7 @@ impl VtEngine for GhosttyVtEngine {
         let cursor = self.read_cursor_state()?;
 
         self.render_state.set_dirty(GhosttyRenderStateDirty::False)?;
+        self.clear_deferred_render_damage();
 
         let grid = ScreenGrid { cells, cols, rows, cursor, dirty_rows };
         self.cached_grid = Some(grid.clone());
@@ -369,7 +430,9 @@ impl VtEngine for GhosttyVtEngine {
     fn render_update(&mut self, dirty: DirtyState) -> Result<TerminalRenderUpdate, String> {
         self.render_state.update(&self.terminal)?;
 
-        let render_dirty = self.render_state.get_dirty()?;
+        let live_dirty = self.render_state.get_dirty()?;
+        let (deferred_dirty, deferred_dirty_rows) = self.deferred_render_damage();
+        let render_dirty = combined_render_dirty(live_dirty, deferred_dirty);
         let cols = self.render_state.get_cols()?;
         let rows = self.render_state.get_rows()?;
         let colors = self.render_state.get_colors()?;
@@ -389,14 +452,14 @@ impl VtEngine for GhosttyVtEngine {
             self.render_state.populate_row_iterator(&mut self.row_iter)?;
             let mut row_idx: usize = 0;
             while self.row_iter.next() {
-                let row_dirty = self.row_iter.get_dirty().unwrap_or(true);
+                let row = u16::try_from(row_idx).unwrap_or(u16::MAX);
+                let row_dirty = self.row_iter.get_dirty().unwrap_or(true) || deferred_dirty_rows.contains(&row);
                 let include_row = match effective_dirty {
                     DirtyState::Clean => false,
                     DirtyState::Partial => row_dirty,
                     DirtyState::Full => true,
                 };
                 if include_row {
-                    let row = u16::try_from(row_idx).unwrap_or(u16::MAX);
                     let raw_row = self.row_iter.get_raw_row()?;
                     let row_start = row_idx * row_stride;
                     let row_end = row_start + row_stride;
@@ -414,6 +477,7 @@ impl VtEngine for GhosttyVtEngine {
             }
             self.render_state.set_dirty(GhosttyRenderStateDirty::False)?;
         }
+        self.clear_deferred_render_damage();
 
         let effective_dirty =
             if effective_dirty == DirtyState::Partial && update_rows.is_empty() { DirtyState::Clean } else { effective_dirty };

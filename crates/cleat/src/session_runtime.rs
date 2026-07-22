@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
     },
     recording::SessionRecorder,
     runtime::{normalize_tags, SessionMetadata},
+    screen_activity::ScreenActivityTracker,
     vt::{self, TerminalModeState, VtEngine},
 };
 
@@ -41,6 +42,8 @@ pub(crate) struct SessionRuntime {
     markers: HashMap<String, u64>,
     epoch: Instant,
     last_pty_output_at: Option<Instant>,
+    screen_activity: ScreenActivityTracker,
+    pending_screen_activity_at: Option<(Instant, u64)>,
     // Current cell pixel size, used to fill the PTY winsize ws_xpixel/ws_ypixel
     // so TIOCGWINSZ-based apps (e.g. katzensteg) can compute image aspect. Zero
     // until the first geometry/set_cell_size, matching a terminal that hasn't
@@ -100,7 +103,7 @@ impl SessionRuntime {
             None
         };
 
-        Ok(Self {
+        let mut runtime = Self {
             session: session.clone(),
             session_dir,
             pty_child,
@@ -110,9 +113,14 @@ impl SessionRuntime {
             markers: HashMap::new(),
             epoch: Instant::now(),
             last_pty_output_at: None,
+            screen_activity: ScreenActivityTracker::new(unix_timestamp_millis(SystemTime::now())),
+            pending_screen_activity_at: None,
             cell_width_px: 0,
             cell_height_px: 0,
-        })
+        };
+        // Establish a clean activity baseline before the child emits output.
+        let _ = runtime.vt_engine.screen_grid();
+        Ok(runtime)
     }
 
     fn pty_pixel_size(&self, cols: u16, rows: u16) -> (u32, u32) {
@@ -174,6 +182,7 @@ impl SessionRuntime {
     }
 
     pub(crate) fn snapshot(&mut self, dirty: DirtyState) -> Result<TerminalSnapshot, String> {
+        self.observe_pending_screen_activity();
         let grid = self.vt_engine.screen_grid()?;
         let scrollbar = self.vt_engine.scrollbar_state()?;
         let mut snapshot = TerminalSnapshot::from_screen_grid(grid, dirty);
@@ -185,6 +194,7 @@ impl SessionRuntime {
     }
 
     pub(crate) fn render_update(&mut self, dirty: DirtyState) -> Result<TerminalRenderUpdate, String> {
+        self.observe_pending_screen_activity();
         let scrollbar = self.vt_engine.scrollbar_state()?;
         let mut update = self.vt_engine.render_update(dirty)?;
         update.viewport_kind = scrollbar.viewport_kind;
@@ -290,6 +300,7 @@ impl SessionRuntime {
         }
         attachments.extend((0..watcher_count).map(|_| crate::protocol::AttachmentInspect { role: "watcher".to_string() }));
 
+        let activity = self.screen_activity.snapshot(Instant::now());
         InspectResult {
             session: crate::protocol::SessionInspect {
                 id: self.session.id.clone(),
@@ -314,6 +325,9 @@ impl SessionRuntime {
                 bytes_written: self.recorder.as_ref().map(|r| r.bytes_written()).unwrap_or(0),
                 markers: self.markers.clone(),
             },
+            screen_activity: activity.screen_activity,
+            stable_since: activity.stable_since,
+            last_output_at: activity.last_output_at,
         }
     }
 
@@ -443,7 +457,34 @@ impl SessionRuntime {
                 Err(err) => return Err(format!("read pty output: {err}")),
             }
         }
+        if !chunks.is_empty() {
+            self.note_screen_activity_candidate(Instant::now(), unix_timestamp_millis(SystemTime::now()));
+        }
         Ok(PtyOutput { chunks })
+    }
+
+    fn note_screen_activity_candidate(&mut self, changed_at: Instant, changed_at_unix_ms: u64) {
+        match self.vt_engine.screen_activity_changed() {
+            Ok(Some(true)) => self.pending_screen_activity_at = Some((changed_at, changed_at_unix_ms)),
+            Ok(Some(false) | None) => {}
+            Err(err) => eprintln!("screen activity observation error: {err}"),
+        }
+    }
+
+    fn observe_pending_screen_activity(&mut self) -> bool {
+        let Some((changed_at, changed_at_unix_ms)) = self.pending_screen_activity_at.take() else {
+            return false;
+        };
+        self.screen_activity.render_changed(changed_at, changed_at_unix_ms);
+        true
+    }
+
+    pub(crate) fn flush_screen_activity(&mut self) {
+        if self.observe_pending_screen_activity() {
+            if let Err(err) = self.vt_engine.screen_grid() {
+                eprintln!("screen activity render flush error: {err}");
+            }
+        }
     }
 
     fn write_detached_replies(&mut self, pty_output: &[u8], engine_reply: &[u8]) -> Result<(), String> {
@@ -491,6 +532,10 @@ fn write_replay_snapshot(engine: &mut dyn VtEngine, recorder: &mut SessionRecord
 
 fn replay_snapshot_payload(engine: &mut dyn VtEngine) -> Option<Vec<u8>> {
     engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()).ok().flatten()
+}
+
+fn unix_timestamp_millis(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {

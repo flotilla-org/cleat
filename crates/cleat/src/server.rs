@@ -138,6 +138,9 @@ impl SessionService {
             cmd: session.cmd,
             tags: session.tags,
             status: SessionStatus::Detached,
+            screen_activity: crate::protocol::ScreenActivity::Stable,
+            stable_since: None,
+            last_output_at: None,
             error: None,
         })
     }
@@ -221,6 +224,9 @@ impl SessionService {
                         cmd: result.session.cmd,
                         tags: result.session.tags,
                         status,
+                        screen_activity: result.screen_activity,
+                        stable_since: result.stable_since,
+                        last_output_at: result.last_output_at,
                         error: None,
                     };
                     if session_matches_selectors(&info, selectors) {
@@ -462,6 +468,9 @@ impl SessionService {
                 cmd: session.cmd,
                 tags: session.tags,
                 status: SessionStatus::Attached,
+                screen_activity: crate::protocol::ScreenActivity::Stable,
+                stable_since: None,
+                last_output_at: None,
                 error: None,
             }
         };
@@ -794,6 +803,9 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
             cmd: None,
             tags: Vec::new(),
             status: SessionStatus::Detached,
+            screen_activity: crate::protocol::ScreenActivity::Stable,
+            stable_since: None,
+            last_output_at: None,
             error: Some(err.clone()),
         });
     }
@@ -867,6 +879,9 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         cmd: result.session.cmd,
         tags: result.session.tags,
         status,
+        screen_activity: result.screen_activity,
+        stable_since: result.stable_since,
+        last_output_at: result.last_output_at,
         error: None,
     }
 }

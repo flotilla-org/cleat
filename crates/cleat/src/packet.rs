@@ -87,8 +87,8 @@ pub struct ActivitySession {
     pub tags: Vec<String>,
     pub activity: ScreenActivity,
     /// Unix timestamp in milliseconds for the beginning of the current quiet
-    /// window. It remains populated while activity is `Active`; the threshold
-    /// determines when that window becomes `Stable`.
+    /// window. While activity is `Active`, this is the quiet window that will
+    /// become `Stable` once the configured threshold elapses.
     pub stable_since_unix_ms: u64,
     /// Unix timestamp in milliseconds for the most recently observed render
     /// generation change, or `None` before the session has rendered.
@@ -440,5 +440,34 @@ mod tests {
         let err = client.read_render(7).expect_err("control error should surface");
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "bad channel");
+    }
+
+    #[test]
+    fn packet_client_reads_activity_events() {
+        let event = ActivityEvent::MembershipAdded {
+            session: ActivitySession {
+                session_id: "alpha".to_string(),
+                tags: vec!["role=impl".to_string()],
+                activity: ScreenActivity::Active,
+                stable_since_unix_ms: 1_000,
+                last_output_at_unix_ms: Some(1_000),
+            },
+            changed_at_unix_ms: 1_000,
+        };
+        let mut bytes = Vec::new();
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+            upserted: Vec::new(),
+            removed_session_ids: Vec::new(),
+        })
+        .expect("encode unrelated delta")
+        .write(&mut bytes)
+        .expect("write unrelated delta");
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_ACTIVITY_EVENT, &event)
+            .expect("encode activity event")
+            .write(&mut bytes)
+            .expect("write activity event");
+        let mut client = PacketClient::new(std::io::Cursor::new(bytes));
+
+        assert_eq!(client.read_activity_event().expect("read activity event"), event);
     }
 }

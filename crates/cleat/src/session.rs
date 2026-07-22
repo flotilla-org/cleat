@@ -1232,6 +1232,9 @@ fn matching_activity_sessions(
 
 fn service_activity_subscriptions(sessions: &HashMap<String, HostedSession>, packet_clients: &mut Vec<PacketClient>) -> Result<(), String> {
     for client in packet_clients {
+        if client.dead {
+            continue;
+        }
         let Some(stable_threshold_ms) = client.screen_activity_stable_ms else {
             continue;
         };

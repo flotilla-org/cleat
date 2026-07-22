@@ -31,6 +31,7 @@ use crate::{
         DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
         ViewportCommand, ViewportCommandOutcome,
     },
+    screen_activity::ScreenActivityTracker,
     session_runtime::{PtyOutput, SessionRuntime},
     vt,
 };
@@ -364,6 +365,7 @@ pub(crate) enum SessionCommand {
 pub(crate) struct SessionActor {
     tx: CommandSender,
     observation: Arc<ObservationMirror>,
+    screen_activity: ScreenActivityTracker,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -634,7 +636,7 @@ impl SessionActor {
         #[cfg(not(unix))]
         let tx = CommandSender::new(tx);
         match ready_rx.recv().map_err(|_| "session actor did not report startup".to_string())? {
-            Ok(()) => Ok(Self { tx, observation, worker: Some(worker) }),
+            Ok(screen_activity) => Ok(Self { tx, observation, screen_activity, worker: Some(worker) }),
             Err(err) => {
                 let _ = worker.join();
                 Err(err)
@@ -648,11 +650,15 @@ impl SessionActor {
         observation: Arc<ObservationMirror>,
         worker: Option<thread::JoinHandle<()>>,
     ) -> Self {
-        Self { tx: CommandSender::inert(tx), observation, worker }
+        Self { tx: CommandSender::inert(tx), observation, screen_activity: ScreenActivityTracker::new(0), worker }
     }
 
     pub(crate) fn observation(&self) -> &ObservationMirror {
         &self.observation
+    }
+
+    pub(crate) fn screen_activity(&self) -> &ScreenActivityTracker {
+        &self.screen_activity
     }
 
     /// True when the actor's worker thread has stopped. Combined with a
@@ -931,7 +937,7 @@ fn session_actor_loop(
     wake: WakeCallback,
     rows: u16,
     mirror: Arc<ObservationMirror>,
-    ready: mpsc::Sender<Result<(), String>>,
+    ready: mpsc::Sender<Result<ScreenActivityTracker, String>>,
     rx: mpsc::Receiver<SessionCommand>,
     #[cfg(unix)] command_wake: CommandWakeReader,
 ) {
@@ -943,7 +949,7 @@ fn session_actor_loop(
         raw_output_taps: Vec::new(),
         last_raw_output_sequence: 0,
     };
-    let _ = ready.send(Ok(()));
+    let _ = ready.send(Ok(runtime.screen_activity_tracker()));
     #[cfg(unix)]
     loop {
         let readiness = match wait_actor_ready(runtime.pty_child(), command_wake.raw_fd()) {

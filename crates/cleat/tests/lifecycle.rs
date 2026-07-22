@@ -16,11 +16,13 @@ use std::{
 
 use clap::Parser;
 #[cfg(feature = "ghostty-vt")]
+use cleat::packet::ScreenActivity;
+#[cfg(feature = "ghostty-vt")]
 use cleat::session::foreground_path;
 use cleat::{
     cli::{self, Cli, ExecResult},
     packet::{
-        ActivityEvent, ActivitySnapshot, ControlHello, DirectoryDelta, DirectorySnapshot, PacketFrame, ScreenActivity, CHANNEL_CONTROL,
+        ActivityEvent, ActivitySnapshot, ControlHello, DirectoryDelta, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL,
         MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT,
         MSG_CONTROL_HELLO, PROTOCOL_VERSION,
     },
@@ -999,6 +1001,7 @@ fn activity_subscription_snapshot_covers_all_matching_sessions() {
     assert_eq!(snapshot.sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
 }
 
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn activity_subscription_emits_threshold_transitions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -1008,7 +1011,7 @@ fn activity_subscription_emits_threshold_transitions() {
     service
         .create_with_options(
             Some("alpha".into()),
-            Some(VtEngineKind::Passthrough),
+            Some(VtEngineKind::Ghostty),
             None,
             Some("sh -c 'stty raw; exec cat'".into()),
             SessionStartOptions {
@@ -1025,16 +1028,8 @@ fn activity_subscription_emits_threshold_transitions() {
     let _directory = PacketFrame::read(&mut stream).expect("read directory");
     let snapshot =
         PacketFrame::read(&mut stream).expect("read activity snapshot").decode::<ActivitySnapshot>().expect("decode activity snapshot");
-    assert_eq!(snapshot.sessions[0].activity, ScreenActivity::Active);
-
-    let first_stable = read_activity_event(&mut stream, Duration::from_secs(2));
-    let ActivityEvent::ActivityChanged { session: stable, changed_at_unix_ms: first_stable_at } = first_stable else {
-        panic!("expected activity change");
-    };
-    assert_eq!(stable.session_id, "alpha");
-    assert_eq!(stable.tags, vec![selector.clone()]);
-    assert_eq!(stable.activity, ScreenActivity::Stable);
-    assert_eq!(first_stable_at, stable.stable_since_unix_ms + 500);
+    assert_eq!(snapshot.sessions[0].activity, ScreenActivity::Stable);
+    assert_eq!(snapshot.sessions[0].last_output_at_unix_ms, None);
 
     service.send_keys("alpha", b"screen changed").expect("write output-producing input");
     let active = read_activity_event(&mut stream, Duration::from_secs(2));
@@ -1042,9 +1037,9 @@ fn activity_subscription_emits_threshold_transitions() {
         panic!("expected activity change");
     };
     assert_eq!(active.activity, ScreenActivity::Active);
+    assert_eq!(active.tags, vec![selector]);
     assert!(active.last_output_at_unix_ms.is_some());
     assert_eq!(active_at, active.last_output_at_unix_ms.expect("active transition output timestamp"));
-    assert!(active_at >= first_stable_at);
 
     let stable_again = read_activity_event(&mut stream, Duration::from_secs(2));
     let ActivityEvent::ActivityChanged { session: stable_again, changed_at_unix_ms: stable_again_at } = stable_again else {

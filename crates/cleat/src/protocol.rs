@@ -5,6 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::screen_activity::ScreenActivity;
 use crate::vt::VtEngineKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,14 +36,6 @@ pub struct SessionInfo {
 pub enum SessionStatus {
     Attached,
     Detached,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ScreenActivity {
-    Active,
-    #[default]
-    Stable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

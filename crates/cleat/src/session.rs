@@ -494,93 +494,6 @@ impl ScreenStableState {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ScreenActivityTracker {
-    render_generation: u64,
-    stable_since: Instant,
-    stable_since_unix_ms: u64,
-    last_output_at: Option<Instant>,
-    last_output_at_unix_ms: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ActivityTime {
-    instant: Instant,
-    unix_ms: u64,
-}
-
-impl ActivityTime {
-    fn now() -> Self {
-        Self { instant: Instant::now(), unix_ms: unix_time_ms() }
-    }
-
-    fn unix_ms_for(self, earlier: Instant) -> u64 {
-        let elapsed_ms = self.instant.checked_duration_since(earlier).map(|elapsed| elapsed.as_millis()).unwrap_or(0);
-        self.unix_ms.saturating_sub(u64::try_from(elapsed_ms).unwrap_or(u64::MAX))
-    }
-}
-
-impl ScreenActivityTracker {
-    fn new(render_generation: u64) -> Self {
-        Self::new_at(render_generation, ActivityTime::now())
-    }
-
-    fn new_at(render_generation: u64, now: ActivityTime) -> Self {
-        Self {
-            render_generation,
-            stable_since: now.instant,
-            stable_since_unix_ms: now.unix_ms,
-            last_output_at: None,
-            last_output_at_unix_ms: None,
-        }
-    }
-
-    fn needs_observation(&self, render_generation: u64) -> bool {
-        render_generation != self.render_generation
-    }
-
-    fn observe(&mut self, render_generation: u64, last_output_at: Option<Instant>) {
-        self.observe_at(render_generation, last_output_at, ActivityTime::now());
-    }
-
-    fn observe_at(&mut self, render_generation: u64, last_output_at: Option<Instant>, observed_at: ActivityTime) {
-        if render_generation == self.render_generation {
-            return;
-        }
-        self.render_generation = render_generation;
-        if last_output_at == self.last_output_at {
-            return;
-        }
-        let Some(last_output_at) = last_output_at else {
-            return;
-        };
-        let last_output_at_unix_ms = observed_at.unix_ms_for(last_output_at);
-        self.stable_since = last_output_at;
-        self.stable_since_unix_ms = last_output_at_unix_ms;
-        self.last_output_at = Some(last_output_at);
-        self.last_output_at_unix_ms = Some(last_output_at_unix_ms);
-    }
-
-    fn session(&self, session_id: String, tags: Vec<String>, stable_threshold_ms: u64) -> ActivitySession {
-        self.session_at(session_id, tags, stable_threshold_ms, Instant::now())
-    }
-
-    fn session_at(&self, session_id: String, tags: Vec<String>, stable_threshold_ms: u64, observed_at: Instant) -> ActivitySession {
-        let stable_for_ms = observed_at
-            .checked_duration_since(self.stable_since)
-            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
-        let activity = if stable_for_ms >= stable_threshold_ms { ScreenActivity::Stable } else { ScreenActivity::Active };
-        ActivitySession {
-            session_id,
-            tags,
-            activity,
-            stable_since_unix_ms: self.stable_since_unix_ms,
-            last_output_at_unix_ms: self.last_output_at_unix_ms,
-        }
-    }
-}
-
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -621,7 +534,6 @@ struct HostedSession {
     /// Render generation at the last screen-stable fingerprint snapshot; lets
     /// the servicing loop skip full-grid snapshots while nothing has rendered.
     screen_stable_snapshot_generation: Option<u64>,
-    screen_activity: ScreenActivityTracker,
     should_keep_session_dir: bool,
 }
 
@@ -634,7 +546,6 @@ impl HostedSession {
             crate::session_runtime::SessionRuntime::spawn(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?)
         })?;
         let raw_output_tap = actor.subscribe_raw_output()?;
-        let screen_activity = ScreenActivityTracker::new(actor.observation().render_generation());
         Ok(Self {
             metadata: session,
             actor,
@@ -647,21 +558,19 @@ impl HostedSession {
             pending_waits: Vec::new(),
             pending_expects: Vec::new(),
             screen_stable_snapshot_generation: None,
-            screen_activity,
             should_keep_session_dir,
         })
     }
 
-    fn observe_screen_activity(&mut self) -> Result<(), String> {
-        let render_generation = self.actor.observation().render_generation();
-        if self.screen_activity.needs_observation(render_generation) {
-            self.screen_activity.observe(render_generation, self.actor.last_pty_output_at()?);
-        }
-        Ok(())
-    }
-
     fn activity_session(&self, stable_threshold_ms: u64) -> ActivitySession {
-        self.screen_activity.session(self.metadata.id.clone(), self.metadata.tags.clone(), stable_threshold_ms)
+        let activity = self.actor.screen_activity().snapshot(Instant::now(), Duration::from_millis(stable_threshold_ms));
+        ActivitySession {
+            session_id: self.metadata.id.clone(),
+            tags: self.metadata.tags.clone(),
+            activity: activity.screen_activity,
+            stable_since_unix_ms: activity.quiet_since,
+            last_output_at_unix_ms: activity.last_output_at,
+        }
     }
 }
 
@@ -1206,14 +1115,11 @@ fn directory_snapshot_for_sessions(
 }
 
 fn activity_snapshot_for_sessions(
-    sessions: &mut HashMap<String, HostedSession>,
+    sessions: &HashMap<String, HostedSession>,
     selectors: &[String],
     stable_threshold_ms: u64,
-) -> Result<ActivitySnapshot, String> {
-    for hosted in sessions.values_mut() {
-        hosted.observe_screen_activity()?;
-    }
-    Ok(ActivitySnapshot { stable_threshold_ms, sessions: matching_activity_sessions(sessions, selectors, stable_threshold_ms) })
+) -> ActivitySnapshot {
+    ActivitySnapshot { stable_threshold_ms, sessions: matching_activity_sessions(sessions, selectors, stable_threshold_ms) }
 }
 
 fn matching_activity_sessions(
@@ -1408,8 +1314,6 @@ fn service_hosted_session(
     if output_drained {
         hosted.actor.enqueue_screen_activity_flush()?;
     }
-    hosted.observe_screen_activity()?;
-
     if resized || previous_controller_count != hosted.active_client.is_some() || previous_watcher_count != hosted.watchers.len() {
         broadcast_directory_upsert(directory_entry_for_session(layout, hosted, packet_clients)?, packet_clients)?;
     }
@@ -1726,8 +1630,7 @@ fn handle_http_request(
             let directory = directory_snapshot_for_sessions(state.layout, state.sessions, state.packet_clients, &selectors)?;
             let activity = subscribe
                 .screen_activity_stable_ms
-                .map(|stable_threshold_ms| activity_snapshot_for_sessions(state.sessions, &selectors, stable_threshold_ms))
-                .transpose()?;
+                .map(|stable_threshold_ms| activity_snapshot_for_sessions(state.sessions, &selectors, stable_threshold_ms));
             let packet_stream = stream.try_clone().map_err(|err| format!("clone HTTP packet stream: {err}"))?;
             #[cfg(unix)]
             set_stream_nonblocking(&packet_stream, true).map_err(|err| format!("set HTTP packet stream nonblocking: {err}"))?;
@@ -3364,25 +3267,6 @@ mod tests {
         assert!(!super::screen_stable_needs_snapshot(7, Some(7)));
         // A pump advanced the generation: re-fingerprint.
         assert!(super::screen_stable_needs_snapshot(8, Some(7)));
-    }
-
-    #[test]
-    fn screen_activity_only_resets_for_new_pty_output() {
-        let started_at = Instant::now();
-        let mut tracker = super::ScreenActivityTracker::new_at(1, super::ActivityTime { instant: started_at, unix_ms: 1_000 });
-
-        tracker.observe_at(2, None, super::ActivityTime { instant: started_at + Duration::from_millis(20), unix_ms: 1_020 });
-        let unchanged = tracker.session_at("alpha".to_string(), Vec::new(), 10, started_at + Duration::from_millis(20));
-        assert_eq!(unchanged.activity, crate::packet::ScreenActivity::Stable);
-        assert_eq!(unchanged.stable_since_unix_ms, 1_000);
-        assert_eq!(unchanged.last_output_at_unix_ms, None);
-
-        let output_at = started_at + Duration::from_millis(30);
-        tracker.observe_at(3, Some(output_at), super::ActivityTime { instant: started_at + Duration::from_millis(35), unix_ms: 1_035 });
-        let active = tracker.session_at("alpha".to_string(), Vec::new(), 10, started_at + Duration::from_millis(35));
-        assert_eq!(active.activity, crate::packet::ScreenActivity::Active);
-        assert_eq!(active.stable_since_unix_ms, 1_030);
-        assert_eq!(active.last_output_at_unix_ms, Some(1_030));
     }
 
     #[test]

@@ -3,8 +3,10 @@ use std::io::{Error, ErrorKind, Read, Write};
 use serde::{Deserialize, Serialize};
 
 use crate::provider::{TerminalInputEvent, TerminalRenderUpdate};
+pub use crate::screen_activity::ScreenActivity;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Version 4 defines activity as render damage rather than raw PTY output.
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -73,13 +75,6 @@ pub struct DirectoryEntry {
     pub rows: u16,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScreenActivity {
-    Active,
-    Stable,
-}
-
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivitySession {
@@ -90,8 +85,8 @@ pub struct ActivitySession {
     /// window. While activity is `Active`, this is the quiet window that will
     /// become `Stable` once the configured threshold elapses.
     pub stable_since_unix_ms: u64,
-    /// Unix timestamp in milliseconds for the most recently observed render
-    /// generation change, or `None` before the session has rendered.
+    /// Unix timestamp in milliseconds for the most recently observed
+    /// render-changing output, or `None` before the screen has changed.
     pub last_output_at_unix_ms: Option<u64>,
 }
 
@@ -359,6 +354,11 @@ mod tests {
     #[test]
     fn current_hello_accepts_current_protocol_version() {
         assert!(ControlHello::current().accepts(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn render_damage_activity_semantics_start_at_protocol_version_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]

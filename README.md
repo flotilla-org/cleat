@@ -107,6 +107,10 @@ Four surfaces cooperate during a session. Knowing which surface is authoritative
 - **Recording** — default-on raw PTY output tee, stored as asciicast v3 in `session.cast`. Authoritative source for `transcript` and `expect`.
 - **Packet surface** — structured multiplexed control/render/directory protocol. `cleat packets` exposes the raw probe surface, and `cleat list --watch` uses the directory subscription to print a snapshot followed by lifecycle deltas. Rust clients can use `SessionService::connect_activity` to subscribe once for every session matching a tag selector: the stream starts with an activity snapshot, then emits threshold-based `active`/`stable` transitions and membership changes with session IDs, tags, and Unix-millisecond timestamps.
 
+Screen activity has one meaning across JSON polling and packet subscriptions: a session is `active` only after PTY output changes its rendered screen, so terminal queries do not count. A never-rendered session starts `stable`, and an engine that cannot observe render damage remains `stable`. JSON uses a fixed one-second stability threshold; each packet subscriber applies its requested threshold to the same render-change timeline. `stable_since` on JSON is when stability was reached, while packet `stable_since_unix_ms` is the beginning of the quiet window that will reach the subscriber's threshold.
+
+This subscription contract starts with packet protocol v4. Version 3 used raw PTY-output timing for subscriptions, so v3 clients and daemons are rejected instead of silently disagreeing about query-only activity. The activity message shapes are otherwise unchanged.
+
 ### Command Map
 
 | Command | Exercises | Notes |

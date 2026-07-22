@@ -888,43 +888,67 @@ fn run_session_daemon_inner(root: &Path, daemon_name: &str, bootstrap_fd: Option
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
     #[cfg(unix)]
     if let Some(bootstrap) = bootstrap {
-        let manifest = bootstrap.manifest;
-        if manifest.version != 1 {
-            return Err(format!("unsupported FD transfer manifest version {}", manifest.version));
+        let bootstrap_result = (|| {
+            let manifest = bootstrap.manifest;
+            if let Some(delay_ms) =
+                std::env::var_os("CLEAT_TEST_FD_TRANSFER_BOOTSTRAP_DELAY_MS").and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+            {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+            if std::env::var_os("CLEAT_TEST_REJECT_FD_TRANSFER").is_some() {
+                return Err("injected FD transfer bootstrap rejection".to_string());
+            }
+            if manifest.version != 1 {
+                return Err(format!("unsupported FD transfer manifest version {}", manifest.version));
+            }
+            if manifest.operation != crate::fd_transfer::FdTransferOperation::Sibling {
+                return Err(format!("unsupported FD transfer operation {:?}", manifest.operation));
+            }
+            if manifest.target_daemon != daemon_name {
+                return Err(format!("FD transfer target daemon {} does not match bootstrap daemon {daemon_name}", manifest.target_daemon));
+            }
+            let mut fds: Vec<_> = bootstrap.fds.into_iter().map(Some).collect();
+            let take_role =
+                |role: &crate::fd_transfer::FdRole, fds: &mut Vec<Option<std::os::fd::OwnedFd>>| -> Result<std::os::fd::OwnedFd, String> {
+                    let entry = manifest
+                        .fds
+                        .iter()
+                        .find(|entry| &entry.role == role)
+                        .ok_or_else(|| format!("FD transfer manifest is missing {}", role.as_str()))?;
+                    fds.get_mut(entry.index)
+                        .and_then(Option::take)
+                        .ok_or_else(|| format!("FD transfer descriptor {} for {} is unavailable", entry.index, role.as_str()))
+                };
+            let pty_master = take_role(&crate::fd_transfer::FdRole::pty_master(), &mut fds)?;
+            let child_status = take_role(&crate::fd_transfer::FdRole::child_status(), &mut fds)?;
+            // Unrecognized roles are intentionally ignored. The manifest's indexed
+            // role map is the extension point for future transfer operations.
+            crate::runtime::validate_runtime_name(&manifest.session.id)?;
+            manifest.session.vt_engine.ensure_available()?;
+            let meta_path = layout.daemon_dir().join("transfer.json");
+            let meta = serde_json::to_vec_pretty(&manifest).map_err(|err| format!("serialize daemon transfer metadata: {err}"))?;
+            fs::write(&meta_path, meta).map_err(|err| format!("write daemon transfer metadata {}: {err}", meta_path.display()))?;
+            let session_dir = layout.session_dir(&manifest.session.id);
+            fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
+            let pty_child = crate::platform::pty::PtyChild::from_transferred(pty_master, child_status, manifest.child_pid)?;
+            let hosted = HostedSession::adopt(session_dir, manifest.session.clone(), pty_child)?;
+            sessions.insert(manifest.session.id.clone(), hosted);
+            fs::write(layout.daemon_dir().join("bootstrap.ready"), b"ready")
+                .map_err(|err| format!("write FD transfer bootstrap readiness: {err}"))?;
+            Ok::<_, String>(())
+        })();
+        let ack_stream = bootstrap_stream.as_mut().expect("bootstrap stream exists with bootstrap manifest");
+        match bootstrap_result {
+            // Adoption is committed once readiness is persisted. A caller that
+            // disconnects before reading ACK must not tear down the new daemon.
+            Ok(()) => {
+                let _ = crate::fd_transfer::send_ack(ack_stream);
+            }
+            Err(err) => {
+                let _ = crate::fd_transfer::send_nack(ack_stream, &err);
+                return Err(err);
+            }
         }
-        if manifest.operation != crate::fd_transfer::FdTransferOperation::Sibling {
-            return Err(format!("unsupported FD transfer operation {:?}", manifest.operation));
-        }
-        if manifest.target_daemon != daemon_name {
-            return Err(format!("FD transfer target daemon {} does not match bootstrap daemon {daemon_name}", manifest.target_daemon));
-        }
-        let mut fds: Vec<_> = bootstrap.fds.into_iter().map(Some).collect();
-        let take_role =
-            |role: &crate::fd_transfer::FdRole, fds: &mut Vec<Option<std::os::fd::OwnedFd>>| -> Result<std::os::fd::OwnedFd, String> {
-                let entry = manifest
-                    .fds
-                    .iter()
-                    .find(|entry| &entry.role == role)
-                    .ok_or_else(|| format!("FD transfer manifest is missing {}", role.as_str()))?;
-                fds.get_mut(entry.index)
-                    .and_then(Option::take)
-                    .ok_or_else(|| format!("FD transfer descriptor {} for {} is unavailable", entry.index, role.as_str()))
-            };
-        let pty_master = take_role(&crate::fd_transfer::FdRole::pty_master(), &mut fds)?;
-        let child_status = take_role(&crate::fd_transfer::FdRole::child_status(), &mut fds)?;
-        // Unrecognized roles are intentionally ignored. The manifest's indexed
-        // role map is the extension point for future transfer operations.
-        crate::runtime::validate_runtime_name(&manifest.session.id)?;
-        manifest.session.vt_engine.ensure_available()?;
-        let meta_path = layout.daemon_dir().join("transfer.json");
-        let meta = serde_json::to_vec_pretty(&manifest).map_err(|err| format!("serialize daemon transfer metadata: {err}"))?;
-        fs::write(&meta_path, meta).map_err(|err| format!("write daemon transfer metadata {}: {err}", meta_path.display()))?;
-        let session_dir = layout.session_dir(&manifest.session.id);
-        fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
-        let pty_child = crate::platform::pty::PtyChild::from_transferred(pty_master, child_status, manifest.child_pid)?;
-        let hosted = HostedSession::adopt(session_dir, manifest.session.clone(), pty_child)?;
-        sessions.insert(manifest.session.id.clone(), hosted);
-        crate::fd_transfer::send_ack(bootstrap_stream.as_mut().expect("bootstrap stream exists with bootstrap manifest"))?;
         drop(bootstrap_stream.take());
     }
     let mut packet_clients: Vec<PacketClient> = Vec::new();
@@ -1698,8 +1722,23 @@ fn handle_http_request(
         http_uds::Route::SessionSiblingCreate { id } => {
             let request: http_uds::CreateSiblingRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP sibling create request: {err}"))?;
-            let response = create_sibling_session(root, daemon_id, &id, request, state.sessions)?;
-            http_uds::write_json(stream, StatusCode::OK, &response).map_err(|err| format!("write HTTP sibling create response: {err}"))
+            let source = state.sessions.get(&id).ok_or_else(|| format!("missing session {id}"))?.metadata.clone();
+            let root = root.to_path_buf();
+            let daemon_id = daemon_id.to_string();
+            let mut response_stream = stream.try_clone().map_err(|err| format!("clone sibling create response stream: {err}"))?;
+            thread::Builder::new()
+                .name("cleat-sibling-bootstrap".to_string())
+                .spawn(move || match create_sibling_session(&root, &daemon_id, &id, request, source) {
+                    Ok(response) => {
+                        let _ = http_uds::write_json(&mut response_stream, StatusCode::OK, &response);
+                    }
+                    Err(err) => {
+                        let _ = http_uds::write_error(&mut response_stream, StatusCode::INTERNAL_SERVER_ERROR, &err);
+                    }
+                })
+                .map_err(|err| format!("spawn sibling bootstrap worker: {err}"))?;
+            *response_committed = true;
+            Ok(())
         }
         http_uds::Route::PacketConnect => {
             if !http_uds::request_has_upgrade_token(&request, "cleat-packet/1") {
@@ -2125,9 +2164,8 @@ fn create_sibling_session(
     source_daemon: &str,
     source_session: &str,
     request: http_uds::CreateSiblingRequest,
-    sessions: &HashMap<String, HostedSession>,
+    source: SessionMetadata,
 ) -> Result<http_uds::CreateSiblingResponse, String> {
-    let source = sessions.get(source_session).ok_or_else(|| format!("missing session {source_session}"))?;
     let session_id = request.id.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
     crate::runtime::validate_runtime_name(&session_id)?;
     let daemon_nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -2142,7 +2180,7 @@ fn create_sibling_session(
     }
     validate_session_socket_path(&target_layout.socket_path())?;
 
-    let mut session = source.metadata.clone();
+    let mut session = source;
     session.id = session_id;
     session.cwd = Some(std::env::current_dir().map_err(|err| format!("read source daemon working directory: {err}"))?);
     session.cmd = request.cmd;
@@ -2172,14 +2210,22 @@ fn create_sibling_session(
         crate::fd_transfer::send(&mut transfer_stream, &manifest, &transfer.fds())?;
         crate::fd_transfer::receive_ack(&mut transfer_stream)
     })();
+    let response = http_uds::CreateSiblingResponse { daemon: target_daemon, session };
     if let Err(err) = transfer_result {
+        // The target records readiness immediately before ACK. If the ACK is
+        // lost after adoption, preserve the live session instead of destroying
+        // a transfer that actually succeeded.
+        if target_layout.daemon_dir().join("bootstrap.ready").exists() {
+            transfer.commit();
+            return Ok(response);
+        }
         let _ = daemon_process.kill();
         let _ = daemon_process.wait();
         let _ = fs::remove_dir_all(target_layout.daemon_dir());
         return Err(err);
     }
     transfer.commit();
-    Ok(http_uds::CreateSiblingResponse { daemon: target_daemon, session })
+    Ok(response)
 }
 
 #[cfg(not(unix))]
@@ -2188,7 +2234,7 @@ fn create_sibling_session(
     _source_daemon: &str,
     _source_session: &str,
     _request: http_uds::CreateSiblingRequest,
-    _sessions: &HashMap<String, HostedSession>,
+    _source: SessionMetadata,
 ) -> Result<http_uds::CreateSiblingResponse, String> {
     Err("sibling session FD transfer is only supported on Unix".to_string())
 }

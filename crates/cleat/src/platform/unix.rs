@@ -190,10 +190,7 @@ impl PtyChild {
 
     pub fn from_transferred(master_fd: OwnedFd, exit_status_fd: OwnedFd, child_pid: u32) -> Result<Self, String> {
         let pid = i32::try_from(child_pid).map(Pid::from_raw).map_err(|_| format!("invalid transferred child pid {child_pid}"))?;
-        let pty =
-            Self { master_fd: Some(master_fd), pid, exit_status_fd: Some(exit_status_fd), reaps_child: false, terminate_on_drop: true };
-        pty.set_nonblocking()?;
-        Ok(pty)
+        Ok(Self { master_fd: Some(master_fd), pid, exit_status_fd: Some(exit_status_fd), reaps_child: false, terminate_on_drop: true })
     }
 
     fn master(&self) -> &OwnedFd {

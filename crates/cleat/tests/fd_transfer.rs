@@ -51,3 +51,14 @@ fn transfers_manifest_and_working_fd_over_unix_socket() {
     std::fs::File::from(received.fds.into_iter().next().expect("received fd")).read_exact(&mut bytes).expect("read through transferred fd");
     assert_eq!(&bytes, b"fd arrived");
 }
+
+#[test]
+fn rejection_returns_target_error_without_waiting_for_timeout() {
+    let (mut sender, mut receiver) = UnixStream::pair().expect("socketpair");
+    let send = std::thread::spawn(move || fd_transfer::send_nack(&mut sender, "unsupported manifest"));
+
+    let error = fd_transfer::receive_ack(&mut receiver).expect_err("transfer is rejected");
+
+    send.join().expect("join sender").expect("send rejection");
+    assert_eq!(error, "FD transfer rejected: unsupported manifest");
+}

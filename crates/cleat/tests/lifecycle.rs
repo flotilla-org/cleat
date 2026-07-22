@@ -948,6 +948,72 @@ fn sibling_child_inherits_source_daemon_cwd_and_environment() {
 }
 
 #[test]
+fn rejected_sibling_bootstrap_fails_fast_and_cleans_target_daemon() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = RuntimeLayout::new(temp.path().to_path_buf()).with_daemon("reject-source".to_string()).expect("source layout");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_cleat"));
+    daemon
+        .args(["--runtime-root", temp.path().to_str().expect("utf8 temp path"), "--server", "reject-source", "serve"])
+        .env("CLEAT_TEST_REJECT_FD_TRANSFER", "1");
+    let mut daemon = daemon.spawn().expect("spawn rejecting source daemon");
+    wait_for_socket(&layout.socket_path());
+
+    let service = service_for(temp.path()).with_daemon("reject-source".to_string()).expect("source service");
+    service.create(Some("parent".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create parent");
+    let started = Instant::now();
+    let error = service
+        .create_sibling("parent", Some("rejected-helper".into()), Some("sleep 30".into()), false)
+        .expect_err("target rejects bootstrap");
+
+    assert!(started.elapsed() < Duration::from_secs(3), "NACK should fail fast, elapsed={:?}", started.elapsed());
+    assert!(error.contains("injected FD transfer bootstrap rejection"), "{error}");
+    assert_eq!(service.inspect("parent").expect("source daemon remains responsive").session.id, "parent");
+    assert!(
+        std::fs::read_dir(temp.path())
+            .expect("read runtime root")
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("sibling-")),
+        "failed transfer target directory should be removed"
+    );
+
+    service.kill("parent").expect("kill parent");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), "reject-source");
+    let _ = daemon.wait();
+}
+
+#[test]
+fn slow_sibling_bootstrap_does_not_block_source_daemon_requests() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = RuntimeLayout::new(temp.path().to_path_buf()).with_daemon("slow-source".to_string()).expect("source layout");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_cleat"));
+    daemon
+        .args(["--runtime-root", temp.path().to_str().expect("utf8 temp path"), "--server", "slow-source", "serve"])
+        .env("CLEAT_TEST_FD_TRANSFER_BOOTSTRAP_DELAY_MS", "1000");
+    let mut daemon = daemon.spawn().expect("spawn delayed source daemon");
+    wait_for_socket(&layout.socket_path());
+
+    let service = service_for(temp.path()).with_daemon("slow-source".to_string()).expect("source service");
+    service.create(Some("parent".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create parent");
+    let create_service = service.clone();
+    let create =
+        std::thread::spawn(move || create_service.create_sibling("parent", Some("slow-helper".into()), Some("sleep 30".into()), false));
+    std::thread::sleep(Duration::from_millis(150));
+
+    let inspect_started = Instant::now();
+    assert_eq!(service.inspect("parent").expect("source serves inspect during bootstrap").session.id, "parent");
+    assert!(inspect_started.elapsed() < Duration::from_millis(500), "inspect was stalled for {:?}", inspect_started.elapsed());
+
+    let sibling = create.join().expect("join sibling create").expect("create delayed sibling");
+    service.with_daemon(sibling.daemon.clone()).expect("helper service").kill(&sibling.session.id).expect("kill sibling");
+    service.kill("parent").expect("kill parent");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), &sibling.daemon);
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), "slow-source");
+    let _ = daemon.wait();
+}
+
+#[test]
 fn transferred_sibling_exit_is_observed_without_affecting_parent() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
@@ -961,6 +1027,22 @@ fn transferred_sibling_exit_is_observed_without_affecting_parent() {
 
     assert_eq!(service.inspect("parent").expect("parent survives sibling exit").session.id, "parent");
     service.kill("parent").expect("kill parent");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), &sibling.daemon);
+}
+
+#[test]
+fn transferred_sibling_exit_is_observed_after_source_daemon_dies() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("parent".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create parent");
+    let sibling = service.create_sibling("parent", Some("orphan-helper".into()), Some("sleep 1".into()), false).expect("create sibling");
+    let helper = service.with_daemon(sibling.daemon.clone()).expect("helper service");
+
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
+    assert_eq!(helper.inspect(&sibling.session.id).expect("sibling survives source daemon death").session.id, "orphan-helper");
+    wait_until("orphaned transferred sibling exit", || helper.inspect(&sibling.session.id).is_err());
+
     cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), &sibling.daemon);
 }
 

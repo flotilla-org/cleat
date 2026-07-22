@@ -16,6 +16,7 @@ use crate::runtime::SessionMetadata;
 
 const TRANSFER_MARKER: u8 = 1;
 const TRANSFER_ACK: u8 = 1;
+const TRANSFER_NACK: u8 = 2;
 const MAX_TRANSFER_FDS: usize = 16;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
@@ -135,13 +136,34 @@ pub fn send_ack(stream: &mut UnixStream) -> Result<(), String> {
     stream.write_all(&[TRANSFER_ACK]).map_err(|err| format!("write FD transfer acknowledgement: {err}"))
 }
 
+pub fn send_nack(stream: &mut UnixStream, message: &str) -> Result<(), String> {
+    let message = message.as_bytes();
+    if message.len() > MAX_MANIFEST_BYTES {
+        return Err(format!("FD transfer rejection exceeds {MAX_MANIFEST_BYTES} bytes"));
+    }
+    let length = u32::try_from(message.len()).map_err(|_| "FD transfer rejection length does not fit u32".to_string())?;
+    stream.write_all(&[TRANSFER_NACK]).map_err(|err| format!("write FD transfer rejection marker: {err}"))?;
+    stream.write_all(&length.to_be_bytes()).map_err(|err| format!("write FD transfer rejection length: {err}"))?;
+    stream.write_all(message).map_err(|err| format!("write FD transfer rejection: {err}"))
+}
+
 pub fn receive_ack(stream: &mut UnixStream) -> Result<(), String> {
     let mut ack = [0u8; 1];
     stream.read_exact(&mut ack).map_err(|err| format!("read FD transfer acknowledgement: {err}"))?;
-    if ack[0] == TRANSFER_ACK {
-        Ok(())
-    } else {
-        Err("invalid FD transfer acknowledgement".to_string())
+    match ack[0] {
+        TRANSFER_ACK => Ok(()),
+        TRANSFER_NACK => {
+            let mut length = [0u8; 4];
+            stream.read_exact(&mut length).map_err(|err| format!("read FD transfer rejection length: {err}"))?;
+            let length = u32::from_be_bytes(length) as usize;
+            if length > MAX_MANIFEST_BYTES {
+                return Err(format!("FD transfer rejection exceeds {MAX_MANIFEST_BYTES} bytes"));
+            }
+            let mut message = vec![0; length];
+            stream.read_exact(&mut message).map_err(|err| format!("read FD transfer rejection: {err}"))?;
+            Err(format!("FD transfer rejected: {}", String::from_utf8_lossy(&message)))
+        }
+        _ => Err("invalid FD transfer acknowledgement".to_string()),
     }
 }
 

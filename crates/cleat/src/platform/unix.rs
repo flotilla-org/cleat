@@ -28,7 +28,7 @@ use nix::{
 use crate::{
     platform::ipc::{SessionListener, SessionStream},
     protocol::SignalTarget,
-    runtime::SessionMetadata,
+    runtime::{AmbientSessionCoordinates, SessionMetadata, AMBIENT_COORDINATE_ENV_NAMES},
 };
 
 const STRIP_ENV_VARS: &[&str] = &["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"];
@@ -49,8 +49,8 @@ pub struct PtyChild {
 static SPAWN_CLOEXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl PtyChild {
-    pub fn spawn(session: &SessionMetadata) -> Result<Self, String> {
-        let exec_spec = ChildExecSpec::new(session)?;
+    pub fn spawn_with_ambient(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Self, String> {
+        let exec_spec = ChildExecSpec::new(session, coordinates)?;
         let winsize = Winsize { ws_row: session.initial_size.rows, ws_col: session.initial_size.cols, ws_xpixel: 0, ws_ypixel: 0 };
         // The child never touches this lock (it only execs or exits), so
         // inheriting it in a locked state across the fork is harmless.
@@ -391,7 +391,7 @@ struct ChildExecSpec {
 }
 
 impl ChildExecSpec {
-    fn new(session: &SessionMetadata) -> Result<Self, String> {
+    fn new(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Self, String> {
         let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
         let program = cstring_from_os(resolve_shell_program(&shell).as_os_str(), "shell path contains interior nul")?;
         let mut argv = vec![cstring_from_os(&shell, "shell contains interior nul")?];
@@ -399,7 +399,7 @@ impl ChildExecSpec {
             argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
             argv.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
         }
-        let envp = filtered_envp_from(env::vars_os())?;
+        let envp = child_envp_from(env::vars_os(), coordinates)?;
         let cwd = session.cwd.as_ref().map(|cwd| cstring_from_os(cwd.as_os_str(), "cwd contains interior nul")).transpose()?;
         let argv_ptrs = null_terminated_ptrs(&argv);
         let envp_ptrs = null_terminated_ptrs(&envp);
@@ -447,10 +447,20 @@ fn is_executable_file(path: &Path) -> bool {
     unsafe { libc::access(path_c.as_ptr(), libc::X_OK) == 0 }
 }
 
+#[cfg(test)]
 fn filtered_envp_from(env: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Vec<CString>, String> {
+    child_envp_from(env, None)
+}
+
+fn child_envp_from(
+    env: impl IntoIterator<Item = (OsString, OsString)>,
+    coordinates: Option<&AmbientSessionCoordinates>,
+) -> Result<Vec<CString>, String> {
     let mut envp = Vec::new();
     for (key, value) in env {
-        if STRIP_ENV_VARS.iter().any(|strip| key == OsStr::new(strip)) {
+        if STRIP_ENV_VARS.iter().any(|strip| key == OsStr::new(strip))
+            || coordinates.is_some() && AMBIENT_COORDINATE_ENV_NAMES.iter().any(|ambient| key == OsStr::new(ambient))
+        {
             continue;
         }
         let mut entry = Vec::with_capacity(key.as_bytes().len() + 1 + value.as_bytes().len());
@@ -458,6 +468,16 @@ fn filtered_envp_from(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
         entry.push(b'=');
         entry.extend_from_slice(value.as_bytes());
         envp.push(CString::new(entry).map_err(|_| "environment contains interior nul".to_string())?);
+    }
+    if let Some(coordinates) = coordinates {
+        for (key, value) in coordinates.child_environment() {
+            let key = OsStr::new(key);
+            let mut entry = Vec::with_capacity(key.as_bytes().len() + 1 + value.as_bytes().len());
+            entry.extend_from_slice(key.as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            envp.push(CString::new(entry).map_err(|_| "ambient session coordinates contain interior nul".to_string())?);
+        }
     }
     Ok(envp)
 }
@@ -655,7 +675,7 @@ mod tests {
             initial_size: TerminalSize::default(),
             colors: TerminalColors::default(),
         };
-        let pty_child = super::PtyChild::spawn(&session).expect("spawn pty child");
+        let pty_child = super::PtyChild::spawn_with_ambient(&session, None).expect("spawn pty child");
         pty_child.set_nonblocking().expect("set pty nonblocking");
         let deadline = Instant::now() + Duration::from_secs(5);
 
@@ -682,7 +702,7 @@ mod tests {
             initial_size: TerminalSize::default(),
             colors: TerminalColors::default(),
         };
-        let pty_child = super::PtyChild::spawn(&session).expect("spawn pty child");
+        let pty_child = super::PtyChild::spawn_with_ambient(&session, None).expect("spawn pty child");
         let master_fd = pty_child.master_fd();
         let pid = pty_child.leader_pid() as libc::pid_t;
 

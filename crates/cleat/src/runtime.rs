@@ -9,6 +9,10 @@ use crate::vt::{TerminalColors, VtEngineKind};
 
 const SESSION_ROOT_DIR: &str = "cleat";
 const SESSIONS_DIR: &str = "sessions";
+pub const RUNTIME_DIR_ENV: &str = "CLEAT_RUNTIME_DIR";
+pub const AMBIENT_DAEMON_ENV: &str = "CLEAT_DAEMON";
+pub const AMBIENT_SESSION_ENV: &str = "CLEAT_SESSION";
+pub const AMBIENT_COORDINATE_ENV_NAMES: [&str; 3] = [RUNTIME_DIR_ENV, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV];
 pub const DEFAULT_DAEMON_NAME: &str = "default";
 pub const DEFAULT_TERMINAL_COLS: u16 = 80;
 pub const DEFAULT_TERMINAL_ROWS: u16 = 24;
@@ -50,10 +54,45 @@ pub struct RuntimeLayout {
     daemon_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbientSessionCoordinates {
+    runtime_root: PathBuf,
+    daemon_name: String,
+    session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DaemonCoordinates {
+    pub name: String,
+    pub runtime_root: PathBuf,
+}
+
+impl AmbientSessionCoordinates {
+    pub fn runtime_root(&self) -> &Path {
+        &self.runtime_root
+    }
+
+    pub fn daemon_name(&self) -> &str {
+        &self.daemon_name
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn child_environment(&self) -> [(&'static str, &std::ffi::OsStr); 3] {
+        [
+            (RUNTIME_DIR_ENV, self.runtime_root.as_os_str()),
+            (AMBIENT_DAEMON_ENV, std::ffi::OsStr::new(&self.daemon_name)),
+            (AMBIENT_SESSION_ENV, std::ffi::OsStr::new(&self.session_id)),
+        ]
+    }
+}
+
 impl RuntimeLayout {
     pub fn discover() -> Result<Self, String> {
         Ok(Self {
-            root: discover_runtime_root(env::var_os("CLEAT_RUNTIME_DIR"), env::var_os("XDG_STATE_HOME"), platform_state_dir())?,
+            root: discover_runtime_root(env::var_os(RUNTIME_DIR_ENV), env::var_os("XDG_STATE_HOME"), platform_state_dir())?,
             daemon_name: DEFAULT_DAEMON_NAME.to_string(),
         })
     }
@@ -74,6 +113,15 @@ impl RuntimeLayout {
 
     pub fn daemon_name(&self) -> &str {
         &self.daemon_name
+    }
+
+    pub fn session_coordinates(&self, session_id: &str) -> Result<AmbientSessionCoordinates, String> {
+        let runtime_root = if self.root.is_absolute() {
+            self.root.clone()
+        } else {
+            env::current_dir().map_err(|err| format!("resolve relative runtime root {}: {err}", self.root.display()))?.join(&self.root)
+        };
+        Ok(AmbientSessionCoordinates { runtime_root, daemon_name: self.daemon_name.clone(), session_id: session_id.to_string() })
     }
 
     pub fn daemon_dir(&self) -> PathBuf {
@@ -146,6 +194,30 @@ impl RuntimeLayout {
     }
 }
 
+pub fn discoverable_runtime_roots() -> Vec<PathBuf> {
+    discoverable_runtime_roots_from(env::var_os(RUNTIME_DIR_ENV), env::var_os("XDG_STATE_HOME"), platform_state_dir())
+}
+
+fn discoverable_runtime_roots_from(
+    ambient_root: Option<std::ffi::OsString>,
+    xdg_state_home: Option<std::ffi::OsString>,
+    platform_state_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = ambient_root {
+        roots.push(PathBuf::from(root));
+    }
+    if let Some(xdg_state_home) = xdg_state_home.map(PathBuf::from).filter(|path| path.is_absolute()) {
+        roots.push(xdg_state_home.join(SESSION_ROOT_DIR));
+    }
+    if let Some(platform_state_dir) = platform_state_dir {
+        roots.push(platform_state_dir.join(SESSION_ROOT_DIR));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 pub fn validate_runtime_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("name must not be empty".to_string());
@@ -196,7 +268,24 @@ fn platform_state_dir() -> Option<PathBuf> {
 mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
-    use super::discover_runtime_root;
+    use super::{discover_runtime_root, RuntimeLayout, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, RUNTIME_DIR_ENV};
+
+    #[test]
+    fn relative_layout_defines_absolute_child_coordinates() {
+        let coordinates = RuntimeLayout::new(PathBuf::from("relative/private-state"))
+            .with_daemon("agent-loop".to_string())
+            .expect("named daemon")
+            .session_coordinates("worker")
+            .expect("session coordinates");
+
+        assert!(coordinates.runtime_root().is_absolute());
+        assert!(coordinates.runtime_root().ends_with("relative/private-state"));
+        assert_eq!(coordinates.child_environment().map(|(name, value)| (name, value.to_string_lossy().into_owned())), [
+            (RUNTIME_DIR_ENV, coordinates.runtime_root().display().to_string()),
+            (AMBIENT_DAEMON_ENV, "agent-loop".to_string()),
+            (AMBIENT_SESSION_ENV, "worker".to_string()),
+        ]);
+    }
 
     #[test]
     fn discover_runtime_root_prefers_explicit_root() {

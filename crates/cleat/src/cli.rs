@@ -6,7 +6,7 @@ use crate::{
     http_uds,
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
-    runtime::{TerminalSize, DEFAULT_DAEMON_NAME},
+    runtime::{validate_runtime_name, TerminalSize, AMBIENT_DAEMON_ENV, DEFAULT_DAEMON_NAME},
     server::{EndBound, FallbackReason, SessionService, StartBound},
     vt::VtEngineKind,
 };
@@ -34,8 +34,8 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub runtime_root: Option<PathBuf>,
 
-    #[arg(long, global = true, default_value = DEFAULT_DAEMON_NAME, value_parser = parse_runtime_name)]
-    pub server: String,
+    #[arg(long, global = true, value_parser = parse_runtime_name, help = "Select daemon (explicit > CLEAT_DAEMON > default)")]
+    pub server: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -158,6 +158,11 @@ pub enum Command {
         all: bool,
         #[arg(long = "selector", value_name = "TAG", allow_hyphen_values = true, help = "Require an exact opaque tag match; repeatable")]
         selectors: Vec<String>,
+    },
+    /// List discoverable daemons (best effort; private state roots may not be found)
+    Daemons {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
     /// Add or remove opaque session tags
     Tag {
@@ -473,7 +478,11 @@ impl ExecResult {
 }
 
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
-    let service = match service.with_daemon(cli.server.clone()) {
+    let daemon_name = match resolve_daemon_name(cli.server.as_deref(), std::env::var_os(AMBIENT_DAEMON_ENV)) {
+        Ok(daemon_name) => daemon_name,
+        Err(err) => return ExecResult::Err(err),
+    };
+    let service = match service.with_daemon(daemon_name) {
         Ok(service) => service,
         Err(err) => return ExecResult::Err(err),
     };
@@ -579,6 +588,25 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(None)
             } else {
                 ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
+            }
+        }
+        Command::Daemons { json } => {
+            let daemons = service.discover_daemons();
+            if json {
+                match serde_json::to_string(&daemons) {
+                    Ok(output) => ExecResult::Ok(Some(output)),
+                    Err(err) => ExecResult::Err(format!("serialize daemon list: {err}")),
+                }
+            } else if daemons.is_empty() {
+                ExecResult::Ok(None)
+            } else {
+                ExecResult::Ok(Some(
+                    daemons
+                        .iter()
+                        .map(|daemon| format!("{}\t{}", daemon.name, daemon.runtime_root.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
             }
         }
         Command::Tag { id, mutations } => {
@@ -812,6 +840,18 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Err(e) => ExecResult::Err(e),
         },
     }
+}
+
+pub fn resolve_daemon_name(explicit: Option<&str>, ambient: Option<std::ffi::OsString>) -> Result<String, String> {
+    let daemon_name = match explicit {
+        Some(explicit) => explicit.to_string(),
+        None => match ambient {
+            Some(ambient) => ambient.into_string().map_err(|_| format!("{AMBIENT_DAEMON_ENV} must be valid UTF-8"))?,
+            None => DEFAULT_DAEMON_NAME.to_string(),
+        },
+    };
+    validate_runtime_name(&daemon_name)?;
+    Ok(daemon_name)
 }
 
 fn execute_wait(

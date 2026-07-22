@@ -16,7 +16,7 @@ use crate::{
         ViewportCommandOutcome,
     },
     recording::SessionRecorder,
-    runtime::{normalize_tags, SessionMetadata},
+    runtime::{normalize_tags, AmbientSessionCoordinates, SessionMetadata},
     screen_activity::{ScreenActivityTime, ScreenActivityTracker},
     vt::{self, TerminalModeState, VtEngine},
 };
@@ -59,7 +59,25 @@ pub(crate) struct PtyOutput {
 }
 
 impl SessionRuntime {
-    pub(crate) fn spawn(session_dir: PathBuf, session: &SessionMetadata, mut vt_engine: Box<dyn VtEngine>) -> Result<Self, String> {
+    pub(crate) fn spawn(session_dir: PathBuf, session: &SessionMetadata, vt_engine: Box<dyn VtEngine>) -> Result<Self, String> {
+        Self::spawn_inner(session_dir, session, vt_engine, None)
+    }
+
+    pub(crate) fn spawn_in_daemon(
+        session_dir: PathBuf,
+        session: &SessionMetadata,
+        vt_engine: Box<dyn VtEngine>,
+        coordinates: &AmbientSessionCoordinates,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(session_dir, session, vt_engine, Some(coordinates))
+    }
+
+    fn spawn_inner(
+        session_dir: PathBuf,
+        session: &SessionMetadata,
+        mut vt_engine: Box<dyn VtEngine>,
+        coordinates: Option<&AmbientSessionCoordinates>,
+    ) -> Result<Self, String> {
         // Recreation from recording (ADR 0001): if the session dir already holds
         // a recording from a prior activation, replay it into the fresh engine so
         // its history returns as scrollback above the freshly-invoked command.
@@ -76,7 +94,7 @@ impl SessionRuntime {
             let _ = vt_engine.drain_replies();
         }
 
-        let pty_child = PtyChild::spawn(session)?;
+        let pty_child = PtyChild::spawn_with_ambient(session, coordinates)?;
         pty_child.set_nonblocking()?;
         let detached_da = match session.vt_engine {
             // The DA tracker is the only DA source for the passthrough engine.

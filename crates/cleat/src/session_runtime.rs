@@ -464,8 +464,10 @@ impl SessionRuntime {
     }
 
     fn note_screen_activity_candidate(&mut self, changed_at: Instant, changed_at_unix_ms: u64) {
-        if self.vt_engine.screen_activity_changed().is_ok_and(|changed| changed == Some(true)) {
-            self.pending_screen_activity_at = Some((changed_at, changed_at_unix_ms));
+        match self.vt_engine.screen_activity_changed() {
+            Ok(Some(true)) => self.pending_screen_activity_at = Some((changed_at, changed_at_unix_ms)),
+            Ok(Some(false) | None) => {}
+            Err(err) => eprintln!("screen activity observation error: {err}"),
         }
     }
 
@@ -479,7 +481,9 @@ impl SessionRuntime {
 
     pub(crate) fn flush_screen_activity(&mut self) {
         if self.observe_pending_screen_activity() {
-            let _ = self.vt_engine.screen_grid();
+            if let Err(err) = self.vt_engine.screen_grid() {
+                eprintln!("screen activity render flush error: {err}");
+            }
         }
     }
 

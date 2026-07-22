@@ -18,6 +18,7 @@ pub struct SessionInfo {
     #[serde(default)]
     pub tags: Vec<String>,
     pub status: SessionStatus,
+    /// Engines without screen-activity observation support report `stable`.
     #[serde(default)]
     pub screen_activity: ScreenActivity,
     /// Unix timestamp in milliseconds when the current stable period began.
@@ -51,6 +52,7 @@ pub struct InspectResult {
     pub process: ProcessInspect,
     pub attachments: Vec<AttachmentInspect>,
     pub recording: RecordingInspect,
+    /// Engines without screen-activity observation support report `stable`.
     #[serde(default)]
     pub screen_activity: ScreenActivity,
     /// Unix timestamp in milliseconds when the current stable period began.

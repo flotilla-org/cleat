@@ -281,7 +281,7 @@ fn send_keys_command_parses() {
         hex: false,
         repeat: 1,
         keys: vec!["Enter".into()],
-        mark_before: None,
+        mark_before: None
     });
 }
 
@@ -320,7 +320,7 @@ fn send_keys_command_parses_repeat() {
         hex: false,
         repeat: 3,
         keys: vec!["C-l".into()],
-        mark_before: None,
+        mark_before: None
     });
 }
 
@@ -810,7 +810,7 @@ fn expect_with_since_offset_parses() {
         since: Some(100),
         since_marker: None,
         timeout: 30.0,
-        json: false,
+        json: false
     });
 }
 

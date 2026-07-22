@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{TerminalInputEvent, TerminalRenderUpdate};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -13,6 +13,8 @@ pub const MSG_CONTROL_DIRECTORY_DELTA: u8 = 3;
 pub const MSG_CONTROL_OPEN_CHANNEL: u8 = 4;
 pub const MSG_CONTROL_CLOSE_CHANNEL: u8 = 5;
 pub const MSG_CONTROL_ERROR: u8 = 6;
+pub const MSG_CONTROL_ACTIVITY_SNAPSHOT: u8 = 7;
+pub const MSG_CONTROL_ACTIVITY_EVENT: u8 = 8;
 
 pub const MSG_SESSION_RENDER: u8 = 16;
 pub const MSG_SESSION_ACK: u8 = 17;
@@ -69,6 +71,40 @@ pub struct DirectoryEntry {
     pub recreatable: bool,
     pub cols: u16,
     pub rows: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenActivity {
+    Active,
+    Stable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivitySession {
+    pub session_id: String,
+    pub tags: Vec<String>,
+    pub activity: ScreenActivity,
+    /// Unix timestamp in milliseconds for the beginning of the current quiet
+    /// window. It remains populated while activity is `Active`; the threshold
+    /// determines when that window becomes `Stable`.
+    pub stable_since_unix_ms: u64,
+    /// Unix timestamp in milliseconds for the most recently observed render
+    /// generation change, or `None` before the session has rendered.
+    pub last_output_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivitySnapshot {
+    pub stable_threshold_ms: u64,
+    pub sessions: Vec<ActivitySession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivityEvent {
+    ActivityChanged { session: ActivitySession, changed_at_unix_ms: u64 },
+    MembershipAdded { session: ActivitySession, changed_at_unix_ms: u64 },
+    MembershipRemoved { session_id: String, tags: Vec<String>, changed_at_unix_ms: u64 },
 }
 
 /// Attachment role of a session channel. One controller per session across
@@ -284,6 +320,15 @@ impl<S: Read + Write> PacketClient<S> {
         loop {
             let frame = self.read_frame()?;
             if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_DIRECTORY_DELTA {
+                return frame.decode();
+            }
+        }
+    }
+
+    pub fn read_activity_event(&mut self) -> std::io::Result<ActivityEvent> {
+        loop {
+            let frame = self.read_frame()?;
+            if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_ACTIVITY_EVENT {
                 return frame.decode();
             }
         }

@@ -105,7 +105,7 @@ Four surfaces cooperate during a session. Knowing which surface is authoritative
 - **Host terminal** — your real terminal emulator (kitty, ghostty, iTerm, Terminal.app, etc). In play *only while a client is attached*. Renders output to you, supplies keyboard input, and answers the child's capability queries (DA, DSR, kitty/sixel protocol queries) with whatever the host terminal actually supports.
 - **VT engine** — cleat's internal terminal emulator (libghostty with `--features ghostty-vt`; the `passthrough` engine is a placeholder for testing). Always active. Parses child PTY output into a structured screen grid, tracks modes/cursor/styles, and — when *detached* — synthesizes replies to capability queries so the child's detection logic doesn't stall.
 - **Recording** — default-on raw PTY output tee, stored as asciicast v3 in `session.cast`. Authoritative source for `transcript` and `expect`.
-- **Packet surface** — structured multiplexed control/render/directory protocol. `cleat packets` exposes the raw probe surface, and `cleat list --watch` uses the directory subscription to print a snapshot followed by lifecycle deltas.
+- **Packet surface** — structured multiplexed control/render/directory protocol. `cleat packets` exposes the raw probe surface, and `cleat list --watch` uses the directory subscription to print a snapshot followed by lifecycle deltas. Rust clients can use `SessionService::connect_activity` to subscribe once for every session matching a tag selector: the stream starts with an activity snapshot, then emits threshold-based `active`/`stable` transitions and membership changes with session IDs, tags, and Unix-millisecond timestamps.
 
 ### Command Map
 

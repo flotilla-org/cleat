@@ -496,11 +496,35 @@ impl SessionService {
         &self,
         selectors: &[String],
     ) -> Result<(crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot), String> {
+        let (client, directory, _) = self.connect_subscription(selectors, None)?;
+        Ok((client, directory))
+    }
+
+    pub fn connect_activity(
+        &self,
+        selectors: &[String],
+        stable_threshold: Duration,
+    ) -> Result<(crate::packet::PacketClient<SessionStream>, crate::packet::ActivitySnapshot), String> {
+        let stable_threshold_ms = u64::try_from(stable_threshold.as_millis())
+            .map_err(|_| "screen activity stability threshold exceeds u64 milliseconds".to_string())?;
+        let (client, _, activity) = self.connect_subscription(selectors, Some(stable_threshold_ms))?;
+        let activity = activity.ok_or_else(|| "packet stream did not send an activity snapshot".to_string())?;
+        Ok((client, activity))
+    }
+
+    fn connect_subscription(
+        &self,
+        selectors: &[String],
+        screen_activity_stable_ms: Option<u64>,
+    ) -> Result<
+        (crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot, Option<crate::packet::ActivitySnapshot>),
+        String,
+    > {
         crate::session::ensure_daemon_started(&self.layout)?;
 
         let socket_path = self.layout.socket_path();
         let mut stream = connect_session_socket(&socket_path)?;
-        let body = serde_json::to_vec(&http_uds::DirectorySubscribeRequest { selectors: selectors.to_vec() })
+        let body = serde_json::to_vec(&http_uds::DirectorySubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms })
             .map_err(|err| format!("serialize directory subscribe request: {err}"))?;
         write!(
             stream,
@@ -529,7 +553,16 @@ impl SessionService {
             return Err("packet stream did not send a directory snapshot after hello".to_string());
         }
         let directory = directory.decode::<crate::packet::DirectorySnapshot>().map_err(|err| format!("decode packet directory: {err}"))?;
-        Ok((client, directory))
+        let activity = if screen_activity_stable_ms.is_some() {
+            let frame = client.read_frame().map_err(|err| format!("read packet activity snapshot: {err}"))?;
+            if frame.channel != crate::packet::CHANNEL_CONTROL || frame.msg_type != crate::packet::MSG_CONTROL_ACTIVITY_SNAPSHOT {
+                return Err("packet stream did not send an activity snapshot after the directory".to_string());
+            }
+            Some(frame.decode::<crate::packet::ActivitySnapshot>().map_err(|err| format!("decode packet activity snapshot: {err}"))?)
+        } else {
+            None
+        };
+        Ok((client, directory, activity))
     }
 
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {

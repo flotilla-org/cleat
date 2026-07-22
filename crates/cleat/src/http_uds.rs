@@ -220,6 +220,8 @@ pub(crate) struct SessionListResponse {
 pub(crate) struct DirectorySubscribeRequest {
     #[serde(default)]
     pub selectors: Vec<String>,
+    #[serde(default)]
+    pub screen_activity_stable_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -3,7 +3,6 @@
 
 use std::{io::Write, path::PathBuf, time::Duration};
 
-use clap::Parser;
 use cleat::{
     asciicast::{encode_event, encode_header, Event, EventCode, Header},
     cli::{Cli, Command},

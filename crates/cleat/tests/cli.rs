@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser};
+use clap::CommandFactory;
 use cleat::{
     cli::{self, execute, Cli, Command, ExecResult, RecordFlags},
     runtime::{RuntimeLayout, TerminalSize},
@@ -111,6 +111,7 @@ fn launch_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--cmd", "bash"]).expect("launch parses");
     assert_eq!(cli.command, Command::Launch {
         id: None,
+        from: None,
         json: false,
         size: None,
         vt: None,
@@ -119,6 +120,25 @@ fn launch_command_parses() {
         tags: Vec::new(),
         record: RecordFlags::default()
     });
+}
+
+#[test]
+fn launch_from_parses_and_rejects_an_explicit_server() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "sibling", "--from", "source"]).expect("launch --from parses");
+    assert!(matches!(cli.command, Command::Launch { from: Some(ref source), .. } if source == "source"));
+
+    assert!(Cli::try_parse_from(["cleat", "--server", "other", "launch", "sibling", "--from", "source"]).is_err());
+}
+
+#[test]
+fn launch_from_rejects_a_missing_source_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "launch", "sibling", "--from", "missing", "--vt", "passthrough"]).expect("parse launch --from");
+
+    let err = execute(cli, &service).expect_err("missing source should fail");
+
+    assert!(err.contains("missing session missing"), "{err}");
 }
 
 #[test]
@@ -145,6 +165,7 @@ fn launch_command_parses_positional_name() {
     let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--cmd", "bash"]).expect("launch positional parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
         json: false,
         size: None,
         vt: None,
@@ -173,6 +194,7 @@ fn launch_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
         json: true,
         size: None,
         vt: None,
@@ -188,6 +210,7 @@ fn launch_command_parses_vt() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--vt", "ghostty", "demo"]).expect("launch --vt parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
         json: false,
         size: None,
         vt: Some(VtEngineKind::Ghostty),
@@ -203,6 +226,7 @@ fn create_alias_still_parses_as_launch() {
     let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create alias parses");
     assert_eq!(cli.command, Command::Launch {
         id: None,
+        from: None,
         json: false,
         size: None,
         vt: None,
@@ -405,7 +429,7 @@ fn record_flags_explicit_record_enables() {
 #[test]
 fn serve_parses_as_daemon_scoped_command() {
     let cli = Cli::try_parse_from(["cleat", "--server", "alternate", "serve"]).expect("parse serve");
-    assert_eq!(cli.server, "alternate");
+    assert_eq!(cli.server.as_deref(), Some("alternate"));
     assert!(matches!(cli.command, Command::Serve));
 }
 
@@ -419,7 +443,7 @@ fn mark_command_parses_session_id() {
 fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,
-        server: cleat::runtime::DEFAULT_DAEMON_NAME.to_string(),
+        server: Some(cleat::runtime::DEFAULT_DAEMON_NAME.to_string()),
         command: Command::SendKeys {
             id: "demo".into(),
             literal: false,

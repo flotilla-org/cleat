@@ -34,11 +34,32 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub runtime_root: Option<PathBuf>,
 
-    #[arg(long, global = true, default_value = DEFAULT_DAEMON_NAME, value_parser = parse_runtime_name)]
-    pub server: String,
+    #[arg(long, global = true, value_parser = parse_runtime_name)]
+    pub server: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    pub fn try_parse_from<I, T>(itr: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        <Self as Parser>::try_parse_from(itr)?.validate_daemon_target()
+    }
+
+    fn validate_daemon_target(self) -> Result<Self, clap::Error> {
+        if self.server.is_some() && matches!(self.command, Command::Launch { from: Some(_), .. }) {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "the argument '--server <SERVER>' cannot be used with '--from <SESSION>'",
+            )
+            .with_cmd(&Self::command()));
+        }
+        Ok(self)
+    }
 }
 
 // Bracketed paste marks the paste/submit boundary explicitly; the delay only
@@ -133,6 +154,9 @@ pub enum Command {
     Launch {
         #[arg(value_name = "ID")]
         id: Option<String>,
+        /// Launch in the daemon that owns this source session
+        #[arg(long, value_name = "SESSION", value_parser = parse_runtime_name)]
+        from: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(long, value_name = "COLSxROWS", value_parser = parse_terminal_size, help = "Initial terminal size, e.g. 120x40")]
@@ -429,7 +453,8 @@ resolved through the live daemon socket. \n\
 /// snippet alongside BUILD_SUPPORT_MESSAGE (which can't be concatenated at
 /// compile time since it's a const &str, not a literal).
 pub fn parse() -> Cli {
-    Cli::from_arg_matches(&command().get_matches()).expect("clap arg parsing should not fail after get_matches succeeds")
+    let cli = Cli::from_arg_matches(&command().get_matches()).expect("clap arg parsing should not fail after get_matches succeeds");
+    cli.validate_daemon_target().unwrap_or_else(|err| err.exit())
 }
 
 pub fn command() -> clap::Command {
@@ -473,7 +498,11 @@ impl ExecResult {
 }
 
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
-    let service = match service.with_daemon(cli.server.clone()) {
+    let daemon_name = match resolve_daemon_target(&cli, service) {
+        Ok(daemon_name) => daemon_name,
+        Err(err) => return ExecResult::Err(err),
+    };
+    let service = match service.with_daemon(daemon_name) {
         Ok(service) => service,
         Err(err) => return ExecResult::Err(err),
     };
@@ -526,7 +555,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, json, size, vt, cwd, cmd, tags, record } => {
+        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -811,6 +840,51 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
+    }
+}
+
+fn resolve_daemon_target(cli: &Cli, service: &SessionService) -> Result<String, String> {
+    if let Some(daemon_name) = &cli.server {
+        return Ok(daemon_name.clone());
+    }
+
+    let Command::Launch { from: Some(source), .. } = &cli.command else {
+        return Ok(DEFAULT_DAEMON_NAME.to_string());
+    };
+
+    let root = service.layout_root();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(format!("missing session {source}")),
+        Err(err) => return Err(format!("read runtime root {}: {err}", root.display())),
+    };
+    let mut owners = Vec::new();
+    let mut candidate_errors = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read runtime entry: {err}"))?;
+        let path = entry.path();
+        if !path.join("sessions").join(source).is_dir() {
+            continue;
+        }
+        let Some(daemon_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let daemon_service = service.with_daemon(daemon_name.to_string())?;
+        match daemon_service.inspect(source) {
+            Ok(_) => owners.push(daemon_name.to_string()),
+            Err(err) => candidate_errors.push(format!("{daemon_name}: {err}")),
+        }
+    }
+    owners.sort();
+
+    match owners.as_slice() {
+        [] if candidate_errors.is_empty() => Err(format!("missing session {source}")),
+        [] => Err(format!("unable to resolve session {source}: {}", candidate_errors.join("; "))),
+        [daemon_name] => Ok(daemon_name.clone()),
+        _ => Err(format!(
+            "session {source} exists in multiple daemons ({}); use --server to select the target daemon instead",
+            owners.join(", ")
+        )),
     }
 }
 

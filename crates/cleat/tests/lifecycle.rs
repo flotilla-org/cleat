@@ -14,7 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Parser;
 #[cfg(feature = "ghostty-vt")]
 use cleat::packet::ScreenActivity;
 #[cfg(feature = "ghostty-vt")]
@@ -472,6 +471,70 @@ fn create_makes_session_directory_and_returns_metadata() {
     let output = cli::execute(cli, &service).expect("execute create").expect("create output");
     assert_eq!(output, "alpha");
     assert!(service.session_dir("alpha").exists());
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn launch_from_creates_a_sibling_in_the_source_daemon() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let source_daemon = service.with_daemon("source-daemon".to_string()).expect("source daemon service");
+    let _ssh_tty = EnvVarGuard::set("SSH_TTY", "/dev/stale-tty");
+    let _ssh_connection = EnvVarGuard::set("SSH_CONNECTION", "stale connection");
+    let _ssh_client = EnvVarGuard::set("SSH_CLIENT", "stale client");
+    source_daemon
+        .create(Some("source".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create source session");
+
+    let mut observer = UnixStream::connect(temp.path().join("source-daemon/socket")).expect("connect source daemon");
+    write!(
+        observer,
+        "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n"
+    )
+    .expect("write packet upgrade request");
+    let response = read_http_response_head(&mut observer);
+    assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
+    let _hello = PacketFrame::read(&mut observer).expect("read hello");
+    let initial_directory = PacketFrame::read(&mut observer).expect("read initial directory");
+    let initial_directory = initial_directory.decode::<DirectorySnapshot>().expect("decode initial directory");
+    assert_eq!(initial_directory.sessions.iter().map(|entry| entry.session_id.as_str()).collect::<Vec<_>>(), vec!["source"]);
+
+    let env_output = temp.path().join("sibling-env");
+    let sibling_command = format!(
+        "sh -c 'printf \"%s|%s|%s\" \"${{SSH_TTY-unset}}\" \"${{SSH_CONNECTION-unset}}\" \"${{SSH_CLIENT-unset}}\" > {}; sleep 30'",
+        env_output.display()
+    );
+    let cli = Cli::try_parse_from([
+        "cleat",
+        "launch",
+        "sibling",
+        "--from",
+        "source",
+        "--tag",
+        "kind=sibling",
+        "--no-record",
+        "--cmd",
+        &sibling_command,
+    ])
+    .expect("parse launch --from");
+
+    let output = cli::execute(cli, &service).expect("launch sibling").expect("sibling id");
+
+    assert_eq!(output, "sibling");
+    let mut packet_buffer = Vec::new();
+    let delta = read_directory_delta_named(&mut observer, &mut packet_buffer, Duration::from_secs(2), "sibling directory delta");
+    let sibling = delta.upserted.iter().find(|entry| entry.session_id == "sibling").expect("sibling upsert");
+    assert_eq!(sibling.tags, vec!["kind=sibling"]);
+    wait_until("sibling environment output", || std::fs::read_to_string(&env_output).as_deref() == Ok("unset|unset|unset"));
+    assert_eq!(std::fs::read_to_string(&env_output).expect("read sibling environment"), "unset|unset|unset");
+    assert!(service.list().expect("list default daemon").is_empty());
+    assert_eq!(source_daemon.list().expect("list source daemon").iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec![
+        "sibling", "source"
+    ]);
+
+    source_daemon.kill("sibling").expect("kill sibling");
+    source_daemon.kill("source").expect("kill source");
 }
 
 #[test]

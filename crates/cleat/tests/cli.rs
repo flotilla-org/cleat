@@ -128,6 +128,13 @@ fn launch_from_parses_and_rejects_an_explicit_server() {
     assert!(matches!(cli.command, Command::Launch { from: Some(ref source), .. } if source == "source"));
 
     assert!(Cli::try_parse_from(["cleat", "--server", "other", "launch", "sibling", "--from", "source"]).is_err());
+
+    let raw_cli = <Cli as clap::Parser>::try_parse_from(["cleat", "--server", "other", "launch", "sibling", "--from", "source"])
+        .expect("raw clap parser accepts cross-scope globals");
+    let service = SessionService::new(RuntimeLayout::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()));
+    assert!(execute(raw_cli, &service)
+        .expect_err("execute must reject an invalid parsed CLI")
+        .contains("--server cannot be used with --from"));
 }
 
 #[test]

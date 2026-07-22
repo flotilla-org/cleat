@@ -526,7 +526,7 @@ fn launch_from_creates_a_sibling_in_the_source_daemon() {
     let delta = read_directory_delta_named(&mut observer, &mut packet_buffer, Duration::from_secs(2), "sibling directory delta");
     let sibling = delta.upserted.iter().find(|entry| entry.session_id == "sibling").expect("sibling upsert");
     assert_eq!(sibling.tags, vec!["kind=sibling"]);
-    wait_until("sibling environment output", || std::fs::read_to_string(&env_output).as_deref() == Ok("unset|unset|unset"));
+    wait_until("sibling environment output", || matches!(std::fs::read_to_string(&env_output), Ok(value) if value == "unset|unset|unset"));
     assert_eq!(std::fs::read_to_string(&env_output).expect("read sibling environment"), "unset|unset|unset");
     assert!(service.list().expect("list default daemon").is_empty());
     assert_eq!(source_daemon.list().expect("list source daemon").iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec![
@@ -574,6 +574,25 @@ fn create_existing_session_returns_its_running_metadata() {
     assert_eq!(second, expected);
 
     service.kill("alpha").expect("kill session");
+}
+
+#[test]
+fn create_in_running_daemon_does_not_start_a_missing_daemon() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path()).with_daemon("gone".to_string()).expect("named daemon service");
+
+    let err = service
+        .create_with_options_in_running_daemon(
+            Some("sibling".into()),
+            Some(VtEngineKind::Passthrough),
+            None,
+            Some("sleep 30".into()),
+            SessionStartOptions::default(),
+        )
+        .expect_err("missing source daemon must not be started");
+
+    assert!(err.contains("source daemon gone is no longer running"), "{err}");
+    assert!(!temp.path().join("gone").exists(), "failed sibling launch must not create a daemon directory");
 }
 
 #[test]

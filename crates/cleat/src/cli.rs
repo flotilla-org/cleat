@@ -42,16 +42,16 @@ pub struct Cli {
 }
 
 impl Cli {
-    pub fn try_parse_from<I, T>(itr: I) -> Result<Self, clap::Error>
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        <Self as Parser>::try_parse_from(itr)?.validate_daemon_target()
+        <Self as Parser>::try_parse_from(args)?.validate_daemon_target()
     }
 
     fn validate_daemon_target(self) -> Result<Self, clap::Error> {
-        if self.server.is_some() && matches!(self.command, Command::Launch { from: Some(_), .. }) {
+        if self.server.is_some() && matches!(&self.command, Command::Launch { from: Some(_), .. }) {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
                 "the argument '--server <SERVER>' cannot be used with '--from <SESSION>'",
@@ -498,6 +498,9 @@ impl ExecResult {
 }
 
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
+    if cli.server.is_some() && matches!(&cli.command, Command::Launch { from: Some(_), .. }) {
+        return ExecResult::Err("--server cannot be used with --from".to_string());
+    }
     let daemon_name = match resolve_daemon_target(&cli, service) {
         Ok(daemon_name) => daemon_name,
         Err(err) => return ExecResult::Err(err),
@@ -555,7 +558,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, record } => {
+        Command::Launch { id, from, json, size, vt, cwd, cmd, tags, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -566,12 +569,17 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(tags) => tags,
                 Err(err) => return ExecResult::Err(err),
             };
-            let created = match service.create_with_options(id, vt, cwd, cmd, crate::session::SessionStartOptions {
+            let options = crate::session::SessionStartOptions {
                 record: record.enabled(),
                 initial_size: size.unwrap_or_default(),
                 colors: crate::vt::TerminalColors::default(),
                 tags,
-            }) {
+            };
+            let created = match if from.is_some() {
+                service.create_with_options_in_running_daemon(id, vt, cwd, cmd, options)
+            } else {
+                service.create_with_options(id, vt, cwd, cmd, options)
+            } {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
@@ -852,40 +860,7 @@ fn resolve_daemon_target(cli: &Cli, service: &SessionService) -> Result<String, 
         return Ok(DEFAULT_DAEMON_NAME.to_string());
     };
 
-    let root = service.layout_root();
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(format!("missing session {source}")),
-        Err(err) => return Err(format!("read runtime root {}: {err}", root.display())),
-    };
-    let mut owners = Vec::new();
-    let mut candidate_errors = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|err| format!("read runtime entry: {err}"))?;
-        let path = entry.path();
-        if !path.join("sessions").join(source).is_dir() {
-            continue;
-        }
-        let Some(daemon_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let daemon_service = service.with_daemon(daemon_name.to_string())?;
-        match daemon_service.inspect(source) {
-            Ok(_) => owners.push(daemon_name.to_string()),
-            Err(err) => candidate_errors.push(format!("{daemon_name}: {err}")),
-        }
-    }
-    owners.sort();
-
-    match owners.as_slice() {
-        [] if candidate_errors.is_empty() => Err(format!("missing session {source}")),
-        [] => Err(format!("unable to resolve session {source}: {}", candidate_errors.join("; "))),
-        [daemon_name] => Ok(daemon_name.clone()),
-        _ => Err(format!(
-            "session {source} exists in multiple daemons ({}); use --server to select the target daemon instead",
-            owners.join(", ")
-        )),
-    }
+    service.daemon_owning_session(source)
 }
 
 fn execute_wait(

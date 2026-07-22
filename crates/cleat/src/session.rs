@@ -256,6 +256,35 @@ pub fn ensure_session_started(
     cmd: Option<String>,
     options: SessionStartOptions,
 ) -> Result<SessionMetadata, String> {
+    start_session(layout, id, vt_engine, cwd, cmd, options, DaemonRequirement::AutoStart)
+}
+
+pub(crate) fn start_session_in_running_daemon(
+    layout: &RuntimeLayout,
+    id: Option<String>,
+    vt_engine: Option<VtEngineKind>,
+    cwd: Option<PathBuf>,
+    cmd: Option<String>,
+    options: SessionStartOptions,
+) -> Result<SessionMetadata, String> {
+    start_session(layout, id, vt_engine, cwd, cmd, options, DaemonRequirement::AlreadyRunning)
+}
+
+#[derive(Clone, Copy)]
+enum DaemonRequirement {
+    AutoStart,
+    AlreadyRunning,
+}
+
+fn start_session(
+    layout: &RuntimeLayout,
+    id: Option<String>,
+    vt_engine: Option<VtEngineKind>,
+    cwd: Option<PathBuf>,
+    cmd: Option<String>,
+    options: SessionStartOptions,
+    daemon_requirement: DaemonRequirement,
+) -> Result<SessionMetadata, String> {
     let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
     vt_engine.ensure_available()?;
     let id = id.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
@@ -267,8 +296,13 @@ pub fn ensure_session_started(
     session.tags = options.tags;
     crate::runtime::normalize_tags(&mut session.tags);
 
-    ensure_daemon_started(layout)?;
-    let mut stream = connect_session_stream(&layout.socket_path())?;
+    if matches!(daemon_requirement, DaemonRequirement::AutoStart) {
+        ensure_daemon_started(layout)?;
+    }
+    let mut stream = connect_session_stream(&layout.socket_path()).map_err(|err| match daemon_requirement {
+        DaemonRequirement::AutoStart => err,
+        DaemonRequirement::AlreadyRunning => format!("source daemon {} is no longer running: {err}", layout.daemon_name()),
+    })?;
     let body = serde_json::to_vec(&session).map_err(|err| format!("serialize session create request: {err}"))?;
     http_uds::write_request(&mut stream, http::Method::POST, "/sessions", &body)
         .map_err(|err| format!("write session create request: {err}"))?;

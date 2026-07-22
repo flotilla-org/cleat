@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use http::StatusCode;
@@ -20,8 +20,9 @@ use crate::{
     host::actor::{RawOutputRecovery, RawOutputReplay, RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
     http_uds,
     packet::{
-        Ack, ChannelRole, CloseChannel, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel,
-        PacketFrame, RenderPacket, Resize, RoleRequest, RoleState, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA,
+        Ack, ActivityEvent, ActivitySession, ActivitySnapshot, ChannelRole, CloseChannel, ControlError, ControlHello, DirectoryDelta,
+        DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame, RenderPacket, Resize, RoleRequest, RoleState, ScreenActivity,
+        CHANNEL_CONTROL, MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA,
         MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT,
         MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE, MSG_SESSION_VIEWPORT,
     },
@@ -493,6 +494,100 @@ impl ScreenStableState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ScreenActivityTracker {
+    render_generation: u64,
+    stable_since: Instant,
+    stable_since_unix_ms: u64,
+    last_output_at: Option<Instant>,
+    last_output_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActivityTime {
+    instant: Instant,
+    unix_ms: u64,
+}
+
+impl ActivityTime {
+    fn now() -> Self {
+        Self { instant: Instant::now(), unix_ms: unix_time_ms() }
+    }
+
+    fn unix_ms_for(self, earlier: Instant) -> u64 {
+        let elapsed_ms = self.instant.checked_duration_since(earlier).map(|elapsed| elapsed.as_millis()).unwrap_or(0);
+        self.unix_ms.saturating_sub(u64::try_from(elapsed_ms).unwrap_or(u64::MAX))
+    }
+}
+
+impl ScreenActivityTracker {
+    fn new(render_generation: u64) -> Self {
+        Self::new_at(render_generation, ActivityTime::now())
+    }
+
+    fn new_at(render_generation: u64, now: ActivityTime) -> Self {
+        Self {
+            render_generation,
+            stable_since: now.instant,
+            stable_since_unix_ms: now.unix_ms,
+            last_output_at: None,
+            last_output_at_unix_ms: None,
+        }
+    }
+
+    fn needs_observation(&self, render_generation: u64) -> bool {
+        render_generation != self.render_generation
+    }
+
+    fn observe(&mut self, render_generation: u64, last_output_at: Option<Instant>) {
+        self.observe_at(render_generation, last_output_at, ActivityTime::now());
+    }
+
+    fn observe_at(&mut self, render_generation: u64, last_output_at: Option<Instant>, observed_at: ActivityTime) {
+        if render_generation == self.render_generation {
+            return;
+        }
+        self.render_generation = render_generation;
+        if last_output_at == self.last_output_at {
+            return;
+        }
+        let Some(last_output_at) = last_output_at else {
+            return;
+        };
+        let last_output_at_unix_ms = observed_at.unix_ms_for(last_output_at);
+        self.stable_since = last_output_at;
+        self.stable_since_unix_ms = last_output_at_unix_ms;
+        self.last_output_at = Some(last_output_at);
+        self.last_output_at_unix_ms = Some(last_output_at_unix_ms);
+    }
+
+    fn session(&self, session_id: String, tags: Vec<String>, stable_threshold_ms: u64) -> ActivitySession {
+        self.session_at(session_id, tags, stable_threshold_ms, Instant::now())
+    }
+
+    fn session_at(&self, session_id: String, tags: Vec<String>, stable_threshold_ms: u64, observed_at: Instant) -> ActivitySession {
+        let stable_for_ms = observed_at
+            .checked_duration_since(self.stable_since)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let activity = if stable_for_ms >= stable_threshold_ms { ScreenActivity::Stable } else { ScreenActivity::Active };
+        ActivitySession {
+            session_id,
+            tags,
+            activity,
+            stable_since_unix_ms: self.stable_since_unix_ms,
+            last_output_at_unix_ms: self.last_output_at_unix_ms,
+        }
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 struct PendingExpect {
     stream: SessionStream,
     text: String,
@@ -526,6 +621,7 @@ struct HostedSession {
     /// Render generation at the last screen-stable fingerprint snapshot; lets
     /// the servicing loop skip full-grid snapshots while nothing has rendered.
     screen_stable_snapshot_generation: Option<u64>,
+    screen_activity: ScreenActivityTracker,
     should_keep_session_dir: bool,
 }
 
@@ -538,6 +634,7 @@ impl HostedSession {
             crate::session_runtime::SessionRuntime::spawn(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?)
         })?;
         let raw_output_tap = actor.subscribe_raw_output()?;
+        let screen_activity = ScreenActivityTracker::new(actor.observation().render_generation());
         Ok(Self {
             metadata: session,
             actor,
@@ -550,8 +647,21 @@ impl HostedSession {
             pending_waits: Vec::new(),
             pending_expects: Vec::new(),
             screen_stable_snapshot_generation: None,
+            screen_activity,
             should_keep_session_dir,
         })
+    }
+
+    fn observe_screen_activity(&mut self) -> Result<(), String> {
+        let render_generation = self.actor.observation().render_generation();
+        if self.screen_activity.needs_observation(render_generation) {
+            self.screen_activity.observe(render_generation, self.actor.last_pty_output_at()?);
+        }
+        Ok(())
+    }
+
+    fn activity_session(&self, stable_threshold_ms: u64) -> ActivitySession {
+        self.screen_activity.session(self.metadata.id.clone(), self.metadata.tags.clone(), stable_threshold_ms)
     }
 }
 
@@ -960,8 +1070,6 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             }
         }
 
-        flush_packet_clients(&mut packet_clients);
-
         if let Some(session_id) = faulted_session.take() {
             cleanup_exited_session(&layout, &session_id, true);
             broadcast_directory_remove(&session_id, &mut packet_clients)?;
@@ -975,6 +1083,9 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             sessions.remove(&session_id);
             remove_packet_channels_for_session(&session_id, &mut packet_clients);
         }
+
+        service_activity_subscriptions(&sessions, &mut packet_clients)?;
+        flush_packet_clients(&mut packet_clients);
 
         if sessions.is_empty() {
             let idle_started = idle_since.get_or_insert_with(Instant::now);
@@ -1092,6 +1203,78 @@ fn directory_snapshot_for_sessions(
     }
     entries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     Ok(DirectorySnapshot { sessions: entries })
+}
+
+fn activity_snapshot_for_sessions(
+    sessions: &mut HashMap<String, HostedSession>,
+    selectors: &[String],
+    stable_threshold_ms: u64,
+) -> Result<ActivitySnapshot, String> {
+    for hosted in sessions.values_mut() {
+        hosted.observe_screen_activity()?;
+    }
+    Ok(ActivitySnapshot { stable_threshold_ms, sessions: matching_activity_sessions(sessions, selectors, stable_threshold_ms) })
+}
+
+fn matching_activity_sessions(
+    sessions: &HashMap<String, HostedSession>,
+    selectors: &[String],
+    stable_threshold_ms: u64,
+) -> Vec<ActivitySession> {
+    let mut activity_sessions = sessions
+        .values()
+        .filter(|hosted| selectors.iter().all(|selector| hosted.metadata.tags.contains(selector)))
+        .map(|hosted| hosted.activity_session(stable_threshold_ms))
+        .collect::<Vec<_>>();
+    activity_sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    activity_sessions
+}
+
+fn service_activity_subscriptions(sessions: &HashMap<String, HostedSession>, packet_clients: &mut Vec<PacketClient>) -> Result<(), String> {
+    for client in packet_clients {
+        if client.dead {
+            continue;
+        }
+        let Some(stable_threshold_ms) = client.screen_activity_stable_ms else {
+            continue;
+        };
+        let current = matching_activity_sessions(sessions, &client.selectors, stable_threshold_ms);
+
+        let current_ids = current.iter().map(|session| session.session_id.clone()).collect::<HashSet<_>>();
+        for session in current {
+            let prior = client.known_activity_sessions.get(&session.session_id);
+            let added = prior.is_none();
+            let changed = prior.is_some_and(|known| known.activity != session.activity);
+            client.known_activity_sessions.insert(session.session_id.clone(), session.clone());
+            if added {
+                client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::MembershipAdded {
+                    session,
+                    changed_at_unix_ms: unix_time_ms(),
+                })?;
+            } else if changed {
+                let changed_at_unix_ms = match session.activity {
+                    ScreenActivity::Active => session.last_output_at_unix_ms.unwrap_or(session.stable_since_unix_ms),
+                    ScreenActivity::Stable => session.stable_since_unix_ms.saturating_add(stable_threshold_ms),
+                };
+                client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::ActivityChanged { session, changed_at_unix_ms })?;
+            }
+        }
+
+        let mut removed_ids =
+            client.known_activity_sessions.keys().filter(|session_id| !current_ids.contains(*session_id)).cloned().collect::<Vec<_>>();
+        removed_ids.sort();
+        for session_id in removed_ids {
+            let Some(removed) = client.known_activity_sessions.remove(&session_id) else {
+                continue;
+            };
+            client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::MembershipRemoved {
+                session_id,
+                tags: removed.tags,
+                changed_at_unix_ms: unix_time_ms(),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn directory_entry_matches_selectors(entry: &DirectoryEntry, selectors: &[String]) -> bool {
@@ -1225,6 +1408,7 @@ fn service_hosted_session(
     if output_drained {
         hosted.actor.enqueue_screen_activity_flush()?;
     }
+    hosted.observe_screen_activity()?;
 
     if resized || previous_controller_count != hosted.active_client.is_some() || previous_watcher_count != hosted.watchers.len() {
         broadcast_directory_upsert(directory_entry_for_session(layout, hosted, packet_clients)?, packet_clients)?;
@@ -1528,20 +1712,33 @@ fn handle_http_request(
             }
 
             let subscribe = if request.body().is_empty() {
-                http_uds::DirectorySubscribeRequest::default()
+                http_uds::PacketSubscribeRequest::default()
             } else {
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP directory subscribe request: {err}"))?
             };
+            if subscribe.screen_activity_stable_ms == Some(0) {
+                http_uds::write_error(stream, StatusCode::BAD_REQUEST, "screen activity stability threshold must be greater than zero")
+                    .map_err(|err| format!("write HTTP activity subscribe error: {err}"))?;
+                return Ok(());
+            }
             let mut selectors = subscribe.selectors;
             crate::runtime::normalize_tags(&mut selectors);
             let directory = directory_snapshot_for_sessions(state.layout, state.sessions, state.packet_clients, &selectors)?;
+            let activity = subscribe
+                .screen_activity_stable_ms
+                .map(|stable_threshold_ms| activity_snapshot_for_sessions(state.sessions, &selectors, stable_threshold_ms))
+                .transpose()?;
             let packet_stream = stream.try_clone().map_err(|err| format!("clone HTTP packet stream: {err}"))?;
             #[cfg(unix)]
             set_stream_nonblocking(&packet_stream, true).map_err(|err| format!("set HTTP packet stream nonblocking: {err}"))?;
             let client_id = *state.next_packet_client_id;
-            let mut client = PacketClient::new(client_id, packet_stream, selectors, &directory)?;
+            let mut client =
+                PacketClient::new(client_id, packet_stream, selectors, subscribe.screen_activity_stable_ms, &directory, activity.as_ref())?;
             client.enqueue_control(MSG_CONTROL_HELLO, &ControlHello::current())?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
+            if let Some(activity) = activity {
+                client.enqueue_control(MSG_CONTROL_ACTIVITY_SNAPSHOT, &activity)?;
+            }
             *response_committed = true;
             http_uds::write_packet_switching_protocols(stream).map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
             maybe_fail_after_http_upgrade("packet")?;
@@ -1986,6 +2183,8 @@ struct PacketClient {
     input_buffer: Vec<u8>,
     channels: HashMap<u32, PacketSessionChannel>,
     selectors: Vec<String>,
+    screen_activity_stable_ms: Option<u64>,
+    known_activity_sessions: HashMap<String, ActivitySession>,
     known_directory_sessions: HashSet<String>,
     /// Marked when this client's transport fails or its output backlog
     /// overflows. Client failures are never daemon-fatal: the client is
@@ -2020,7 +2219,14 @@ impl PacketRenderCache {
 }
 
 impl PacketClient {
-    fn new(id: u64, stream: SessionStream, selectors: Vec<String>, initial_directory: &DirectorySnapshot) -> Result<Self, String> {
+    fn new(
+        id: u64,
+        stream: SessionStream,
+        selectors: Vec<String>,
+        screen_activity_stable_ms: Option<u64>,
+        initial_directory: &DirectorySnapshot,
+        initial_activity: Option<&ActivitySnapshot>,
+    ) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
         Ok(Self {
             id,
@@ -2030,6 +2236,12 @@ impl PacketClient {
             input_buffer: Vec::new(),
             channels: HashMap::new(),
             selectors,
+            screen_activity_stable_ms,
+            known_activity_sessions: initial_activity
+                .into_iter()
+                .flat_map(|snapshot| &snapshot.sessions)
+                .map(|session| (session.session_id.clone(), session.clone()))
+                .collect(),
             known_directory_sessions: initial_directory.sessions.iter().map(|entry| entry.session_id.clone()).collect(),
             dead: false,
         })
@@ -2934,8 +3146,9 @@ mod tests {
     #[test]
     fn packet_client_backlog_overflow_marks_client_dead_not_daemon_fatal() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
-        let mut client = super::PacketClient::new(1, stream, Vec::new(), &crate::packet::DirectorySnapshot { sessions: Vec::new() })
-            .expect("create packet client");
+        let mut client =
+            super::PacketClient::new(1, stream, Vec::new(), None, &crate::packet::DirectorySnapshot { sessions: Vec::new() }, None)
+                .expect("create packet client");
         client.pending_output = super::PendingOutput::from(vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1]);
 
         let frame = crate::packet::PacketFrame { channel: 1, msg_type: 0, payload: vec![0; 64] };
@@ -2952,8 +3165,9 @@ mod tests {
     #[test]
     fn dead_packet_client_does_not_hold_the_controller_slot() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
-        let mut client = super::PacketClient::new(7, stream, Vec::new(), &crate::packet::DirectorySnapshot { sessions: Vec::new() })
-            .expect("create packet client");
+        let mut client =
+            super::PacketClient::new(7, stream, Vec::new(), None, &crate::packet::DirectorySnapshot { sessions: Vec::new() }, None)
+                .expect("create packet client");
         let holder = super::PacketChannelRef { client_id: 7, channel: 1 };
 
         assert!(super::packet_controller_holder_is_live(holder, std::slice::from_ref(&client)));
@@ -3150,6 +3364,25 @@ mod tests {
         assert!(!super::screen_stable_needs_snapshot(7, Some(7)));
         // A pump advanced the generation: re-fingerprint.
         assert!(super::screen_stable_needs_snapshot(8, Some(7)));
+    }
+
+    #[test]
+    fn screen_activity_only_resets_for_new_pty_output() {
+        let started_at = Instant::now();
+        let mut tracker = super::ScreenActivityTracker::new_at(1, super::ActivityTime { instant: started_at, unix_ms: 1_000 });
+
+        tracker.observe_at(2, None, super::ActivityTime { instant: started_at + Duration::from_millis(20), unix_ms: 1_020 });
+        let unchanged = tracker.session_at("alpha".to_string(), Vec::new(), 10, started_at + Duration::from_millis(20));
+        assert_eq!(unchanged.activity, crate::packet::ScreenActivity::Stable);
+        assert_eq!(unchanged.stable_since_unix_ms, 1_000);
+        assert_eq!(unchanged.last_output_at_unix_ms, None);
+
+        let output_at = started_at + Duration::from_millis(30);
+        tracker.observe_at(3, Some(output_at), super::ActivityTime { instant: started_at + Duration::from_millis(35), unix_ms: 1_035 });
+        let active = tracker.session_at("alpha".to_string(), Vec::new(), 10, started_at + Duration::from_millis(35));
+        assert_eq!(active.activity, crate::packet::ScreenActivity::Active);
+        assert_eq!(active.stable_since_unix_ms, 1_030);
+        assert_eq!(active.last_output_at_unix_ms, Some(1_030));
     }
 
     #[test]

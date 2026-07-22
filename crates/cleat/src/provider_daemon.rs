@@ -559,7 +559,7 @@ impl Drop for DaemonConnection {
 pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]) -> Result<(SessionStream, DirectorySnapshot), String> {
     let socket_path = layout.socket_path();
     let mut stream = try_connect_session_stream(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
-    let body = serde_json::to_vec(&http_uds::DirectorySubscribeRequest { selectors: selectors.to_vec() })
+    let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms: None })
         .map_err(|err| format!("serialize packet subscribe request: {err}"))?;
     let head = format!(
         "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",

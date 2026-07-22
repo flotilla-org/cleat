@@ -18,6 +18,14 @@ pub struct SessionInfo {
     #[serde(default)]
     pub tags: Vec<String>,
     pub status: SessionStatus,
+    #[serde(default)]
+    pub screen_activity: ScreenActivity,
+    /// Unix timestamp in milliseconds when the current stable period began.
+    #[serde(default)]
+    pub stable_since: Option<u64>,
+    /// Unix timestamp in milliseconds of the most recent render-changing output.
+    #[serde(default)]
+    pub last_output_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -28,6 +36,14 @@ pub enum SessionStatus {
     Detached,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenActivity {
+    Active,
+    #[default]
+    Stable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResult {
     pub session: SessionInspect,
@@ -35,6 +51,14 @@ pub struct InspectResult {
     pub process: ProcessInspect,
     pub attachments: Vec<AttachmentInspect>,
     pub recording: RecordingInspect,
+    #[serde(default)]
+    pub screen_activity: ScreenActivity,
+    /// Unix timestamp in milliseconds when the current stable period began.
+    #[serde(default)]
+    pub stable_since: Option<u64>,
+    /// Unix timestamp in milliseconds of the most recent render-changing output.
+    #[serde(default)]
+    pub last_output_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

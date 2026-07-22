@@ -307,6 +307,11 @@ pub struct MouseModifiers {
 // handles that are only accessed from the single session daemon event loop.
 pub trait VtEngine {
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String>;
+    /// Report whether output fed since the engine's render state was last
+    /// consumed caused screen damage. `None` means activity is unobservable.
+    fn screen_activity_changed(&mut self) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String>;
     fn set_cell_size(&mut self, _cell_width_px: u32, _cell_height_px: u32) -> Result<(), String> {
         Ok(())

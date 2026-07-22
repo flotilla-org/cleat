@@ -666,6 +666,84 @@ fn list_and_inspect_report_opaque_tags() {
 }
 
 #[test]
+fn list_and_inspect_json_report_screen_activity_for_detached_sessions() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create detached session");
+
+    let list_cli = Cli::try_parse_from(["cleat", "list", "--json"]).expect("parse list --json");
+    let list_output = cli::execute(list_cli, &service).expect("execute list --json").expect("list JSON");
+    let list: serde_json::Value = serde_json::from_str(&list_output).expect("parse list JSON");
+    let row = &list.as_array().expect("list array")[0];
+    assert_eq!(row["screen_activity"], "stable");
+    assert!(row.get("stable_since").is_some(), "stable_since field should be present: {row}");
+    assert!(row.get("last_output_at").is_some(), "last_output_at field should be present: {row}");
+
+    let inspect_cli = Cli::try_parse_from(["cleat", "inspect", "alpha", "--json"]).expect("parse inspect --json");
+    let inspect_output = cli::execute(inspect_cli, &service).expect("execute inspect --json").expect("inspect JSON");
+    let inspect: serde_json::Value = serde_json::from_str(&inspect_output).expect("parse inspect JSON");
+    assert_eq!(inspect["screen_activity"], "stable");
+    assert!(inspect.get("stable_since").is_some(), "stable_since field should be present: {inspect}");
+    assert!(inspect.get("last_output_at").is_some(), "last_output_at field should be present: {inspect}");
+
+    service.kill("alpha").expect("kill detached session");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn detached_spinner_activity_changes_from_active_to_stable() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let vt_engine = VtEngineKind::Ghostty;
+    service
+        .create(
+            Some("alpha".into()),
+            Some(vt_engine),
+            None,
+            Some("sh -c 'i=0; while [ $i -lt 25 ]; do printf \"\\r%s\" \"$((i % 10))\"; i=$((i + 1)); sleep 0.1; done; sleep 30'".into()),
+            false,
+        )
+        .expect("create outputting detached session");
+
+    let active_deadline = Instant::now() + Duration::from_secs(5);
+    let active = loop {
+        let inspected = service.inspect("alpha").expect("inspect active session");
+        if inspected.screen_activity == cleat::protocol::ScreenActivity::Active {
+            break inspected;
+        }
+        assert!(Instant::now() < active_deadline, "session never reported active: {inspected:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let last_output_at = active.last_output_at.expect("active session last_output_at");
+    assert_eq!(active.stable_since, None);
+    assert!(active.attachments.is_empty(), "session should remain detached");
+
+    let stable_deadline = Instant::now() + Duration::from_secs(8);
+    let stable = loop {
+        let inspected = service.inspect("alpha").expect("inspect stabilizing session");
+        if inspected.screen_activity == cleat::protocol::ScreenActivity::Stable && inspected.last_output_at.is_some() {
+            break inspected;
+        }
+        assert!(Instant::now() < stable_deadline, "session never reported stable: {inspected:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(stable.last_output_at.expect("stable session last_output_at") >= last_output_at);
+    assert_eq!(stable.stable_since, stable.last_output_at.map(|timestamp| timestamp + 1_000));
+    assert!(stable.attachments.is_empty(), "session should remain detached");
+
+    let listed = service.list().expect("list stable session");
+    assert_eq!(listed[0].screen_activity, cleat::protocol::ScreenActivity::Stable);
+    assert_eq!(listed[0].stable_since, stable.stable_since);
+    assert_eq!(listed[0].last_output_at, stable.last_output_at);
+
+    service.kill("alpha").expect("kill detached session");
+}
+
+#[test]
 fn list_selector_requires_exact_opaque_tag_matches() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

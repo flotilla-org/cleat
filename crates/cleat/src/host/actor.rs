@@ -338,6 +338,7 @@ pub(crate) enum SessionCommand {
     ValidateTextMatching { reply: mpsc::Sender<Result<(), String>> },
     ScreenContains { text: String, reply: mpsc::Sender<Result<bool, String>> },
     LastPtyOutputAt { reply: mpsc::Sender<Result<Option<Instant>, String>> },
+    FlushScreenActivity,
     FlushRecording { reply: mpsc::Sender<Result<(), String>> },
     RecordingActive { reply: mpsc::Sender<Result<bool, String>> },
     RecordAttach { reply: mpsc::Sender<Result<(), String>> },
@@ -764,6 +765,10 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::LastPtyOutputAt { reply })
     }
 
+    pub(crate) fn enqueue_screen_activity_flush(&self) -> Result<(), String> {
+        self.tx.send(SessionCommand::FlushScreenActivity).map_err(|_| "session actor is not running".to_string())
+    }
+
     pub(crate) fn flush_recording(&self) -> Result<(), String> {
         self.request_result(|reply| SessionCommand::FlushRecording { reply })
     }
@@ -1109,6 +1114,9 @@ fn session_actor_handle_command(
         }
         SessionCommand::LastPtyOutputAt { reply } => {
             let _ = reply.send(Ok(runtime.last_pty_output_at()));
+        }
+        SessionCommand::FlushScreenActivity => {
+            runtime.flush_screen_activity();
         }
         SessionCommand::FlushRecording { reply } => {
             runtime.flush_recording();

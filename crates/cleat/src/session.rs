@@ -1170,8 +1170,9 @@ fn service_hosted_session(
     let previous_watcher_count = hosted.watchers.len();
     let mut resized = false;
 
-    did_work |=
+    let output_drained =
         drain_raw_output_tap(layout, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
+    did_work |= output_drained;
     drain_watcher_inputs(&mut hosted.watchers);
 
     if hosted.active_client.is_some() {
@@ -1221,6 +1222,9 @@ fn service_hosted_session(
     }
     flush_watchers(&mut hosted.watchers);
     push_due_packet_renders(id, &hosted.actor, packet_clients, &mut hosted.packet_render_cache)?;
+    if output_drained {
+        hosted.actor.enqueue_screen_activity_flush()?;
+    }
 
     if resized || previous_controller_count != hosted.active_client.is_some() || previous_watcher_count != hosted.watchers.len() {
         broadcast_directory_upsert(directory_entry_for_session(layout, hosted, packet_clients)?, packet_clients)?;

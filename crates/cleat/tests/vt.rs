@@ -89,6 +89,24 @@ fn vt_ghostty_formatter_alloc_round_trips_output() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn vt_ghostty_screen_activity_detects_coalesced_changes_but_not_queries() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
+    engine.screen_grid().expect("initialize render state");
+
+    engine.feed(b"|").expect("draw initial spinner frame");
+    assert_eq!(engine.screen_activity_changed().expect("initial spinner activity"), Some(true));
+
+    engine.feed(b"\x1b[6n").expect("feed cursor-position query while render damage is deferred");
+    assert_eq!(engine.screen_activity_changed().expect("query activity"), Some(false));
+
+    engine.feed(b"\r/\r|").expect("draw a complete spinner cycle");
+    assert_eq!(engine.screen_activity_changed().expect("coalesced spinner activity"), Some(true));
+    let grid = engine.screen_grid().expect("consume deferred spinner activity");
+    assert_eq!(grid.row_text(0).trim_end(), "|");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn vt_ghostty_screen_text_round_trips_output() {
     let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(80, 24);
 

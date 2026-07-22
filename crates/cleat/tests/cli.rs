@@ -143,6 +143,20 @@ fn create_from_parses_sibling_session_options() {
 }
 
 #[test]
+fn create_from_parses_canonical_sibling_id_option() {
+    let cli = Cli::try_parse_from(["cleat", "create", "--from", "parent", "--id", "helper"]).expect("create --from --id parses");
+
+    assert!(matches!(
+        cli.command,
+        Command::Launch {
+            from: Some(ref source),
+            sibling_id: Some(ref id),
+            ..
+        } if source == "parent" && id == "helper"
+    ));
+}
+
+#[test]
 fn create_from_rejects_regular_launch_placement_options() {
     assert!(Cli::try_parse_from(["cleat", "create", "child", "--from", "parent"]).is_err());
     assert!(Cli::try_parse_from(["cleat", "create", "--from", "parent", "--cwd", "/tmp"]).is_err());

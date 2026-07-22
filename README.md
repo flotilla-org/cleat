@@ -65,7 +65,7 @@ find .tools/ghostty-install -maxdepth 3 | sort
 
 **Session IDs.** You choose the ID (`cleat launch my-session`) or let cleat generate one (`session-<uuid>`). IDs are directory names under their daemon's `sessions/` directory, so use filesystem-safe characters. Launching with an ID that already has a live session in the selected daemon reuses that session; it does not create a duplicate.
 
-**Sibling sessions.** On Unix, `cleat create --from PARENT [--name ID] [--cmd COMMAND]` asks the selected daemon to spawn a child in its exact cwd, environment, container, and namespace context. It then transfers the new PTY master with `SCM_RIGHTS` to a fresh `sibling-<uuid>` daemon. `--name` is the issue-compatible spelling for the sibling's durable ID; when omitted, cleat generates `session-<uuid>`. The command prints both the ID and owning daemon, and `cleat list --all` includes the daemon for every independently hosted sibling. The fresh daemon is an explicit isolation boundary for this transfer path and remains a normal multi-session daemon after bootstrap.
+**Sibling sessions.** On Unix, `cleat create --from PARENT [--id ID] [--cmd COMMAND]` asks the selected daemon to spawn a child in its exact cwd, environment, container, and namespace context. It then transfers the new PTY master with `SCM_RIGHTS` to a fresh `sibling-<uuid>` daemon. The original `--name` spelling remains accepted as a compatibility alias for `--id`; when omitted, cleat generates `session-<uuid>`. The command prints both the ID and owning daemon, and `cleat list --all` includes the daemon for every independently hosted sibling. The fresh daemon is an explicit isolation boundary for this transfer path and remains a normal multi-session daemon after bootstrap.
 
 **Tags.** Sessions may carry flat, opaque tags. Add them at launch with repeated `--tag TAG`, mutate them with `cleat tag <id> +TAG -TAG`, and filter directory reads with repeated `--selector TAG`. Selectors are exact whole-tag matches and are ANDed when repeated. `key=value` is only a client convention; cleat does not interpret tag keys, values, hierarchy, or globs.
 
@@ -92,7 +92,7 @@ Runtime layout v2 is daemon-scoped:
 
 `socket` and `daemon.pid` belong to the daemon, not to an individual session. Session directories live under `sessions/`. `session.cast` is the asciicast v3 recording when recording is active. `foreground` is a transient attachment marker.
 
-**Liveness and discovery.** Session liveness is daemon state, not a per-session socket stat. `cleat list` queries the selected daemon. `cleat list --all` enumerates every daemon directory under the state root and queries or sweeps each daemon independently. If a daemon is definitively stale, cleat performs a daemon-scoped sweep: sessions with a non-empty recording are preserved as recreatable, and sessions without a recording are removed.
+**Liveness and discovery.** Session liveness is daemon state, not a per-session socket stat. One-shot `cleat list` enumerates every daemon directory under the state root and identifies each session's owning daemon; the older `--all` spelling remains accepted for compatibility. `cleat list --watch` subscribes to the selected daemon. If a daemon is definitively stale, cleat performs a daemon-scoped sweep: sessions with a non-empty recording are preserved as recreatable, and sessions without a recording are removed.
 
 **Linger and cleanup.** A daemon starts on first use of its name. When it has no live sessions, it lingers for 120 seconds before exiting so a burst of commands does not repeatedly bounce the daemon. When a child process exits, its session is removed unless it has a recording that makes it recreatable.
 
@@ -119,12 +119,12 @@ This subscription contract starts with packet protocol v4. Version 3 used raw PT
 |---|---|---|
 | `--server NAME` | daemon selection | Selects the named daemon for the command; default is `default` |
 | `launch [--tag TAG]... [--record|--no-record]` | daemon + VT engine + recording | Creates or reuses a session in the selected daemon |
-| `create --from ID [--name NAME] [--cmd COMMAND]` | source daemon + FD transfer | Unix only; spawns in the source daemon context and gives the new PTY to an independent daemon |
+| `create --from ID [--id ID] [--cmd COMMAND]` | source daemon + FD transfer | Unix only; spawns in the source daemon context and gives the new PTY to an independent daemon |
 | `tag <id> +TAG -TAG` | daemon directory state | Mutates opaque tags; tags are not interpreted by cleat |
 | `attach` / `detach` | host terminal + daemon | While attached, host terminal is authoritative for query replies |
 | `watch` | host terminal + daemon | Read-only live view; does not take foreground control |
-| `list [--selector TAG]...` | daemon directory state | One-shot read of the selected daemon's directory |
-| `list --all` | daemon directory state | Enumerates every daemon directory under the state root |
+| `list [--selector TAG]...` | daemon directory state | One-shot read across every daemon directory under the state root |
+| `list --all` | daemon directory state | Compatibility spelling for the global one-shot list |
 | `list --watch [--selector TAG]...` | packet directory subscription | Prints a snapshot, then one line per directory delta |
 | `packets` | packet protocol | Opens the structured multiplexed probe surface |
 | `inspect`, `kill`, `signal` | daemon state | No VT / recording involvement |

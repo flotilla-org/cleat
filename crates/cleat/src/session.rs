@@ -1,7 +1,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 #[cfg(unix)]
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsFd, FromRawFd};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -17,6 +17,8 @@ use std::{
 };
 
 use http::StatusCode;
+#[cfg(unix)]
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
 use crate::{
     host::actor::{RawOutputRecovery, RawOutputReplay, RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
@@ -848,11 +850,16 @@ fn run_session_daemon_inner(root: &Path, daemon_name: &str, bootstrap_fd: Option
         return Err("FD transfer bootstrap is only supported on Unix".to_string());
     }
     #[cfg(unix)]
-    let mut bootstrap_stream = bootstrap_fd.map(|fd| {
-        // SAFETY: the internal `serve --bootstrap-fd` command receives sole
-        // ownership of the inherited socketpair descriptor.
-        unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) }
-    });
+    let mut bootstrap_stream = bootstrap_fd
+        .map(|fd| {
+            // SAFETY: the internal `serve --bootstrap-fd` command receives sole
+            // ownership of the inherited socketpair descriptor.
+            let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            fcntl(stream.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+                .map_err(|err| format!("restore close-on-exec on bootstrap descriptor: {err}"))?;
+            Ok::<_, String>(stream)
+        })
+        .transpose()?;
     #[cfg(unix)]
     let bootstrap = bootstrap_stream.as_mut().map(crate::fd_transfer::receive).transpose()?;
 
@@ -909,12 +916,16 @@ fn run_session_daemon_inner(root: &Path, daemon_name: &str, bootstrap_fd: Option
         // role map is the extension point for future transfer operations.
         crate::runtime::validate_runtime_name(&manifest.session.id)?;
         manifest.session.vt_engine.ensure_available()?;
+        let meta_path = layout.daemon_dir().join("meta.json");
+        let meta = serde_json::to_vec_pretty(&manifest).map_err(|err| format!("serialize daemon transfer metadata: {err}"))?;
+        fs::write(&meta_path, meta).map_err(|err| format!("write daemon transfer metadata {}: {err}", meta_path.display()))?;
         let session_dir = layout.session_dir(&manifest.session.id);
         fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
         let pty_child = crate::platform::pty::PtyChild::from_transferred(pty_master, child_status, manifest.child_pid)?;
         let hosted = HostedSession::adopt(session_dir, manifest.session.clone(), pty_child)?;
         sessions.insert(manifest.session.id.clone(), hosted);
         crate::fd_transfer::send_ack(bootstrap_stream.as_mut().expect("bootstrap stream exists with bootstrap manifest"))?;
+        drop(bootstrap_stream.take());
     }
     let mut packet_clients: Vec<PacketClient> = Vec::new();
     let mut pending_http_handshakes: Vec<PendingHttpHandshake> = Vec::new();

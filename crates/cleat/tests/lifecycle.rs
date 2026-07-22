@@ -21,6 +21,7 @@ use cleat::packet::ScreenActivity;
 use cleat::session::foreground_path;
 use cleat::{
     cli::{self, Cli, ExecResult},
+    fd_transfer::FdTransferManifest,
     packet::{
         ActivityEvent, ActivitySnapshot, ControlHello, DirectoryDelta, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL,
         MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT,
@@ -819,7 +820,7 @@ fn list_selector_requires_exact_opaque_tag_matches() {
 }
 
 #[test]
-fn list_defaults_to_selected_daemon_and_all_enumerates_every_daemon() {
+fn service_list_is_daemon_scoped_while_cli_list_enumerates_every_daemon() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
@@ -830,12 +831,16 @@ fn list_defaults_to_selected_daemon_and_all_enumerates_every_daemon() {
     let default_sessions = service.list().expect("list default daemon");
     let other_sessions = other.list().expect("list other daemon");
     let all_sessions = service.list_all_with_selectors(&[]).expect("list all daemons");
+    let default_cli = Cli::try_parse_from(["cleat", "list"]).expect("parse default list");
+    let default_output = cli::execute(default_cli, &service).expect("execute default list").expect("default list output");
     let all_cli = Cli::try_parse_from(["cleat", "list", "--all"]).expect("parse list --all");
     let all_output = cli::execute(all_cli, &service).expect("execute list --all").expect("list all output");
 
     assert_eq!(default_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["alpha"]);
     assert_eq!(other_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
     assert_eq!(all_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
+    assert!(default_output.contains("alpha"), "{default_output}");
+    assert!(default_output.contains("beta"), "{default_output}");
     assert!(all_output.contains("alpha"), "{all_output}");
     assert!(all_output.contains("beta"), "{all_output}");
 
@@ -860,9 +865,22 @@ fn sibling_session_runs_in_its_own_daemon_without_affecting_parent() {
     let all_sessions = service.list_all_with_selectors(&[]).expect("list all");
     let sibling = all_sessions.iter().find(|session| session.id == "helper").expect("listed sibling");
     assert_ne!(sibling.daemon, "default");
-    let list_cli = Cli::try_parse_from(["cleat", "list", "--all"]).expect("parse global list");
+    let list_cli = Cli::try_parse_from(["cleat", "list"]).expect("parse global list");
     let list_output = cli::execute(list_cli, &service).expect("execute global list").expect("global list output");
     assert!(list_output.contains(&format!("helper\tdaemon={}", sibling.daemon)), "{list_output}");
+    let manifest: FdTransferManifest = serde_json::from_slice(
+        &std::fs::read(
+            RuntimeLayout::new(temp.path().to_path_buf())
+                .with_daemon(sibling.daemon.clone())
+                .expect("sibling layout")
+                .daemon_dir()
+                .join("meta.json"),
+        )
+        .expect("read sibling daemon metadata"),
+    )
+    .expect("parse sibling daemon metadata");
+    assert_eq!(manifest.session.id, "helper");
+    assert_eq!(manifest.target_daemon, sibling.daemon);
     let helper = service.with_daemon(sibling.daemon.clone()).expect("helper daemon service");
     let helper_pid = std::fs::read_to_string(
         RuntimeLayout::new(temp.path().to_path_buf()).with_daemon(sibling.daemon.clone()).expect("helper layout").daemon_pid_path(),

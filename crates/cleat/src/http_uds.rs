@@ -16,6 +16,7 @@ use crate::{
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const DAEMON_INSTANCE_HEADER: &str = "x-cleat-daemon-pid";
 
 pub(crate) type HttpRequest = Request<Vec<u8>>;
 
@@ -420,6 +421,15 @@ pub(crate) fn write_request(writer: &mut impl Write, method: Method, path: &str,
     write!(
         writer,
         "{method} {path} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    writer.write_all(body)
+}
+
+pub(crate) fn write_session_create_request(writer: &mut impl Write, body: &[u8], expected_daemon_pid: u32) -> std::io::Result<()> {
+    write!(
+        writer,
+        "POST /sessions HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{DAEMON_INSTANCE_HEADER}: {expected_daemon_pid}\r\n\r\n",
         body.len()
     )?;
     writer.write_all(body)

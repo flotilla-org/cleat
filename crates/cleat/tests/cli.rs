@@ -1,6 +1,6 @@
-use clap::{CommandFactory, Parser};
+use clap::CommandFactory;
 use cleat::{
-    cli::{self, execute, resolve_daemon_name, Cli, Command, ExecResult, RecordFlags},
+    cli::{self, execute, resolve_daemon_target, Cli, Command, ExecResult, RecordFlags},
     runtime::{RuntimeLayout, TerminalSize},
     server::SessionService,
     session::session_socket_path,
@@ -9,30 +9,53 @@ use cleat::{
 
 #[test]
 fn daemon_target_resolution_prefers_explicit_server_over_ambient() {
-    let resolved = resolve_daemon_name(Some("explicit"), Some("ambient".into())).expect("resolve daemon");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let resolved = resolve_daemon_target(Some("explicit"), None, Some("ambient".into()), &service).expect("resolve daemon");
 
-    assert_eq!(resolved, "explicit");
+    assert_eq!(resolved.name(), "explicit");
 }
 
 #[test]
 fn daemon_target_resolution_uses_ambient_server_when_unqualified() {
-    let resolved = resolve_daemon_name(None, Some("ambient".into())).expect("resolve daemon");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let resolved = resolve_daemon_target(None, None, Some("ambient".into()), &service).expect("resolve daemon");
 
-    assert_eq!(resolved, "ambient");
+    assert_eq!(resolved.name(), "ambient");
 }
 
 #[test]
 fn daemon_target_resolution_falls_back_to_default_outside_a_session() {
-    let resolved = resolve_daemon_name(None, None).expect("resolve daemon");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let resolved = resolve_daemon_target(None, None, None, &service).expect("resolve daemon");
 
-    assert_eq!(resolved, cleat::runtime::DEFAULT_DAEMON_NAME);
+    assert_eq!(resolved.name(), cleat::runtime::DEFAULT_DAEMON_NAME);
 }
 
 #[test]
 fn daemon_target_resolution_rejects_an_invalid_ambient_server() {
-    let err = resolve_daemon_name(None, Some("not/a/name".into())).expect_err("reject invalid ambient daemon");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let err = resolve_daemon_target(None, None, Some("not/a/name".into()), &service).expect_err("reject invalid ambient daemon");
 
     assert!(err.contains("invalid filesystem-safe name"), "{err}");
+}
+
+#[test]
+fn daemon_target_resolution_prefers_source_session_over_ambient() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let source_daemon = service.with_daemon("source-daemon".to_string()).expect("source daemon service");
+    source_daemon
+        .create(Some("source".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create source session");
+
+    let resolved = resolve_daemon_target(None, Some("source"), Some("ambient".into()), &service).expect("resolve source daemon");
+
+    assert_eq!(resolved.name(), "source-daemon");
+    source_daemon.kill("source").expect("kill source session");
 }
 
 #[test]
@@ -140,6 +163,7 @@ fn launch_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--cmd", "bash"]).expect("launch parses");
     assert_eq!(cli.command, Command::Launch {
         id: None,
+        from: None,
         json: false,
         size: None,
         vt: None,
@@ -148,6 +172,32 @@ fn launch_command_parses() {
         tags: Vec::new(),
         record: RecordFlags::default()
     });
+}
+
+#[test]
+fn launch_from_parses_and_rejects_an_explicit_server() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "sibling", "--from", "source"]).expect("launch --from parses");
+    assert!(matches!(cli.command, Command::Launch { from: Some(ref source), .. } if source == "source"));
+
+    assert!(Cli::try_parse_from(["cleat", "--server", "other", "launch", "sibling", "--from", "source"]).is_err());
+
+    let raw_cli = <Cli as clap::Parser>::try_parse_from(["cleat", "--server", "other", "launch", "sibling", "--from", "source"])
+        .expect("raw clap parser accepts cross-scope globals");
+    let service = SessionService::new(RuntimeLayout::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()));
+    assert!(execute(raw_cli, &service)
+        .expect_err("execute must reject an invalid parsed CLI")
+        .contains("--server cannot be used with --from"));
+}
+
+#[test]
+fn launch_from_rejects_a_missing_source_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "launch", "sibling", "--from", "missing", "--vt", "passthrough"]).expect("parse launch --from");
+
+    let err = execute(cli, &service).expect_err("missing source should fail");
+
+    assert!(err.contains("missing session missing"), "{err}");
 }
 
 #[test]
@@ -174,6 +224,7 @@ fn launch_command_parses_positional_name() {
     let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--cmd", "bash"]).expect("launch positional parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
         json: false,
         size: None,
         vt: None,
@@ -202,6 +253,7 @@ fn launch_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
         json: true,
         size: None,
         vt: None,
@@ -217,6 +269,7 @@ fn launch_command_parses_vt() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--vt", "ghostty", "demo"]).expect("launch --vt parses");
     assert_eq!(cli.command, Command::Launch {
         id: Some("demo".into()),
+        from: None,
         json: false,
         size: None,
         vt: Some(VtEngineKind::Ghostty),
@@ -232,6 +285,7 @@ fn create_alias_still_parses_as_launch() {
     let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create alias parses");
     assert_eq!(cli.command, Command::Launch {
         id: None,
+        from: None,
         json: false,
         size: None,
         vt: None,

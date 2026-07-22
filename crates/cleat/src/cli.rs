@@ -7,7 +7,7 @@ use crate::{
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
     runtime::{validate_runtime_name, TerminalSize, AMBIENT_DAEMON_ENV, DEFAULT_DAEMON_NAME},
-    server::{EndBound, FallbackReason, SessionService, StartBound},
+    server::{DaemonInstance, EndBound, FallbackReason, SessionService, StartBound},
     vt::VtEngineKind,
 };
 
@@ -39,6 +39,33 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// Adds product-level validation that clap cannot express across a global
+    /// option and a field on one subcommand.
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        <Self as Parser>::try_parse_from(args)?.validate_daemon_target()
+    }
+
+    fn validate_daemon_target(self) -> Result<Self, clap::Error> {
+        if self.has_conflicting_daemon_targets() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "the argument '--server <SERVER>' cannot be used with '--from <SESSION>'",
+            )
+            .with_cmd(&Self::command()));
+        }
+        Ok(self)
+    }
+
+    fn has_conflicting_daemon_targets(&self) -> bool {
+        self.server.is_some() && matches!(&self.command, Command::Launch { from: Some(_), .. })
+    }
 }
 
 // Bracketed paste marks the paste/submit boundary explicitly; the delay only
@@ -133,6 +160,9 @@ pub enum Command {
     Launch {
         #[arg(value_name = "ID")]
         id: Option<String>,
+        /// Launch in the daemon that owns this source session
+        #[arg(long, value_name = "SESSION", value_parser = parse_runtime_name)]
+        from: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(long, value_name = "COLSxROWS", value_parser = parse_terminal_size, help = "Initial terminal size, e.g. 120x40")]
@@ -434,7 +464,8 @@ resolved through the live daemon socket. \n\
 /// snippet alongside BUILD_SUPPORT_MESSAGE (which can't be concatenated at
 /// compile time since it's a const &str, not a literal).
 pub fn parse() -> Cli {
-    Cli::from_arg_matches(&command().get_matches()).expect("clap arg parsing should not fail after get_matches succeeds")
+    let cli = Cli::from_arg_matches(&command().get_matches()).expect("clap arg parsing should not fail after get_matches succeeds");
+    cli.validate_daemon_target().unwrap_or_else(|err| err.exit())
 }
 
 pub fn command() -> clap::Command {
@@ -478,11 +509,18 @@ impl ExecResult {
 }
 
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
-    let daemon_name = match resolve_daemon_name(cli.server.as_deref(), std::env::var_os(AMBIENT_DAEMON_ENV)) {
-        Ok(daemon_name) => daemon_name,
+    if cli.has_conflicting_daemon_targets() {
+        return ExecResult::Err("--server cannot be used with --from".to_string());
+    }
+    let source = match &cli.command {
+        Command::Launch { from, .. } => from.as_deref(),
+        _ => None,
+    };
+    let daemon_target = match resolve_daemon_target(cli.server.as_deref(), source, std::env::var_os(AMBIENT_DAEMON_ENV), service) {
+        Ok(daemon_target) => daemon_target,
         Err(err) => return ExecResult::Err(err),
     };
-    let service = match service.with_daemon(daemon_name) {
+    let service = match service.with_daemon(daemon_target.name().to_string()) {
         Ok(service) => service,
         Err(err) => return ExecResult::Err(err),
     };
@@ -535,7 +573,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, json, size, vt, cwd, cmd, tags, record } => {
+        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -546,12 +584,17 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(tags) => tags,
                 Err(err) => return ExecResult::Err(err),
             };
-            let created = match service.create_with_options(id, vt, cwd, cmd, crate::session::SessionStartOptions {
+            let options = crate::session::SessionStartOptions {
                 record: record.enabled(),
                 initial_size: size.unwrap_or_default(),
                 colors: crate::vt::TerminalColors::default(),
                 tags,
-            }) {
+            };
+            let create_result = match &daemon_target {
+                DaemonTarget::Running(daemon) => service.create_with_options_in_running_daemon(daemon, id, vt, cwd, cmd, options),
+                DaemonTarget::AutoStart(_) => service.create_with_options(id, vt, cwd, cmd, options),
+            };
+            let created = match create_result {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
@@ -842,16 +885,42 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     }
 }
 
-pub fn resolve_daemon_name(explicit: Option<&str>, ambient: Option<std::ffi::OsString>) -> Result<String, String> {
-    let daemon_name = match explicit {
-        Some(explicit) => explicit.to_string(),
-        None => match ambient {
-            Some(ambient) => ambient.into_string().map_err(|_| format!("{AMBIENT_DAEMON_ENV} must be valid UTF-8"))?,
-            None => DEFAULT_DAEMON_NAME.to_string(),
-        },
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonTarget {
+    AutoStart(String),
+    Running(DaemonInstance),
+}
+
+impl DaemonTarget {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::AutoStart(name) => name,
+            Self::Running(daemon) => daemon.name(),
+        }
+    }
+}
+
+pub fn resolve_daemon_target(
+    explicit: Option<&str>,
+    source: Option<&str>,
+    ambient: Option<std::ffi::OsString>,
+    service: &SessionService,
+) -> Result<DaemonTarget, String> {
+    if let Some(explicit) = explicit {
+        validate_runtime_name(explicit)?;
+        return Ok(DaemonTarget::AutoStart(explicit.to_string()));
+    }
+
+    if let Some(source) = source {
+        return service.daemon_owning_session(source).map(DaemonTarget::Running);
+    }
+
+    let daemon_name = match ambient {
+        Some(ambient) => ambient.into_string().map_err(|_| format!("{AMBIENT_DAEMON_ENV} must be valid UTF-8"))?,
+        None => DEFAULT_DAEMON_NAME.to_string(),
     };
     validate_runtime_name(&daemon_name)?;
-    Ok(daemon_name)
+    Ok(DaemonTarget::AutoStart(daemon_name))
 }
 
 fn execute_wait(

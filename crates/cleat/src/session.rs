@@ -256,6 +256,36 @@ pub fn ensure_session_started(
     cmd: Option<String>,
     options: SessionStartOptions,
 ) -> Result<SessionMetadata, String> {
+    start_session(layout, id, vt_engine, cwd, cmd, options, DaemonRequirement::AutoStart)
+}
+
+pub(crate) fn start_session_in_running_daemon(
+    layout: &RuntimeLayout,
+    expected_daemon_pid: u32,
+    id: Option<String>,
+    vt_engine: Option<VtEngineKind>,
+    cwd: Option<PathBuf>,
+    cmd: Option<String>,
+    options: SessionStartOptions,
+) -> Result<SessionMetadata, String> {
+    start_session(layout, id, vt_engine, cwd, cmd, options, DaemonRequirement::AlreadyRunning(expected_daemon_pid))
+}
+
+#[derive(Clone, Copy)]
+enum DaemonRequirement {
+    AutoStart,
+    AlreadyRunning(u32),
+}
+
+fn start_session(
+    layout: &RuntimeLayout,
+    id: Option<String>,
+    vt_engine: Option<VtEngineKind>,
+    cwd: Option<PathBuf>,
+    cmd: Option<String>,
+    options: SessionStartOptions,
+    daemon_requirement: DaemonRequirement,
+) -> Result<SessionMetadata, String> {
     let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
     vt_engine.ensure_available()?;
     let id = id.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
@@ -267,11 +297,19 @@ pub fn ensure_session_started(
     session.tags = options.tags;
     crate::runtime::normalize_tags(&mut session.tags);
 
-    ensure_daemon_started(layout)?;
-    let mut stream = connect_session_stream(&layout.socket_path())?;
+    if matches!(daemon_requirement, DaemonRequirement::AutoStart) {
+        ensure_daemon_started(layout)?;
+    }
+    let mut stream = connect_session_stream(&layout.socket_path()).map_err(|err| match daemon_requirement {
+        DaemonRequirement::AutoStart => err,
+        DaemonRequirement::AlreadyRunning(_) => format!("source daemon {} is no longer running: {err}", layout.daemon_name()),
+    })?;
     let body = serde_json::to_vec(&session).map_err(|err| format!("serialize session create request: {err}"))?;
-    http_uds::write_request(&mut stream, http::Method::POST, "/sessions", &body)
-        .map_err(|err| format!("write session create request: {err}"))?;
+    match daemon_requirement {
+        DaemonRequirement::AutoStart => http_uds::write_request(&mut stream, http::Method::POST, "/sessions", &body),
+        DaemonRequirement::AlreadyRunning(expected_pid) => http_uds::write_session_create_request(&mut stream, &body, expected_pid),
+    }
+    .map_err(|err| format!("write session create request: {err}"))?;
     let response = http_uds::read_response(&mut stream).map_err(|err| format!("read session create response: {err}"))?;
     if response.status != StatusCode::OK {
         return Err(http_error_message(http_uds::HttpResponse { status: response.status, body: response.body }));
@@ -1588,6 +1626,16 @@ fn handle_http_request(
                 .map_err(|err| format!("write HTTP sessions response: {err}"))
         }
         http_uds::Route::SessionCreate => {
+            if let Some(expected_pid) = request.headers().get(http_uds::DAEMON_INSTANCE_HEADER) {
+                let Some(expected_pid) = expected_pid.to_str().ok().and_then(|value| value.parse::<u32>().ok()) else {
+                    return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "invalid daemon instance header")
+                        .map_err(|err| format!("write HTTP error response: {err}"));
+                };
+                if expected_pid != std::process::id() {
+                    return http_uds::write_error(stream, StatusCode::CONFLICT, "source daemon instance changed")
+                        .map_err(|err| format!("write HTTP error response: {err}"));
+                }
+            }
             let session: SessionMetadata =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP session create request: {err}"))?;
             crate::runtime::validate_runtime_name(&session.id)?;

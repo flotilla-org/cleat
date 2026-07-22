@@ -16,7 +16,10 @@ use crate::{
     },
     protocol::{SessionInfo, SessionStatus},
     runtime::{discoverable_runtime_roots, validate_runtime_name, DaemonCoordinates, RuntimeLayout, TerminalSize},
-    session::{attach_foreground, ensure_session_started, run_session_daemon, watch_foreground, ForegroundAttach, SessionStartOptions},
+    session::{
+        attach_foreground, ensure_session_started, run_session_daemon, start_session_in_running_daemon, watch_foreground, ForegroundAttach,
+        SessionStartOptions,
+    },
     vt::VtEngineKind,
 };
 
@@ -59,6 +62,18 @@ pub struct SliceOutcome {
 #[derive(Debug, Clone)]
 pub struct SessionService {
     layout: RuntimeLayout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonInstance {
+    name: String,
+    pid: u32,
+}
+
+impl DaemonInstance {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,11 +170,31 @@ impl SessionService {
         options: SessionStartOptions,
     ) -> Result<SessionInfo, String> {
         let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, options)?;
+        Ok(self.session_info_after_create(session))
+    }
+
+    pub fn create_with_options_in_running_daemon(
+        &self,
+        daemon: &DaemonInstance,
+        name: Option<String>,
+        vt_engine: Option<VtEngineKind>,
+        cwd: Option<std::path::PathBuf>,
+        cmd: Option<String>,
+        options: SessionStartOptions,
+    ) -> Result<SessionInfo, String> {
+        if self.layout.daemon_name() != daemon.name {
+            return Err(format!("daemon instance {} does not match target {}", daemon.name, self.layout.daemon_name()));
+        }
+        let session = start_session_in_running_daemon(&self.layout, daemon.pid, name, vt_engine, cwd, cmd, options)?;
+        Ok(self.session_info_after_create(session))
+    }
+
+    fn session_info_after_create(&self, session: crate::runtime::SessionMetadata) -> SessionInfo {
         // If the daemon was already running, get real config via inspect.
         if let Ok(result) = self.inspect(&session.id) {
-            return Ok(session_info_from_inspect(result, SessionStatus::Detached));
+            return session_info_from_inspect(result, SessionStatus::Detached);
         }
-        Ok(SessionInfo {
+        SessionInfo {
             id: session.id,
             vt_engine: session.vt_engine,
             vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
@@ -172,7 +207,7 @@ impl SessionService {
             stable_since: None,
             last_output_at: None,
             error: None,
-        })
+        }
     }
 
     pub fn list(&self) -> Result<Vec<SessionInfo>, String> {
@@ -185,6 +220,45 @@ impl SessionService {
 
     pub fn list_all_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
         self.list_daemons(selectors, ListScope::All)
+    }
+
+    pub fn daemon_owning_session(&self, id: &str) -> Result<DaemonInstance, String> {
+        if !self.layout.root().exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let mut owners = Vec::new();
+        let mut candidate_errors = Vec::new();
+        for daemon_name in self.daemon_names(ListScope::All)? {
+            let daemon_service = self.with_daemon(daemon_name.clone())?;
+            if !daemon_service.session_dir(id).is_dir() {
+                continue;
+            }
+            let pid_before = daemon_service.registered_daemon_pid();
+            match daemon_service.inspect(id) {
+                Ok(_) => match (pid_before, daemon_service.registered_daemon_pid()) {
+                    (Ok(before), Ok(after)) if before == after => owners.push(DaemonInstance { name: daemon_name, pid: after }),
+                    (Ok(_), Ok(_)) => candidate_errors.push(format!("{daemon_name}: daemon changed while resolving session")),
+                    (_, Err(err)) | (Err(err), _) => candidate_errors.push(format!("{daemon_name}: {err}")),
+                },
+                Err(err) => candidate_errors.push(format!("{daemon_name}: {err}")),
+            }
+        }
+
+        match owners.as_slice() {
+            [] if candidate_errors.is_empty() => Err(format!("missing session {id}")),
+            [] => Err(format!("unable to resolve session {id}: {}", candidate_errors.join("; "))),
+            [daemon] => Ok(daemon.clone()),
+            _ => Err(format!(
+                "session {id} exists in multiple daemons ({}); use --server to select the target daemon instead",
+                owners.iter().map(|daemon| daemon.name.as_str()).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+
+    fn registered_daemon_pid(&self) -> Result<u32, String> {
+        let path = self.layout.daemon_pid_path();
+        let value = std::fs::read_to_string(&path).map_err(|err| format!("read daemon registration {}: {err}", path.display()))?;
+        value.trim().parse().map_err(|err| format!("parse daemon registration {}: {err}", path.display()))
     }
 
     fn list_daemons(&self, selectors: &[String], scope: ListScope) -> Result<Vec<SessionInfo>, String> {

@@ -1,11 +1,39 @@
 use clap::{CommandFactory, Parser};
 use cleat::{
-    cli::{self, execute, Cli, Command, ExecResult, RecordFlags},
+    cli::{self, execute, resolve_daemon_name, Cli, Command, ExecResult, RecordFlags},
     runtime::{RuntimeLayout, TerminalSize},
     server::SessionService,
     session::session_socket_path,
     vt::{self, VtEngineKind},
 };
+
+#[test]
+fn daemon_target_resolution_prefers_explicit_server_over_ambient() {
+    let resolved = resolve_daemon_name(Some("explicit"), Some("ambient".into())).expect("resolve daemon");
+
+    assert_eq!(resolved, "explicit");
+}
+
+#[test]
+fn daemon_target_resolution_uses_ambient_server_when_unqualified() {
+    let resolved = resolve_daemon_name(None, Some("ambient".into())).expect("resolve daemon");
+
+    assert_eq!(resolved, "ambient");
+}
+
+#[test]
+fn daemon_target_resolution_falls_back_to_default_outside_a_session() {
+    let resolved = resolve_daemon_name(None, None).expect("resolve daemon");
+
+    assert_eq!(resolved, cleat::runtime::DEFAULT_DAEMON_NAME);
+}
+
+#[test]
+fn daemon_target_resolution_rejects_an_invalid_ambient_server() {
+    let err = resolve_daemon_name(None, Some("not/a/name".into())).expect_err("reject invalid ambient daemon");
+
+    assert!(err.contains("invalid filesystem-safe name"), "{err}");
+}
 
 #[test]
 fn help_lists_expected_subcommands() {
@@ -17,6 +45,7 @@ fn help_lists_expected_subcommands() {
         "packets",
         "launch",
         "list",
+        "daemons",
         "tag",
         "capture",
         "transcript",
@@ -249,6 +278,13 @@ fn list_command_rejects_all_with_watch() {
 }
 
 #[test]
+fn daemons_command_parses_json() {
+    let cli = Cli::try_parse_from(["cleat", "daemons", "--json"]).expect("daemons --json parses");
+
+    assert_eq!(cli.command, Command::Daemons { json: true });
+}
+
+#[test]
 fn capture_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "capture", "session-1"]).expect("capture parses");
     assert_eq!(cli.command, Command::Capture { id: "session-1".into() });
@@ -405,7 +441,7 @@ fn record_flags_explicit_record_enables() {
 #[test]
 fn serve_parses_as_daemon_scoped_command() {
     let cli = Cli::try_parse_from(["cleat", "--server", "alternate", "serve"]).expect("parse serve");
-    assert_eq!(cli.server, "alternate");
+    assert_eq!(cli.server.as_deref(), Some("alternate"));
     assert!(matches!(cli.command, Command::Serve));
 }
 
@@ -419,7 +455,7 @@ fn mark_command_parses_session_id() {
 fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,
-        server: cleat::runtime::DEFAULT_DAEMON_NAME.to_string(),
+        server: Some(cleat::runtime::DEFAULT_DAEMON_NAME.to_string()),
         command: Command::SendKeys {
             id: "demo".into(),
             literal: false,

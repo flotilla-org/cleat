@@ -80,6 +80,7 @@ pub enum ScreenActivity {
     Stable,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivitySession {
     pub session_id: String,
@@ -100,6 +101,7 @@ pub struct ActivitySnapshot {
     pub sessions: Vec<ActivitySession>,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActivityEvent {
     ActivityChanged { session: ActivitySession, changed_at_unix_ms: u64 },

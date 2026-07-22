@@ -956,6 +956,7 @@ fn activity_subscription_emits_threshold_transitions() {
     assert_eq!(stable.session_id, "alpha");
     assert_eq!(stable.tags, vec![selector.clone()]);
     assert_eq!(stable.activity, ScreenActivity::Stable);
+    assert_eq!(first_stable_at, stable.stable_since_unix_ms + 500);
 
     service.send_keys("alpha", b"screen changed").expect("write output-producing input");
     let active = read_activity_event(&mut stream, Duration::from_secs(2));
@@ -964,6 +965,7 @@ fn activity_subscription_emits_threshold_transitions() {
     };
     assert_eq!(active.activity, ScreenActivity::Active);
     assert!(active.last_output_at_unix_ms.is_some());
+    assert_eq!(active_at, active.last_output_at_unix_ms.expect("active transition output timestamp"));
     assert!(active_at >= first_stable_at);
 
     let stable_again = read_activity_event(&mut stream, Duration::from_secs(2));
@@ -971,7 +973,19 @@ fn activity_subscription_emits_threshold_transitions() {
         panic!("expected activity change");
     };
     assert_eq!(stable_again.activity, ScreenActivity::Stable);
+    assert_eq!(stable_again_at, stable_again.stable_since_unix_ms + 500);
     assert!(stable_again_at >= active_at);
+}
+
+#[test]
+fn activity_subscription_rejects_zero_stability_threshold() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+
+    let result = service.connect_activity(&[], Duration::ZERO);
+
+    assert!(result.is_err());
+    assert!(result.err().expect("zero threshold error").contains("greater than zero"));
 }
 
 #[test]
@@ -991,7 +1005,8 @@ fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_sna
             .expect("create session");
     }
 
-    let mut stream = http_activity_stream(temp.path(), "alpha", std::slice::from_ref(&selector), Duration::ZERO);
+    let stable_threshold = Duration::from_secs(60);
+    let mut stream = http_activity_stream(temp.path(), "alpha", std::slice::from_ref(&selector), stable_threshold);
     let _hello = PacketFrame::read(&mut stream).expect("read hello");
     let _directory = PacketFrame::read(&mut stream).expect("read directory");
     let initial =
@@ -1032,7 +1047,7 @@ fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_sna
     assert_eq!(session_id, "gamma");
     drop(stream);
 
-    let mut reconnected = http_activity_stream(temp.path(), "beta", std::slice::from_ref(&selector), Duration::ZERO);
+    let mut reconnected = http_activity_stream(temp.path(), "beta", std::slice::from_ref(&selector), stable_threshold);
     let _hello = PacketFrame::read(&mut reconnected).expect("read reconnect hello");
     let _directory = PacketFrame::read(&mut reconnected).expect("read reconnect directory");
     let snapshot = PacketFrame::read(&mut reconnected)

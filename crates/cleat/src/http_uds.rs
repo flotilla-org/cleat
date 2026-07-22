@@ -217,7 +217,7 @@ pub(crate) struct SessionListResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct DirectorySubscribeRequest {
+pub(crate) struct PacketSubscribeRequest {
     #[serde(default)]
     pub selectors: Vec<String>,
     #[serde(default)]

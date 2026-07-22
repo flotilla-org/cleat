@@ -505,8 +505,14 @@ impl SessionService {
         selectors: &[String],
         stable_threshold: Duration,
     ) -> Result<(crate::packet::PacketClient<SessionStream>, crate::packet::ActivitySnapshot), String> {
+        if stable_threshold.is_zero() {
+            return Err("screen activity stability threshold must be greater than zero".to_string());
+        }
         let stable_threshold_ms = u64::try_from(stable_threshold.as_millis())
             .map_err(|_| "screen activity stability threshold exceeds u64 milliseconds".to_string())?;
+        if stable_threshold_ms == 0 {
+            return Err("screen activity stability threshold must be at least one millisecond".to_string());
+        }
         let (client, _, activity) = self.connect_subscription(selectors, Some(stable_threshold_ms))?;
         let activity = activity.ok_or_else(|| "packet stream did not send an activity snapshot".to_string())?;
         Ok((client, activity))
@@ -524,7 +530,7 @@ impl SessionService {
 
         let socket_path = self.layout.socket_path();
         let mut stream = connect_session_socket(&socket_path)?;
-        let body = serde_json::to_vec(&http_uds::DirectorySubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms })
+        let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms })
             .map_err(|err| format!("serialize directory subscribe request: {err}"))?;
         write!(
             stream,

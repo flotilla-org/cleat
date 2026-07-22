@@ -60,6 +60,25 @@ resident process forever). A daemon is an **isolation boundary** — analogous t
 k8s namespace: separate project checkouts, an agent loop's process backing, test
 scratch space. It is *not* an organizational grouping mechanism.
 
+**Ambient daemon**:
+The daemon a command targets when none is named: the daemon hosting the session
+the command runs *inside* (carried by the session environment), falling back to
+the daemon named `default` outside any session. Equivalently: "the daemon a new
+session would be created in." Uniform across all verbs — listing, launching,
+addressing. Daemon *discovery* (enumerating daemons at well-known state roots
+plus the ambient root) is best-effort convenience, never exhaustive: private
+daemons (e.g. temp-dir state in a test suite) legitimately exist outside it, and
+each daemon's Directory remains the only authority on its sessions.
+
+**Sibling session**:
+A session launched into the same daemon as an existing source session, thereby
+sharing that daemon's **initial** execution context — container, namespace,
+environment. "Sibling of S" names the shared starting point (the daemon's
+context); S is just how you name the daemon. A sibling does not inherit S's
+*current* state (its cwd changes, exported variables).
+_Avoid_: a per-sibling daemon (a sibling is not an isolation decision); "exact
+context of the session" (the shared context is the daemon's, not the session's).
+
 **Tag**:
 A flat label on a session, used to organize and select sessions *within* a daemon —
 analogous to k8s labels inside a namespace. A session may carry many tags; clients

@@ -1622,11 +1622,10 @@ fn handle_http_request(
         }
         http_uds::Route::SessionCreate => {
             if let Some(expected_pid) = request.headers().get(http_uds::DAEMON_INSTANCE_HEADER) {
-                let expected_pid = expected_pid
-                    .to_str()
-                    .ok()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .ok_or_else(|| "invalid daemon instance header".to_string())?;
+                let Some(expected_pid) = expected_pid.to_str().ok().and_then(|value| value.parse::<u32>().ok()) else {
+                    return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "invalid daemon instance header")
+                        .map_err(|err| format!("write HTTP error response: {err}"));
+                };
                 if expected_pid != std::process::id() {
                     return http_uds::write_error(stream, StatusCode::CONFLICT, "source daemon instance changed")
                         .map_err(|err| format!("write HTTP error response: {err}"));

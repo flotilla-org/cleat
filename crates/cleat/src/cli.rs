@@ -42,6 +42,8 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Adds product-level validation that clap cannot express across a global
+    /// option and a field on one subcommand.
     pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
@@ -51,7 +53,7 @@ impl Cli {
     }
 
     fn validate_daemon_target(self) -> Result<Self, clap::Error> {
-        if self.server.is_some() && matches!(&self.command, Command::Launch { from: Some(_), .. }) {
+        if self.has_conflicting_daemon_targets() {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
                 "the argument '--server <SERVER>' cannot be used with '--from <SESSION>'",
@@ -59,6 +61,10 @@ impl Cli {
             .with_cmd(&Self::command()));
         }
         Ok(self)
+    }
+
+    fn has_conflicting_daemon_targets(&self) -> bool {
+        self.server.is_some() && matches!(&self.command, Command::Launch { from: Some(_), .. })
     }
 }
 
@@ -498,7 +504,7 @@ impl ExecResult {
 }
 
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
-    if cli.server.is_some() && matches!(&cli.command, Command::Launch { from: Some(_), .. }) {
+    if cli.has_conflicting_daemon_targets() {
         return ExecResult::Err("--server cannot be used with --from".to_string());
     }
     let daemon_target = match resolve_daemon_target(&cli, service) {

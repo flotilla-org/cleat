@@ -1273,6 +1273,14 @@ fn session_daemon_accepts_http_control_requests_on_session_socket() {
     let inspect_json: serde_json::Value = serde_json::from_str(http_body(&inspect)).expect("inspect json");
     assert_eq!(inspect_json["session"]["id"], "alpha");
 
+    let invalid_daemon_instance = http_session_request(
+        temp.path(),
+        "alpha",
+        "POST /sessions HTTP/1.1\r\nHost: cleat\r\nx-cleat-daemon-pid: invalid\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(invalid_daemon_instance.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{invalid_daemon_instance}");
+    assert!(http_body(&invalid_daemon_instance).contains("invalid daemon instance header"));
+
     let keys_body = r#"{"bytes":[104,105,10]}"#;
     let keys = http_session_request(
         temp.path(),

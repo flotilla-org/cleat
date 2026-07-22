@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{TerminalInputEvent, TerminalRenderUpdate};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -13,6 +13,8 @@ pub const MSG_CONTROL_DIRECTORY_DELTA: u8 = 3;
 pub const MSG_CONTROL_OPEN_CHANNEL: u8 = 4;
 pub const MSG_CONTROL_CLOSE_CHANNEL: u8 = 5;
 pub const MSG_CONTROL_ERROR: u8 = 6;
+pub const MSG_CONTROL_ACTIVITY_SNAPSHOT: u8 = 7;
+pub const MSG_CONTROL_ACTIVITY_EVENT: u8 = 8;
 
 pub const MSG_SESSION_RENDER: u8 = 16;
 pub const MSG_SESSION_ACK: u8 = 17;
@@ -69,6 +71,42 @@ pub struct DirectoryEntry {
     pub recreatable: bool,
     pub cols: u16,
     pub rows: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenActivity {
+    Active,
+    Stable,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivitySession {
+    pub session_id: String,
+    pub tags: Vec<String>,
+    pub activity: ScreenActivity,
+    /// Unix timestamp in milliseconds for the beginning of the current quiet
+    /// window. While activity is `Active`, this is the quiet window that will
+    /// become `Stable` once the configured threshold elapses.
+    pub stable_since_unix_ms: u64,
+    /// Unix timestamp in milliseconds for the most recently observed render
+    /// generation change, or `None` before the session has rendered.
+    pub last_output_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivitySnapshot {
+    pub stable_threshold_ms: u64,
+    pub sessions: Vec<ActivitySession>,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivityEvent {
+    ActivityChanged { session: ActivitySession, changed_at_unix_ms: u64 },
+    MembershipAdded { session: ActivitySession, changed_at_unix_ms: u64 },
+    MembershipRemoved { session_id: String, tags: Vec<String>, changed_at_unix_ms: u64 },
 }
 
 /// Attachment role of a session channel. One controller per session across
@@ -289,6 +327,15 @@ impl<S: Read + Write> PacketClient<S> {
         }
     }
 
+    pub fn read_activity_event(&mut self) -> std::io::Result<ActivityEvent> {
+        loop {
+            let frame = self.read_frame()?;
+            if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_ACTIVITY_EVENT {
+                return frame.decode();
+            }
+        }
+    }
+
     fn write<T: Serialize>(&mut self, channel: u32, msg_type: u8, value: &T) -> std::io::Result<()> {
         PacketFrame::new(channel, msg_type, value)?.write(&mut self.stream)
     }
@@ -393,5 +440,34 @@ mod tests {
         let err = client.read_render(7).expect_err("control error should surface");
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "bad channel");
+    }
+
+    #[test]
+    fn packet_client_reads_activity_events() {
+        let event = ActivityEvent::MembershipAdded {
+            session: ActivitySession {
+                session_id: "alpha".to_string(),
+                tags: vec!["role=impl".to_string()],
+                activity: ScreenActivity::Active,
+                stable_since_unix_ms: 1_000,
+                last_output_at_unix_ms: Some(1_000),
+            },
+            changed_at_unix_ms: 1_000,
+        };
+        let mut bytes = Vec::new();
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+            upserted: Vec::new(),
+            removed_session_ids: Vec::new(),
+        })
+        .expect("encode unrelated delta")
+        .write(&mut bytes)
+        .expect("write unrelated delta");
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_ACTIVITY_EVENT, &event)
+            .expect("encode activity event")
+            .write(&mut bytes)
+            .expect("write activity event");
+        let mut client = PacketClient::new(std::io::Cursor::new(bytes));
+
+        assert_eq!(client.read_activity_event().expect("read activity event"), event);
     }
 }

@@ -20,8 +20,9 @@ use cleat::session::foreground_path;
 use cleat::{
     cli::{self, Cli, ExecResult},
     packet::{
-        ControlHello, DirectoryDelta, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA,
-        MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO, PROTOCOL_VERSION,
+        ActivityEvent, ActivitySnapshot, ControlHello, DirectoryDelta, DirectorySnapshot, PacketFrame, ScreenActivity, CHANNEL_CONTROL,
+        MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT,
+        MSG_CONTROL_HELLO, PROTOCOL_VERSION,
     },
     protocol::{Frame, SessionInfo},
     provider::ProviderFeatures,
@@ -127,6 +128,37 @@ fn http_packet_stream_with_selectors(root: &std::path::Path, id: &str, selectors
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
     assert!(response.contains("Upgrade: cleat-packet/1\r\n"), "{response}");
     stream
+}
+
+fn http_activity_stream(root: &std::path::Path, id: &str, selectors: &[String], stable_threshold: Duration) -> UnixStream {
+    let socket_path = session_socket_path(root, id);
+    let mut stream = UnixStream::connect(&socket_path).expect("connect session socket");
+    let body = serde_json::json!({
+        "selectors": selectors,
+        "screen_activity_stable_ms": stable_threshold.as_millis() as u64,
+    })
+    .to_string();
+    write!(
+        stream,
+        "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write activity upgrade request");
+
+    let response = read_http_response_head(&mut stream);
+    assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
+    stream
+}
+
+fn read_activity_event(stream: &mut UnixStream, timeout: Duration) -> ActivityEvent {
+    stream.set_read_timeout(Some(timeout)).expect("set activity timeout");
+    loop {
+        let frame = PacketFrame::read(stream).expect("read activity frame");
+        if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_ACTIVITY_EVENT {
+            return frame.decode().expect("decode activity event");
+        }
+    }
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -846,6 +878,183 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
     service.update_tags("alpha", Vec::new(), vec![selector]).expect("untag alpha");
     let delta = read_until_directory_remove(&mut stream, &mut buffer, "alpha", Duration::from_secs(30));
     assert_eq!(delta.removed_session_ids, vec!["alpha"]);
+}
+
+#[test]
+fn activity_subscription_snapshot_covers_all_matching_sessions() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let selector = "role=impl".to_string();
+    for (id, tags) in [
+        ("alpha", vec![selector.clone(), "vessel=one".to_string()]),
+        ("beta", vec![selector.clone(), "vessel=two".to_string()]),
+        ("gamma", vec!["role=review".to_string()]),
+    ] {
+        service
+            .create_with_options(Some(id.into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags,
+            })
+            .expect("create session");
+    }
+
+    let mut stream = http_activity_stream(temp.path(), "alpha", std::slice::from_ref(&selector), Duration::from_millis(50));
+    let hello = PacketFrame::read(&mut stream).expect("read hello");
+    assert_eq!(hello.msg_type, MSG_CONTROL_HELLO);
+    let directory = PacketFrame::read(&mut stream).expect("read directory");
+    assert_eq!(directory.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
+    let snapshot = PacketFrame::read(&mut stream).expect("read activity snapshot");
+    assert_eq!(snapshot.channel, CHANNEL_CONTROL);
+    assert_eq!(snapshot.msg_type, MSG_CONTROL_ACTIVITY_SNAPSHOT);
+    let snapshot = snapshot.decode::<ActivitySnapshot>().expect("decode activity snapshot");
+
+    assert_eq!(snapshot.stable_threshold_ms, 50);
+    assert_eq!(snapshot.sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
+    assert_eq!(snapshot.sessions[0].tags, vec!["role=impl", "vessel=one"]);
+    assert_eq!(snapshot.sessions[1].tags, vec!["role=impl", "vessel=two"]);
+
+    let (_client, snapshot) =
+        service.connect_activity(std::slice::from_ref(&selector), Duration::from_millis(50)).expect("connect through activity client API");
+    assert_eq!(snapshot.sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
+}
+
+#[test]
+fn activity_subscription_emits_threshold_transitions() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let selector = "vessel=work".to_string();
+    service
+        .create_with_options(
+            Some("alpha".into()),
+            Some(VtEngineKind::Passthrough),
+            None,
+            Some("sh -c 'stty raw; exec cat'".into()),
+            SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags: vec![selector.clone()],
+            },
+        )
+        .expect("create alpha");
+
+    let mut stream = http_activity_stream(temp.path(), "alpha", std::slice::from_ref(&selector), Duration::from_millis(500));
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+    let snapshot =
+        PacketFrame::read(&mut stream).expect("read activity snapshot").decode::<ActivitySnapshot>().expect("decode activity snapshot");
+    assert_eq!(snapshot.sessions[0].activity, ScreenActivity::Active);
+
+    let first_stable = read_activity_event(&mut stream, Duration::from_secs(2));
+    let ActivityEvent::ActivityChanged { session: stable, changed_at_unix_ms: first_stable_at } = first_stable else {
+        panic!("expected activity change");
+    };
+    assert_eq!(stable.session_id, "alpha");
+    assert_eq!(stable.tags, vec![selector.clone()]);
+    assert_eq!(stable.activity, ScreenActivity::Stable);
+    assert_eq!(first_stable_at, stable.stable_since_unix_ms + 500);
+
+    service.send_keys("alpha", b"screen changed").expect("write output-producing input");
+    let active = read_activity_event(&mut stream, Duration::from_secs(2));
+    let ActivityEvent::ActivityChanged { session: active, changed_at_unix_ms: active_at } = active else {
+        panic!("expected activity change");
+    };
+    assert_eq!(active.activity, ScreenActivity::Active);
+    assert!(active.last_output_at_unix_ms.is_some());
+    assert_eq!(active_at, active.last_output_at_unix_ms.expect("active transition output timestamp"));
+    assert!(active_at >= first_stable_at);
+
+    let stable_again = read_activity_event(&mut stream, Duration::from_secs(2));
+    let ActivityEvent::ActivityChanged { session: stable_again, changed_at_unix_ms: stable_again_at } = stable_again else {
+        panic!("expected activity change");
+    };
+    assert_eq!(stable_again.activity, ScreenActivity::Stable);
+    assert_eq!(stable_again_at, stable_again.stable_since_unix_ms + 500);
+    assert!(stable_again_at >= active_at);
+}
+
+#[test]
+fn activity_subscription_rejects_zero_stability_threshold() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+
+    let result = service.connect_activity(&[], Duration::ZERO);
+
+    assert!(result.is_err());
+    assert!(result.err().expect("zero threshold error").contains("greater than zero"));
+}
+
+#[test]
+fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_snapshot() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let selector = "vessel=work".to_string();
+    for (id, tags) in [("alpha", vec![selector.clone()]), ("beta", Vec::new())] {
+        service
+            .create_with_options(Some(id.into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), SessionStartOptions {
+                record: false,
+                initial_size: TerminalSize::default(),
+                colors: cleat::vt::TerminalColors::default(),
+                tags,
+            })
+            .expect("create session");
+    }
+
+    let stable_threshold = Duration::from_secs(60);
+    let mut stream = http_activity_stream(temp.path(), "alpha", std::slice::from_ref(&selector), stable_threshold);
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+    let initial =
+        PacketFrame::read(&mut stream).expect("read activity snapshot").decode::<ActivitySnapshot>().expect("decode activity snapshot");
+    assert_eq!(initial.sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(), vec!["alpha"]);
+
+    service
+        .create_with_options(Some("gamma".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), SessionStartOptions {
+            record: false,
+            initial_size: TerminalSize::default(),
+            colors: cleat::vt::TerminalColors::default(),
+            tags: vec![selector.clone()],
+        })
+        .expect("create gamma");
+    let ActivityEvent::MembershipAdded { session: added, .. } = read_activity_event(&mut stream, Duration::from_secs(2)) else {
+        panic!("expected membership add");
+    };
+    assert_eq!(added.session_id, "gamma");
+    assert_eq!(added.tags, vec![selector.clone()]);
+
+    service.update_tags("beta", vec![selector.clone()], Vec::new()).expect("tag beta into selector");
+    let ActivityEvent::MembershipAdded { session: added, .. } = read_activity_event(&mut stream, Duration::from_secs(2)) else {
+        panic!("expected membership add");
+    };
+    assert_eq!(added.session_id, "beta");
+
+    service.update_tags("alpha", Vec::new(), vec![selector.clone()]).expect("tag alpha out of selector");
+    let ActivityEvent::MembershipRemoved { session_id, tags, .. } = read_activity_event(&mut stream, Duration::from_secs(2)) else {
+        panic!("expected membership remove");
+    };
+    assert_eq!(session_id, "alpha");
+    assert_eq!(tags, vec![selector.clone()]);
+
+    service.kill("gamma").expect("kill gamma");
+    let ActivityEvent::MembershipRemoved { session_id, .. } = read_activity_event(&mut stream, Duration::from_secs(2)) else {
+        panic!("expected membership remove");
+    };
+    assert_eq!(session_id, "gamma");
+    drop(stream);
+
+    let mut reconnected = http_activity_stream(temp.path(), "beta", std::slice::from_ref(&selector), stable_threshold);
+    let _hello = PacketFrame::read(&mut reconnected).expect("read reconnect hello");
+    let _directory = PacketFrame::read(&mut reconnected).expect("read reconnect directory");
+    let snapshot = PacketFrame::read(&mut reconnected)
+        .expect("read reconnect activity snapshot")
+        .decode::<ActivitySnapshot>()
+        .expect("decode reconnect activity snapshot");
+    assert_eq!(snapshot.sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
 }
 
 #[test]

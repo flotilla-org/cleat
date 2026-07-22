@@ -52,12 +52,16 @@ it was a historical artifact of the daemon predating the shared host shape.
   This is the largest mechanical chunk of the change, and it depends on the
   progress/servicing split (the daemon answering these queries must be the
   never-blocked servicing side — see the provider threading spec).
-- **The directory is a subscription.** The daemon's session set + metadata is
+- **The directory is a subscription.** One daemon's session set + metadata is
   frontend-relevant state: multi-pane clients subscribe (optionally via tag
   selector) over one multiplexed connection that also carries their session
-  streams; `cleat list` is a one-shot read of the same state. The single-session
-  surfaces (`attach`, `watch`, one-shot CLI ops) remain first-class alongside —
-  the CLI is not collapsed into the uishell model.
+  streams. A one-shot read of a daemon Directory uses that same protocol state.
+  The top-level `cleat list` discovery command projects those reads across all
+  named daemons so transferred sessions remain discoverable; it does not create
+  a second directory authority, and `list --watch` remains a subscription to the
+  selected daemon. The single-session surfaces (`attach`, `watch`, one-shot CLI
+  ops) remain first-class alongside — the CLI is not collapsed into the uishell
+  model.
 - **Blast radius is managed, not eliminated.** A daemon crash now takes down every
   session it hosts. Mitigations, in order: per-session `catch_unwind` containment,
   FD transfer for planned handoff/upgrade, recreation-from-recording as the

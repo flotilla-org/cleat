@@ -874,7 +874,7 @@ fn sibling_session_runs_in_its_own_daemon_without_affecting_parent() {
                 .with_daemon(sibling.daemon.clone())
                 .expect("sibling layout")
                 .daemon_dir()
-                .join("meta.json"),
+                .join("transfer.json"),
         )
         .expect("read sibling daemon metadata"),
     )

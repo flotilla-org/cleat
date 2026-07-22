@@ -916,7 +916,7 @@ fn run_session_daemon_inner(root: &Path, daemon_name: &str, bootstrap_fd: Option
         // role map is the extension point for future transfer operations.
         crate::runtime::validate_runtime_name(&manifest.session.id)?;
         manifest.session.vt_engine.ensure_available()?;
-        let meta_path = layout.daemon_dir().join("meta.json");
+        let meta_path = layout.daemon_dir().join("transfer.json");
         let meta = serde_json::to_vec_pretty(&manifest).map_err(|err| format!("serialize daemon transfer metadata: {err}"))?;
         fs::write(&meta_path, meta).map_err(|err| format!("write daemon transfer metadata {}: {err}", meta_path.display()))?;
         let session_dir = layout.session_dir(&manifest.session.id);

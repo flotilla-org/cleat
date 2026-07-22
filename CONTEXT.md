@@ -69,13 +69,15 @@ _Avoid_: hierarchical groups / paths (a hierarchy forces each session into exact
 one grouping; sessions legitimately belong to several).
 
 **Directory**:
-The live set of sessions a daemon hosts, with their metadata (tags, liveness,
+The live set of sessions one daemon hosts, with their metadata (tags, liveness,
 control state, recreatability). Frontend-relevant state like any other: a
 multi-pane client **subscribes** to it (optionally through a tag selector) and
-receives the current set plus pushed changes; a one-shot listing is a single read
-of the same state, never a separate polling mechanism. A session's address is
-`(daemon, id)` — unqualified means the default daemon; tag selectors select *sets*,
-never address a single session.
+receives the current set plus pushed changes; a one-shot read of that Directory
+uses the same state, never a separate polling mechanism. Top-level discovery may
+project one such read from every named daemon into a global result; that projection
+is not itself a Directory, and subscriptions remain daemon-local. A session's
+address is `(daemon, id)` — unqualified means the default daemon; tag selectors
+select *sets*, never address a single session.
 
 **Client connection shapes**: a multi-pane client (e.g. uishell) holds one
 multiplexed connection to a daemon carrying the directory subscription and its

@@ -17,7 +17,7 @@ use crate::{
     },
     recording::SessionRecorder,
     runtime::{normalize_tags, SessionMetadata},
-    screen_activity::ScreenActivityTracker,
+    screen_activity::{ScreenActivityTime, ScreenActivityTracker},
     vt::{self, TerminalModeState, VtEngine},
 };
 
@@ -43,7 +43,7 @@ pub(crate) struct SessionRuntime {
     epoch: Instant,
     last_pty_output_at: Option<Instant>,
     screen_activity: ScreenActivityTracker,
-    pending_screen_activity_at: Option<(Instant, u64)>,
+    pending_screen_activity_at: Option<ScreenActivityTime>,
     // Current cell pixel size, used to fill the PTY winsize ws_xpixel/ws_ypixel
     // so TIOCGWINSZ-based apps (e.g. katzensteg) can compute image aspect. Zero
     // until the first geometry/set_cell_size, matching a terminal that hasn't
@@ -133,6 +133,10 @@ impl SessionRuntime {
 
     pub(crate) fn last_pty_output_at(&self) -> Option<Instant> {
         self.last_pty_output_at
+    }
+
+    pub(crate) fn screen_activity_tracker(&self) -> ScreenActivityTracker {
+        self.screen_activity.clone()
     }
 
     pub(crate) fn recording_active(&self) -> bool {
@@ -300,7 +304,7 @@ impl SessionRuntime {
         }
         attachments.extend((0..watcher_count).map(|_| crate::protocol::AttachmentInspect { role: "watcher".to_string() }));
 
-        let activity = self.screen_activity.snapshot(Instant::now());
+        let activity = self.screen_activity.json_snapshot(Instant::now());
         InspectResult {
             session: crate::protocol::SessionInspect {
                 id: self.session.id.clone(),
@@ -458,24 +462,24 @@ impl SessionRuntime {
             }
         }
         if !chunks.is_empty() {
-            self.note_screen_activity_candidate(Instant::now(), unix_timestamp_millis(SystemTime::now()));
+            self.note_screen_activity_candidate(ScreenActivityTime::new(Instant::now(), unix_timestamp_millis(SystemTime::now())));
         }
         Ok(PtyOutput { chunks })
     }
 
-    fn note_screen_activity_candidate(&mut self, changed_at: Instant, changed_at_unix_ms: u64) {
+    fn note_screen_activity_candidate(&mut self, changed_at: ScreenActivityTime) {
         match self.vt_engine.screen_activity_changed() {
-            Ok(Some(true)) => self.pending_screen_activity_at = Some((changed_at, changed_at_unix_ms)),
+            Ok(Some(true)) => self.pending_screen_activity_at = Some(changed_at),
             Ok(Some(false) | None) => {}
             Err(err) => eprintln!("screen activity observation error: {err}"),
         }
     }
 
     fn observe_pending_screen_activity(&mut self) -> bool {
-        let Some((changed_at, changed_at_unix_ms)) = self.pending_screen_activity_at.take() else {
+        let Some(changed_at) = self.pending_screen_activity_at.take() else {
             return false;
         };
-        self.screen_activity.render_changed(changed_at, changed_at_unix_ms);
+        self.screen_activity.render_changed(changed_at);
         true
     }
 

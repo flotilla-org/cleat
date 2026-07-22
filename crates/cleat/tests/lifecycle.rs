@@ -486,6 +486,7 @@ fn launch_from_creates_a_sibling_in_the_source_daemon() {
     source_daemon
         .create(Some("source".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
         .expect("create source session");
+    let _ambient_daemon = EnvVarGuard::set("CLEAT_DAEMON", "ambient-daemon");
 
     let mut observer = UnixStream::connect(temp.path().join("source-daemon/socket")).expect("connect source daemon");
     write!(
@@ -502,7 +503,7 @@ fn launch_from_creates_a_sibling_in_the_source_daemon() {
 
     let env_output = temp.path().join("sibling-env");
     let sibling_command = format!(
-        "sh -c 'printf \"%s|%s|%s\" \"${{SSH_TTY-unset}}\" \"${{SSH_CONNECTION-unset}}\" \"${{SSH_CLIENT-unset}}\" > {}; sleep 30'",
+        "sh -c 'printf \"%s|%s|%s|%s\" \"${{SSH_TTY-unset}}\" \"${{SSH_CONNECTION-unset}}\" \"${{SSH_CLIENT-unset}}\" \"${{CLEAT_DAEMON-unset}}\" > {}; sleep 30'",
         env_output.display()
     );
     let cli = Cli::try_parse_from([
@@ -526,9 +527,18 @@ fn launch_from_creates_a_sibling_in_the_source_daemon() {
     let delta = read_directory_delta_named(&mut observer, &mut packet_buffer, Duration::from_secs(2), "sibling directory delta");
     let sibling = delta.upserted.iter().find(|entry| entry.session_id == "sibling").expect("sibling upsert");
     assert_eq!(sibling.tags, vec!["kind=sibling"]);
-    wait_until("sibling environment output", || matches!(std::fs::read_to_string(&env_output), Ok(value) if value == "unset|unset|unset"));
-    assert_eq!(std::fs::read_to_string(&env_output).expect("read sibling environment"), "unset|unset|unset");
+    wait_until(
+        "sibling environment output",
+        || matches!(std::fs::read_to_string(&env_output), Ok(value) if value == "unset|unset|unset|source-daemon"),
+    );
+    assert_eq!(std::fs::read_to_string(&env_output).expect("read sibling environment"), "unset|unset|unset|source-daemon");
     assert!(service.list().expect("list default daemon").is_empty());
+    assert!(service
+        .with_daemon("ambient-daemon".to_string())
+        .expect("ambient daemon service")
+        .list()
+        .expect("list ambient daemon")
+        .is_empty());
     assert_eq!(source_daemon.list().expect("list source daemon").iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec![
         "sibling", "source"
     ]);
@@ -610,6 +620,84 @@ fn create_in_running_daemon_rejects_a_replacement_daemon() {
         "replacement"
     ]);
     source_daemon.kill("replacement").expect("kill replacement");
+}
+
+#[test]
+fn daemon_exports_private_root_name_and_session_id_to_the_child() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = RuntimeLayout::new(temp.path().join("private-state")).with_daemon("agent-loop".to_string()).expect("named daemon layout");
+    let service = SessionService::new(layout.clone());
+    let output_path = temp.path().join("ambient-coordinates");
+    let command = "printf '%s\\n%s\\n%s\\n' \"$CLEAT_RUNTIME_DIR\" \"$CLEAT_DAEMON\" \"$CLEAT_SESSION\" > ambient-coordinates; sleep 30";
+
+    service
+        .create(Some("worker".into()), Some(VtEngineKind::Passthrough), Some(temp.path().to_path_buf()), Some(command.into()), false)
+        .expect("create session");
+    wait_until("ambient coordinates file", || output_path.exists());
+
+    let coordinates = std::fs::read_to_string(&output_path).expect("read ambient coordinates");
+    assert_eq!(coordinates, format!("{}\nagent-loop\nworker\n", layout.root().display()));
+
+    service.kill("worker").expect("kill session");
+}
+
+#[test]
+fn daemons_lists_ambient_and_well_known_roots_best_effort() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ambient_root = temp.path().join("private-state");
+    let xdg_home = temp.path().join("xdg-state");
+    let well_known_root = xdg_home.join("cleat");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(ambient_root.join("ambient-daemon/sessions")).expect("create ambient daemon directory");
+    std::fs::create_dir_all(well_known_root.join("well-known/sessions")).expect("create well-known daemon directory");
+    std::fs::create_dir_all(well_known_root.join("not a daemon/sessions")).expect("create malformed daemon directory");
+    let _runtime = EnvVarGuard::set("CLEAT_RUNTIME_DIR", ambient_root.to_str().expect("utf8 ambient root"));
+    let _daemon = EnvVarGuard::set("CLEAT_DAEMON", "ambient-daemon");
+    let _xdg = EnvVarGuard::set("XDG_STATE_HOME", xdg_home.to_str().expect("utf8 xdg root"));
+    let _home = EnvVarGuard::set("HOME", home.to_str().expect("utf8 home"));
+    let service = SessionService::new(RuntimeLayout::new(ambient_root.clone()));
+    let cli = Cli::try_parse_from(["cleat", "daemons", "--json"]).expect("parse daemons");
+
+    let output = cli::execute(cli, &service).expect("execute daemons").expect("daemon list output");
+    let daemons: serde_json::Value = serde_json::from_str(&output).expect("parse daemon list JSON");
+
+    assert_eq!(
+        daemons,
+        serde_json::json!([
+            {"name": "ambient-daemon", "runtime_root": ambient_root},
+            {"name": "well-known", "runtime_root": well_known_root},
+        ])
+    );
+}
+
+#[test]
+fn bare_list_targets_ambient_daemon_and_explicit_server_wins() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let ambient = service.with_daemon("agent-loop".to_string()).expect("ambient daemon service");
+    service
+        .create(Some("default-session".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create default session");
+    ambient
+        .create(Some("ambient-session".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create ambient session");
+    let _daemon = EnvVarGuard::set("CLEAT_DAEMON", "agent-loop");
+
+    let bare = Cli::try_parse_from(["cleat", "list", "--json"]).expect("parse bare list");
+    let bare_output = cli::execute(bare, &service).expect("execute bare list").expect("bare list output");
+    let bare_sessions: Vec<SessionInfo> = serde_json::from_str(&bare_output).expect("parse bare list JSON");
+    assert_eq!(bare_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), ["ambient-session"]);
+
+    let explicit = Cli::try_parse_from(["cleat", "--server", "default", "list", "--json"]).expect("parse explicit list");
+    let explicit_output = cli::execute(explicit, &service).expect("execute explicit list").expect("explicit list output");
+    let explicit_sessions: Vec<SessionInfo> = serde_json::from_str(&explicit_output).expect("parse explicit list JSON");
+    assert_eq!(explicit_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), ["default-session"]);
+
+    ambient.kill("ambient-session").expect("kill ambient session");
+    service.kill("default-session").expect("kill default session");
 }
 
 #[test]

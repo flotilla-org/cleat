@@ -38,7 +38,7 @@ use crate::{
     provider::{
         DirtyState, TerminalInputEvent, TerminalKey, TerminalMouseButton, TerminalMouseEventKind, TerminalNamedKey, TerminalRenderUpdate,
     },
-    runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
+    runtime::{AmbientSessionCoordinates, RuntimeLayout, SessionMetadata, TerminalSize},
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
 
@@ -576,12 +576,17 @@ struct HostedSession {
 }
 
 impl HostedSession {
-    fn spawn(session_dir: PathBuf, session: SessionMetadata) -> Result<Self, String> {
+    fn spawn(session_dir: PathBuf, session: SessionMetadata, coordinates: AmbientSessionCoordinates) -> Result<Self, String> {
         let should_keep_session_dir = session.record;
         let actor_session_dir = session_dir;
         let actor_session = session.clone();
         let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
-            crate::session_runtime::SessionRuntime::spawn(actor_session_dir, &actor_session, default_vt_engine(&actor_session)?)
+            crate::session_runtime::SessionRuntime::spawn_in_daemon(
+                actor_session_dir,
+                &actor_session,
+                default_vt_engine(&actor_session)?,
+                &coordinates,
+            )
         })?;
         let raw_output_tap = actor.subscribe_raw_output()?;
         Ok(Self {
@@ -1639,7 +1644,8 @@ fn handle_http_request(
             if !state.sessions.contains_key(&session.id) {
                 let session_dir = state.layout.session_dir(&session.id);
                 fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
-                let hosted = HostedSession::spawn(session_dir, session.clone())?;
+                let coordinates = state.layout.session_coordinates(&session.id)?;
+                let hosted = HostedSession::spawn(session_dir, session.clone(), coordinates)?;
                 state.sessions.insert(session.id.clone(), hosted);
                 created = true;
             }

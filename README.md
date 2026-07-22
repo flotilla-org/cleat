@@ -61,7 +61,7 @@ find .tools/ghostty-install -maxdepth 3 | sort
 
 ## Session Model
 
-**Named daemons host sets of sessions.** A daemon is the process boundary for one named session set. The default daemon is named `default`; pass `--server NAME` to address a different daemon. A session address is therefore `(daemon, id)`, with an unqualified ID meaning "this ID in the selected daemon."
+**Named daemons host sets of sessions.** A daemon is the process boundary for one named session set. The default daemon is named `default`; pass `--server NAME` to address a different daemon. Without `--server`, commands target the ambient daemon named by `$CLEAT_DAEMON` when running inside a session, and `default` otherwise. An explicit `--server` always wins. A session address is therefore `(daemon, id)`, with an unqualified ID meaning "this ID in the selected daemon."
 
 **Session IDs.** You choose the ID (`cleat launch my-session`) or let cleat generate one (`session-<uuid>`). IDs are directory names under their daemon's `sessions/` directory, so use filesystem-safe characters. Launching with an ID that already has a live session in the selected daemon reuses that session; it does not create a duplicate.
 
@@ -76,6 +76,14 @@ find .tools/ghostty-install -maxdepth 3 | sort
 3. `$HOME/.local/state/cleat` on Unix, or `%LOCALAPPDATA%\cleat` on Windows
 
 Discovery fails with an actionable error when no persistent state directory is available; cleat never implicitly stores daemon state or recordings in a temporary directory. `CLEAT_RUNTIME_DIR` retains its historical name as the explicit whole-layout override. Use a short persistent path for this override if the discovered Unix socket path exceeds the platform limit; cleat rejects an unusable socket path before starting a daemon.
+
+Every daemon exports its coordinates into each session child, following the same pattern as tmux's `$TMUX` variable:
+
+- `$CLEAT_RUNTIME_DIR` — the daemon's state root, including private roots
+- `$CLEAT_DAEMON` — the daemon name used for ambient command targeting
+- `$CLEAT_SESSION` — the current session ID
+
+This makes bare commands inside a session use that session's daemon and state root. `cleat daemons` discovers daemon directories at the ambient root and the well-known XDG/platform roots. Discovery is intentionally best-effort, not exhaustive: private roots that are not ambient can remain undiscoverable, and each daemon's own Directory remains authoritative for its sessions. Use `cleat daemons --json` for structured `{name, runtime_root}` coordinates.
 
 Runtime layout v2 is daemon-scoped:
 
@@ -117,7 +125,8 @@ This subscription contract starts with packet protocol v4. Version 3 used raw PT
 
 | Command | Exercises | Notes |
 |---|---|---|
-| `--server NAME` | daemon selection | Selects the named daemon for the command; default is `default` |
+| `--server NAME` | daemon selection | Explicit daemon selection; otherwise `$CLEAT_DAEMON`, then `default` |
+| `daemons [--json]` | daemon discovery | Best-effort discovery across ambient and well-known state roots |
 | `launch [--from SOURCE] [--tag TAG]... [--record|--no-record]` | daemon + VT engine + recording | Creates or reuses a session in the selected daemon, or in `SOURCE`'s daemon with `--from` |
 | `tag <id> +TAG -TAG` | daemon directory state | Mutates opaque tags; tags are not interpreted by cleat |
 | `attach` / `detach` | host terminal + daemon | While attached, host terminal is authoritative for query replies |

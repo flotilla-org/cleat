@@ -6,7 +6,7 @@ use crate::{
     http_uds,
     keys::encode_send_keys,
     protocol::{WaitCondition, WaitStatus},
-    runtime::{TerminalSize, DEFAULT_DAEMON_NAME},
+    runtime::{validate_runtime_name, TerminalSize, AMBIENT_DAEMON_ENV, DEFAULT_DAEMON_NAME},
     server::{DaemonInstance, EndBound, FallbackReason, SessionService, StartBound},
     vt::VtEngineKind,
 };
@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub runtime_root: Option<PathBuf>,
 
-    #[arg(long, global = true, value_parser = parse_runtime_name)]
+    #[arg(long, global = true, value_parser = parse_runtime_name, help = "Select daemon (explicit > CLEAT_DAEMON > default)")]
     pub server: Option<String>,
 
     #[command(subcommand)]
@@ -188,6 +188,11 @@ pub enum Command {
         all: bool,
         #[arg(long = "selector", value_name = "TAG", allow_hyphen_values = true, help = "Require an exact opaque tag match; repeatable")]
         selectors: Vec<String>,
+    },
+    /// List discoverable daemons (best effort; private state roots may not be found)
+    Daemons {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
     /// Add or remove opaque session tags
     Tag {
@@ -507,7 +512,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     if cli.has_conflicting_daemon_targets() {
         return ExecResult::Err("--server cannot be used with --from".to_string());
     }
-    let daemon_target = match resolve_daemon_target(&cli, service) {
+    let source = match &cli.command {
+        Command::Launch { from, .. } => from.as_deref(),
+        _ => None,
+    };
+    let daemon_target = match resolve_daemon_target(cli.server.as_deref(), source, std::env::var_os(AMBIENT_DAEMON_ENV), service) {
         Ok(daemon_target) => daemon_target,
         Err(err) => return ExecResult::Err(err),
     };
@@ -622,6 +631,25 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(None)
             } else {
                 ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
+            }
+        }
+        Command::Daemons { json } => {
+            let daemons = service.discover_daemons();
+            if json {
+                match serde_json::to_string(&daemons) {
+                    Ok(output) => ExecResult::Ok(Some(output)),
+                    Err(err) => ExecResult::Err(format!("serialize daemon list: {err}")),
+                }
+            } else if daemons.is_empty() {
+                ExecResult::Ok(None)
+            } else {
+                ExecResult::Ok(Some(
+                    daemons
+                        .iter()
+                        .map(|daemon| format!("{}\t{}", daemon.name, daemon.runtime_root.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
             }
         }
         Command::Tag { id, mutations } => {
@@ -857,13 +885,14 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     }
 }
 
-enum DaemonTarget {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonTarget {
     AutoStart(String),
     Running(DaemonInstance),
 }
 
 impl DaemonTarget {
-    fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         match self {
             Self::AutoStart(name) => name,
             Self::Running(daemon) => daemon.name(),
@@ -871,16 +900,27 @@ impl DaemonTarget {
     }
 }
 
-fn resolve_daemon_target(cli: &Cli, service: &SessionService) -> Result<DaemonTarget, String> {
-    if let Some(daemon_name) = &cli.server {
-        return Ok(DaemonTarget::AutoStart(daemon_name.clone()));
+pub fn resolve_daemon_target(
+    explicit: Option<&str>,
+    source: Option<&str>,
+    ambient: Option<std::ffi::OsString>,
+    service: &SessionService,
+) -> Result<DaemonTarget, String> {
+    if let Some(explicit) = explicit {
+        validate_runtime_name(explicit)?;
+        return Ok(DaemonTarget::AutoStart(explicit.to_string()));
     }
 
-    let Command::Launch { from: Some(source), .. } = &cli.command else {
-        return Ok(DaemonTarget::AutoStart(DEFAULT_DAEMON_NAME.to_string()));
-    };
+    if let Some(source) = source {
+        return service.daemon_owning_session(source).map(DaemonTarget::Running);
+    }
 
-    service.daemon_owning_session(source).map(DaemonTarget::Running)
+    let daemon_name = match ambient {
+        Some(ambient) => ambient.into_string().map_err(|_| format!("{AMBIENT_DAEMON_ENV} must be valid UTF-8"))?,
+        None => DEFAULT_DAEMON_NAME.to_string(),
+    };
+    validate_runtime_name(&daemon_name)?;
+    Ok(DaemonTarget::AutoStart(daemon_name))
 }
 
 fn execute_wait(

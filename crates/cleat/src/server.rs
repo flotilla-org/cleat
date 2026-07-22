@@ -15,7 +15,7 @@ use crate::{
         ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
     protocol::{SessionInfo, SessionStatus},
-    runtime::{RuntimeLayout, TerminalSize},
+    runtime::{discoverable_runtime_roots, validate_runtime_name, DaemonCoordinates, RuntimeLayout, TerminalSize},
     session::{
         attach_foreground, ensure_session_started, run_session_daemon, start_session_in_running_daemon, watch_foreground, ForegroundAttach,
         SessionStartOptions,
@@ -97,6 +97,36 @@ impl SessionService {
 
     pub fn layout_root(&self) -> &std::path::Path {
         self.layout.root()
+    }
+
+    pub fn discover_daemons(&self) -> Vec<DaemonCoordinates> {
+        let mut roots = discoverable_runtime_roots();
+        roots.push(self.layout.root().to_path_buf());
+        roots.sort();
+        roots.dedup();
+
+        let mut daemons = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() || !path.join("sessions").is_dir() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if validate_runtime_name(name).is_err() {
+                    continue;
+                }
+                daemons.push(DaemonCoordinates { name: name.to_string(), runtime_root: root.clone() });
+            }
+        }
+        daemons.sort_by(|left, right| left.runtime_root.cmp(&right.runtime_root).then_with(|| left.name.cmp(&right.name)));
+        daemons.dedup();
+        daemons
     }
 
     pub fn session_dir(&self, id: &str) -> std::path::PathBuf {

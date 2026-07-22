@@ -1,11 +1,62 @@
 use clap::CommandFactory;
 use cleat::{
-    cli::{self, execute, Cli, Command, ExecResult, RecordFlags},
+    cli::{self, execute, resolve_daemon_target, Cli, Command, ExecResult, RecordFlags},
     runtime::{RuntimeLayout, TerminalSize},
     server::SessionService,
     session::session_socket_path,
     vt::{self, VtEngineKind},
 };
+
+#[test]
+fn daemon_target_resolution_prefers_explicit_server_over_ambient() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let resolved = resolve_daemon_target(Some("explicit"), None, Some("ambient".into()), &service).expect("resolve daemon");
+
+    assert_eq!(resolved.name(), "explicit");
+}
+
+#[test]
+fn daemon_target_resolution_uses_ambient_server_when_unqualified() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let resolved = resolve_daemon_target(None, None, Some("ambient".into()), &service).expect("resolve daemon");
+
+    assert_eq!(resolved.name(), "ambient");
+}
+
+#[test]
+fn daemon_target_resolution_falls_back_to_default_outside_a_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let resolved = resolve_daemon_target(None, None, None, &service).expect("resolve daemon");
+
+    assert_eq!(resolved.name(), cleat::runtime::DEFAULT_DAEMON_NAME);
+}
+
+#[test]
+fn daemon_target_resolution_rejects_an_invalid_ambient_server() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let err = resolve_daemon_target(None, None, Some("not/a/name".into()), &service).expect_err("reject invalid ambient daemon");
+
+    assert!(err.contains("invalid filesystem-safe name"), "{err}");
+}
+
+#[test]
+fn daemon_target_resolution_prefers_source_session_over_ambient() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let source_daemon = service.with_daemon("source-daemon".to_string()).expect("source daemon service");
+    source_daemon
+        .create(Some("source".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false)
+        .expect("create source session");
+
+    let resolved = resolve_daemon_target(None, Some("source"), Some("ambient".into()), &service).expect("resolve source daemon");
+
+    assert_eq!(resolved.name(), "source-daemon");
+    source_daemon.kill("source").expect("kill source session");
+}
 
 #[test]
 fn help_lists_expected_subcommands() {
@@ -17,6 +68,7 @@ fn help_lists_expected_subcommands() {
         "packets",
         "launch",
         "list",
+        "daemons",
         "tag",
         "capture",
         "transcript",
@@ -277,6 +329,13 @@ fn list_command_parses_all() {
 #[test]
 fn list_command_rejects_all_with_watch() {
     assert!(Cli::try_parse_from(["cleat", "list", "--all", "--watch"]).is_err());
+}
+
+#[test]
+fn daemons_command_parses_json() {
+    let cli = Cli::try_parse_from(["cleat", "daemons", "--json"]).expect("daemons --json parses");
+
+    assert_eq!(cli.command, Command::Daemons { json: true });
 }
 
 #[test]

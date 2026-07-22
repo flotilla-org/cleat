@@ -1,12 +1,12 @@
 use crate::{
     platform::ipc::{SessionListener, SessionStream},
-    runtime::SessionMetadata,
+    runtime::{AmbientSessionCoordinates, SessionMetadata},
 };
 
 pub struct PtyChild;
 
 impl PtyChild {
-    pub fn spawn(_session: &SessionMetadata) -> Result<Self, String> {
+    pub fn spawn_with_ambient(_session: &SessionMetadata, _coordinates: Option<&AmbientSessionCoordinates>) -> Result<Self, String> {
         Err("PTY sessions are only supported on Unix".to_string())
     }
 }

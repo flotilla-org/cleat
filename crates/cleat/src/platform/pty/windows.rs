@@ -1,7 +1,9 @@
 use std::{
-    ffi::c_void,
+    env,
+    ffi::{c_void, OsStr, OsString},
     io,
     mem::{size_of, zeroed},
+    os::windows::ffi::OsStrExt,
     path::PathBuf,
     ptr::{null, null_mut},
     thread,
@@ -17,8 +19,9 @@ use windows_sys::Win32::{
         Pipes::CreatePipe,
         Threading::{
             CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, InitializeProcThreadAttributeList, TerminateProcess,
-            UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, EXTENDED_STARTUPINFO_PRESENT,
-            LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW,
         },
     },
 };
@@ -26,7 +29,7 @@ use windows_sys::Win32::{
 use crate::{
     platform::ipc::{handle_has_available_bytes, SessionListener, SessionStream},
     protocol::SignalTarget,
-    runtime::SessionMetadata,
+    runtime::{AmbientSessionCoordinates, SessionMetadata, AMBIENT_COORDINATE_ENV_NAMES},
 };
 
 const POSIX_SIGINT: i32 = 2;
@@ -43,10 +46,10 @@ pub struct PtyChild {
 }
 
 impl PtyChild {
-    pub fn spawn(session: &SessionMetadata) -> Result<Self, String> {
+    pub fn spawn_with_ambient(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Self, String> {
         let pipes = Pipes::new()?;
         let conpty = create_pseudo_console(session.initial_size.cols, session.initial_size.rows, pipes.input_read, pipes.output_write)?;
-        let process = spawn_with_conpty(&windows_shell_command(session), conpty, session.cwd.as_ref())?;
+        let process = spawn_with_conpty(&windows_shell_command(session), conpty, session.cwd.as_ref(), coordinates)?;
         unsafe {
             CloseHandle(pipes.input_read);
             CloseHandle(pipes.output_write);
@@ -252,7 +255,12 @@ fn create_pseudo_console(cols: u16, rows: u16, input: HANDLE, output: HANDLE) ->
     }
 }
 
-fn spawn_with_conpty(command_line: &str, conpty: HPCON, cwd: Option<&PathBuf>) -> Result<PROCESS_INFORMATION, String> {
+fn spawn_with_conpty(
+    command_line: &str,
+    conpty: HPCON,
+    cwd: Option<&PathBuf>,
+    coordinates: Option<&AmbientSessionCoordinates>,
+) -> Result<PROCESS_INFORMATION, String> {
     let mut attr_size = 0;
     unsafe {
         InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_size);
@@ -296,6 +304,10 @@ fn spawn_with_conpty(command_line: &str, conpty: HPCON, cwd: Option<&PathBuf>) -
     let mut command_line = wide_null(command_line);
     let cwd = cwd.map(|path| wide_null(&path.to_string_lossy()));
     let cwd_ptr = cwd.as_ref().map(|value| value.as_ptr()).unwrap_or_else(null);
+    let mut environment = coordinates.map(child_environment_block).transpose()?;
+    let environment_ptr = environment.as_mut().map(|block| block.as_mut_ptr().cast::<c_void>()).unwrap_or_else(null_mut);
+    let creation_flags =
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP | if environment.is_some() { CREATE_UNICODE_ENVIRONMENT } else { 0 };
 
     let created = unsafe {
         CreateProcessW(
@@ -304,8 +316,8 @@ fn spawn_with_conpty(command_line: &str, conpty: HPCON, cwd: Option<&PathBuf>) -
             null(),
             null(),
             0,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP,
-            null(),
+            creation_flags,
+            environment_ptr,
             cwd_ptr,
             &startup_info as *const STARTUPINFOEXW as *const _,
             &mut process_info,
@@ -321,6 +333,27 @@ fn spawn_with_conpty(command_line: &str, conpty: HPCON, cwd: Option<&PathBuf>) -
     } else {
         Ok(process_info)
     }
+}
+
+fn child_environment_block(coordinates: &AmbientSessionCoordinates) -> Result<Vec<u16>, String> {
+    let mut variables: Vec<(OsString, OsString)> = env::vars_os()
+        .filter(|(key, _)| !AMBIENT_COORDINATE_ENV_NAMES.iter().any(|name| key.eq_ignore_ascii_case(OsStr::new(name))))
+        .collect();
+    variables.extend(coordinates.child_environment().map(|(name, value)| (OsString::from(name), value.to_os_string())));
+    variables
+        .sort_by(|(left, _), (right, _)| left.to_string_lossy().to_ascii_lowercase().cmp(&right.to_string_lossy().to_ascii_lowercase()));
+
+    let mut block = Vec::new();
+    for (key, value) in variables {
+        let mut entry: Vec<u16> = key.encode_wide().chain(std::iter::once('=' as u16)).chain(value.encode_wide()).collect();
+        if entry.contains(&0) {
+            return Err("environment contains interior nul".to_string());
+        }
+        block.append(&mut entry);
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
 }
 
 fn windows_shell_command(session: &SessionMetadata) -> String {

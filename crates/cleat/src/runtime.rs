@@ -17,6 +17,21 @@ pub const DEFAULT_DAEMON_NAME: &str = "default";
 pub const DEFAULT_TERMINAL_COLS: u16 = 80;
 pub const DEFAULT_TERMINAL_ROWS: u16 = 24;
 
+pub fn validate_environment(environment: &[(String, String)]) -> Result<(), String> {
+    for (name, value) in environment {
+        if name.is_empty() || name.contains('\0') || name.contains('=') {
+            return Err("environment name must be non-empty and contain neither '=' nor NUL".to_string());
+        }
+        if value.contains('\0') {
+            return Err("environment value must not contain NUL".to_string());
+        }
+        if AMBIENT_COORDINATE_ENV_NAMES.iter().any(|reserved| name.eq_ignore_ascii_case(reserved)) {
+            return Err(format!("{name} is managed by cleat and cannot be overridden"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalSize {
     pub cols: u16,
@@ -43,6 +58,9 @@ pub struct SessionMetadata {
     pub cmd: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Explicit environment entries supplied when the session was launched.
+    #[serde(default)]
+    pub environment: Vec<(String, String)>,
     pub record: bool,
     pub initial_size: TerminalSize,
     pub colors: TerminalColors,
@@ -179,6 +197,7 @@ impl RuntimeLayout {
             cwd,
             cmd,
             tags: Vec::new(),
+            environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
             colors: TerminalColors::default(),
@@ -268,7 +287,15 @@ fn platform_state_dir() -> Option<PathBuf> {
 mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
-    use super::{discover_runtime_root, RuntimeLayout, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, RUNTIME_DIR_ENV};
+    use super::{discover_runtime_root, validate_environment, RuntimeLayout, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, RUNTIME_DIR_ENV};
+
+    #[test]
+    fn session_environment_rejects_reserved_ambient_coordinates() {
+        for name in [RUNTIME_DIR_ENV, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, "cleat_daemon"] {
+            let err = validate_environment(&[(name.to_string(), "spoofed".to_string())]).expect_err("reject reserved environment");
+            assert!(err.contains("managed by cleat"), "{err}");
+        }
+    }
 
     #[test]
     fn relative_layout_defines_absolute_child_coordinates() {

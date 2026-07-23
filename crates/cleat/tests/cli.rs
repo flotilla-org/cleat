@@ -170,6 +170,7 @@ fn launch_command_parses() {
         cwd: None,
         cmd: Some("bash".into()),
         tags: Vec::new(),
+        environment: Vec::new(),
         record: RecordFlags::default()
     });
 }
@@ -231,6 +232,7 @@ fn launch_command_parses_positional_name() {
         cwd: None,
         cmd: Some("bash".into()),
         tags: Vec::new(),
+        environment: Vec::new(),
         record: RecordFlags::default()
     });
 }
@@ -249,6 +251,27 @@ fn launch_command_parses_repeatable_tags() {
 }
 
 #[test]
+fn launch_command_parses_repeatable_environment_entries() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--env", "TERM=screen-256color", "--env", "EDITOR=vim"])
+        .expect("launch environment parses");
+    assert!(matches!(
+        cli.command,
+        Command::Launch { environment, .. }
+            if environment == vec![("TERM".to_string(), "screen-256color".to_string()), ("EDITOR".to_string(), "vim".to_string())]
+    ));
+}
+
+#[test]
+fn launch_command_rejects_malformed_environment_entry() {
+    assert!(Cli::try_parse_from(["cleat", "launch", "demo", "--env", "TERM"]).is_err());
+}
+
+#[test]
+fn launch_command_rejects_reserved_environment_entry() {
+    assert!(Cli::try_parse_from(["cleat", "launch", "demo", "--env", "CLEAT_DAEMON=other"]).is_err());
+}
+
+#[test]
 fn launch_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
     assert_eq!(cli.command, Command::Launch {
@@ -260,6 +283,7 @@ fn launch_command_parses_json() {
         cwd: None,
         cmd: None,
         tags: Vec::new(),
+        environment: Vec::new(),
         record: RecordFlags::default()
     });
 }
@@ -276,6 +300,7 @@ fn launch_command_parses_vt() {
         cwd: None,
         cmd: None,
         tags: Vec::new(),
+        environment: Vec::new(),
         record: RecordFlags::default()
     });
 }
@@ -292,6 +317,7 @@ fn create_alias_still_parses_as_launch() {
         cwd: None,
         cmd: Some("bash".into()),
         tags: Vec::new(),
+        environment: Vec::new(),
         record: RecordFlags::default()
     });
 }

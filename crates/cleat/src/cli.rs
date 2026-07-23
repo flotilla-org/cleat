@@ -175,6 +175,8 @@ pub enum Command {
         cmd: Option<String>,
         #[arg(long = "tag", value_name = "TAG", allow_hyphen_values = true, help = "Attach an opaque tag to the session; repeatable")]
         tags: Vec<String>,
+        #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_environment, help = "Set a child environment variable; repeatable")]
+        environment: Vec<(String, String)>,
         #[command(flatten)]
         record: RecordFlags,
     },
@@ -573,7 +575,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, record } => {
+        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, environment, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -589,6 +591,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 initial_size: size.unwrap_or_default(),
                 colors: crate::vt::TerminalColors::default(),
                 tags,
+                environment,
             };
             let create_result = match &daemon_target {
                 DaemonTarget::Running(daemon) => service.create_with_options_in_running_daemon(daemon, id, vt, cwd, cmd, options),
@@ -1318,6 +1321,13 @@ fn parse_signal_target(target: &str) -> Result<crate::protocol::SignalTarget, St
         "tree" => Ok(crate::protocol::SignalTarget::Tree),
         other => Err(format!("unknown signal target: {other}")),
     }
+}
+
+fn parse_environment(value: &str) -> Result<(String, String), String> {
+    let (name, value) = value.split_once('=').ok_or_else(|| "environment must use NAME=VALUE".to_string())?;
+    let environment = (name.to_string(), value.to_string());
+    crate::runtime::validate_environment(std::slice::from_ref(&environment))?;
+    Ok(environment)
 }
 
 fn parse_terminal_size(value: &str) -> Result<TerminalSize, String> {

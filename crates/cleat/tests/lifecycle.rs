@@ -449,6 +449,13 @@ impl EnvVarGuard {
         std::env::set_var(key, value);
         Self { key, original }
     }
+
+    #[cfg(feature = "ghostty-vt")]
+    fn remove(key: &'static str) -> Self {
+        let original = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, original }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -471,6 +478,41 @@ fn create_makes_session_directory_and_returns_metadata() {
     let output = cli::execute(cli, &service).expect("execute create").expect("create output");
     assert_eq!(output, "alpha");
     assert!(service.session_dir("alpha").exists());
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn launch_owns_term_when_daemon_environment_is_scrubbed_and_honors_override() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _term = EnvVarGuard::remove("TERM");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+
+    let default_output = temp.path().join("default-term");
+    let default_command = format!("printf %s \"$TERM\" > {}; sleep 30", default_output.display());
+    let default_launch = Cli::try_parse_from(["cleat", "launch", "default-term", "--no-record", "--cmd", &default_command])
+        .expect("parse default TERM launch");
+    cli::execute(default_launch, &service).expect("launch with scrubbed TERM");
+    wait_until("default TERM output", || matches!(std::fs::read_to_string(&default_output), Ok(value) if value == "xterm-256color"));
+
+    let override_output = temp.path().join("override-term");
+    let override_command = format!("printf %s \"$TERM\" > {}; sleep 30", override_output.display());
+    let override_launch = Cli::try_parse_from([
+        "cleat",
+        "launch",
+        "override-term",
+        "--env",
+        "TERM=screen-256color",
+        "--no-record",
+        "--cmd",
+        &override_command,
+    ])
+    .expect("parse TERM override launch");
+    cli::execute(override_launch, &service).expect("launch with TERM override");
+    wait_until("overridden TERM output", || matches!(std::fs::read_to_string(&override_output), Ok(value) if value == "screen-256color"));
+
+    service.kill("default-term").expect("kill default TERM session");
+    service.kill("override-term").expect("kill overridden TERM session");
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -874,6 +916,7 @@ fn list_and_inspect_report_opaque_tags() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec!["task=99".into(), "role=impl".into(), "role=impl".into()],
+                environment: Vec::new(),
             },
         )
         .expect("create alpha");
@@ -980,6 +1023,7 @@ fn list_selector_requires_exact_opaque_tag_matches() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec!["role=impl".into(), "task=99".into()],
+                environment: Vec::new(),
             },
         )
         .expect("create alpha");
@@ -994,6 +1038,7 @@ fn list_selector_requires_exact_opaque_tag_matches() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec!["role=shepherd".into()],
+                environment: Vec::new(),
             },
         )
         .expect("create beta");
@@ -1080,6 +1125,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec![selector.clone()],
+                environment: Vec::new(),
             },
         )
         .expect("create alpha");
@@ -1107,6 +1153,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec![selector.clone()],
+                environment: Vec::new(),
             },
         )
         .expect("create gamma");
@@ -1136,6 +1183,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec![selector.clone()],
+                environment: Vec::new(),
             },
         )
         .expect("create short");
@@ -1164,6 +1212,7 @@ fn activity_subscription_snapshot_covers_all_matching_sessions() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags,
+                environment: Vec::new(),
             })
             .expect("create session");
     }
@@ -1206,6 +1255,7 @@ fn activity_subscription_emits_threshold_transitions() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec![selector.clone()],
+                environment: Vec::new(),
             },
         )
         .expect("create alpha");
@@ -1261,6 +1311,7 @@ fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_sna
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags,
+                environment: Vec::new(),
             })
             .expect("create session");
     }
@@ -1279,6 +1330,7 @@ fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_sna
             initial_size: TerminalSize::default(),
             colors: cleat::vt::TerminalColors::default(),
             tags: vec![selector.clone()],
+            environment: Vec::new(),
         })
         .expect("create gamma");
     let ActivityEvent::MembershipAdded { session: added, .. } = read_activity_event(&mut stream, Duration::from_secs(2)) else {

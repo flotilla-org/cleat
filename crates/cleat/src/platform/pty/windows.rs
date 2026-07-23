@@ -49,7 +49,7 @@ impl PtyChild {
     pub fn spawn_with_ambient(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Self, String> {
         let pipes = Pipes::new()?;
         let conpty = create_pseudo_console(session.initial_size.cols, session.initial_size.rows, pipes.input_read, pipes.output_write)?;
-        let process = spawn_with_conpty(&windows_shell_command(session), conpty, session.cwd.as_ref(), coordinates)?;
+        let process = spawn_with_conpty(&windows_shell_command(session), conpty, session, coordinates)?;
         unsafe {
             CloseHandle(pipes.input_read);
             CloseHandle(pipes.output_write);
@@ -258,7 +258,7 @@ fn create_pseudo_console(cols: u16, rows: u16, input: HANDLE, output: HANDLE) ->
 fn spawn_with_conpty(
     command_line: &str,
     conpty: HPCON,
-    cwd: Option<&PathBuf>,
+    session: &SessionMetadata,
     coordinates: Option<&AmbientSessionCoordinates>,
 ) -> Result<PROCESS_INFORMATION, String> {
     let mut attr_size = 0;
@@ -302,12 +302,11 @@ fn spawn_with_conpty(
 
     let mut process_info: PROCESS_INFORMATION = unsafe { zeroed() };
     let mut command_line = wide_null(command_line);
-    let cwd = cwd.map(|path| wide_null(&path.to_string_lossy()));
+    let cwd = session.cwd.as_ref().map(|path| wide_null(&path.to_string_lossy()));
     let cwd_ptr = cwd.as_ref().map(|value| value.as_ptr()).unwrap_or_else(null);
-    let mut environment = coordinates.map(child_environment_block).transpose()?;
-    let environment_ptr = environment.as_mut().map(|block| block.as_mut_ptr().cast::<c_void>()).unwrap_or_else(null_mut);
-    let creation_flags =
-        EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP | if environment.is_some() { CREATE_UNICODE_ENVIRONMENT } else { 0 };
+    let mut environment = child_environment_block(session, coordinates)?;
+    let environment_ptr = environment.as_mut_ptr().cast::<c_void>();
+    let creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
 
     let created = unsafe {
         CreateProcessW(
@@ -335,11 +334,29 @@ fn spawn_with_conpty(
     }
 }
 
-fn child_environment_block(coordinates: &AmbientSessionCoordinates) -> Result<Vec<u16>, String> {
+fn child_environment_block(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Vec<u16>, String> {
     let mut variables: Vec<(OsString, OsString)> = env::vars_os()
-        .filter(|(key, _)| !AMBIENT_COORDINATE_ENV_NAMES.iter().any(|name| key.eq_ignore_ascii_case(OsStr::new(name))))
+        .filter(|(key, _)| {
+            !key.eq_ignore_ascii_case(OsStr::new("TERM"))
+                && !session.environment.iter().any(|(name, _)| key.eq_ignore_ascii_case(OsStr::new(name)))
+                && !coordinates.is_some_and(|_| AMBIENT_COORDINATE_ENV_NAMES.iter().any(|name| key.eq_ignore_ascii_case(OsStr::new(name))))
+        })
         .collect();
-    variables.extend(coordinates.child_environment().map(|(name, value)| (OsString::from(name), value.to_os_string())));
+    if !session.environment.iter().any(|(name, _)| name.eq_ignore_ascii_case("TERM")) {
+        variables.push((OsString::from("TERM"), OsString::from(session.vt_engine.terminal_name())));
+    }
+    for (index, (name, value)) in session.environment.iter().enumerate() {
+        if name.is_empty() || name.contains('=') {
+            return Err("environment name must be non-empty and contain no '='".to_string());
+        }
+        if session.environment[index + 1..].iter().any(|(later, _)| later.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        variables.push((OsString::from(name), OsString::from(value)));
+    }
+    if let Some(coordinates) = coordinates {
+        variables.extend(coordinates.child_environment().map(|(name, value)| (OsString::from(name), value.to_os_string())));
+    }
     variables
         .sort_by(|(left, _), (right, _)| left.to_string_lossy().to_ascii_lowercase().cmp(&right.to_string_lossy().to_ascii_lowercase()));
 

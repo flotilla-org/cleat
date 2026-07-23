@@ -399,7 +399,7 @@ impl ChildExecSpec {
             argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
             argv.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
         }
-        let envp = child_envp_from(env::vars_os(), coordinates)?;
+        let envp = child_envp_from(env::vars_os(), session.vt_engine, &session.environment, coordinates)?;
         let cwd = session.cwd.as_ref().map(|cwd| cstring_from_os(cwd.as_os_str(), "cwd contains interior nul")).transpose()?;
         let argv_ptrs = null_terminated_ptrs(&argv);
         let envp_ptrs = null_terminated_ptrs(&envp);
@@ -449,16 +449,20 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 fn filtered_envp_from(env: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Vec<CString>, String> {
-    child_envp_from(env, None)
+    child_envp_from(env, crate::vt::VtEngineKind::Passthrough, &[], None)
 }
 
 fn child_envp_from(
     env: impl IntoIterator<Item = (OsString, OsString)>,
+    vt_engine: crate::vt::VtEngineKind,
+    overrides: &[(String, String)],
     coordinates: Option<&AmbientSessionCoordinates>,
 ) -> Result<Vec<CString>, String> {
     let mut envp = Vec::new();
     for (key, value) in env {
         if STRIP_ENV_VARS.iter().any(|strip| key == OsStr::new(strip))
+            || key == OsStr::new("TERM")
+            || overrides.iter().any(|(name, _)| key == OsStr::new(name))
             || coordinates.is_some() && AMBIENT_COORDINATE_ENV_NAMES.iter().any(|ambient| key == OsStr::new(ambient))
         {
             continue;
@@ -468,6 +472,20 @@ fn child_envp_from(
         entry.push(b'=');
         entry.extend_from_slice(value.as_bytes());
         envp.push(CString::new(entry).map_err(|_| "environment contains interior nul".to_string())?);
+    }
+    if !overrides.iter().any(|(name, _)| name == "TERM") {
+        envp.push(
+            CString::new(format!("TERM={}", vt_engine.terminal_name())).map_err(|_| "terminal name contains interior nul".to_string())?,
+        );
+    }
+    for (index, (name, value)) in overrides.iter().enumerate() {
+        if name.is_empty() || name.contains('=') {
+            return Err("environment name must be non-empty and contain no '='".to_string());
+        }
+        if overrides[index + 1..].iter().any(|(later, _)| later == name) {
+            continue;
+        }
+        envp.push(CString::new(format!("{name}={value}")).map_err(|_| "environment override contains interior nul".to_string())?);
     }
     if let Some(coordinates) = coordinates {
         for (key, value) in coordinates.child_environment() {
@@ -649,15 +667,32 @@ mod tests {
             (OsString::from("SSH_CONNECTION"), OsString::from("client server")),
             (OsString::from("SSH_CLIENT"), OsString::from("client")),
             (OsString::from("CLEAT_KEEP"), OsString::from("1")),
+            (OsString::from("TERM"), OsString::from("vt100")),
         ])
         .expect("filtered envp");
         let entries: Vec<_> = envp.iter().map(|entry| entry.to_str().expect("utf8 env")).collect();
 
         assert!(entries.contains(&"PATH=/bin"));
         assert!(entries.contains(&"CLEAT_KEEP=1"));
+        assert!(entries.contains(&"TERM=xterm-256color"));
+        assert!(!entries.contains(&"TERM=vt100"));
         assert!(!entries.iter().any(|entry| entry.starts_with("SSH_TTY=")));
         assert!(!entries.iter().any(|entry| entry.starts_with("SSH_CONNECTION=")));
         assert!(!entries.iter().any(|entry| entry.starts_with("SSH_CLIENT=")));
+    }
+
+    #[test]
+    fn child_exec_env_uses_explicit_term_override() {
+        let envp = super::child_envp_from(
+            [(OsString::from("TERM"), OsString::from("vt100"))],
+            VtEngineKind::Passthrough,
+            &[("TERM".to_string(), "screen-256color".to_string())],
+            None,
+        )
+        .expect("child environment");
+        let entries: Vec<_> = envp.iter().map(|entry| entry.to_str().expect("utf8 env")).collect();
+
+        assert_eq!(entries, vec!["TERM=screen-256color"]);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -671,6 +706,7 @@ mod tests {
             cwd: None,
             cmd: Some("sleep 0.2; printf READY; sleep 0.2".to_string()),
             tags: Vec::new(),
+            environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
             colors: TerminalColors::default(),
@@ -698,6 +734,7 @@ mod tests {
             cwd: None,
             cmd: Some("sleep 5".to_string()),
             tags: Vec::new(),
+            environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
             colors: TerminalColors::default(),

@@ -158,6 +158,7 @@ impl SessionService {
             initial_size,
             colors: crate::vt::TerminalColors::default(),
             tags: Vec::new(),
+            environment: Vec::new(),
         })
     }
 
@@ -555,6 +556,7 @@ impl SessionService {
                 initial_size: TerminalSize::default(),
                 colors: crate::vt::TerminalColors::default(),
                 tags: Vec::new(),
+                environment: Vec::new(),
             }
         } else {
             ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions::default())?

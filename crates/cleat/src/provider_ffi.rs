@@ -2169,6 +2169,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         initial_size: TerminalSize { cols, rows },
         colors,
         tags,
+        environment: Vec::new(),
     })?;
     let (channel, slot) = connection.open_session_channel(metadata.id.clone(), cols, rows, channel_role_from_ffi(desc.role)?);
     Ok(DaemonSession { id: metadata.id, connection: Arc::clone(connection), channel, slot })

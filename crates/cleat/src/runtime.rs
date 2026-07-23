@@ -43,6 +43,9 @@ pub struct SessionMetadata {
     pub cmd: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Explicit environment entries supplied when the session was launched.
+    #[serde(default)]
+    pub environment: Vec<(String, String)>,
     pub record: bool,
     pub initial_size: TerminalSize,
     pub colors: TerminalColors,
@@ -179,6 +182,7 @@ impl RuntimeLayout {
             cwd,
             cmd,
             tags: Vec::new(),
+            environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
             colors: TerminalColors::default(),

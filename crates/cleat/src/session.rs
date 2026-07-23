@@ -1318,6 +1318,8 @@ fn service_hosted_session(
             }
         }
 
+        coalesce_resize_bursts(&mut pending);
+
         while let Some(frame) = pending.pop_front() {
             did_work = true;
             match frame {
@@ -1367,6 +1369,31 @@ fn service_hosted_session(
     // round-trip here (ADR 0004: the servicing side is never blocked).
 
     Ok(did_work)
+}
+
+/// A terminal drag generates a run of resize frames, but only the final size
+/// is meaningful until an input frame establishes an ordering boundary. Each
+/// resize synchronously pumps the PTY actor, so applying every intermediate
+/// size can fill the raw-output tap before the daemon returns to drain it.
+fn coalesce_resize_bursts(pending: &mut VecDeque<Frame>) {
+    let mut coalesced = VecDeque::with_capacity(pending.len());
+    let mut latest_resize = None;
+
+    while let Some(frame) = pending.pop_front() {
+        match frame {
+            Frame::Resize { .. } => latest_resize = Some(frame),
+            frame => {
+                if let Some(resize) = latest_resize.take() {
+                    coalesced.push_back(resize);
+                }
+                coalesced.push_back(frame);
+            }
+        }
+    }
+    if let Some(resize) = latest_resize {
+        coalesced.push_back(resize);
+    }
+    *pending = coalesced;
 }
 
 /// Whether a screen-stable wait needs a fresh full-grid fingerprint. An
@@ -3002,6 +3029,7 @@ fn http_error_message(response: http_uds::HttpResponse) -> String {
 mod tests {
     use std::{
         cell::RefCell,
+        collections::VecDeque,
         io::Write,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
@@ -3358,6 +3386,29 @@ mod tests {
             crate::protocol::Frame::Output(b"line2\n".to_vec()),
             crate::protocol::Frame::Output(b"line3\n".to_vec())
         ]);
+    }
+
+    #[test]
+    fn resize_burst_is_coalesced_to_the_latest_geometry_without_reordering_input() {
+        let mut frames = VecDeque::from([
+            crate::protocol::Frame::Resize { cols: 94, rows: 24 },
+            crate::protocol::Frame::Resize { cols: 95, rows: 30 },
+            crate::protocol::Frame::Resize { cols: 99, rows: 48 },
+            crate::protocol::Frame::Input(b"x".to_vec()),
+            crate::protocol::Frame::Resize { cols: 100, rows: 49 },
+            crate::protocol::Frame::Resize { cols: 101, rows: 50 },
+        ]);
+
+        super::coalesce_resize_bursts(&mut frames);
+
+        assert_eq!(
+            frames,
+            VecDeque::from([
+                crate::protocol::Frame::Resize { cols: 99, rows: 48 },
+                crate::protocol::Frame::Input(b"x".to_vec()),
+                crate::protocol::Frame::Resize { cols: 101, rows: 50 },
+            ])
+        );
     }
 
     struct FakeRawOutputRecoverySource {

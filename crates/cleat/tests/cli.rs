@@ -267,6 +267,11 @@ fn launch_command_rejects_malformed_environment_entry() {
 }
 
 #[test]
+fn launch_command_rejects_reserved_environment_entry() {
+    assert!(Cli::try_parse_from(["cleat", "launch", "demo", "--env", "CLEAT_DAEMON=other"]).is_err());
+}
+
+#[test]
 fn launch_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
     assert_eq!(cli.command, Command::Launch {

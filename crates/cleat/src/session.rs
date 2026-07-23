@@ -291,6 +291,7 @@ fn start_session(
     vt_engine.ensure_available()?;
     let id = id.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
     crate::runtime::validate_runtime_name(&id)?;
+    crate::runtime::validate_environment(&options.environment)?;
     let mut session = layout.session_metadata(id, vt_engine, cwd, cmd);
     session.record = options.record;
     session.initial_size = options.initial_size;
@@ -1641,6 +1642,7 @@ fn handle_http_request(
             let session: SessionMetadata =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP session create request: {err}"))?;
             crate::runtime::validate_runtime_name(&session.id)?;
+            crate::runtime::validate_environment(&session.environment)?;
             session.vt_engine.ensure_available()?;
             let mut created = false;
             if !state.sessions.contains_key(&session.id) {

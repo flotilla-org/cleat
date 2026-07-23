@@ -1325,13 +1325,9 @@ fn parse_signal_target(target: &str) -> Result<crate::protocol::SignalTarget, St
 
 fn parse_environment(value: &str) -> Result<(String, String), String> {
     let (name, value) = value.split_once('=').ok_or_else(|| "environment must use NAME=VALUE".to_string())?;
-    if name.is_empty() || name.contains('\0') || name.contains('=') {
-        return Err("environment name must be non-empty and contain neither '=' nor NUL".to_string());
-    }
-    if value.contains('\0') {
-        return Err("environment value must not contain NUL".to_string());
-    }
-    Ok((name.to_string(), value.to_string()))
+    let environment = (name.to_string(), value.to_string());
+    crate::runtime::validate_environment(std::slice::from_ref(&environment))?;
+    Ok(environment)
 }
 
 fn parse_terminal_size(value: &str) -> Result<TerminalSize, String> {

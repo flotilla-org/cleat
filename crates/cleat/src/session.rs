@@ -198,7 +198,11 @@ fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: 
             write!(writer, "\x1b[1;{}r", rows - 1).map_err(|err| format!("reserve watcher banner row: {err}"))?;
         }
         write!(writer, "\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("position watcher banner: {err}"))?;
-        let controller = state.controller.as_ref().map(AttachmentIdentity::display_name).unwrap_or("none");
+        let controller = state
+            .controller
+            .as_ref()
+            .map(|identity| sanitize_attachment_name(identity.display_name()))
+            .unwrap_or_else(|| "none".to_string());
         write!(writer, "\x1b[7m watching — controller: {controller} \x1b[0m").map_err(|err| format!("write watcher banner: {err}"))?;
     } else {
         write!(writer, "\x1b[r\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("clear watcher banner: {err}"))?;
@@ -207,10 +211,18 @@ fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: 
 }
 
 fn normalize_attachment_identity(mut identity: AttachmentIdentity) -> AttachmentIdentity {
-    if identity.name.trim().is_empty() {
-        identity.name = "unknown".to_string();
-    }
+    identity.name = sanitize_attachment_name(&identity.name);
     identity
+}
+
+fn sanitize_attachment_name(name: &str) -> String {
+    let name = name.chars().filter(|character| !character.is_control()).take(128).collect::<String>();
+    let name = name.trim();
+    if name.is_empty() {
+        "unknown".to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 fn is_graceful_socket_shutdown(err: &std::io::Error) -> bool {
@@ -2612,13 +2624,6 @@ fn grant_packet_role(
                         if let Some(session_channel) = client.channels.get_mut(&current.channel) {
                             session_channel.role = ChannelRole::Watcher;
                         }
-                        client.enqueue_frame(
-                            &PacketFrame::new(current.channel, MSG_SESSION_ROLE, &RoleState {
-                                role: ChannelRole::Watcher,
-                                controller: None,
-                            })
-                            .map_err(|err| format!("encode role demotion packet: {err}"))?,
-                        )?;
                         break;
                     }
                     hosted.packet_controller = Some(requester);
@@ -2731,7 +2736,7 @@ fn apply_packet_role_request(
     let Some(hosted) = sessions.get_mut(&session_id) else {
         return Ok(());
     };
-    let previous_controller = controller_identity(hosted, packet_clients);
+    let previous_controller = (hosted.active_client.is_some(), hosted.packet_controller);
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel };
     let granted = grant_packet_role(hosted, packet_clients, requester, request.role, request.take)?;
     let controller = controller_identity(hosted, packet_clients);
@@ -2747,7 +2752,7 @@ fn apply_packet_role_request(
         updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
     }
     if let Some(hosted) = sessions.get_mut(&session_id) {
-        if controller_identity(hosted, packet_clients) != previous_controller {
+        if (hosted.active_client.is_some(), hosted.packet_controller) != previous_controller {
             announce_seat_state_except(hosted, packet_clients, Some(requester))?;
         }
     }
@@ -2792,7 +2797,7 @@ fn open_packet_channel(
             return Ok(());
         }
     };
-    let previous_controller = controller_identity(hosted, packet_clients);
+    let previous_controller = (hosted.active_client.is_some(), hosted.packet_controller);
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel: open.channel };
     let granted = grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?;
     let session_id = open.session_id;
@@ -2820,7 +2825,7 @@ fn open_packet_channel(
         updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
     }
     if let Some(hosted) = sessions.get_mut(&session_id) {
-        if controller_identity(hosted, packet_clients) != previous_controller {
+        if (hosted.active_client.is_some(), hosted.packet_controller) != previous_controller {
             announce_seat_state_except(hosted, packet_clients, Some(requester))?;
         }
     }
@@ -3345,6 +3350,29 @@ mod tests {
         assert!(output.contains("\u{1b}[1;23r"));
         assert!(output.contains("\u{1b}[24;1H"));
         assert!(output.contains("watching — controller: crew-runner"));
+    }
+
+    #[test]
+    fn watcher_chrome_strips_control_sequences_from_controller_identity() {
+        let mut output = Vec::new();
+        super::render_seat_chrome_at_rows(
+            &mut output,
+            &crate::protocol::SeatState {
+                role: "watcher".to_string(),
+                controller: Some(crate::protocol::AttachmentIdentity {
+                    kind: crate::protocol::AttachmentKind::Tool,
+                    name: "bad\u{1b}]2;injected\u{7}\nname".to_string(),
+                }),
+            },
+            24,
+        )
+        .expect("render sanitized watcher chrome");
+
+        let output = String::from_utf8(output).expect("watcher chrome is utf8");
+        assert!(!output.contains("\u{1b}]2;injected"));
+        assert!(!output.contains('\u{7}'));
+        assert!(!output.contains('\n'));
+        assert!(output.contains("watching — controller: bad]2;injectedname"));
     }
 
     #[test]

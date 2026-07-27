@@ -33,6 +33,7 @@ use crate::{
         PROTOCOL_VERSION,
     },
     platform::ipc::{try_connect_session_stream, SessionStream},
+    protocol::AttachmentIdentity,
     provider::{
         DirtyState, TerminalCursor, TerminalInputEvent, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalScrollbarState,
         TerminalViewportKind,
@@ -135,6 +136,7 @@ pub(crate) struct ChannelSlot {
     /// Role the caller wants; requested on every (re)open with take=false —
     /// control lost across a disconnect is re-taken explicitly, not silently.
     pub desired_role: ChannelRole,
+    pub identity: AttachmentIdentity,
     /// Role the daemon granted (None until the first RoleState arrives).
     pub granted_role: Option<ChannelRole>,
     /// Set when the daemon reported an error for this channel (e.g. the
@@ -262,6 +264,7 @@ impl DaemonConnection {
         cols: u16,
         rows: u16,
         role: ChannelRole,
+        identity: AttachmentIdentity,
     ) -> (u32, Arc<Mutex<ChannelSlot>>) {
         let slot = Arc::new(Mutex::new(ChannelSlot {
             session_id: session_id.clone(),
@@ -270,6 +273,7 @@ impl DaemonConnection {
             desired_cols: cols,
             desired_rows: rows,
             desired_role: role,
+            identity: identity.clone(),
             granted_role: None,
             closed: None,
         }));
@@ -281,7 +285,7 @@ impl DaemonConnection {
             (channel, state.connected)
         };
         if connected {
-            let _ = self.send_open_frame(channel, &session_id, cols, rows, role);
+            let _ = self.send_open_frame(channel, &session_id, cols, rows, role, &identity);
         } else {
             // The caller may have just spawned the daemon (session create);
             // cut the reconnect backoff short.
@@ -347,12 +351,21 @@ impl DaemonConnection {
         self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_ACK, &crate::packet::Ack { generation }))
     }
 
-    fn send_open_frame(&self, channel: u32, session_id: &str, cols: u16, rows: u16, role: ChannelRole) -> Result<(), String> {
+    fn send_open_frame(
+        &self,
+        channel: u32,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        role: ChannelRole,
+        identity: &AttachmentIdentity,
+    ) -> Result<(), String> {
         self.send_frame_result(PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
             channel,
             session_id: session_id.to_string(),
             role,
             take: false,
+            identity: identity.clone(),
         }))?;
         // The daemon does not resize on channel open; assert the size this
         // client wants so a session created detached comes up at view size.
@@ -423,7 +436,7 @@ impl DaemonConnection {
             let mut state = recover_lock(&self.state);
             state.connected = true;
             state.directory.replace(snapshot);
-            let reopen: Vec<(u32, String, u16, u16, ChannelRole)> = state
+            let reopen: Vec<(u32, String, u16, u16, ChannelRole, AttachmentIdentity)> = state
                 .channels
                 .iter()
                 .filter_map(|(channel, slot)| {
@@ -436,13 +449,20 @@ impl DaemonConnection {
                     }
                     // the old grant died with the connection
                     slot.granted_role = None;
-                    Some((*channel, slot.session_id.clone(), slot.desired_cols, slot.desired_rows, slot.desired_role))
+                    Some((
+                        *channel,
+                        slot.session_id.clone(),
+                        slot.desired_cols,
+                        slot.desired_rows,
+                        slot.desired_role,
+                        slot.identity.clone(),
+                    ))
                 })
                 .collect();
             (reopen, std::mem::take(&mut state.queued_input))
         };
-        for (channel, session_id, cols, rows, role) in reopen {
-            let _ = self.send_open_frame(channel, &session_id, cols, rows, role);
+        for (channel, session_id, cols, rows, role, identity) in reopen {
+            let _ = self.send_open_frame(channel, &session_id, cols, rows, role, &identity);
         }
         for frame in queued_input {
             let _ = self.send_frame_result(Ok(frame));
@@ -666,6 +686,7 @@ mod tests {
             state: "running".to_string(),
             controller_count: 0,
             watcher_count: 0,
+            controller: None,
             recreatable: false,
             cols: 80,
             rows: 24,
@@ -702,14 +723,16 @@ mod tests {
         wait_until(|| connection.is_connected());
         assert_eq!(connection.with_directory(|directory| directory.entries.len()), 1);
 
-        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 100, 40, ChannelRole::Controller);
+        let (channel, slot) =
+            connection.open_session_channel("alpha".to_string(), 100, 40, ChannelRole::Controller, AttachmentIdentity::default());
         let open = PacketFrame::read(&mut server).expect("open frame");
         assert_eq!((open.channel, open.msg_type), (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL));
         assert_eq!(open.decode::<OpenChannel>().expect("open payload"), OpenChannel {
             channel,
             session_id: "alpha".to_string(),
             role: ChannelRole::Controller,
-            take: false
+            take: false,
+            identity: AttachmentIdentity::default(),
         });
         let resize = PacketFrame::read(&mut server).expect("resize frame");
         assert_eq!((resize.channel, resize.msg_type), (channel, MSG_SESSION_RESIZE));
@@ -748,7 +771,8 @@ mod tests {
 
         let mut server = daemon.accept(vec![directory_entry("alpha")]);
         wait_until(|| connection.is_connected());
-        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller);
+        let (channel, slot) =
+            connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller, AttachmentIdentity::default());
         let _open = PacketFrame::read(&mut server).expect("open frame");
         let _resize = PacketFrame::read(&mut server).expect("resize frame");
 
@@ -769,7 +793,8 @@ mod tests {
             channel,
             session_id: "alpha".to_string(),
             role: ChannelRole::Controller,
-            take: false
+            take: false,
+            identity: AttachmentIdentity::default(),
         });
         let resize = PacketFrame::read(&mut server).expect("resize frame");
         assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 120, rows: 50 });
@@ -788,8 +813,10 @@ mod tests {
 
         let mut server = daemon.accept(vec![directory_entry("alpha"), directory_entry("beta")]);
         wait_until(|| connection.is_connected());
-        let (closed_channel, closed_slot) = connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller);
-        let (live_channel, _live_slot) = connection.open_session_channel("beta".to_string(), 80, 24, ChannelRole::Controller);
+        let (closed_channel, closed_slot) =
+            connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller, AttachmentIdentity::default());
+        let (live_channel, _live_slot) =
+            connection.open_session_channel("beta".to_string(), 80, 24, ChannelRole::Controller, AttachmentIdentity::default());
         for _ in 0..4 {
             PacketFrame::read(&mut server).expect("initial open/resize frames");
         }
@@ -816,7 +843,8 @@ mod tests {
             channel: live_channel,
             session_id: "beta".to_string(),
             role: ChannelRole::Controller,
-            take: false
+            take: false,
+            identity: AttachmentIdentity::default(),
         });
         let resize = PacketFrame::read(&mut server).expect("resize frame");
         assert_eq!((resize.channel, resize.msg_type), (live_channel, MSG_SESSION_RESIZE));
@@ -870,7 +898,8 @@ mod tests {
     fn poisoned_client_mutexes_do_not_cascade_panics() {
         let (_temp, layout) = test_layout();
         let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
-        let (channel, slot) = connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller);
+        let (channel, slot) =
+            connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller, AttachmentIdentity::default());
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _state = connection.state.lock().expect("state lock");

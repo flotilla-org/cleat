@@ -1,6 +1,7 @@
 use clap::CommandFactory;
 use cleat::{
-    cli::{self, execute, resolve_daemon_target, Cli, Command, ExecResult, RecordFlags},
+    cli::{self, execute, resolve_daemon_target, AttachmentFlags, Cli, Command, ExecResult, RecordFlags},
+    protocol::AttachmentKind,
     runtime::{RuntimeLayout, TerminalSize},
     server::SessionService,
     session::session_socket_path,
@@ -122,6 +123,9 @@ fn attach_command_parses() {
         vt: None,
         cwd: None,
         cmd: None,
+        strict: false,
+        take: false,
+        attachment: AttachmentFlags::default(),
         record: RecordFlags::default()
     });
 }
@@ -135,6 +139,9 @@ fn attach_command_parses_no_create() {
         vt: None,
         cwd: None,
         cmd: None,
+        strict: false,
+        take: false,
+        attachment: AttachmentFlags::default(),
         record: RecordFlags::default()
     });
 }
@@ -148,6 +155,9 @@ fn attach_command_parses_vt() {
         vt: Some(VtEngineKind::Passthrough),
         cwd: None,
         cmd: None,
+        strict: false,
+        take: false,
+        attachment: AttachmentFlags::default(),
         record: RecordFlags::default()
     });
 }
@@ -155,7 +165,30 @@ fn attach_command_parses_vt() {
 #[test]
 fn watch_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "watch", "demo"]).expect("watch parses");
-    assert_eq!(cli.command, Command::Watch { id: "demo".into() });
+    assert_eq!(cli.command, Command::Watch { id: "demo".into(), attachment: AttachmentFlags::default() });
+}
+
+#[test]
+fn attach_command_parses_seat_control_and_identity_flags() {
+    let cli = Cli::try_parse_from(["cleat", "attach", "--take", "--identity", "crew-runner", "--identity-kind", "supervisor", "demo"])
+        .expect("attach seat flags parse");
+    assert!(matches!(
+        cli.command,
+        Command::Attach {
+            take: true,
+            strict: false,
+            attachment: AttachmentFlags {
+                identity: Some(ref name),
+                identity_kind: AttachmentKind::Supervisor,
+            },
+            ..
+        } if name == "crew-runner"
+    ));
+}
+
+#[test]
+fn attach_command_rejects_strict_with_take() {
+    assert!(Cli::try_parse_from(["cleat", "attach", "--strict", "--take", "demo"]).is_err());
 }
 
 #[test]

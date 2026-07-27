@@ -53,7 +53,7 @@ cleat kill build                     # ends it; recording survives
 | Wait for readiness | `wait <id> --text "str" --screen-stable 30 --idle-time 5 --timeout 600` — conditions OR together |
 | Structured state | `inspect <id>` — size, leader pid, **foreground pgid** (`fg_pgid != leader_pid` ⇒ a command is running), attachments, recording |
 | Recorded output since a point | `mark <id> name` … `transcript <id> --since-marker name` ; `expect <id> "text"` blocks on recorded output |
-| Interactive use (human) | `attach <id>` (controller), `watch <id>` (read-only) |
+| Interactive use (human) | `attach <id>` (controller, or automatic watcher fallback), `attach --take <id>` (claim control), `watch <id>` (read-only) |
 | Signals | `interrupt <id>` (byte Ctrl-C) vs `signal <id> INT` (real signal, `--target foreground|leader`; `tree` not yet implemented) |
 | End it | `kill <id>` — **recording is preserved**; `kill --purge` discards |
 | Enumerate | `list [--selector k=v]... [--watch] [--all]` |
@@ -187,9 +187,12 @@ section is the honest way to work remotely.
   real terminal. Programs that branch on capability detection can behave
   differently detached vs attached; recordings faithfully capture whichever
   actually happened.
-- **Controller vs watcher**: one controller (input + resize) at a time;
-  watchers are read-only and never affect the session. A watcher smaller
-  than the session grid sees wrap artifacts (byte-tee limitation).
+- **Controller vs watcher**: one controller (input + resize) at a time.
+  A plain `attach` falls back to watcher when that seat is occupied;
+  `attach --strict` refuses, while `attach --take` demotes the holder without
+  disconnecting it. Watchers are read-only and never affect the session. A
+  watcher smaller than the session grid sees wrap artifacts (byte-tee
+  limitation).
 - **The passthrough engine is test-only.** A functional binary is built
   with `--features ghostty-vt`; `capture`/`wait --text` error on
   passthrough builds.

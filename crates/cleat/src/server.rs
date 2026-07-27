@@ -14,7 +14,7 @@ use crate::{
         daemon::is_session_daemon_alive,
         ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
-    protocol::{SessionInfo, SessionStatus},
+    protocol::{AttachmentIdentity, SessionInfo, SessionStatus},
     runtime::{discoverable_runtime_roots, validate_runtime_name, DaemonCoordinates, RuntimeLayout, TerminalSize},
     session::{
         attach_foreground, ensure_session_started, run_session_daemon, start_session_in_running_daemon, watch_foreground, ForegroundAttach,
@@ -68,6 +68,13 @@ pub struct SessionService {
 pub struct DaemonInstance {
     name: String,
     pid: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttachOptions {
+    pub identity: AttachmentIdentity,
+    pub strict: bool,
+    pub take: bool,
 }
 
 impl DaemonInstance {
@@ -207,6 +214,7 @@ impl SessionService {
             screen_activity: crate::protocol::ScreenActivity::Stable,
             stable_since: None,
             last_output_at: None,
+            controller: None,
             error: None,
         }
     }
@@ -332,6 +340,7 @@ impl SessionService {
                         screen_activity: result.screen_activity,
                         stable_since: result.stable_since,
                         last_output_at: result.last_output_at,
+                        controller: controller_identity(&result.attachments),
                         error: None,
                     };
                     if session_matches_selectors(&info, selectors) {
@@ -533,6 +542,7 @@ impl SessionService {
         cwd: Option<std::path::PathBuf>,
         cmd: Option<String>,
         no_create: bool,
+        options: AttachOptions,
     ) -> Result<(SessionInfo, ForegroundAttach), String> {
         let session = if no_create {
             let id = name.ok_or_else(|| "attach --no-create requires a session id".to_string())?;
@@ -577,18 +587,19 @@ impl SessionService {
                 screen_activity: crate::protocol::ScreenActivity::Stable,
                 stable_since: None,
                 last_output_at: None,
+                controller: None,
                 error: None,
             }
         };
-        let attach = attach_foreground(&self.layout, &info.id)?;
+        let attach = attach_foreground(&self.layout, &info.id, options.identity, options.strict, options.take)?;
         Ok((info, attach))
     }
 
-    pub fn watch(&self, id: &str) -> Result<ForegroundAttach, String> {
+    pub fn watch(&self, id: &str, identity: AttachmentIdentity) -> Result<ForegroundAttach, String> {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        watch_foreground(&self.layout, id)
+        watch_foreground(&self.layout, id, identity)
     }
 
     pub fn connect_packets(
@@ -912,6 +923,7 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
             screen_activity: crate::protocol::ScreenActivity::Stable,
             stable_since: None,
             last_output_at: None,
+            controller: None,
             error: Some(err.clone()),
         });
     }
@@ -988,12 +1000,17 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         screen_activity: result.screen_activity,
         stable_since: result.stable_since,
         last_output_at: result.last_output_at,
+        controller: controller_identity(&result.attachments),
         error: None,
     }
 }
 
 fn has_controller_attachment(attachments: &[crate::protocol::AttachmentInspect]) -> bool {
     attachments.iter().any(|attachment| attachment.role == "controller")
+}
+
+fn controller_identity(attachments: &[crate::protocol::AttachmentInspect]) -> Option<AttachmentIdentity> {
+    attachments.iter().find(|attachment| attachment.role == "controller").map(|attachment| attachment.identity.clone())
 }
 
 fn signal_target_to_http(target: crate::protocol::SignalTarget) -> http_uds::SignalTargetRequest {

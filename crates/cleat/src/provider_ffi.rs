@@ -9,6 +9,7 @@ use std::{
 use crate::{
     host::actor::{ObservationState, SessionActor, SessionCommand, SessionMouseEvent, SessionWheelEvent},
     keys,
+    protocol::{AttachmentIdentity, AttachmentKind},
     provider::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
         TerminalFocusEvent, TerminalGeometry, TerminalImagePlacement, TerminalImageResource, TerminalInputEvent, TerminalModifiers,
@@ -24,7 +25,7 @@ use crate::{
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 7;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 8;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -38,6 +39,9 @@ pub const CLEAT_SESSION_CLOSED: u32 = 3;
 pub const CLEAT_ROLE_UNKNOWN: u32 = 0;
 pub const CLEAT_ROLE_WATCHER: u32 = 1;
 pub const CLEAT_ROLE_CONTROLLER: u32 = 2;
+pub const CLEAT_ATTACHMENT_PRINCIPAL: u32 = 0;
+pub const CLEAT_ATTACHMENT_SUPERVISOR: u32 = 1;
+pub const CLEAT_ATTACHMENT_TOOL: u32 = 2;
 pub const CLEAT_INPUT_KEY: u32 = 1;
 pub const CLEAT_INPUT_TEXT: u32 = 2;
 pub const CLEAT_INPUT_MOUSE: u32 = 3;
@@ -201,6 +205,11 @@ pub struct CleatSessionDesc {
     /// another controller holds the session); CLEAT_ROLE_WATCHER attaches
     /// read-only. Ignored by other backends.
     pub role: u32,
+    /// UTF-8 name used in seat status and watcher banners.
+    pub attachment_name: *const u8,
+    pub attachment_name_len: usize,
+    /// CLEAT_ATTACHMENT_PRINCIPAL / SUPERVISOR / TOOL.
+    pub attachment_kind: u32,
 }
 
 #[repr(C)]
@@ -1200,6 +1209,9 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         tags: ptr::null(),
         tag_count: 0,
         role: CLEAT_ROLE_UNKNOWN,
+        attachment_name: ptr::null(),
+        attachment_name_len: 0,
+        attachment_kind: CLEAT_ATTACHMENT_TOOL,
     });
     let geometry = TerminalGeometry::from_cell_size(desc.cols.max(1), desc.rows.max(1), desc.cell_width_px, desc.cell_height_px);
     let backend = match provider.backend {
@@ -2171,7 +2183,13 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         tags,
         environment: Vec::new(),
     })?;
-    let (channel, slot) = connection.open_session_channel(metadata.id.clone(), cols, rows, channel_role_from_ffi(desc.role)?);
+    let (channel, slot) = connection.open_session_channel(
+        metadata.id.clone(),
+        cols,
+        rows,
+        channel_role_from_ffi(desc.role)?,
+        attachment_identity_from_desc(desc)?,
+    );
     Ok(DaemonSession { id: metadata.id, connection: Arc::clone(connection), channel, slot })
 }
 
@@ -2180,8 +2198,13 @@ fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let id = read_optional_utf8(desc.id, desc.id_len)
         .map_err(|err| format!("id is not valid UTF-8: {err}"))?
         .ok_or_else(|| "attach requires a session id".to_string())?;
-    let (channel, slot) =
-        connection.open_session_channel(id.clone(), desc.cols.max(1), desc.rows.max(1), channel_role_from_ffi(desc.role)?);
+    let (channel, slot) = connection.open_session_channel(
+        id.clone(),
+        desc.cols.max(1),
+        desc.rows.max(1),
+        channel_role_from_ffi(desc.role)?,
+        attachment_identity_from_desc(desc)?,
+    );
     Ok(DaemonSession { id, connection: Arc::clone(connection), channel, slot })
 }
 
@@ -2191,6 +2214,20 @@ fn channel_role_from_ffi(role: u32) -> Result<crate::packet::ChannelRole, String
         CLEAT_ROLE_WATCHER => Ok(crate::packet::ChannelRole::Watcher),
         other => Err(format!("unsupported role tag {other}")),
     }
+}
+
+fn attachment_identity_from_desc(desc: CleatSessionDesc) -> Result<AttachmentIdentity, String> {
+    let name = read_optional_utf8(desc.attachment_name, desc.attachment_name_len)
+        .map_err(|err| format!("attachment name is not valid UTF-8: {err}"))?
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "provider".to_string());
+    let kind = match desc.attachment_kind {
+        CLEAT_ATTACHMENT_PRINCIPAL => AttachmentKind::Principal,
+        CLEAT_ATTACHMENT_SUPERVISOR => AttachmentKind::Supervisor,
+        CLEAT_ATTACHMENT_TOOL => AttachmentKind::Tool,
+        other => return Err(format!("unsupported attachment kind tag {other}")),
+    };
+    Ok(AttachmentIdentity { kind, name })
 }
 
 fn vt_engine_from_tag(tag: u32) -> Result<VtEngineKind, String> {

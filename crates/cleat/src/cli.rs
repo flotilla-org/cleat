@@ -5,9 +5,9 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::{
     http_uds,
     keys::encode_send_keys,
-    protocol::{WaitCondition, WaitStatus},
+    protocol::{AttachmentIdentity, AttachmentKind, WaitCondition, WaitStatus},
     runtime::{validate_runtime_name, TerminalSize, AMBIENT_DAEMON_ENV, DEFAULT_DAEMON_NAME},
-    server::{DaemonInstance, EndBound, FallbackReason, SessionService, StartBound},
+    server::{AttachOptions, DaemonInstance, EndBound, FallbackReason, SessionService, StartBound},
     vt::VtEngineKind,
 };
 
@@ -85,6 +85,28 @@ pub struct RecordFlags {
     pub no_record: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Args)]
+pub struct AttachmentFlags {
+    /// Name this attachment in seat status and watcher banners
+    #[arg(long, env = "CLEAT_ATTACHMENT_IDENTITY", value_name = "NAME")]
+    pub identity: Option<String>,
+    /// Describe what owns this attachment
+    #[arg(long = "identity-kind", env = "CLEAT_ATTACHMENT_KIND", value_parser = parse_attachment_kind, default_value = "principal")]
+    pub identity_kind: AttachmentKind,
+}
+
+impl AttachmentFlags {
+    fn resolve(self) -> AttachmentIdentity {
+        let name = self
+            .identity
+            .or_else(|| std::env::var("USER").ok())
+            .or_else(|| std::env::var("USERNAME").ok())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| format!("cleat-{}", std::process::id()));
+        AttachmentIdentity { kind: self.identity_kind, name }
+    }
+}
+
 impl RecordFlags {
     /// Resolve the effective recording setting. Default is on; `CLEAT_RECORD`
     /// provides a boolish opt-out baseline that an explicit flag overrides.
@@ -123,6 +145,10 @@ pub enum Command {
                            Unlike launch, attach enters interactive foreground mode — your terminal\n\
                            is connected to the session's PTY until you detach.\n\
                            \n\
+                           If another attachment holds control, attach falls back to read-only watch\n\
+                           mode. Use --strict to refuse instead, or --take to demote the holder and\n\
+                           claim control. --identity and --identity-kind name the attachment.\n\
+                           \n\
                            To detach, run 'cleat detach <ID>' from another terminal.")]
     Attach {
         #[arg(value_name = "ID")]
@@ -135,6 +161,12 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long, help = "Command to run (default: user's shell)")]
         cmd: Option<String>,
+        #[arg(long, conflicts_with = "take", help = "Fail when another attachment holds the controller seat")]
+        strict: bool,
+        #[arg(long, conflicts_with = "strict", help = "Take control and demote the current controller to watcher")]
+        take: bool,
+        #[command(flatten)]
+        attachment: AttachmentFlags,
         #[command(flatten)]
         record: RecordFlags,
     },
@@ -144,6 +176,8 @@ pub enum Command {
     Watch {
         #[arg(value_name = "ID")]
         id: String,
+        #[command(flatten)]
+        attachment: AttachmentFlags,
     },
     /// Subscribe to packet render updates and print debug summaries
     Packets {
@@ -528,7 +562,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     };
     let service = &service;
     match cli.command {
-        Command::Attach { id, no_create, vt, cwd, cmd, record } => {
+        Command::Attach { id, no_create, vt, cwd, cmd, strict, take, attachment, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -542,10 +576,11 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(handlers) => handlers,
                 Err(e) => return ExecResult::Err(e),
             };
-            let (attached, guard) = match service.attach(id, vt, cwd, cmd, no_create) {
-                Ok(v) => v,
-                Err(e) => return ExecResult::Err(e),
-            };
+            let (attached, guard) =
+                match service.attach(id, vt, cwd, cmd, no_create, AttachOptions { identity: attachment.resolve(), strict, take }) {
+                    Ok(v) => v,
+                    Err(e) => return ExecResult::Err(e),
+                };
             if record.enabled() {
                 if let Err(e) = service.record(&attached.id, true) {
                     return ExecResult::Err(e);
@@ -556,12 +591,12 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Watch { id } => {
+        Command::Watch { id, attachment } => {
             let signal_handlers = match crate::platform::terminal::AttachSignalHandlers::install() {
                 Ok(handlers) => handlers,
                 Err(e) => return ExecResult::Err(e),
             };
-            let guard = match service.watch(&id) {
+            let guard = match service.watch(&id, attachment.resolve()) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
@@ -1076,6 +1111,9 @@ fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
     if !session.tags.is_empty() {
         fields.push(format!("tags={}", session.tags.join(",")));
     }
+    if let Some(controller) = &session.controller {
+        fields.push(format!("controller={} ({})", controller.name, controller.kind.as_str()));
+    }
     fields.join("\t")
 }
 
@@ -1188,6 +1226,9 @@ fn format_directory_entry(entry: &crate::packet::DirectoryEntry) -> String {
         format!("watchers={}", entry.watcher_count),
         format!("recreatable={}", if entry.recreatable { "yes" } else { "no" }),
     ];
+    if let Some(controller) = &entry.controller {
+        fields.push(format!("controller={} ({})", controller.name, controller.kind.as_str()));
+    }
     if !entry.tags.is_empty() {
         fields.push(format!("tags={}", entry.tags.join(",")));
     }
@@ -1296,7 +1337,12 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
         table.add_row(vec!["fg_cwd", &cwd.display().to_string()]);
     }
     if !result.attachments.is_empty() {
-        let attachments = result.attachments.iter().map(|attachment| attachment.role.as_str()).collect::<Vec<_>>().join(", ");
+        let attachments = result
+            .attachments
+            .iter()
+            .map(|attachment| format!("{}: {} ({})", attachment.role, attachment.identity.name, attachment.identity.kind.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
         table.add_row(vec!["attachments", &attachments]);
     }
     table.add_row(vec!["recording", if result.recording.active { "active" } else { "off" }]);
@@ -1328,6 +1374,15 @@ fn parse_environment(value: &str) -> Result<(String, String), String> {
     let environment = (name.to_string(), value.to_string());
     crate::runtime::validate_environment(std::slice::from_ref(&environment))?;
     Ok(environment)
+}
+
+fn parse_attachment_kind(value: &str) -> Result<AttachmentKind, String> {
+    match value {
+        "principal" => Ok(AttachmentKind::Principal),
+        "supervisor" => Ok(AttachmentKind::Supervisor),
+        "tool" => Ok(AttachmentKind::Tool),
+        other => Err(format!("unknown attachment kind {other:?}; expected principal, supervisor, or tool")),
+    }
 }
 
 fn parse_terminal_size(value: &str) -> Result<TerminalSize, String> {

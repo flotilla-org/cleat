@@ -318,9 +318,15 @@ impl SessionRuntime {
         let foreground_pgid = self.pty_child.foreground_pgid();
         let mut attachments = Vec::new();
         if has_controller {
-            attachments.push(crate::protocol::AttachmentInspect { role: "controller".to_string() });
+            attachments.push(crate::protocol::AttachmentInspect {
+                role: "controller".to_string(),
+                identity: crate::protocol::AttachmentIdentity::default(),
+            });
         }
-        attachments.extend((0..watcher_count).map(|_| crate::protocol::AttachmentInspect { role: "watcher".to_string() }));
+        attachments.extend((0..watcher_count).map(|_| crate::protocol::AttachmentInspect {
+            role: "watcher".to_string(),
+            identity: crate::protocol::AttachmentIdentity::default(),
+        }));
 
         let activity = self.screen_activity.json_snapshot(Instant::now());
         InspectResult {

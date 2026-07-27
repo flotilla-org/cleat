@@ -86,6 +86,12 @@ pub(crate) struct AttachRequest {
     pub cols: u16,
     pub rows: u16,
     pub capabilities: AttachCapabilitiesRequest,
+    #[serde(default)]
+    pub identity: crate::protocol::AttachmentIdentity,
+    #[serde(default)]
+    pub take: bool,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

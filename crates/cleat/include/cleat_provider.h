@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 7u
+#define CLEAT_PROVIDER_ABI_VERSION 8u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -25,6 +25,9 @@ extern "C" {
 #define CLEAT_ROLE_UNKNOWN 0u
 #define CLEAT_ROLE_WATCHER 1u
 #define CLEAT_ROLE_CONTROLLER 2u
+#define CLEAT_ATTACHMENT_PRINCIPAL 0u
+#define CLEAT_ATTACHMENT_SUPERVISOR 1u
+#define CLEAT_ATTACHMENT_TOOL 2u
 #define CLEAT_INPUT_KEY 1u
 #define CLEAT_INPUT_TEXT 2u
 #define CLEAT_INPUT_MOUSE 3u
@@ -202,6 +205,13 @@ typedef struct cleat_session_desc {
      * read-only. The granted role is reported by cleat_session_role.
      */
     uint32_t role;
+    /*
+     * Daemon-backend attachment identity. The name is UTF-8 and paired with
+     * attachment_name_len; kind is one of CLEAT_ATTACHMENT_*.
+     */
+    const uint8_t *attachment_name;
+    size_t attachment_name_len;
+    uint32_t attachment_kind;
 } cleat_session_desc;
 
 /*

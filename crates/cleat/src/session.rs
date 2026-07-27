@@ -34,7 +34,7 @@ use crate::{
         },
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
-    protocol::Frame,
+    protocol::{AttachmentIdentity, Frame, SeatState},
     provider::{
         DirtyState, TerminalInputEvent, TerminalKey, TerminalMouseButton, TerminalMouseEventKind, TerminalNamedKey, TerminalRenderUpdate,
     },
@@ -92,10 +92,17 @@ impl ForegroundAttach {
         let alive_out = Arc::clone(&alive);
         let relay_out = thread::spawn(move || -> Result<(), String> {
             let mut stdout = std::io::stdout().lock();
+            let mut seat_state = SeatState { role: "controller".to_string(), controller: None };
             loop {
                 match Frame::read(&mut read_stream) {
                     Ok(Frame::Output(bytes)) => {
                         stdout.write_all(&bytes).map_err(|err| format!("write stdout: {err}"))?;
+                        render_seat_chrome(&mut stdout, &seat_state)?;
+                        stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
+                    }
+                    Ok(Frame::SeatState(state)) => {
+                        seat_state = state;
+                        render_seat_chrome(&mut stdout, &seat_state)?;
                         stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
                     }
                     Ok(_) => {}
@@ -174,6 +181,36 @@ impl ForegroundAttach {
         out_result?;
         resize_result
     }
+}
+
+fn render_seat_chrome(writer: &mut impl Write, state: &SeatState) -> Result<(), String> {
+    let (_, rows) = current_terminal_size();
+    render_seat_chrome_at_rows(writer, state, rows)
+}
+
+fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: u16) -> Result<(), String> {
+    if rows == 0 {
+        return Ok(());
+    }
+    writer.write_all(b"\x1b7").map_err(|err| format!("save cursor for watcher banner: {err}"))?;
+    if state.role == "watcher" {
+        if rows > 1 {
+            write!(writer, "\x1b[1;{}r", rows - 1).map_err(|err| format!("reserve watcher banner row: {err}"))?;
+        }
+        write!(writer, "\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("position watcher banner: {err}"))?;
+        let controller = state.controller.as_ref().map(AttachmentIdentity::display_name).unwrap_or("none");
+        write!(writer, "\x1b[7m watching — controller: {controller} \x1b[0m").map_err(|err| format!("write watcher banner: {err}"))?;
+    } else {
+        write!(writer, "\x1b[r\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("clear watcher banner: {err}"))?;
+    }
+    writer.write_all(b"\x1b8").map_err(|err| format!("restore cursor after watcher banner: {err}"))
+}
+
+fn normalize_attachment_identity(mut identity: AttachmentIdentity) -> AttachmentIdentity {
+    if identity.name.trim().is_empty() {
+        identity.name = "unknown".to_string();
+    }
+    identity
 }
 
 fn is_graceful_socket_shutdown(err: &std::io::Error) -> bool {
@@ -322,15 +359,28 @@ fn start_session(
     Ok(response.session)
 }
 
-pub fn attach_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundAttach, String> {
-    connect_foreground_upgrade(layout, id, "attach")
+pub fn attach_foreground(
+    layout: &RuntimeLayout,
+    id: &str,
+    identity: AttachmentIdentity,
+    strict: bool,
+    take: bool,
+) -> Result<ForegroundAttach, String> {
+    connect_foreground_upgrade(layout, id, "attach", identity, strict, take)
 }
 
-pub fn watch_foreground(layout: &RuntimeLayout, id: &str) -> Result<ForegroundAttach, String> {
-    connect_foreground_upgrade(layout, id, "watch")
+pub fn watch_foreground(layout: &RuntimeLayout, id: &str, identity: AttachmentIdentity) -> Result<ForegroundAttach, String> {
+    connect_foreground_upgrade(layout, id, "watch", identity, false, false)
 }
 
-fn connect_foreground_upgrade(layout: &RuntimeLayout, id: &str, role: &str) -> Result<ForegroundAttach, String> {
+fn connect_foreground_upgrade(
+    layout: &RuntimeLayout,
+    id: &str,
+    role: &str,
+    identity: AttachmentIdentity,
+    strict: bool,
+    take: bool,
+) -> Result<ForegroundAttach, String> {
     let socket_path = layout.socket_path();
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
@@ -340,6 +390,9 @@ fn connect_foreground_upgrade(layout: &RuntimeLayout, id: &str, role: &str) -> R
             cols,
             rows,
             capabilities: attach_capabilities_to_http(attach_init_capabilities()),
+            identity: identity.clone(),
+            take,
+            strict,
         })
         .map_err(|err| format!("serialize attach request: {err}"))?;
         http_uds::write_attach_upgrade_request(&mut stream, &format!("/sessions/{id}/{role}"), &body)
@@ -347,11 +400,19 @@ fn connect_foreground_upgrade(layout: &RuntimeLayout, id: &str, role: &str) -> R
         let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read {role} upgrade response: {err}"))?;
         match response.status {
             StatusCode::SWITCHING_PROTOCOLS => return Ok(ForegroundAttach { stream: Arc::new(Mutex::new(stream)) }),
-            StatusCode::CONFLICT => {}
+            StatusCode::CONFLICT => {
+                let mut body = String::new();
+                let _ = stream.read_to_string(&mut body);
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+                        return Err(error.to_string());
+                    }
+                }
+            }
             other => return Err(format!("unexpected {role} response: {other}")),
         }
         if Instant::now() >= deadline {
-            return Err(format!("session {id} already has a foreground client"));
+            return Err(format!("session {id} controller seat is held"));
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1124,12 +1185,84 @@ fn packet_role_counts(session_id: &str, packet_clients: &[PacketClient]) -> (u32
     (controllers, watchers)
 }
 
+fn packet_controller_identity(hosted: &HostedSession, packet_clients: &[PacketClient]) -> Option<AttachmentIdentity> {
+    let holder = hosted.packet_controller?;
+    packet_clients
+        .iter()
+        .find(|client| client.id == holder.client_id)
+        .and_then(|client| client.channels.get(&holder.channel))
+        .map(|channel| channel.identity.clone())
+}
+
+fn controller_identity(hosted: &HostedSession, packet_clients: &[PacketClient]) -> Option<AttachmentIdentity> {
+    hosted.active_client.as_ref().map(|client| client.identity.clone()).or_else(|| packet_controller_identity(hosted, packet_clients))
+}
+
+fn announce_seat_state(hosted: &mut HostedSession, packet_clients: &mut [PacketClient]) -> Result<(), String> {
+    announce_seat_state_except(hosted, packet_clients, None)
+}
+
+fn announce_seat_state_except(
+    hosted: &mut HostedSession,
+    packet_clients: &mut [PacketClient],
+    excluded: Option<PacketChannelRef>,
+) -> Result<(), String> {
+    let controller = controller_identity(hosted, packet_clients);
+    for watcher in &mut hosted.watchers {
+        watcher.enqueue_frame(&Frame::SeatState(SeatState { role: "watcher".to_string(), controller: controller.clone() }))?;
+    }
+    for client in packet_clients {
+        let channels: Vec<(u32, ChannelRole)> = client
+            .channels
+            .iter()
+            .filter(|(_, channel)| channel.session_id == hosted.metadata.id)
+            .map(|(id, channel)| (*id, channel.role))
+            .collect();
+        for (channel, role) in channels {
+            if excluded == Some(PacketChannelRef { client_id: client.id, channel }) {
+                continue;
+            }
+            client.enqueue_frame(
+                &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState { role, controller: controller.clone() })
+                    .map_err(|err| format!("encode seat state packet: {err}"))?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn inspect_hosted_session(hosted: &HostedSession, packet_clients: &[PacketClient]) -> Result<crate::protocol::InspectResult, String> {
+    let mut result = hosted.actor.inspect(false, 0)?;
+    if let Some(client) = hosted.active_client.as_ref() {
+        result.attachments.push(crate::protocol::AttachmentInspect { role: "controller".to_string(), identity: client.identity.clone() });
+    }
+    result.attachments.extend(
+        hosted
+            .watchers
+            .iter()
+            .map(|client| crate::protocol::AttachmentInspect { role: "watcher".to_string(), identity: client.identity.clone() }),
+    );
+    for client in packet_clients {
+        result.attachments.extend(client.channels.values().filter(|channel| channel.session_id == result.session.id).map(|channel| {
+            crate::protocol::AttachmentInspect {
+                role: match channel.role {
+                    ChannelRole::Controller => "controller",
+                    ChannelRole::Watcher => "watcher",
+                }
+                .to_string(),
+                identity: channel.identity.clone(),
+            }
+        }));
+    }
+    Ok(result)
+}
+
 fn directory_entry_for_session(
     layout: &RuntimeLayout,
     hosted: &HostedSession,
     packet_clients: &[PacketClient],
 ) -> Result<DirectoryEntry, String> {
-    let inspect = hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?;
+    let inspect = inspect_hosted_session(hosted, packet_clients)?;
     let (packet_controllers, packet_watchers) = packet_role_counts(&inspect.session.id, packet_clients);
     Ok(DirectoryEntry {
         session_id: inspect.session.id.clone(),
@@ -1137,6 +1270,7 @@ fn directory_entry_for_session(
         state: inspect.session.state,
         controller_count: (if hosted.active_client.is_some() { 1 } else { 0 }) + packet_controllers,
         watcher_count: u32::try_from(hosted.watchers.len()).unwrap_or(u32::MAX).saturating_add(packet_watchers),
+        controller: controller_identity(hosted, packet_clients),
         recreatable: crate::recreate::session_is_recreatable(&layout.session_dir(&inspect.session.id)),
         cols: inspect.terminal.cols,
         rows: inspect.terminal.rows,
@@ -1363,6 +1497,7 @@ fn service_hosted_session(
         hosted.actor.enqueue_screen_activity_flush()?;
     }
     if resized || previous_controller_count != hosted.active_client.is_some() || previous_watcher_count != hosted.watchers.len() {
+        announce_seat_state(hosted, packet_clients)?;
         broadcast_directory_upsert(directory_entry_for_session(layout, hosted, packet_clients)?, packet_clients)?;
     }
 
@@ -1649,7 +1784,7 @@ fn handle_http_request(
         http_uds::Route::Sessions => {
             let mut sessions = Vec::new();
             for hosted in state.sessions.values() {
-                sessions.push(hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?);
+                sessions.push(inspect_hosted_session(hosted, state.packet_clients)?);
             }
             sessions.sort_by(|a, b| a.session.id.cmp(&b.session.id));
             http_uds::write_json(stream, StatusCode::OK, &http_uds::SessionListResponse { sessions })
@@ -1738,7 +1873,7 @@ fn handle_http_request(
             let Some(hosted) = state.sessions.get(&id) else {
                 return write_http_not_found(stream);
             };
-            let result = hosted.actor.inspect(hosted.active_client.is_some(), hosted.watchers.len())?;
+            let result = inspect_hosted_session(hosted, state.packet_clients)?;
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
         }
         http_uds::Route::SessionDelete { id } => {
@@ -1755,37 +1890,78 @@ fn handle_http_request(
             let body: http_uds::AttachRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP attach request: {err}"))?;
             vacate_dead_packet_controller(hosted, state.packet_clients);
-            if hosted.active_client.is_some() || hosted.packet_controller.is_some() {
-                http_uds::write_error(stream, StatusCode::CONFLICT, "session already has a foreground client")
+            let seat_is_held = hosted.active_client.is_some() || hosted.packet_controller.is_some();
+            if seat_is_held && body.strict {
+                let holder = controller_identity(hosted, state.packet_clients)
+                    .map(|identity| format!("{} ({})", identity.name, identity.kind.as_str()))
+                    .unwrap_or_else(|| "unknown".to_string());
+                http_uds::write_error(stream, StatusCode::CONFLICT, &format!("session {id} controller seat is held by {holder}"))
                     .map_err(|err| format!("write HTTP attach busy response: {err}"))?;
                 break 'attach Ok(());
             }
+            if seat_is_held && body.take {
+                if let Some(controller) = hosted.active_client.take() {
+                    hosted.watchers.push(controller);
+                }
+                if let Some(current) = hosted.packet_controller.take() {
+                    for client in state.packet_clients.iter_mut() {
+                        if client.id == current.client_id {
+                            if let Some(channel) = client.channels.get_mut(&current.channel) {
+                                channel.role = ChannelRole::Watcher;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            let grant_controller = !seat_is_held || body.take;
 
             let capabilities = attach_capabilities_from_http(body.capabilities);
-            let replay = hosted.actor.apply_attach_state(body.cols, body.rows, capabilities)?;
+            let replay = if grant_controller {
+                hosted.actor.apply_attach_state(body.cols, body.rows, capabilities)?
+            } else {
+                hosted.actor.replay_payload(capabilities)?
+            };
             let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
-            let mut client = ActiveClient::new(attach_stream, capabilities)?;
+            let mut client = ActiveClient::new(attach_stream, capabilities, normalize_attachment_identity(body.identity))?;
             let replay_mode = if hosted.had_foreground_client { ReplayMode::ResetTerminal } else { ReplayMode::FreshTerminal };
+            let role = if grant_controller { "controller" } else { "watcher" };
+            let seat_controller =
+                if grant_controller { Some(client.identity.clone()) } else { controller_identity(hosted, state.packet_clients) };
+            if !grant_controller {
+                client.enqueue_frame(&Frame::SeatState(SeatState { role: role.to_string(), controller: seat_controller }))?;
+            }
             drain_raw_output_tap_before_client_install(state.layout, &id, hosted, &mut client, replay, replay_mode)?;
             *response_committed = true;
             http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
             maybe_fail_after_http_upgrade("attach")?;
             #[cfg(unix)]
             set_stream_nonblocking(&client.stream, true).map_err(|err| format!("set HTTP attach stream nonblocking: {err}"))?;
-            let _ = fs::write(state.layout.foreground_path(&id), b"1");
-            hosted.active_client = Some(client);
+            if grant_controller {
+                let _ = fs::write(state.layout.foreground_path(&id), b"1");
+                hosted.active_client = Some(client);
+            } else {
+                hosted.watchers.push(client);
+            }
             let activation = (|| {
-                hosted.actor.set_client_presence(true)?;
-                hosted.actor.record_attach()?;
+                if grant_controller {
+                    hosted.actor.set_client_presence(true)?;
+                    hosted.actor.record_attach()?;
+                }
+                announce_seat_state(hosted, state.packet_clients)?;
                 broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)
             })();
             if let Err(err) = activation {
-                hosted.active_client = None;
-                let _ = hosted.actor.set_client_presence(false);
-                let _ = fs::remove_file(state.layout.foreground_path(&id));
+                if grant_controller {
+                    hosted.active_client = None;
+                    let _ = hosted.actor.set_client_presence(false);
+                    let _ = fs::remove_file(state.layout.foreground_path(&id));
+                } else {
+                    hosted.watchers.pop();
+                }
                 return Err(err);
             }
-            hosted.had_foreground_client = true;
+            hosted.had_foreground_client |= grant_controller;
             Ok(())
         }
         http_uds::Route::SessionWatch { id } => {
@@ -1797,7 +1973,11 @@ fn handle_http_request(
             let capabilities = attach_capabilities_from_http(body.capabilities);
             let replay = hosted.actor.replay_payload(capabilities)?;
             let watch_stream = stream.try_clone().map_err(|err| format!("clone HTTP watch stream: {err}"))?;
-            let mut watcher = ActiveClient::new(watch_stream, capabilities)?;
+            let mut watcher = ActiveClient::new(watch_stream, capabilities, normalize_attachment_identity(body.identity))?;
+            watcher.enqueue_frame(&Frame::SeatState(SeatState {
+                role: "watcher".to_string(),
+                controller: controller_identity(hosted, state.packet_clients),
+            }))?;
             drain_raw_output_tap_before_client_install(state.layout, &id, hosted, &mut watcher, replay, ReplayMode::FreshTerminal)?;
             *response_committed = true;
             http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
@@ -1824,6 +2004,7 @@ fn handle_http_request(
             }
             hosted.actor.set_client_presence(false)?;
             hosted.active_client = None;
+            announce_seat_state(hosted, state.packet_clients)?;
             broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP detach response: {err}"))
         }
@@ -2183,6 +2364,7 @@ struct PacketClient {
 struct PacketSessionChannel {
     session_id: String,
     role: ChannelRole,
+    identity: AttachmentIdentity,
     in_flight_generation: Option<u64>,
     last_sent_generation: u64,
 }
@@ -2357,10 +2539,11 @@ fn release_packet_client_roles(
     affected.sort();
     affected.dedup();
     for session_id in affected {
-        if let Some(hosted) = sessions.get(session_id) {
+        if let Some(hosted) = sessions.get_mut(session_id) {
             // A failing session actor must not turn role release into a
             // daemon-fatal error; the session faults on its own servicing
             // pass and broadcasts its removal there.
+            let _ = announce_seat_state(hosted, packet_clients);
             match directory_entry_for_session(layout, hosted, packet_clients) {
                 Ok(entry) => broadcast_directory_upsert(entry, packet_clients)?,
                 Err(err) => eprintln!("skipping directory update for session {session_id}: {err}"),
@@ -2385,9 +2568,8 @@ fn packet_controller_holder_is_live(current: PacketChannelRef, packet_clients: &
 }
 
 /// Resolve a controller/watcher request for `requester`, demoting the current
-/// packet controller when `take` is set. A legacy stream controller is never
-/// preempted (a raw attach cannot be demoted to read-only), so requests grant
-/// Watcher while one is attached.
+/// controller when `take` is set. Legacy stream controllers are moved into the
+/// watcher set so their connection and output stream remain alive.
 fn grant_packet_role(
     hosted: &mut HostedSession,
     packet_clients: &mut [PacketClient],
@@ -2404,7 +2586,13 @@ fn grant_packet_role(
         }
         ChannelRole::Controller => {
             if hosted.active_client.is_some() {
-                return Ok(ChannelRole::Watcher);
+                if !take {
+                    return Ok(ChannelRole::Watcher);
+                }
+                if let Some(controller) = hosted.active_client.take() {
+                    hosted.watchers.push(controller);
+                    hosted.actor.set_client_presence(false)?;
+                }
             }
             vacate_dead_packet_controller(hosted, packet_clients);
             match hosted.packet_controller {
@@ -2425,8 +2613,11 @@ fn grant_packet_role(
                             session_channel.role = ChannelRole::Watcher;
                         }
                         client.enqueue_frame(
-                            &PacketFrame::new(current.channel, MSG_SESSION_ROLE, &RoleState { role: ChannelRole::Watcher })
-                                .map_err(|err| format!("encode role demotion packet: {err}"))?,
+                            &PacketFrame::new(current.channel, MSG_SESSION_ROLE, &RoleState {
+                                role: ChannelRole::Watcher,
+                                controller: None,
+                            })
+                            .map_err(|err| format!("encode role demotion packet: {err}"))?,
                         )?;
                         break;
                     }
@@ -2459,8 +2650,7 @@ fn handle_packet_frame(
                     if hosted.packet_controller == Some(PacketChannelRef { client_id, channel: close.channel }) {
                         hosted.packet_controller = None;
                     }
-                }
-                if let Some(hosted) = sessions.get(&removed.session_id) {
+                    announce_seat_state(hosted, packet_clients)?;
                     updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
                 }
             }
@@ -2541,18 +2731,25 @@ fn apply_packet_role_request(
     let Some(hosted) = sessions.get_mut(&session_id) else {
         return Ok(());
     };
+    let previous_controller = controller_identity(hosted, packet_clients);
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel };
     let granted = grant_packet_role(hosted, packet_clients, requester, request.role, request.take)?;
+    let controller = controller_identity(hosted, packet_clients);
     let client = &mut packet_clients[index];
     if let Some(session_channel) = client.channels.get_mut(&channel) {
         session_channel.role = granted;
     }
     client.enqueue_frame(
-        &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState { role: granted })
+        &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState { role: granted, controller })
             .map_err(|err| format!("encode role state packet: {err}"))?,
     )?;
     if let Some(hosted) = sessions.get(&session_id) {
         updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+    }
+    if let Some(hosted) = sessions.get_mut(&session_id) {
+        if controller_identity(hosted, packet_clients) != previous_controller {
+            announce_seat_state_except(hosted, packet_clients, Some(requester))?;
+        }
     }
     Ok(())
 }
@@ -2572,6 +2769,8 @@ fn open_packet_channel(
         })?;
         return Ok(());
     }
+    let mut open = open;
+    open.identity = normalize_attachment_identity(open.identity);
     let Some(hosted) = sessions.get_mut(&open.session_id) else {
         packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
             channel: open.channel,
@@ -2593,14 +2792,17 @@ fn open_packet_channel(
             return Ok(());
         }
     };
+    let previous_controller = controller_identity(hosted, packet_clients);
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel: open.channel };
     let granted = grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?;
     let session_id = open.session_id;
     let generation = update.render_generation;
+    let controller =
+        if granted == ChannelRole::Controller { Some(open.identity.clone()) } else { controller_identity(hosted, packet_clients) };
     hosted.packet_render_cache.store(update.clone());
     let client = &mut packet_clients[index];
     client.enqueue_frame(
-        &PacketFrame::new(open.channel, MSG_SESSION_ROLE, &RoleState { role: granted })
+        &PacketFrame::new(open.channel, MSG_SESSION_ROLE, &RoleState { role: granted, controller })
             .map_err(|err| format!("encode role state packet: {err}"))?,
     )?;
     client.enqueue_frame(
@@ -2610,11 +2812,17 @@ fn open_packet_channel(
     client.channels.insert(open.channel, PacketSessionChannel {
         session_id: session_id.clone(),
         role: granted,
+        identity: open.identity,
         in_flight_generation: Some(generation),
         last_sent_generation: generation,
     });
     if let Some(hosted) = sessions.get(&session_id) {
         updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+    }
+    if let Some(hosted) = sessions.get_mut(&session_id) {
+        if controller_identity(hosted, packet_clients) != previous_controller {
+            announce_seat_state_except(hosted, packet_clients, Some(requester))?;
+        }
     }
     Ok(())
 }
@@ -2877,12 +3085,13 @@ struct ActiveClient {
     input_reader: ActiveClientReader,
     input_buffer: Vec<u8>,
     capabilities: vt::ClientCapabilities,
+    identity: AttachmentIdentity,
 }
 
 impl ActiveClient {
-    fn new(stream: SessionStream, capabilities: vt::ClientCapabilities) -> Result<Self, String> {
+    fn new(stream: SessionStream, capabilities: vt::ClientCapabilities, identity: AttachmentIdentity) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
-        Ok(Self { stream, pending_output: PendingOutput::new(), input_reader, input_buffer: Vec::new(), capabilities })
+        Ok(Self { stream, pending_output: PendingOutput::new(), input_reader, input_buffer: Vec::new(), capabilities, identity })
     }
 
     fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>, timeout: Duration) -> Result<bool, std::io::Error> {
@@ -3045,6 +3254,7 @@ mod tests {
     };
     use crate::{
         http_uds::read_http_request_for_test,
+        protocol::AttachmentIdentity,
         runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
         vt::{self, VtEngine},
     };
@@ -3072,7 +3282,7 @@ mod tests {
                 .expect("write response");
         });
 
-        let attach = attach_foreground(&layout, "alpha").expect("attach");
+        let attach = attach_foreground(&layout, "alpha", AttachmentIdentity::default(), false, false).expect("attach");
         drop(attach);
         let request = rx.recv_timeout(Duration::from_secs(1)).expect("receive request");
 
@@ -3084,7 +3294,8 @@ mod tests {
         // against the serialization of whatever detection currently reports.
         let expected_capabilities =
             serde_json::to_string(&super::attach_capabilities_to_http(attach_init_capabilities())).expect("serialize capabilities");
-        assert!(request.ends_with(&format!(r#""capabilities":{expected_capabilities}}}"#)), "{request}");
+        assert!(request.contains(&format!(r#""capabilities":{expected_capabilities}"#)), "{request}");
+        assert!(request.contains(r#""identity":{"kind":"principal","name":""}"#), "{request}");
     }
 
     #[test]
@@ -3112,6 +3323,28 @@ mod tests {
             *output.lock().expect("lock output"),
             b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
+    }
+
+    #[test]
+    fn watcher_chrome_reserves_the_last_row_and_names_the_controller() {
+        let mut output = Vec::new();
+        super::render_seat_chrome_at_rows(
+            &mut output,
+            &crate::protocol::SeatState {
+                role: "watcher".to_string(),
+                controller: Some(crate::protocol::AttachmentIdentity {
+                    kind: crate::protocol::AttachmentKind::Supervisor,
+                    name: "crew-runner".to_string(),
+                }),
+            },
+            24,
+        )
+        .expect("render watcher chrome");
+
+        let output = String::from_utf8(output).expect("watcher chrome is utf8");
+        assert!(output.contains("\u{1b}[1;23r"));
+        assert!(output.contains("\u{1b}[24;1H"));
+        assert!(output.contains("watching — controller: crew-runner"));
     }
 
     #[test]
@@ -3207,8 +3440,8 @@ mod tests {
         let (stream_a, _peer_a) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
         let (stream_b, _peer_b) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
         let capabilities = crate::vt::ClientCapabilities::conservative_fallback();
-        let mut via_output = super::ActiveClient::new(stream_a, capabilities).expect("create active client");
-        let mut via_frame = super::ActiveClient::new(stream_b, capabilities).expect("create active client");
+        let mut via_output = super::ActiveClient::new(stream_a, capabilities, AttachmentIdentity::default()).expect("create active client");
+        let mut via_frame = super::ActiveClient::new(stream_b, capabilities, AttachmentIdentity::default()).expect("create active client");
 
         let payload = b"\x1b[1mchunk\x00\xff";
         via_output.enqueue_output(payload).expect("enqueue output payload");
@@ -3222,7 +3455,8 @@ mod tests {
     fn active_client_rejects_unbounded_output_backlog() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
         let mut client =
-            super::ActiveClient::new(stream, crate::vt::ClientCapabilities::conservative_fallback()).expect("create active client");
+            super::ActiveClient::new(stream, crate::vt::ClientCapabilities::conservative_fallback(), AttachmentIdentity::default())
+                .expect("create active client");
         client.pending_output = super::PendingOutput::from(vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1]);
 
         let err = client.enqueue_frame(&super::Frame::Output(vec![1])).expect_err("backlog should overflow");

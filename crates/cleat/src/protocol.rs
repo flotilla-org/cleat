@@ -28,6 +28,8 @@ pub struct SessionInfo {
     /// Unix timestamp in milliseconds of the most recent render-changing output.
     #[serde(default)]
     pub last_output_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<AttachmentIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -90,6 +92,39 @@ pub struct ProcessInspect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentInspect {
     pub role: String,
+    #[serde(default)]
+    pub identity: AttachmentIdentity,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    #[default]
+    Principal,
+    Supervisor,
+    Tool,
+}
+
+impl AttachmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Principal => "principal",
+            Self::Supervisor => "supervisor",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentIdentity {
+    pub kind: AttachmentKind,
+    pub name: String,
+}
+
+impl AttachmentIdentity {
+    pub fn display_name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +147,13 @@ const TAG_INPUT: u8 = 2;
 const TAG_OUTPUT: u8 = 3;
 const TAG_RESIZE: u8 = 4;
 const TAG_ERROR: u8 = 9;
+const TAG_SEAT_STATE: u8 = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatState {
+    pub role: String,
+    pub controller: Option<AttachmentIdentity>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
@@ -133,6 +175,7 @@ pub enum Frame {
     Output(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     Error(String),
+    SeatState(SeatState),
 }
 
 impl Frame {
@@ -176,6 +219,10 @@ impl Frame {
             Frame::Input(bytes) => write_tagged(writer, TAG_INPUT, bytes),
             Frame::Output(bytes) => write_tagged(writer, TAG_OUTPUT, bytes),
             Frame::Error(message) => write_tagged(writer, TAG_ERROR, message.as_bytes()),
+            Frame::SeatState(state) => {
+                let payload = serde_json::to_vec(state).map_err(Error::other)?;
+                write_tagged(writer, TAG_SEAT_STATE, &payload)
+            }
         }
     }
 
@@ -186,6 +233,7 @@ impl Frame {
             Frame::Resize { .. } => 4,
             Frame::Input(bytes) | Frame::Output(bytes) => bytes.len(),
             Frame::Error(message) => message.len(),
+            Frame::SeatState(state) => serde_json::to_vec(state).map(|payload| payload.len()).unwrap_or(0),
         };
         WIRE_HEADER_LEN + payload_len
     }
@@ -210,6 +258,9 @@ impl Frame {
             TAG_ERROR => String::from_utf8(payload)
                 .map(Frame::Error)
                 .map_err(|err| Error::new(ErrorKind::InvalidData, format!("invalid error frame utf-8: {err}"))),
+            TAG_SEAT_STATE => serde_json::from_slice(&payload)
+                .map(Frame::SeatState)
+                .map_err(|err| Error::new(ErrorKind::InvalidData, format!("invalid seat state frame: {err}"))),
             _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown frame tag {tag}"))),
         }
     }

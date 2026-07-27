@@ -25,7 +25,7 @@ use cleat::{
         MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT,
         MSG_CONTROL_HELLO, PROTOCOL_VERSION,
     },
-    protocol::{Frame, SessionInfo},
+    protocol::{AttachmentIdentity, AttachmentKind, Frame, SeatState, SessionInfo},
     provider::ProviderFeatures,
     provider_ffi::{
         cleat_provider_close, cleat_provider_directory_generation, cleat_provider_directory_release, cleat_provider_directory_snapshot,
@@ -35,7 +35,7 @@ use cleat::{
     },
     recording::{SessionRecorder, CAST_FILE_NAME},
     runtime::{RuntimeLayout, TerminalSize, DEFAULT_DAEMON_NAME},
-    server::{EndBound, SessionService, StartBound},
+    server::{AttachOptions, EndBound, SessionService, StartBound},
     session::{daemon_pid_path, ensure_session_started, run_session_daemon, session_socket_path, SessionStartOptions},
     vt::{self, ClientCapabilities, ColorLevel, VtEngineKind},
 };
@@ -179,6 +179,7 @@ fn packet_open_channel_role(stream: &mut UnixStream, channel: u32, session_id: &
         session_id: session_id.to_string(),
         role,
         take,
+        identity: AttachmentIdentity::default(),
     });
 }
 
@@ -394,6 +395,49 @@ fn http_upgrade_stream(
     let response = read_http_response_head(&mut stream);
     assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
     stream
+}
+
+fn http_attach_with_seat_options(
+    root: &std::path::Path,
+    id: &str,
+    identity: AttachmentIdentity,
+    strict: bool,
+    take: bool,
+) -> (UnixStream, String) {
+    let socket_path = session_socket_path(root, id);
+    let mut stream = UnixStream::connect(&socket_path).expect("connect session socket");
+    let body = serde_json::json!({
+        "cols": 80,
+        "rows": 24,
+        "capabilities": {
+            "color_level": "sixteen",
+            "kitty_keyboard": false
+        },
+        "identity": identity,
+        "strict": strict,
+        "take": take
+    })
+    .to_string();
+    write!(
+        stream,
+        "POST /sessions/{id}/attach HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write seat-aware attach request");
+    let response = read_http_response_head(&mut stream);
+    (stream, response)
+}
+
+fn read_until_seat_state(stream: &mut UnixStream, timeout: Duration) -> SeatState {
+    stream.set_read_timeout(Some(timeout)).expect("set seat state timeout");
+    loop {
+        match Frame::read(stream).expect("read attachment frame") {
+            Frame::SeatState(state) => return state,
+            Frame::Output(_) => {}
+            other => panic!("unexpected attachment frame before seat state: {other:?}"),
+        }
+    }
 }
 
 fn read_http_response_head(stream: &mut UnixStream) -> String {
@@ -1166,7 +1210,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
     let delta = read_directory_delta_named(&mut stream, &mut buffer, Duration::from_secs(30), "beta retag delta");
     assert_eq!(delta.upserted.iter().map(|entry| entry.session_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
 
-    let (_info, attach) = service.attach(Some("beta".into()), None, None, None, true).expect("attach beta");
+    let (_info, attach) = service.attach(Some("beta".into()), None, None, None, true, AttachOptions::default()).expect("attach beta");
     let delta = read_directory_delta_named(&mut stream, &mut buffer, Duration::from_secs(30), "beta attach delta");
     assert_eq!(delta.upserted[0].session_id, "beta");
     assert_eq!(delta.upserted[0].controller_count, 1);
@@ -1820,6 +1864,7 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
             state: "running".to_string(),
             controller_count: 0,
             watcher_count: 0,
+            controller: None,
             recreatable: false,
             cols: 80,
             rows: 24,
@@ -1830,6 +1875,7 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
             state: "running".to_string(),
             controller_count: 0,
             watcher_count: 0,
+            controller: None,
             recreatable: false,
             cols: 80,
             rows: 24,
@@ -2294,14 +2340,17 @@ fn attach_creates_session_lazily_and_reuses_it_on_later_attach() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
-    let (first, attach) = service.attach(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("first attach");
+    let (first, attach) =
+        service.attach(Some("alpha".into()), None, None, Some("sleep 5".into()), false, AttachOptions::default()).expect("first attach");
     assert_eq!(first.id, "alpha");
     assert_eq!(first.vt_engine, vt::default_vt_engine_kind());
     assert!(daemon_pid_path(temp.path(), "alpha").exists());
 
     drop(attach);
 
-    let (second, _attach2) = service.attach(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, None, false).expect("reattach");
+    let (second, _attach2) = service
+        .attach(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, None, false, AttachOptions::default())
+        .expect("reattach");
     assert_eq!(second.id, "alpha");
     assert_eq!(second.vt_engine, vt::default_vt_engine_kind());
 }
@@ -2326,32 +2375,96 @@ fn attach_vt_only_applies_when_creating_new_session() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
-    let (created, attach) =
-        service.attach(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 5".into()), false).expect("first attach");
+    let (created, attach) = service
+        .attach(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 5".into()), false, AttachOptions::default())
+        .expect("first attach");
     assert_eq!(created.vt_engine, VtEngineKind::Passthrough);
     drop(attach);
 
-    let (reattached, _attach2) =
-        service.attach(Some("alpha".into()), Some(vt::default_vt_engine_kind()), None, None, false).expect("reattach");
+    let (reattached, _attach2) = service
+        .attach(Some("alpha".into()), Some(vt::default_vt_engine_kind()), None, None, false, AttachOptions::default())
+        .expect("reattach");
     assert_eq!(reattached.vt_engine, VtEngineKind::Passthrough);
+}
+
+#[test]
+fn attach_falls_back_strictly_refuses_and_take_demotes_without_losing_session_state() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("cat".into()), true).expect("create alpha");
+
+    let alice = AttachmentIdentity { kind: AttachmentKind::Principal, name: "alice".to_string() };
+    let bob = AttachmentIdentity { kind: AttachmentKind::Supervisor, name: "bob".to_string() };
+    let carol = AttachmentIdentity { kind: AttachmentKind::Tool, name: "carol".to_string() };
+
+    let (mut controller, first_response) = http_attach_with_seat_options(temp.path(), "alpha", alice.clone(), false, false);
+    assert!(first_response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{first_response}");
+
+    let (mut strict_stream, strict_response) = http_attach_with_seat_options(temp.path(), "alpha", bob.clone(), true, false);
+    assert!(strict_response.starts_with("HTTP/1.1 409 Conflict\r\n"), "{strict_response}");
+    let mut strict_body = String::new();
+    strict_stream.read_to_string(&mut strict_body).expect("read strict error body");
+    assert!(strict_body.contains("alice (principal)"), "{strict_body}");
+
+    let (mut watcher, fallback_response) = http_attach_with_seat_options(temp.path(), "alpha", bob.clone(), false, false);
+    assert!(fallback_response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{fallback_response}");
+    assert_eq!(read_until_seat_state(&mut watcher, Duration::from_secs(2)), SeatState {
+        role: "watcher".to_string(),
+        controller: Some(alice.clone())
+    });
+
+    let before = service.inspect("alpha").expect("inspect before take");
+    assert!(before.recording.active);
+    assert_eq!(before.attachments, vec![
+        cleat::protocol::AttachmentInspect { role: "controller".to_string(), identity: alice },
+        cleat::protocol::AttachmentInspect { role: "watcher".to_string(), identity: bob },
+    ]);
+
+    let (_new_controller, take_response) = http_attach_with_seat_options(temp.path(), "alpha", carol.clone(), false, true);
+    assert!(take_response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{take_response}");
+    assert_eq!(read_until_seat_state(&mut controller, Duration::from_secs(2)), SeatState {
+        role: "watcher".to_string(),
+        controller: Some(carol.clone())
+    });
+
+    let after = service.inspect("alpha").expect("inspect after take");
+    assert_eq!(after.session.state, "running");
+    assert!(after.recording.active);
+    assert_eq!(after.attachments.iter().filter(|attachment| attachment.role == "controller").collect::<Vec<_>>(), vec![
+        &cleat::protocol::AttachmentInspect { role: "controller".to_string(), identity: carol.clone() }
+    ]);
+    assert_eq!(service.list().expect("list sessions")[0].controller, Some(carol));
 }
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
-fn attach_rejects_second_foreground_client_while_one_is_active() {
+fn attach_strict_rejects_second_foreground_client_while_one_is_active() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
-    let (_session, _attach) = service.attach(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("first attach");
-    let err = service.attach(Some("alpha".into()), None, None, None, false).expect_err("second attach should fail");
+    let (_session, _attach) = service
+        .attach(Some("alpha".into()), None, None, Some("sleep 5".into()), false, AttachOptions {
+            identity: AttachmentIdentity { kind: AttachmentKind::Principal, name: "first".to_string() },
+            strict: false,
+            take: false,
+        })
+        .expect("first attach");
+    let err = service
+        .attach(Some("alpha".into()), None, None, None, false, AttachOptions {
+            identity: AttachmentIdentity { kind: AttachmentKind::Principal, name: "second".to_string() },
+            strict: true,
+            take: false,
+        })
+        .expect_err("second strict attach should fail");
 
-    assert!(err.contains("foreground client"));
+    assert!(err.contains("first (principal)"));
 }
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
-fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_client_policy() {
+fn lifecycle_attach_init_with_capabilities_is_accepted_with_strict_seat_policy() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
@@ -2360,8 +2473,14 @@ fn lifecycle_attach_init_with_capabilities_is_accepted_without_changing_single_c
 
     let _stream = http_attach_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::new(ColorLevel::Ansi256, true));
 
-    let err = service.attach(Some("alpha".into()), None, None, None, false).expect_err("second attach should fail");
-    assert!(err.contains("foreground client"));
+    let err = service
+        .attach(Some("alpha".into()), None, None, None, false, AttachOptions {
+            identity: AttachmentIdentity::default(),
+            strict: true,
+            take: false,
+        })
+        .expect_err("second attach should fail");
+    assert!(err.contains("controller seat is held by unknown (principal)"));
 }
 
 #[test]
@@ -2417,6 +2536,8 @@ fn lifecycle_watch_gets_replay_without_resizing_session() {
 
     let mut stream = http_watch_stream(temp.path(), "alpha", 100, 30, ClientCapabilities::new(ColorLevel::Ansi256, true));
 
+    let seat = Frame::read(&mut stream).expect("read watcher seat state");
+    assert_eq!(seat, Frame::SeatState(SeatState { role: "watcher".to_string(), controller: None }));
     let replay = Frame::read(&mut stream).expect("read watch replay output");
     assert_eq!(replay, Frame::Output(b"Ansi256:true".to_vec()));
     let result = service.inspect("alpha").expect("inspect watched session");
@@ -2731,13 +2852,15 @@ fn dropping_foreground_attach_keeps_session_alive_for_later_attach() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
 
-    let (_session, attach) = service.attach(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("first attach");
+    let (_session, attach) =
+        service.attach(Some("alpha".into()), None, None, Some("sleep 5".into()), false, AttachOptions::default()).expect("first attach");
     let pid_path = daemon_pid_path(temp.path(), "alpha");
     assert!(pid_path.exists());
 
     drop(attach);
 
-    let (_session, _reattach) = service.attach(Some("alpha".into()), None, None, None, false).expect("reattach after disconnect");
+    let (_session, _reattach) =
+        service.attach(Some("alpha".into()), None, None, None, false, AttachOptions::default()).expect("reattach after disconnect");
     assert!(pid_path.exists());
 }
 
@@ -2751,7 +2874,9 @@ fn stale_foreground_file_does_not_block_attach() {
     service.create(Some("alpha".into()), None, None, Some("sleep 5".into()), false).expect("create alpha");
     std::fs::write(foreground_path(temp.path(), "alpha"), b"999999").expect("write stale foreground marker");
 
-    let (_session, _attach) = service.attach(Some("alpha".into()), None, None, None, false).expect("attach with stale foreground marker");
+    let (_session, _attach) = service
+        .attach(Some("alpha".into()), None, None, None, false, AttachOptions::default())
+        .expect("attach with stale foreground marker");
 }
 
 // A session flooding output at PTY saturation (`yes`) must not starve the

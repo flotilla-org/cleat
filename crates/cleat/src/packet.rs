@@ -2,11 +2,14 @@ use std::io::{Error, ErrorKind, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{TerminalInputEvent, TerminalRenderUpdate};
 pub use crate::screen_activity::ScreenActivity;
+use crate::{
+    protocol::AttachmentIdentity,
+    provider::{TerminalInputEvent, TerminalRenderUpdate},
+};
 
-/// Version 4 defines activity as render damage rather than raw PTY output.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// Version 5 adds structured attachment identity and controller seat state.
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -70,6 +73,8 @@ pub struct DirectoryEntry {
     #[serde(default)]
     pub watcher_count: u32,
     #[serde(default)]
+    pub controller: Option<AttachmentIdentity>,
+    #[serde(default)]
     pub recreatable: bool,
     pub cols: u16,
     pub rows: u16,
@@ -120,9 +125,10 @@ pub struct OpenChannel {
     /// Requested role; the granted role arrives as a `RoleState` before the
     /// initial render packet (a controller request may be granted Watcher).
     pub role: ChannelRole,
-    /// Preempt an existing packet controller. Never preempts a legacy stream
-    /// controller (there is no way to demote a raw attach to read-only).
+    /// Preempt the existing controller, which remains connected as a watcher.
     pub take: bool,
+    #[serde(default)]
+    pub identity: AttachmentIdentity,
 }
 
 /// Client→server on an open session channel: request a role change.
@@ -134,9 +140,11 @@ pub struct RoleRequest {
 
 /// Server→client on a session channel: the granted role, sent on open and on
 /// any later change (e.g. demotion because another client took control).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleState {
     pub role: ChannelRole,
+    #[serde(default)]
+    pub controller: Option<AttachmentIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +273,7 @@ impl<S: Read + Write> PacketClient<S> {
             session_id: session_id.to_string(),
             role,
             take: false,
+            identity: AttachmentIdentity::default(),
         })
     }
 
@@ -357,8 +366,8 @@ mod tests {
     }
 
     #[test]
-    fn render_damage_activity_semantics_start_at_protocol_version_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn attachment_identity_semantics_start_at_protocol_version_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -385,6 +394,7 @@ mod tests {
                 state: "running".to_string(),
                 controller_count: 0,
                 watcher_count: 0,
+                controller: None,
                 recreatable: false,
                 cols: 80,
                 rows: 24,

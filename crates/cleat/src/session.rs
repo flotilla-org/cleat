@@ -92,17 +92,15 @@ impl ForegroundAttach {
         let alive_out = Arc::clone(&alive);
         let relay_out = thread::spawn(move || -> Result<(), String> {
             let mut stdout = std::io::stdout().lock();
-            let mut seat_state = SeatState { role: "controller".to_string(), controller: None };
+            let mut watcher_state = None;
             loop {
                 match Frame::read(&mut read_stream) {
                     Ok(Frame::Output(bytes)) => {
-                        stdout.write_all(&bytes).map_err(|err| format!("write stdout: {err}"))?;
-                        render_seat_chrome(&mut stdout, &seat_state)?;
+                        write_attach_output(&mut stdout, &bytes, watcher_state.as_ref())?;
                         stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
                     }
                     Ok(Frame::SeatState(state)) => {
-                        seat_state = state;
-                        render_seat_chrome(&mut stdout, &seat_state)?;
+                        update_watcher_chrome(&mut stdout, &mut watcher_state, state)?;
                         stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
                     }
                     Ok(_) => {}
@@ -181,6 +179,24 @@ impl ForegroundAttach {
         out_result?;
         resize_result
     }
+}
+
+fn write_attach_output(writer: &mut impl Write, bytes: &[u8], watcher_state: Option<&SeatState>) -> Result<(), String> {
+    writer.write_all(bytes).map_err(|err| format!("write stdout: {err}"))?;
+    if let Some(state) = watcher_state {
+        render_seat_chrome(writer, state)?;
+    }
+    Ok(())
+}
+
+fn update_watcher_chrome(writer: &mut impl Write, watcher_state: &mut Option<SeatState>, state: SeatState) -> Result<(), String> {
+    if state.role == "watcher" {
+        render_seat_chrome(writer, &state)?;
+        *watcher_state = Some(state);
+    } else if watcher_state.take().is_some() {
+        render_seat_chrome(writer, &state)?;
+    }
+    Ok(())
 }
 
 fn render_seat_chrome(writer: &mut impl Write, state: &SeatState) -> Result<(), String> {
@@ -3373,6 +3389,14 @@ mod tests {
         assert!(!output.contains('\u{7}'));
         assert!(!output.contains('\n'));
         assert!(output.contains("watching — controller: bad]2;injectedname"));
+    }
+
+    #[test]
+    fn controller_output_does_not_render_watcher_chrome() {
+        let mut output = Vec::new();
+        super::write_attach_output(&mut output, b"last terminal row", None).expect("relay controller output");
+
+        assert_eq!(output, b"last terminal row");
     }
 
     #[test]

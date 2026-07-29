@@ -18,4 +18,6 @@ ref = "64daa599c531e6938bc4c52d9198a91f1e6ce8cf"
 # -Doptimize matters: zig defaults to Debug, and a Debug libghostty-vt feeds
 # scroll-heavy output at ~KB/s — slow enough to wedge session actors behind
 # PTY floods. ReleaseSafe keeps bounds checks on untrusted terminal input.
-build_step = "-Demit-lib-vt=true -Dsimd=true -Doptimize=ReleaseSafe"
+# The Cleat embed only needs the host library. Disabling the Apple XCFramework
+# avoids building unused iOS slices and invoking xcodebuild.
+build_step = "-Demit-lib-vt=true -Demit-xcframework=false -Dsimd=true -Doptimize=ReleaseSafe"

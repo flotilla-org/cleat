@@ -8,26 +8,26 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fleet-release-${{ github.repository }}-${{ github.sha }}
+  cancel-in-progress: false
+
 env:
   CARGO_INCREMENTAL: "0"
-  FORGEJO_SERVER_URL: ${{ forgejo.server_url }}
-  FORGEJO_PACKAGE_OWNER: robert
-  FORGEJO_PACKAGE_NAME: cleat
 
 jobs:
   linux:
     name: Linux x86_64
-    runs-on: feta
+    runs-on: [self-hosted, Linux, X64, fleet-release]
     timeout-minutes: 30
     steps:
-      - name: Verify fleet runner
+      - name: Verify release runner capability
         run: |
-          test "$(hostname -s)" = feta
           test "$(uname -s)" = Linux
           test "$(uname -m)" = x86_64
 
       - name: Check out source
-        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Prepare Ghostty VT
         run: |
@@ -42,9 +42,8 @@ jobs:
         run: cargo +stable build -p cleat --locked --features ghostty-vt --release
 
       - name: Gate and describe artifact
-        env:
-          COMMIT_SHA: ${{ forgejo.sha }}
         run: |
+          RELEASE_TAG="fleet-$GITHUB_SHA"
           mkdir -p dist
           install -m 0755 target/release/cleat dist/cleat-linux-x86_64
           dist/cleat-linux-x86_64 launch --help | grep -q -- --tag
@@ -55,39 +54,41 @@ jobs:
           scripts/write-artifact-metadata.sh \
             dist/cleat-linux-x86_64 \
             dist/cleat-linux-x86_64.json \
-            flotilla-org/cleat "$COMMIT_SHA" linux-x86_64 "" false
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RELEASE_TAG" \
+            linux-x86_64 "" false
 
-      - name: Publish immutable package version
-        env:
-          FORGEJO_PACKAGE_VERSION: ${{ forgejo.sha }}
-          FORGEJO_PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-        run: scripts/publish-forgejo-generic.sh dist/*
+      - name: Transfer release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fleet-linux-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
 
   darwin:
     name: Darwin arm64
-    runs-on: comte
+    runs-on: [self-hosted, macOS, ARM64, fleet-release-signing]
     timeout-minutes: 30
     steps:
-      - name: Verify fleet runner
+      - name: Verify release runner capability
         run: |
-          test "$(hostname -s)" = comte
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
+          : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
+          : "${FLEET_MACOS_SDK:?runner environment must provide FLEET_MACOS_SDK}"
+          test -d "$FLEET_MACOS_SDK"
           signing_probe=$(mktemp)
           trap 'rm -f "$signing_probe"' EXIT
           cp /usr/bin/true "$signing_probe"
-          codesign --force \
-            --sign "Apple Development: Robert Wittams (DYYMCPD885)" \
-            "$signing_probe"
+          codesign --force --sign "$FLEET_CODESIGN_IDENTITY" "$signing_probe"
           codesign --verify --strict "$signing_probe"
 
       - name: Check out source
-        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Prepare Ghostty VT
-        env:
-          FLEET_MACOS_SDK: /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk
         run: |
+          : "${FLEET_MACOS_SDK:?runner environment must provide FLEET_MACOS_SDK}"
           test "$(zig version)" = 0.15.2
           test -d "$FLEET_MACOS_SDK"
           export PATH="$PWD/tools/macos-zig-sdk-shim:$PATH"
@@ -102,10 +103,9 @@ jobs:
         run: cargo +stable build -p cleat --locked --features ghostty-vt --release
 
       - name: Gate, sign, and describe artifact
-        env:
-          COMMIT_SHA: ${{ forgejo.sha }}
-          CODESIGN_IDENTITY: "Apple Development: Robert Wittams (DYYMCPD885)"
         run: |
+          : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
+          RELEASE_TAG="fleet-$GITHUB_SHA"
           mkdir -p dist
           install -m 0755 target/release/cleat dist/cleat-darwin-arm64
           dist/cleat-darwin-arm64 launch --help | grep -q -- --tag
@@ -115,16 +115,42 @@ jobs:
           fi
           codesign --force --options runtime \
             --entitlements packaging/macos-cli.entitlements \
-            --sign "$CODESIGN_IDENTITY" \
+            --sign "$FLEET_CODESIGN_IDENTITY" \
             dist/cleat-darwin-arm64
           codesign --verify --strict --verbose=2 dist/cleat-darwin-arm64
           scripts/write-artifact-metadata.sh \
             dist/cleat-darwin-arm64 \
             dist/cleat-darwin-arm64.json \
-            flotilla-org/cleat "$COMMIT_SHA" darwin-arm64 "" true
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RELEASE_TAG" \
+            darwin-arm64 "" true
 
-      - name: Publish immutable package version
+      - name: Transfer release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fleet-darwin-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: [linux, darwin]
+    runs-on: [self-hosted, Linux, X64, fleet-release]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out publisher
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Collect release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: fleet-*-${{ github.sha }}
+          path: dist
+          merge-multiple: true
+
+      - name: Publish immutable GitHub Release
         env:
-          FORGEJO_PACKAGE_VERSION: ${{ forgejo.sha }}
-          FORGEJO_PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-        run: scripts/publish-forgejo-generic.sh dist/*
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/publish-github-release.sh dist/*

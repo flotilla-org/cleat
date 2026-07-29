@@ -1,0 +1,113 @@
+name: Publish fleet artifacts
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_INCREMENTAL: "0"
+  FORGEJO_SERVER_URL: ${{ forgejo.server_url }}
+  FORGEJO_PACKAGE_OWNER: robert
+  FORGEJO_PACKAGE_NAME: cleat
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: feta
+    steps:
+      - name: Verify fleet runner
+        run: |
+          test "$(hostname -s)" = feta
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+
+      - name: Check out source
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Prepare Ghostty VT
+        run: |
+          test "$(zig version)" = 0.15.2
+          ./tools/prepare-ghostty-vt.sh
+          test -f .tools/ghostty-install/lib/libghostty-vt.a
+          find .tools/ghostty-install/lib -maxdepth 1 \
+            \( -name 'libghostty-vt.so' -o -name 'libghostty-vt.dylib' \) \
+            -delete
+
+      - name: Build functional release binary
+        run: cargo +stable build -p cleat --locked --features ghostty-vt --release
+
+      - name: Gate and describe artifact
+        env:
+          COMMIT_SHA: ${{ forgejo.sha }}
+        run: |
+          mkdir -p dist
+          install -m 0755 target/release/cleat dist/cleat-linux-x86_64
+          dist/cleat-linux-x86_64 launch --help | grep -q -- --tag
+          if ldd dist/cleat-linux-x86_64 | grep -q ghostty-vt; then
+            echo "cleat must be self-contained; found a dynamic ghostty-vt dependency" >&2
+            exit 1
+          fi
+          scripts/write-artifact-metadata.sh \
+            dist/cleat-linux-x86_64 \
+            dist/cleat-linux-x86_64.json \
+            flotilla-org/cleat "$COMMIT_SHA" linux-x86_64 "" false
+
+      - name: Publish immutable package version
+        env:
+          FORGEJO_PACKAGE_VERSION: ${{ forgejo.sha }}
+          FORGEJO_PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: scripts/publish-forgejo-generic.sh dist/*
+
+  darwin:
+    name: Darwin arm64
+    runs-on: comte
+    steps:
+      - name: Verify fleet runner
+        run: |
+          test "$(hostname -s)" = comte
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+
+      - name: Check out source
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Prepare Ghostty VT
+        run: |
+          test "$(zig version)" = 0.15.2
+          ./tools/prepare-ghostty-vt.sh
+          test -f .tools/ghostty-install/lib/libghostty-vt.a
+          find .tools/ghostty-install/lib -maxdepth 1 \
+            \( -name 'libghostty-vt.so' -o -name 'libghostty-vt.dylib' \) \
+            -delete
+
+      - name: Build functional release binary
+        run: cargo +stable build -p cleat --locked --features ghostty-vt --release
+
+      - name: Gate, sign, and describe artifact
+        env:
+          COMMIT_SHA: ${{ forgejo.sha }}
+          CODESIGN_IDENTITY: "Apple Development: Robert Wittams (DYYMCPD885)"
+        run: |
+          mkdir -p dist
+          install -m 0755 target/release/cleat dist/cleat-darwin-arm64
+          dist/cleat-darwin-arm64 launch --help | grep -q -- --tag
+          if otool -L dist/cleat-darwin-arm64 | grep -q ghostty-vt; then
+            echo "cleat must be self-contained; found a dynamic ghostty-vt dependency" >&2
+            exit 1
+          fi
+          codesign --force --options runtime \
+            --entitlements packaging/macos-cli.entitlements \
+            --sign "$CODESIGN_IDENTITY" \
+            dist/cleat-darwin-arm64
+          codesign --verify --strict --verbose=2 dist/cleat-darwin-arm64
+          scripts/write-artifact-metadata.sh \
+            dist/cleat-darwin-arm64 \
+            dist/cleat-darwin-arm64.json \
+            flotilla-org/cleat "$COMMIT_SHA" darwin-arm64 "" true
+
+      - name: Publish immutable package version
+        env:
+          FORGEJO_PACKAGE_VERSION: ${{ forgejo.sha }}
+          FORGEJO_PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: scripts/publish-forgejo-generic.sh dist/*

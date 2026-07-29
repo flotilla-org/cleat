@@ -1,0 +1,84 @@
+name: Publish fleet artifacts (Linux)
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-release-${{ github.repository }}-${{ github.sha }}-linux
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: [self-hosted, Linux, X64, fleet-release]
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Verify release runner capability
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+
+      - name: Check out exact source revision
+        env:
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          git init .
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$SOURCE_URL"
+          else
+            git remote add origin "$SOURCE_URL"
+          fi
+          git fetch --force --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --force --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git clean -ffdx
+
+      - name: Prepare Ghostty VT
+        run: |
+          test "$(zig version)" = 0.15.2
+          ./tools/prepare-ghostty-vt.sh
+          test -f .tools/ghostty-install/lib/libghostty-vt.a
+          find .tools/ghostty-install/lib -maxdepth 1 \
+            \( -name 'libghostty-vt.so' -o -name 'libghostty-vt.dylib' \) \
+            -delete
+
+      - name: Build functional release binary
+        run: cargo +stable build -p cleat --locked --features ghostty-vt --release
+
+      - name: Test and describe artifact
+        run: |
+          RELEASE_TAG="fleet-$GITHUB_SHA"
+          mkdir -p dist
+          install -m 0755 target/release/cleat dist/cleat-linux-x86_64
+          dist/cleat-linux-x86_64 launch --help | grep -q -- --tag
+          if ldd dist/cleat-linux-x86_64 | grep -q ghostty-vt; then
+            echo "cleat must be self-contained; found a dynamic ghostty-vt dependency" >&2
+            exit 1
+          fi
+          scripts/write-artifact-metadata.sh \
+            dist/cleat-linux-x86_64 \
+            dist/cleat-linux-x86_64.json \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RELEASE_TAG" \
+            linux-x86_64 "" false
+
+      # Publishing adapter: a Forgejo fork replaces only this step.
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/publish-github-release.sh \
+            --expect cleat-linux-x86_64 \
+            --expect cleat-linux-x86_64.json \
+            --expect cleat-darwin-arm64 \
+            --expect cleat-darwin-arm64.json \
+            -- dist/*

@@ -1,0 +1,102 @@
+name: Publish fleet artifacts (Darwin)
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-release-${{ github.repository }}-${{ github.sha }}-darwin
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  darwin:
+    name: Darwin arm64
+    runs-on: [self-hosted, macOS, ARM64, fleet-release-signing]
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Verify release runner capability
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
+          : "${FLEET_MACOS_SDK:?runner environment must provide FLEET_MACOS_SDK}"
+          test -d "$FLEET_MACOS_SDK"
+          signing_probe=$(mktemp)
+          trap 'rm -f "$signing_probe"' EXIT
+          cp /usr/bin/true "$signing_probe"
+          codesign --force --sign "$FLEET_CODESIGN_IDENTITY" "$signing_probe"
+          codesign --verify --strict "$signing_probe"
+
+      - name: Check out exact source revision
+        env:
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          git init .
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$SOURCE_URL"
+          else
+            git remote add origin "$SOURCE_URL"
+          fi
+          git fetch --force --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --force --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git clean -ffdx
+
+      - name: Prepare Ghostty VT
+        run: |
+          : "${FLEET_MACOS_SDK:?runner environment must provide FLEET_MACOS_SDK}"
+          test "$(zig version)" = 0.15.2
+          test -d "$FLEET_MACOS_SDK"
+          export PATH="$PWD/tools/macos-zig-sdk-shim:$PATH"
+          test "$(xcrun --show-sdk-path)" = "$FLEET_MACOS_SDK"
+          ./tools/prepare-ghostty-vt.sh
+          test -f .tools/ghostty-install/lib/libghostty-vt.a
+          find .tools/ghostty-install/lib -maxdepth 1 \
+            \( -name 'libghostty-vt.so' -o -name 'libghostty-vt.dylib' \) \
+            -delete
+
+      - name: Build functional release binary
+        run: cargo +stable build -p cleat --locked --features ghostty-vt --release
+
+      - name: Test, sign, and describe artifact
+        run: |
+          : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
+          RELEASE_TAG="fleet-$GITHUB_SHA"
+          mkdir -p dist
+          install -m 0755 target/release/cleat dist/cleat-darwin-arm64
+          dist/cleat-darwin-arm64 launch --help | grep -q -- --tag
+          if otool -L dist/cleat-darwin-arm64 | grep -q ghostty-vt; then
+            echo "cleat must be self-contained; found a dynamic ghostty-vt dependency" >&2
+            exit 1
+          fi
+          codesign --force --options runtime \
+            --entitlements packaging/macos-cli.entitlements \
+            --sign "$FLEET_CODESIGN_IDENTITY" \
+            dist/cleat-darwin-arm64
+          codesign --verify --strict --verbose=2 dist/cleat-darwin-arm64
+          scripts/write-artifact-metadata.sh \
+            dist/cleat-darwin-arm64 \
+            dist/cleat-darwin-arm64.json \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RELEASE_TAG" \
+            darwin-arm64 "" true
+
+      # Publishing adapter: a Forgejo fork replaces only this step.
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/publish-github-release.sh \
+            --expect cleat-linux-x86_64 \
+            --expect cleat-linux-x86_64.json \
+            --expect cleat-darwin-arm64 \
+            --expect cleat-darwin-arm64.json \
+            -- dist/*

@@ -73,8 +73,13 @@ jobs:
         uses: https://data.forgejo.org/actions/checkout@v6
 
       - name: Prepare Ghostty VT
+        env:
+          FLEET_MACOS_SDK: /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk
         run: |
           test "$(zig version)" = 0.15.2
+          test -d "$FLEET_MACOS_SDK"
+          export PATH="$PWD/tools/macos-zig-sdk-shim:$PATH"
+          test "$(xcrun --show-sdk-path)" = "$FLEET_MACOS_SDK"
           ./tools/prepare-ghostty-vt.sh
           test -f .tools/ghostty-install/lib/libghostty-vt.a
           find .tools/ghostty-install/lib -maxdepth 1 \

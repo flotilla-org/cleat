@@ -9,7 +9,7 @@ build = "build.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = []
+default = ["ghostty-vt"]
 ghostty-vt = ["dep:png"]
 
 [dependencies]

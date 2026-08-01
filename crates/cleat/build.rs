@@ -8,13 +8,13 @@ fn main() {
 
     if env::var_os("CARGO_FEATURE_GHOSTTY_VT").is_none() {
         println!("cargo:rustc-env=CLEAT_FUNCTIONAL_VT_AVAILABLE=0");
-        println!("cargo:warning=building cleat without ghostty-vt; this binary is non-functional for real terminal usage");
+        println!("cargo:warning=building cleat without ghostty-vt (--no-default-features); this binary is non-functional for real terminal usage");
         println!("cargo:warning=Ghostty is currently the only functional VT engine");
         println!("cargo:warning=passthrough is a placeholder/testing engine only");
         if cfg!(target_os = "windows") {
-            println!("cargo:warning=run ./tools/prepare-ghostty-vt.ps1 and rebuild with --features ghostty-vt for a functional binary");
+            println!("cargo:warning=run ./tools/prepare-ghostty-vt.ps1 and rebuild with default features for a functional binary");
         } else {
-            println!("cargo:warning=run ./tools/prepare-ghostty-vt.sh and rebuild with --features ghostty-vt for a functional binary");
+            println!("cargo:warning=run ./tools/prepare-ghostty-vt.sh and rebuild with default features for a functional binary");
         }
         return;
     }
@@ -139,7 +139,7 @@ fn missing_ghostty_install_message(prefix: &Path, reason: String) -> String {
         format!(
             "ghostty-vt feature requires a prepared Ghostty install prefix. {reason}.\n\
 run ./tools/prepare-ghostty-vt.ps1 and retry with:\n\
-$env:CLEAT_GHOSTTY_PREFIX=\"{}\"; $env:PATH=\"{}\\bin;{}\\lib;$env:PATH\"; cargo build -p cleat --locked --features ghostty-vt",
+$env:CLEAT_GHOSTTY_PREFIX=\"{}\"; $env:PATH=\"{}\\bin;{}\\lib;$env:PATH\"; cargo build -p cleat --locked",
             prefix.display(),
             prefix.display(),
             prefix.display()
@@ -148,7 +148,7 @@ $env:CLEAT_GHOSTTY_PREFIX=\"{}\"; $env:PATH=\"{}\\bin;{}\\lib;$env:PATH\"; cargo
         format!(
             "ghostty-vt feature requires a prepared Ghostty install prefix. {reason}.\n\
 run ./tools/prepare-ghostty-vt.sh and retry with:\n\
-CLEAT_GHOSTTY_PREFIX=\"{}\" cargo build -p cleat --locked --features ghostty-vt",
+CLEAT_GHOSTTY_PREFIX=\"{}\" cargo build -p cleat --locked",
             prefix.display()
         )
     }

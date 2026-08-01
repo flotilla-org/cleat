@@ -17,38 +17,35 @@ A future Rust VT engine may be added later. Until then, treat Ghostty as the onl
 Default development builds still compile without Ghostty so contributors can work in the repo, but those binaries are intentionally incomplete for real use.
 
 ```bash
+./tools/prepare-ghostty-vt.sh   # once per checkout (fetches + builds the pinned Ghostty VT)
 cargo build --locked
 cargo +nightly-2026-03-12 fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
+The `ghostty-vt` feature is a **default feature**: a plain `cargo build` produces a functional binary, and fails with an actionable message if the prepared Ghostty install is missing. Build the VT-less variant (placeholder engine, testing only) with `--no-default-features`.
+
 ## Functional Ghostty Build
 
-Use the repo-local helper to fetch the pinned Ghostty ref and build a local install prefix under `.tools/`, then build `cleat` with `ghostty-vt` enabled.
+Use the repo-local helper to fetch the pinned Ghostty ref and build a local install prefix under `.tools/`; `ghostty-vt` is enabled by default, so a normal build picks it up.
 
 ```bash
 ./tools/prepare-ghostty-vt.sh
 ```
 
-On **Linux**:
+On **Linux** and **macOS**:
 ```bash
-cargo build -p cleat --locked --features ghostty-vt
-cargo test -p cleat --locked --features ghostty-vt
-```
-
-On **macOS**:
-```bash
-cargo build -p cleat --locked --features ghostty-vt
-cargo test -p cleat --locked --features ghostty-vt
+cargo build -p cleat --locked
+cargo test -p cleat --locked
 ```
 
 On **Windows**:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\prepare-ghostty-vt.ps1
 $env:CLEAT_GHOSTTY_PREFIX = (Resolve-Path .tools\ghostty-install).Path
-cargo build -p cleat --locked --features ghostty-vt
-cargo test -p cleat --locked --features ghostty-vt
+cargo build -p cleat --locked
+cargo test -p cleat --locked
 ```
 
 The helpers read pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verify or install Zig `0.15.2`, clone or refresh Ghostty into `.tools/ghostty-src`, and install the Ghostty VT headers and libraries into `.tools/ghostty-install`.

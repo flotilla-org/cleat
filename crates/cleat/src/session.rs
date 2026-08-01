@@ -1019,7 +1019,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         let mut did_work = false;
 
         loop {
-            match listener.accept() {
+            match retry_interrupted(|| listener.accept()) {
                 Ok((stream, _)) => {
                     did_work = true;
                     if let Ok(pending) = PendingHttpHandshake::new(stream) {
@@ -1770,7 +1770,7 @@ impl PendingHttpHandshake {
     #[cfg(unix)]
     fn read_available(&mut self) -> io::Result<Option<Vec<u8>>> {
         let mut chunk = vec![0; 8192];
-        match self.stream.read(&mut chunk) {
+        match retry_interrupted(|| self.stream.read(&mut chunk)) {
             Ok(read) => {
                 chunk.truncate(read);
                 Ok(Some(chunk))
@@ -2490,7 +2490,7 @@ impl PacketClient {
 
     fn flush_pending_output(&mut self) -> Result<bool, String> {
         while !self.pending_output.is_empty() {
-            match self.stream.write(self.pending_output.as_slice()) {
+            match retry_interrupted(|| self.stream.write(self.pending_output.as_slice())) {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
                     self.pending_output.consume(n);
@@ -3156,7 +3156,7 @@ impl ActiveClient {
 
     fn flush_pending_output(&mut self) -> Result<bool, String> {
         while !self.pending_output.is_empty() {
-            match self.stream.write(self.pending_output.as_slice()) {
+            match retry_interrupted(|| self.stream.write(self.pending_output.as_slice())) {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
                     self.pending_output.consume(n);
@@ -3206,7 +3206,7 @@ impl ActiveClientReader {
 
     fn poll_timeout(&mut self, stream: &mut SessionStream, _timeout: Duration) -> Result<Option<Vec<u8>>, std::io::Error> {
         let mut buf = vec![0; 64 * 1024];
-        match stream.read(&mut buf) {
+        match retry_interrupted(|| stream.read(&mut buf)) {
             Ok(0) => Ok(Some(Vec::new())),
             Ok(n) => {
                 buf.truncate(n);
@@ -3214,6 +3214,15 @@ impl ActiveClientReader {
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(err) => Err(err),
+        }
+    }
+}
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
         }
     }
 }
@@ -3264,7 +3273,7 @@ mod tests {
     use std::{
         cell::RefCell,
         collections::VecDeque,
-        io::Write,
+        io::{self, Write},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -3414,6 +3423,24 @@ mod tests {
     fn graceful_socket_shutdown_classifies_broken_pipe_disconnects() {
         let err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         assert!(super::is_graceful_socket_shutdown(&err));
+    }
+
+    #[test]
+    fn interrupted_socket_operations_are_retried() {
+        let mut attempts = 0;
+
+        let value = super::retry_interrupted(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "injected interrupt"))
+            } else {
+                Ok(7)
+            }
+        })
+        .expect("operation should succeed after transient interrupts");
+
+        assert_eq!(value, 7);
+        assert_eq!(attempts, 3);
     }
 
     #[cfg(unix)]

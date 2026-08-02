@@ -787,6 +787,35 @@ fn bare_list_targets_ambient_daemon_and_explicit_server_wins() {
 }
 
 #[test]
+fn read_verbs_auto_start_an_absent_daemon() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for (verb, args) in [
+        ("list", vec!["cleat", "list", "--json"]),
+        ("inspect", vec!["cleat", "inspect", "alpha", "--json"]),
+        ("capture", vec!["cleat", "capture", "alpha"]),
+    ] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = service_for(temp.path());
+        service
+            .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("printf sentinel; sleep 30".into()), true)
+            .expect("create recorded session");
+        cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
+        wait_until("daemon exit", || UnixStream::connect(session_socket_path(temp.path(), "alpha")).is_err());
+
+        let command = Cli::try_parse_from(args).unwrap_or_else(|err| panic!("parse {verb}: {err}"));
+        let result = cli::execute(command, &service);
+
+        assert!(session_socket_path(temp.path(), "alpha").exists(), "{verb} should restart the daemon");
+        if verb == "list" {
+            result.expect("execute list");
+        } else {
+            assert_eq!(result.expect_err(&format!("execute {verb}")), "not found");
+        }
+        cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
+    }
+}
+
+#[test]
 fn failures_after_protocol_upgrade_close_without_an_http_error() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     for route in ["attach", "watch", "packet"] {

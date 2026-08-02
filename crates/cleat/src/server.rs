@@ -224,12 +224,10 @@ impl SessionService {
     }
 
     pub fn list_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
-        crate::session::ensure_daemon_started(&self.layout)?;
         self.list_daemons(selectors, ListScope::Current)
     }
 
     pub fn list_all_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
-        crate::session::ensure_daemon_started(&self.layout)?;
         self.list_daemons(selectors, ListScope::All)
     }
 
@@ -319,6 +317,7 @@ impl SessionService {
         if !self.layout.sessions_dir().is_dir() {
             return Ok(vec![]);
         }
+        crate::session::ensure_daemon_started(&self.layout)?;
 
         match self.http_json_daemon::<_, http_uds::SessionListResponse>(Method::GET, "/sessions", &()) {
             Ok(result) => {
@@ -1259,6 +1258,16 @@ mod tests {
         assert!(discarded_dir.exists(), "list should not remove retained session state");
         assert_ne!(fs::read_to_string(layout.daemon_pid_path()).expect("read daemon pid"), "999999999");
         crate::platform::daemon::terminate_session_daemon_if_expected(temp.path(), crate::runtime::DEFAULT_DAEMON_NAME);
+    }
+
+    #[test]
+    fn list_without_sessions_does_not_start_a_daemon() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        let service = SessionService::new(layout.clone());
+
+        assert!(service.list().expect("list empty runtime").is_empty());
+        assert!(!layout.daemon_dir().exists(), "empty list should not create a daemon directory");
     }
 
     #[test]

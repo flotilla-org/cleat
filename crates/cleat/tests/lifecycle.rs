@@ -796,13 +796,11 @@ fn read_verbs_auto_start_an_absent_daemon() {
     ] {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = service_for(temp.path());
-        if verb != "list" {
-            service
-                .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("printf sentinel; sleep 30".into()), true)
-                .expect("create recorded session");
-            cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
-            wait_until("daemon exit", || UnixStream::connect(session_socket_path(temp.path(), "alpha")).is_err());
-        }
+        service
+            .create(Some("alpha".into()), Some(VtEngineKind::Passthrough), None, Some("printf sentinel; sleep 30".into()), true)
+            .expect("create recorded session");
+        cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
+        wait_until("daemon exit", || UnixStream::connect(session_socket_path(temp.path(), "alpha")).is_err());
 
         let command = Cli::try_parse_from(args).unwrap_or_else(|err| panic!("parse {verb}: {err}"));
         let result = cli::execute(command, &service);

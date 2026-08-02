@@ -224,10 +224,12 @@ impl SessionService {
     }
 
     pub fn list_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
+        crate::session::ensure_daemon_started(&self.layout)?;
         self.list_daemons(selectors, ListScope::Current)
     }
 
     pub fn list_all_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
+        crate::session::ensure_daemon_started(&self.layout)?;
         self.list_daemons(selectors, ListScope::All)
     }
 
@@ -316,10 +318,6 @@ impl SessionService {
     fn list_one_daemon_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
         if !self.layout.sessions_dir().is_dir() {
             return Ok(vec![]);
-        }
-        if daemon_control_is_unavailable(&self.layout) {
-            return sweep_dead_daemon_sessions(&self.layout, "daemon control socket is unavailable".to_string())
-                .map(|sessions| sessions.into_iter().filter(|session| session_matches_selectors(session, selectors)).collect());
         }
 
         match self.http_json_daemon::<_, http_uds::SessionListResponse>(Method::GET, "/sessions", &()) {
@@ -414,6 +412,7 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
+        crate::session::ensure_daemon_started(&self.layout)?;
 
         let response: http_uds::ScreenResponse = self.http_json(id, Method::GET, &format!("/sessions/{id}/screen"), &())?;
         Ok(response.text)
@@ -701,6 +700,7 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
+        crate::session::ensure_daemon_started(&self.layout)?;
         self.http_json(id, Method::GET, &format!("/sessions/{id}"), &())
     }
 
@@ -1240,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn list_sweeps_dead_daemon_and_preserves_only_recreatable_sessions() {
+    fn list_starts_dead_daemon_without_sweeping_retained_sessions() {
         let temp = tempfile::tempdir().expect("tempdir");
         let layout = RuntimeLayout::new(temp.path().to_path_buf());
         let kept_dir = create_test_session_dir(temp.path(), "kept");
@@ -1252,14 +1252,13 @@ mod tests {
         let service = SessionService::new(layout.clone());
         let sessions = service.list_all_with_selectors(&[]).expect("list all");
 
-        assert_eq!(sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["kept"]);
-        assert_eq!(sessions[0].status, crate::protocol::SessionStatus::Detached);
-        assert!(sessions[0].error.as_deref().unwrap_or_default().contains("daemon control socket"));
+        assert!(sessions.is_empty(), "new daemon has no live sessions");
         assert!(kept_dir.exists(), "recreatable session should be preserved");
         assert!(kept_dir.join(crate::recording::CAST_FILE_NAME).exists(), "recording should remain");
-        assert!(!layout.foreground_path("kept").exists(), "volatile foreground marker should be removed");
-        assert!(!discarded_dir.exists(), "non-recreatable session should be removed");
-        assert!(!layout.daemon_pid_path().exists(), "stale daemon pid should be removed");
+        assert!(layout.foreground_path("kept").exists(), "list should not mutate retained session state");
+        assert!(discarded_dir.exists(), "list should not remove retained session state");
+        assert_ne!(fs::read_to_string(layout.daemon_pid_path()).expect("read daemon pid"), "999999999");
+        crate::platform::daemon::terminate_session_daemon_if_expected(temp.path(), crate::runtime::DEFAULT_DAEMON_NAME);
     }
 
     #[test]

@@ -1340,7 +1340,16 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
         let attachments = result
             .attachments
             .iter()
-            .map(|attachment| format!("{}: {} ({})", attachment.role, attachment.identity.name, attachment.identity.kind.as_str()))
+            .map(|attachment| {
+                let denial = attachment.denial_reason.map(|reason| format!(", denied: held_by={}", reason.held_by.as_str()));
+                format!(
+                    "{}: {} ({}){}",
+                    attachment.role,
+                    attachment.identity.name,
+                    attachment.identity.kind.as_str(),
+                    denial.unwrap_or_default()
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         table.add_row(vec!["attachments", &attachments]);

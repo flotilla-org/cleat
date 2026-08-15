@@ -321,11 +321,13 @@ impl SessionRuntime {
             attachments.push(crate::protocol::AttachmentInspect {
                 role: "controller".to_string(),
                 identity: crate::protocol::AttachmentIdentity::default(),
+                denial_reason: None,
             });
         }
         attachments.extend((0..watcher_count).map(|_| crate::protocol::AttachmentInspect {
             role: "watcher".to_string(),
             identity: crate::protocol::AttachmentIdentity::default(),
+            denial_reason: None,
         }));
 
         let activity = self.screen_activity.json_snapshot(Instant::now());

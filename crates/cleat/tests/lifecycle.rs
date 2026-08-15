@@ -205,10 +205,13 @@ impl<'a> PacketReader<'a> {
     }
 
     fn role(&mut self, channel: u32, timeout: Duration) -> ChannelRole {
+        self.role_state(channel, timeout).role
+    }
+
+    fn role_state(&mut self, channel: u32, timeout: Duration) -> RoleState {
         self.next_matching(timeout, |frame| frame.channel == channel && frame.msg_type == MSG_SESSION_ROLE, "role state packet")
             .decode::<RoleState>()
             .expect("decode role state packet")
-            .role
     }
 
     fn render(&mut self, channel: u32, timeout: Duration) -> TerminalRenderUpdate {
@@ -2017,7 +2020,9 @@ fn packet_roles_gate_input_and_take_control_demotes() {
     let _directory = PacketFrame::read(&mut watcher_stream).expect("read directory");
     packet_open_channel_role(&mut watcher_stream, 1, "alpha", ChannelRole::Controller, false);
     let mut watcher = PacketReader::new(&mut watcher_stream);
-    assert_eq!(watcher.role(1, Duration::from_secs(2)), ChannelRole::Watcher);
+    let denied = watcher.role_state(1, Duration::from_secs(2));
+    assert_eq!(denied.role, ChannelRole::Watcher);
+    assert_eq!(denied.denial_reason, Some(cleat::packet::RoleDenialReason { held_by: cleat::packet::ControllerHolder::Packet }));
     let watcher_initial = watcher.render(1, Duration::from_secs(2));
     packet_write(watcher.stream, 1, MSG_SESSION_ACK, &Ack { generation: watcher_initial.render_generation });
 
@@ -2063,6 +2068,74 @@ fn packet_roles_gate_input_and_take_control_demotes() {
         event: TerminalInputEvent::Paste(TerminalPasteEvent { text: "stale".to_string() }),
     });
     watcher.expect_no_render(1, Duration::from_millis(700));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_role_denial_identifies_legacy_stream_holder_and_inspect_exposes_it() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), false)
+        .expect("create alpha");
+
+    let legacy_identity = AttachmentIdentity { kind: AttachmentKind::Principal, name: "legacy attach".to_string() };
+    let (_legacy, response) = http_attach_with_seat_options(temp.path(), "alpha", legacy_identity, false, false);
+    assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{response}");
+
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    let _hello = PacketFrame::read(&mut stream).expect("read hello");
+    let _directory = PacketFrame::read(&mut stream).expect("read directory");
+    packet_open_channel_role(&mut stream, 1, "alpha", ChannelRole::Controller, false);
+    let mut reader = PacketReader::new(&mut stream);
+    let denied = reader.role_state(1, Duration::from_secs(2));
+    assert_eq!(denied.role, ChannelRole::Watcher);
+    assert_eq!(denied.denial_reason, Some(cleat::packet::RoleDenialReason { held_by: cleat::packet::ControllerHolder::Stream }));
+
+    let inspected = service.inspect("alpha").expect("inspect denied packet attachment");
+    let watcher = inspected.attachments.iter().find(|attachment| attachment.role == "watcher").expect("watcher attachment");
+    assert_eq!(watcher.denial_reason, denied.denial_reason);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn interactive_packet_attach_is_demoted_by_take_without_losing_recording_state() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("sh -c 'stty raw; exec cat'".into()), true)
+        .expect("create alpha");
+
+    let first_identity = AttachmentIdentity { kind: AttachmentKind::Principal, name: "first attach".to_string() };
+    let taker_identity = AttachmentIdentity { kind: AttachmentKind::Supervisor, name: "governor".to_string() };
+    let (_session, _first) = service
+        .attach(Some("alpha".into()), None, None, None, false, AttachOptions {
+            identity: first_identity.clone(),
+            strict: false,
+            take: false,
+        })
+        .expect("first interactive packet attach");
+    let (_session, _taker) = service
+        .attach(Some("alpha".into()), None, None, None, false, AttachOptions {
+            identity: taker_identity.clone(),
+            strict: false,
+            take: true,
+        })
+        .expect("take interactive packet controller");
+
+    let inspected = service.inspect("alpha").expect("inspect after interactive transfer");
+    assert!(inspected.recording.active);
+    assert_eq!(inspected.session.state, "running");
+    assert!(inspected.attachments.iter().any(|attachment| {
+        attachment.role == "controller" && attachment.identity == taker_identity && attachment.denial_reason.is_none()
+    }));
+    assert!(inspected.attachments.iter().any(|attachment| {
+        attachment.role == "watcher"
+            && attachment.identity == first_identity
+            && attachment.denial_reason == Some(cleat::packet::RoleDenialReason { held_by: cleat::packet::ControllerHolder::Packet })
+    }));
 }
 
 #[cfg(feature = "ghostty-vt")]
@@ -2446,8 +2519,12 @@ fn attach_falls_back_strictly_refuses_and_take_demotes_without_losing_session_st
     let before = service.inspect("alpha").expect("inspect before take");
     assert!(before.recording.active);
     assert_eq!(before.attachments, vec![
-        cleat::protocol::AttachmentInspect { role: "controller".to_string(), identity: alice },
-        cleat::protocol::AttachmentInspect { role: "watcher".to_string(), identity: bob },
+        cleat::protocol::AttachmentInspect { role: "controller".to_string(), identity: alice, denial_reason: None },
+        cleat::protocol::AttachmentInspect {
+            role: "watcher".to_string(),
+            identity: bob,
+            denial_reason: Some(cleat::packet::RoleDenialReason { held_by: cleat::packet::ControllerHolder::Stream }),
+        },
     ]);
 
     let (_new_controller, take_response) = http_attach_with_seat_options(temp.path(), "alpha", carol.clone(), false, true);
@@ -2461,7 +2538,7 @@ fn attach_falls_back_strictly_refuses_and_take_demotes_without_losing_session_st
     assert_eq!(after.session.state, "running");
     assert!(after.recording.active);
     assert_eq!(after.attachments.iter().filter(|attachment| attachment.role == "controller").collect::<Vec<_>>(), vec![
-        &cleat::protocol::AttachmentInspect { role: "controller".to_string(), identity: carol.clone() }
+        &cleat::protocol::AttachmentInspect { role: "controller".to_string(), identity: carol.clone(), denial_reason: None }
     ]);
     assert_eq!(service.list().expect("list sessions")[0].controller, Some(carol));
 }

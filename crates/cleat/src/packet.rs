@@ -8,8 +8,8 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 5 adds structured attachment identity and controller seat state.
-pub const PROTOCOL_VERSION: u16 = 5;
+/// Version 6 adds controller-denial reasons to role state.
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -145,6 +145,23 @@ pub struct RoleState {
     pub role: ChannelRole,
     #[serde(default)]
     pub controller: Option<AttachmentIdentity>,
+    #[serde(default)]
+    pub denial_reason: Option<RoleDenialReason>,
+}
+
+/// Why a controller request was granted as a watcher instead. This stays
+/// separate from `controller`: identity answers who has control, while the
+/// holder kind tells clients whether a retry with `take` can preempt it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleDenialReason {
+    pub held_by: ControllerHolder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerHolder {
+    Packet,
+    Stream,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,8 +383,8 @@ mod tests {
     }
 
     #[test]
-    fn attachment_identity_semantics_start_at_protocol_version_five() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn denial_reason_semantics_start_at_protocol_version_six() {
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     #[test]

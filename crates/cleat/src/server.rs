@@ -17,8 +17,8 @@ use crate::{
     protocol::{AttachmentIdentity, SessionInfo, SessionStatus},
     runtime::{discoverable_runtime_roots, validate_runtime_name, DaemonCoordinates, RuntimeLayout, TerminalSize},
     session::{
-        attach_foreground, ensure_session_started, run_session_daemon, start_session_in_running_daemon, watch_foreground, ForegroundAttach,
-        SessionStartOptions,
+        attach_foreground, attach_packet_foreground, ensure_session_started, run_session_daemon, start_session_in_running_daemon,
+        watch_foreground, ForegroundAttach, SessionStartOptions,
     },
     vt::VtEngineKind,
 };
@@ -591,7 +591,20 @@ impl SessionService {
                 error: None,
             }
         };
-        let attach = attach_foreground(&self.layout, &info.id, options.identity, options.strict, options.take)?;
+        // Passthrough has no structured render surface, so it remains on the
+        // legacy byte stream. Functional interactive terminals use packets.
+        let attach = if info.vt_engine == VtEngineKind::Passthrough {
+            attach_foreground(&self.layout, &info.id, options.identity, options.strict, options.take)?
+        } else {
+            attach_packet_foreground(
+                &self.layout,
+                &info.id,
+                options.identity,
+                crate::packet::ChannelRole::Controller,
+                options.strict,
+                options.take,
+            )?
+        };
         Ok((info, attach))
     }
 
@@ -599,7 +612,12 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        watch_foreground(&self.layout, id, identity)
+        let vt_engine = self.inspect(id)?.session.vt_engine;
+        if vt_engine == VtEngineKind::Passthrough.as_str() {
+            watch_foreground(&self.layout, id, identity)
+        } else {
+            attach_packet_foreground(&self.layout, id, identity, crate::packet::ChannelRole::Watcher, false, false)
+        }
     }
 
     pub fn connect_packets(

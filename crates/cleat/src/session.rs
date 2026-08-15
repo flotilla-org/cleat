@@ -20,11 +20,12 @@ use crate::{
     host::actor::{RawOutputRecovery, RawOutputReplay, RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
     http_uds,
     packet::{
-        Ack, ActivityEvent, ActivitySession, ActivitySnapshot, ChannelRole, CloseChannel, ControlError, ControlHello, DirectoryDelta,
-        DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame, RenderPacket, Resize, RoleRequest, RoleState, ScreenActivity,
-        CHANNEL_CONTROL, MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA,
-        MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT,
-        MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE, MSG_SESSION_VIEWPORT,
+        Ack, ActivityEvent, ActivitySession, ActivitySnapshot, ChannelRole, CloseChannel, ControlError, ControlHello, ControllerHolder,
+        DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame, RenderPacket, Resize, RoleDenialReason,
+        RoleRequest, RoleState, ScreenActivity, CHANNEL_CONTROL, MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT,
+        MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO,
+        MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE,
+        MSG_SESSION_VIEWPORT,
     },
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
@@ -56,7 +57,21 @@ const SCREEN_STABLE_CHANGED_CELL_TOLERANCE: usize = 16;
 
 #[derive(Debug)]
 pub struct ForegroundAttach {
+    transport: ForegroundTransport,
+}
+
+#[derive(Debug)]
+enum ForegroundTransport {
+    Legacy(Arc<Mutex<SessionStream>>),
+    Packet(Box<PacketForegroundAttach>),
+}
+
+#[derive(Debug)]
+struct PacketForegroundAttach {
     stream: Arc<Mutex<SessionStream>>,
+    channel: u32,
+    initial_update: TerminalRenderUpdate,
+    initial_role: RoleState,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,105 +95,438 @@ impl ForegroundAttach {
     /// already be caught, or the process dies with default disposition
     /// (observed as a test race once the daemon got fast enough).
     pub fn relay_stdio_with_handlers(self, signal_handlers: AttachSignalHandlers) -> Result<(), String> {
-        let _signal_handlers = signal_handlers;
-        let mut cleanup = AttachCleanupGuard::stdout();
-        let mut terminal = ForegroundTerminal::enter()?;
-        let read_handle = {
-            let stream = self.stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
-            stream.try_clone().map_err(|err| format!("clone attach stream: {err}"))?
-        };
-        let mut read_stream = read_handle;
-        let alive = Arc::new(AtomicBool::new(true));
-        let alive_out = Arc::clone(&alive);
-        let relay_out = thread::spawn(move || -> Result<(), String> {
-            let mut stdout = std::io::stdout().lock();
-            let mut watcher_state = None;
-            loop {
-                match Frame::read(&mut read_stream) {
-                    Ok(Frame::Output(bytes)) => {
-                        write_attach_output(&mut stdout, &bytes, watcher_state.as_ref())?;
-                        stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
-                    }
-                    Ok(Frame::SeatState(state)) => {
-                        update_watcher_chrome(&mut stdout, &mut watcher_state, state)?;
-                        stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        alive_out.store(false, Ordering::SeqCst);
-                        if is_graceful_socket_shutdown(&err) {
-                            return Ok(());
-                        }
-                        return Err(format!("read attach frame: {err}"));
-                    }
-                }
-            }
-        });
-
-        let write_stream = Arc::clone(&self.stream);
-        let alive_resize = Arc::clone(&alive);
-        let resize_loop = thread::spawn(move || -> Result<(), String> {
-            let mut last = current_terminal_size();
-            while alive_resize.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(100));
-                let next = current_terminal_size();
-                if next != last {
-                    let mut stream = write_stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
-                    Frame::Resize { cols: next.0, rows: next.1 }.write(&mut *stream).map_err(|err| format!("write resize frame: {err}"))?;
-                    last = next;
-                }
-            }
-            Ok(())
-        });
-
-        let mut buf = [0u8; 4096];
-        let stdin_result = loop {
-            if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
-                break Ok(());
-            }
-            match terminal.read_input(Duration::from_millis(100), &mut buf) {
-                Ok(None) => continue,
-                Ok(Some(0)) => break Ok(()),
-                Ok(Some(n)) => {
-                    let mut stream = self.stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
-                    if let Err(err) = Frame::Input(buf[..n].to_vec()).write(&mut *stream) {
-                        if is_graceful_socket_shutdown(&err) {
-                            break Ok(());
-                        }
-                        break Err(format!("write input frame: {err}"));
-                    }
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::UnexpectedEof
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionAborted
-                    ) =>
-                {
-                    break Ok(())
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => break Err(format!("read stdin: {err}")),
-            }
-        };
-
-        let signal_exit = attach_signal_exit_requested();
-        alive.store(false, Ordering::SeqCst);
-        if let Ok(stream) = self.stream.lock() {
-            shutdown_stream(&stream);
+        match self.transport {
+            ForegroundTransport::Legacy(stream) => relay_legacy_stdio(stream, signal_handlers),
+            ForegroundTransport::Packet(packet) => relay_packet_stdio(*packet, signal_handlers),
         }
-        let out_result = relay_out.join().map_err(|_| "stdout relay thread panicked".to_string())?;
-        let resize_result = resize_loop.join().map_err(|_| "resize thread panicked".to_string())?;
-        cleanup.emit()?;
-        if signal_exit {
-            return Ok(());
-        }
-        stdin_result?;
-        out_result?;
-        resize_result
     }
+}
+
+fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: AttachSignalHandlers) -> Result<(), String> {
+    let _signal_handlers = signal_handlers;
+    let mut cleanup = AttachCleanupGuard::stdout();
+    let mut terminal = ForegroundTerminal::enter()?;
+    let read_handle = {
+        let stream = stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
+        stream.try_clone().map_err(|err| format!("clone attach stream: {err}"))?
+    };
+    let mut read_stream = read_handle;
+    let alive = Arc::new(AtomicBool::new(true));
+    let alive_out = Arc::clone(&alive);
+    let relay_out = thread::spawn(move || -> Result<(), String> {
+        let mut stdout = std::io::stdout().lock();
+        let mut watcher_state = None;
+        loop {
+            match Frame::read(&mut read_stream) {
+                Ok(Frame::Output(bytes)) => {
+                    write_attach_output(&mut stdout, &bytes, watcher_state.as_ref())?;
+                    stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
+                }
+                Ok(Frame::SeatState(state)) => {
+                    update_watcher_chrome(&mut stdout, &mut watcher_state, state)?;
+                    stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    alive_out.store(false, Ordering::SeqCst);
+                    if is_graceful_socket_shutdown(&err) {
+                        return Ok(());
+                    }
+                    return Err(format!("read attach frame: {err}"));
+                }
+            }
+        }
+    });
+
+    let write_stream = Arc::clone(&stream);
+    let alive_resize = Arc::clone(&alive);
+    let resize_loop = thread::spawn(move || -> Result<(), String> {
+        let mut last = current_terminal_size();
+        while alive_resize.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+            let next = current_terminal_size();
+            if next != last {
+                let mut stream = write_stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
+                Frame::Resize { cols: next.0, rows: next.1 }.write(&mut *stream).map_err(|err| format!("write resize frame: {err}"))?;
+                last = next;
+            }
+        }
+        Ok(())
+    });
+
+    let mut buf = [0u8; 4096];
+    let stdin_result = loop {
+        if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
+            break Ok(());
+        }
+        match terminal.read_input(Duration::from_millis(100), &mut buf) {
+            Ok(None) => continue,
+            Ok(Some(0)) => break Ok(()),
+            Ok(Some(n)) => {
+                let mut stream = stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
+                if let Err(err) = Frame::Input(buf[..n].to_vec()).write(&mut *stream) {
+                    if is_graceful_socket_shutdown(&err) {
+                        break Ok(());
+                    }
+                    break Err(format!("write input frame: {err}"));
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => break Err(format!("read stdin: {err}")),
+        }
+    };
+
+    let signal_exit = attach_signal_exit_requested();
+    alive.store(false, Ordering::SeqCst);
+    if let Ok(stream) = stream.lock() {
+        shutdown_stream(&stream);
+    }
+    let out_result = relay_out.join().map_err(|_| "stdout relay thread panicked".to_string())?;
+    let resize_result = resize_loop.join().map_err(|_| "resize thread panicked".to_string())?;
+    cleanup.emit()?;
+    if signal_exit {
+        return Ok(());
+    }
+    stdin_result?;
+    out_result?;
+    resize_result
+}
+
+fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSignalHandlers) -> Result<(), String> {
+    let _signal_handlers = signal_handlers;
+    let mut cleanup = AttachCleanupGuard::stdout();
+    let mut terminal = ForegroundTerminal::enter()?;
+    let read_handle = {
+        let stream = packet.stream.lock().map_err(|_| "packet attach stream lock poisoned".to_string())?;
+        stream.try_clone().map_err(|err| format!("clone packet attach stream: {err}"))?
+    };
+    let alive = Arc::new(AtomicBool::new(true));
+    let controller = Arc::new(AtomicBool::new(packet.initial_role.role == ChannelRole::Controller));
+    let alive_out = Arc::clone(&alive);
+    let controller_out = Arc::clone(&controller);
+    let write_stream = Arc::clone(&packet.stream);
+    let channel = packet.channel;
+    let initial_update = packet.initial_update;
+    let initial_role = packet.initial_role;
+    let relay_out = thread::spawn(move || -> Result<(), String> {
+        let mut read_stream = read_handle;
+        let mut stdout = std::io::stdout().lock();
+        let mut renderer = PacketTerminalRenderer::new(initial_update.cols, initial_update.rows);
+        let mut watcher_state = (initial_role.role == ChannelRole::Watcher)
+            .then(|| SeatState { role: "watcher".to_string(), controller: initial_role.controller.clone() });
+        let mut control_was_taken = false;
+        renderer.apply_and_render(&mut stdout, &initial_update)?;
+        if let Some(state) = watcher_state.as_ref() {
+            render_seat_chrome(&mut stdout, state)?;
+        }
+        stdout.flush().map_err(|err| format!("flush packet attach stdout: {err}"))?;
+        write_packet_frame(
+            &write_stream,
+            PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: initial_update.render_generation }),
+        )?;
+
+        loop {
+            let frame = match PacketFrame::read(&mut read_stream) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    alive_out.store(false, Ordering::SeqCst);
+                    if is_graceful_socket_shutdown(&err) {
+                        return Ok(());
+                    }
+                    return Err(format!("read packet attach frame: {err}"));
+                }
+            };
+            match (frame.channel, frame.msg_type) {
+                (frame_channel, MSG_SESSION_RENDER) if frame_channel == channel => {
+                    let update = frame.decode::<RenderPacket>().map_err(|err| format!("decode packet render: {err}"))?.update;
+                    renderer.apply_and_render(&mut stdout, &update)?;
+                    if let Some(state) = watcher_state.as_ref() {
+                        if control_was_taken {
+                            render_control_taken_chrome(&mut stdout, state)?;
+                        } else {
+                            render_seat_chrome(&mut stdout, state)?;
+                        }
+                    }
+                    stdout.flush().map_err(|err| format!("flush packet attach stdout: {err}"))?;
+                    write_packet_frame(
+                        &write_stream,
+                        PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: update.render_generation }),
+                    )?;
+                }
+                (frame_channel, MSG_SESSION_ROLE) if frame_channel == channel => {
+                    let state = frame.decode::<RoleState>().map_err(|err| format!("decode packet role state: {err}"))?;
+                    let was_controller = controller_out.swap(state.role == ChannelRole::Controller, Ordering::SeqCst);
+                    let seat_state = SeatState {
+                        role: if state.role == ChannelRole::Controller { "controller" } else { "watcher" }.to_string(),
+                        controller: state.controller,
+                    };
+                    if was_controller && state.role == ChannelRole::Watcher {
+                        control_was_taken = true;
+                        render_control_taken_chrome(&mut stdout, &seat_state)?;
+                        watcher_state = Some(seat_state);
+                    } else {
+                        if state.role == ChannelRole::Controller {
+                            control_was_taken = false;
+                        }
+                        update_watcher_chrome(&mut stdout, &mut watcher_state, seat_state)?;
+                    }
+                    stdout.flush().map_err(|err| format!("flush packet role notice: {err}"))?;
+                }
+                (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
+                    let error = frame.decode::<ControlError>().map_err(|err| format!("decode packet control error: {err}"))?;
+                    if error.channel == channel {
+                        alive_out.store(false, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let resize_stream = Arc::clone(&packet.stream);
+    let alive_resize = Arc::clone(&alive);
+    let controller_resize = Arc::clone(&controller);
+    let resize_loop = thread::spawn(move || -> Result<(), String> {
+        let mut last = current_terminal_size();
+        while alive_resize.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+            let next = current_terminal_size();
+            if next != last {
+                if controller_resize.load(Ordering::SeqCst) {
+                    write_packet_frame(
+                        &resize_stream,
+                        PacketFrame::new(channel, MSG_SESSION_RESIZE, &Resize { cols: next.0, rows: next.1 }),
+                    )?;
+                }
+                last = next;
+            }
+        }
+        Ok(())
+    });
+
+    let mut buf = [0u8; 4096];
+    let stdin_result = loop {
+        if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
+            break Ok(());
+        }
+        match terminal.read_input(Duration::from_millis(100), &mut buf) {
+            Ok(None) => continue,
+            Ok(Some(0)) => break Ok(()),
+            Ok(Some(n)) => {
+                if !controller.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let frame = PacketFrame::new(channel, MSG_SESSION_INPUT, &Input { event: TerminalInputEvent::RawBytes(buf[..n].to_vec()) });
+                if let Err(err) = write_packet_frame(&packet.stream, frame) {
+                    break Err(err);
+                }
+            }
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe) => break Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => break Err(format!("read stdin: {err}")),
+        }
+    };
+
+    let signal_exit = attach_signal_exit_requested();
+    alive.store(false, Ordering::SeqCst);
+    if let Ok(stream) = packet.stream.lock() {
+        shutdown_stream(&stream);
+    }
+    let out_result = relay_out.join().map_err(|_| "packet stdout relay thread panicked".to_string())?;
+    let resize_result = resize_loop.join().map_err(|_| "packet resize thread panicked".to_string())?;
+    cleanup.emit()?;
+    if signal_exit {
+        return Ok(());
+    }
+    stdin_result?;
+    out_result?;
+    resize_result
+}
+
+fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
+    let frame = frame.map_err(|err| format!("encode packet attach frame: {err}"))?;
+    let mut stream = stream.lock().map_err(|_| "packet attach stream lock poisoned".to_string())?;
+    frame.write(&mut *stream).map_err(|err| format!("write packet attach frame: {err}"))
+}
+
+#[derive(Debug)]
+struct PacketTerminalRenderer {
+    cols: u16,
+    rows: u16,
+    cells: Vec<Vec<crate::provider::TerminalRenderCell>>,
+    terminal_modes: vt::TerminalModeState,
+}
+
+impl PacketTerminalRenderer {
+    fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            cols,
+            rows,
+            cells: vec![vec![crate::provider::TerminalRenderCell::default(); cols as usize]; rows as usize],
+            terminal_modes: vt::TerminalModeState::default(),
+        }
+    }
+
+    fn apply_and_render(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
+        if self.cols != update.cols || self.rows != update.rows {
+            self.cols = update.cols;
+            self.rows = update.rows;
+            self.cells = vec![vec![crate::provider::TerminalRenderCell::default(); self.cols as usize]; self.rows as usize];
+        }
+        render_packet_terminal_modes(writer, self.terminal_modes, update.terminal_modes)?;
+        self.terminal_modes = update.terminal_modes;
+        for op in &update.ops {
+            match op.kind {
+                crate::provider::TerminalRenderUpdateOpKind::FullVisibleReplace => {
+                    self.cells = vec![vec![crate::provider::TerminalRenderCell::default(); self.cols as usize]; self.rows as usize];
+                    self.replace_rows(&op.rows);
+                }
+                crate::provider::TerminalRenderUpdateOpKind::RowReplace => self.replace_rows(&op.rows),
+                crate::provider::TerminalRenderUpdateOpKind::ScrollCopy => {
+                    let copied =
+                        (0..op.row_count).filter_map(|offset| self.cells.get((op.src_row + offset) as usize).cloned()).collect::<Vec<_>>();
+                    for (offset, row) in copied.into_iter().enumerate() {
+                        if let Some(target) = self.cells.get_mut(op.dst_row as usize + offset) {
+                            *target = row;
+                        }
+                    }
+                }
+            }
+        }
+        writer.write_all(b"\x1b[H").map_err(|err| format!("position packet render: {err}"))?;
+        for (row_index, row) in self.cells.iter().enumerate() {
+            write!(writer, "\x1b[{};1H\x1b[2K", row_index + 1).map_err(|err| format!("position packet row: {err}"))?;
+            for cell in row {
+                render_packet_cell(writer, cell)?;
+            }
+        }
+        writer.write_all(b"\x1b[0m").map_err(|err| format!("reset packet render style: {err}"))?;
+        write!(writer, "\x1b[{};{}H", update.cursor.row.saturating_add(1), update.cursor.col.saturating_add(1))
+            .map_err(|err| format!("position packet cursor: {err}"))?;
+        let cursor_style = match update.cursor.style {
+            crate::provider::TerminalCursorStyle::Block => 2,
+            crate::provider::TerminalCursorStyle::Underline => 4,
+            crate::provider::TerminalCursorStyle::Bar => 6,
+            crate::provider::TerminalCursorStyle::BlockHollow => 2,
+        };
+        write!(writer, "\x1b[{cursor_style} q").map_err(|err| format!("set packet cursor style: {err}"))?;
+        writer
+            .write_all(if update.cursor.visible { b"\x1b[?25h" } else { b"\x1b[?25l" })
+            .map_err(|err| format!("set packet cursor visibility: {err}"))
+    }
+
+    fn replace_rows(&mut self, rows: &[crate::provider::TerminalRenderRow]) {
+        for row in rows {
+            if let Some(target) = self.cells.get_mut(row.row as usize) {
+                *target = row.cells.clone();
+                target.resize(self.cols as usize, crate::provider::TerminalRenderCell::default());
+            }
+        }
+    }
+}
+
+fn render_packet_terminal_modes(
+    writer: &mut impl Write,
+    previous: vt::TerminalModeState,
+    current: vt::TerminalModeState,
+) -> Result<(), String> {
+    if previous.active_alternate_screen != current.active_alternate_screen {
+        writer
+            .write_all(if current.active_alternate_screen { b"\x1b[?1049h" } else { b"\x1b[?1049l" })
+            .map_err(|err| format!("set packet alternate screen: {err}"))?;
+    }
+    if previous.application_cursor_keys != current.application_cursor_keys {
+        writer
+            .write_all(if current.application_cursor_keys { b"\x1b[?1h" } else { b"\x1b[?1l" })
+            .map_err(|err| format!("set packet cursor-key mode: {err}"))?;
+    }
+    if previous.mouse_tracking_mode != current.mouse_tracking_mode {
+        writer.write_all(b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l").map_err(|err| format!("reset packet mouse mode: {err}"))?;
+        let enable = match current.mouse_tracking_mode {
+            vt::MouseTrackingMode::None => None,
+            vt::MouseTrackingMode::X10 => Some(&b"\x1b[?9h"[..]),
+            vt::MouseTrackingMode::Normal => Some(&b"\x1b[?1000h"[..]),
+            vt::MouseTrackingMode::Button => Some(&b"\x1b[?1002h"[..]),
+            vt::MouseTrackingMode::Any => Some(&b"\x1b[?1003h"[..]),
+        };
+        if let Some(enable) = enable {
+            writer.write_all(enable).map_err(|err| format!("set packet mouse mode: {err}"))?;
+        }
+    }
+    if previous.mouse_report_format != current.mouse_report_format {
+        writer.write_all(b"\x1b[?1006l\x1b[?1016l").map_err(|err| format!("reset packet mouse format: {err}"))?;
+        let enable = match current.mouse_report_format {
+            vt::MouseReportFormat::Legacy => None,
+            vt::MouseReportFormat::Sgr => Some(&b"\x1b[?1006h"[..]),
+            vt::MouseReportFormat::SgrPixels => Some(&b"\x1b[?1016h"[..]),
+        };
+        if let Some(enable) = enable {
+            writer.write_all(enable).map_err(|err| format!("set packet mouse format: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn render_packet_cell(writer: &mut impl Write, cell: &crate::provider::TerminalRenderCell) -> Result<(), String> {
+    use crate::provider::{TerminalCellFlags as Flags, TerminalCellWidth};
+    if cell.style.width == TerminalCellWidth::SpacerTail {
+        return Ok(());
+    }
+    writer.write_all(b"\x1b[0m").map_err(|err| format!("reset packet cell style: {err}"))?;
+    let flags = cell.style.flags;
+    if flags.contains(Flags::BOLD) {
+        writer.write_all(b"\x1b[1m").map_err(|err| format!("write bold style: {err}"))?;
+    }
+    if flags.contains(Flags::FAINT) {
+        writer.write_all(b"\x1b[2m").map_err(|err| format!("write faint style: {err}"))?;
+    }
+    if flags.contains(Flags::ITALIC) {
+        writer.write_all(b"\x1b[3m").map_err(|err| format!("write italic style: {err}"))?;
+    }
+    if flags.contains(Flags::UNDERLINE) {
+        writer.write_all(b"\x1b[4m").map_err(|err| format!("write underline style: {err}"))?;
+    }
+    if flags.contains(Flags::INVERSE) {
+        writer.write_all(b"\x1b[7m").map_err(|err| format!("write inverse style: {err}"))?;
+    }
+    if flags.contains(Flags::BLINK) {
+        writer.write_all(b"\x1b[5m").map_err(|err| format!("write blink style: {err}"))?;
+    }
+    if flags.contains(Flags::INVISIBLE) {
+        writer.write_all(b"\x1b[8m").map_err(|err| format!("write invisible style: {err}"))?;
+    }
+    if flags.contains(Flags::STRIKETHROUGH) {
+        writer.write_all(b"\x1b[9m").map_err(|err| format!("write strikethrough style: {err}"))?;
+    }
+    if flags.contains(Flags::OVERLINE) {
+        writer.write_all(b"\x1b[53m").map_err(|err| format!("write overline style: {err}"))?;
+    }
+    let fg = cell.style.resolved_fg;
+    let bg = cell.style.resolved_bg;
+    write!(writer, "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m", fg.r, fg.g, fg.b, bg.r, bg.g, bg.b)
+        .map_err(|err| format!("write packet cell colours: {err}"))?;
+    if cell.graphemes.is_empty() {
+        writer.write_all(b" ").map_err(|err| format!("write packet blank cell: {err}"))?;
+    } else {
+        for codepoint in &cell.graphemes {
+            if let Some(character) = char::from_u32(*codepoint) {
+                write!(writer, "{character}").map_err(|err| format!("write packet grapheme: {err}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_attach_output(writer: &mut impl Write, bytes: &[u8], watcher_state: Option<&SeatState>) -> Result<(), String> {
@@ -202,6 +550,29 @@ fn update_watcher_chrome(writer: &mut impl Write, watcher_state: &mut Option<Sea
 fn render_seat_chrome(writer: &mut impl Write, state: &SeatState) -> Result<(), String> {
     let (_, rows) = current_terminal_size();
     render_seat_chrome_at_rows(writer, state, rows)
+}
+
+fn render_control_taken_chrome(writer: &mut impl Write, state: &SeatState) -> Result<(), String> {
+    let (_, rows) = current_terminal_size();
+    render_control_taken_chrome_at_rows(writer, state, rows)
+}
+
+fn render_control_taken_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: u16) -> Result<(), String> {
+    if rows == 0 {
+        return Ok(());
+    }
+    writer.write_all(b"\x1b7").map_err(|err| format!("save cursor for control notice: {err}"))?;
+    if rows > 1 {
+        write!(writer, "\x1b[1;{}r", rows - 1).map_err(|err| format!("reserve control notice row: {err}"))?;
+    }
+    write!(writer, "\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("position control notice: {err}"))?;
+    let controller = state
+        .controller
+        .as_ref()
+        .map(|identity| sanitize_attachment_name(identity.display_name()))
+        .unwrap_or_else(|| "another client".to_string());
+    write!(writer, "\x1b[7m watching — control taken by {controller} \x1b[0m").map_err(|err| format!("write control notice: {err}"))?;
+    writer.write_all(b"\x1b8").map_err(|err| format!("restore cursor after control notice: {err}"))
 }
 
 fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: u16) -> Result<(), String> {
@@ -397,6 +768,74 @@ pub fn attach_foreground(
     connect_foreground_upgrade(layout, id, "attach", identity, strict, take)
 }
 
+pub fn attach_packet_foreground(
+    layout: &RuntimeLayout,
+    id: &str,
+    identity: AttachmentIdentity,
+    role: ChannelRole,
+    strict: bool,
+    take: bool,
+) -> Result<ForegroundAttach, String> {
+    const FOREGROUND_CHANNEL: u32 = 1;
+    let (mut stream, directory) = crate::provider_daemon::connect_packet_stream(layout, &[])?;
+    if !directory.sessions.iter().any(|entry| entry.session_id == id) {
+        return Err(format!("session {id} was not present in packet directory"));
+    }
+    let (cols, rows) = current_terminal_size();
+    PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
+        channel: FOREGROUND_CHANNEL,
+        session_id: id.to_string(),
+        role,
+        take,
+        identity,
+    })
+    .map_err(|err| format!("encode foreground packet channel: {err}"))?
+    .write(&mut stream)
+    .map_err(|err| format!("open foreground packet channel: {err}"))?;
+    PacketFrame::new(FOREGROUND_CHANNEL, MSG_SESSION_RESIZE, &Resize { cols, rows })
+        .map_err(|err| format!("encode foreground packet resize: {err}"))?
+        .write(&mut stream)
+        .map_err(|err| format!("resize foreground packet channel: {err}"))?;
+
+    let mut initial_role = None;
+    let mut initial_update = None;
+    while initial_role.is_none() || initial_update.is_none() {
+        let frame = PacketFrame::read(&mut stream).map_err(|err| format!("read foreground packet handshake: {err}"))?;
+        match (frame.channel, frame.msg_type) {
+            (FOREGROUND_CHANNEL, MSG_SESSION_ROLE) => {
+                initial_role = Some(frame.decode::<RoleState>().map_err(|err| format!("decode foreground role: {err}"))?);
+            }
+            (FOREGROUND_CHANNEL, MSG_SESSION_RENDER) => {
+                initial_update = Some(frame.decode::<RenderPacket>().map_err(|err| format!("decode foreground render: {err}"))?.update);
+            }
+            (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
+                let error = frame.decode::<ControlError>().map_err(|err| format!("decode foreground open error: {err}"))?;
+                if error.channel == FOREGROUND_CHANNEL {
+                    return Err(error.message);
+                }
+            }
+            _ => {}
+        }
+    }
+    let initial_role = initial_role.expect("role checked above");
+    if strict && initial_role.role != ChannelRole::Controller {
+        let holder = initial_role
+            .controller
+            .as_ref()
+            .map(|identity| format!("{} ({})", identity.name, identity.kind.as_str()))
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(format!("session {id} controller seat is held by {holder}"));
+    }
+    Ok(ForegroundAttach {
+        transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
+            stream: Arc::new(Mutex::new(stream)),
+            channel: FOREGROUND_CHANNEL,
+            initial_update: initial_update.expect("render checked above"),
+            initial_role,
+        })),
+    })
+}
+
 pub fn watch_foreground(layout: &RuntimeLayout, id: &str, identity: AttachmentIdentity) -> Result<ForegroundAttach, String> {
     connect_foreground_upgrade(layout, id, "watch", identity, false, false)
 }
@@ -427,7 +866,9 @@ fn connect_foreground_upgrade(
             .map_err(|err| format!("write {role} upgrade request: {err}"))?;
         let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read {role} upgrade response: {err}"))?;
         match response.status {
-            StatusCode::SWITCHING_PROTOCOLS => return Ok(ForegroundAttach { stream: Arc::new(Mutex::new(stream)) }),
+            StatusCode::SWITCHING_PROTOCOLS => {
+                return Ok(ForegroundAttach { transport: ForegroundTransport::Legacy(Arc::new(Mutex::new(stream))) })
+            }
             StatusCode::CONFLICT => {
                 let mut body = String::new();
                 let _ = stream.read_to_string(&mut body);
@@ -1226,6 +1667,22 @@ fn controller_identity(hosted: &HostedSession, packet_clients: &[PacketClient]) 
     hosted.active_client.as_ref().map(|client| client.identity.clone()).or_else(|| packet_controller_identity(hosted, packet_clients))
 }
 
+fn sync_packet_controller_presence(layout: &RuntimeLayout, hosted: &HostedSession, previously_had_controller: bool) -> Result<(), String> {
+    let has_controller = hosted.active_client.is_some() || hosted.packet_controller.is_some();
+    if has_controller == previously_had_controller {
+        return Ok(());
+    }
+    if has_controller {
+        let _ = fs::write(layout.foreground_path(&hosted.metadata.id), b"1");
+        hosted.actor.set_client_presence(true)?;
+        hosted.actor.record_attach()
+    } else {
+        let _ = fs::remove_file(layout.foreground_path(&hosted.metadata.id));
+        hosted.actor.set_client_presence(false)?;
+        hosted.actor.record_detach()
+    }
+}
+
 fn announce_seat_state(hosted: &mut HostedSession, packet_clients: &mut [PacketClient]) -> Result<(), String> {
     announce_seat_state_except(hosted, packet_clients, None)
 }
@@ -1236,22 +1693,31 @@ fn announce_seat_state_except(
     excluded: Option<PacketChannelRef>,
 ) -> Result<(), String> {
     let controller = controller_identity(hosted, packet_clients);
+    let holder_kind = if hosted.active_client.is_some() { ControllerHolder::Stream } else { ControllerHolder::Packet };
     for watcher in &mut hosted.watchers {
+        if watcher.denial_reason.is_some() {
+            watcher.denial_reason = Some(RoleDenialReason { held_by: holder_kind });
+        }
         watcher.enqueue_frame(&Frame::SeatState(SeatState { role: "watcher".to_string(), controller: controller.clone() }))?;
     }
     for client in packet_clients {
-        let channels: Vec<(u32, ChannelRole)> = client
+        let channels: Vec<(u32, ChannelRole, ChannelRole)> = client
             .channels
             .iter()
             .filter(|(_, channel)| channel.session_id == hosted.metadata.id)
-            .map(|(id, channel)| (*id, channel.role))
+            .map(|(id, channel)| (*id, channel.role, channel.requested_role))
             .collect();
-        for (channel, role) in channels {
+        for (channel, role, requested_role) in channels {
             if excluded == Some(PacketChannelRef { client_id: client.id, channel }) {
                 continue;
             }
+            let denial_reason = (role == ChannelRole::Watcher && requested_role == ChannelRole::Controller)
+                .then_some(RoleDenialReason { held_by: holder_kind });
+            if let Some(session_channel) = client.channels.get_mut(&channel) {
+                session_channel.denial_reason = denial_reason;
+            }
             client.enqueue_frame(
-                &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState { role, controller: controller.clone() })
+                &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState { role, controller: controller.clone(), denial_reason })
                     .map_err(|err| format!("encode seat state packet: {err}"))?,
             )?;
         }
@@ -1262,14 +1728,17 @@ fn announce_seat_state_except(
 fn inspect_hosted_session(hosted: &HostedSession, packet_clients: &[PacketClient]) -> Result<crate::protocol::InspectResult, String> {
     let mut result = hosted.actor.inspect(false, 0)?;
     if let Some(client) = hosted.active_client.as_ref() {
-        result.attachments.push(crate::protocol::AttachmentInspect { role: "controller".to_string(), identity: client.identity.clone() });
+        result.attachments.push(crate::protocol::AttachmentInspect {
+            role: "controller".to_string(),
+            identity: client.identity.clone(),
+            denial_reason: None,
+        });
     }
-    result.attachments.extend(
-        hosted
-            .watchers
-            .iter()
-            .map(|client| crate::protocol::AttachmentInspect { role: "watcher".to_string(), identity: client.identity.clone() }),
-    );
+    result.attachments.extend(hosted.watchers.iter().map(|client| crate::protocol::AttachmentInspect {
+        role: "watcher".to_string(),
+        identity: client.identity.clone(),
+        denial_reason: client.denial_reason,
+    }));
     for client in packet_clients {
         result.attachments.extend(client.channels.values().filter(|channel| channel.session_id == result.session.id).map(|channel| {
             crate::protocol::AttachmentInspect {
@@ -1279,6 +1748,7 @@ fn inspect_hosted_session(hosted: &HostedSession, packet_clients: &[PacketClient
                 }
                 .to_string(),
                 identity: channel.identity.clone(),
+                denial_reason: channel.denial_reason,
             }
         }));
     }
@@ -1929,6 +2399,8 @@ fn handle_http_request(
             }
             if seat_is_held && body.take {
                 if let Some(controller) = hosted.active_client.take() {
+                    let mut controller = controller;
+                    controller.denial_reason = Some(RoleDenialReason { held_by: ControllerHolder::Stream });
                     hosted.watchers.push(controller);
                 }
                 if let Some(current) = hosted.packet_controller.take() {
@@ -1936,6 +2408,7 @@ fn handle_http_request(
                         if client.id == current.client_id {
                             if let Some(channel) = client.channels.get_mut(&current.channel) {
                                 channel.role = ChannelRole::Watcher;
+                                channel.denial_reason = Some(RoleDenialReason { held_by: ControllerHolder::Stream });
                             }
                             break;
                         }
@@ -1952,6 +2425,11 @@ fn handle_http_request(
             };
             let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
             let mut client = ActiveClient::new(attach_stream, capabilities, normalize_attachment_identity(body.identity))?;
+            if !grant_controller {
+                client.denial_reason = Some(RoleDenialReason {
+                    held_by: if hosted.active_client.is_some() { ControllerHolder::Stream } else { ControllerHolder::Packet },
+                });
+            }
             let replay_mode = if hosted.had_foreground_client { ReplayMode::ResetTerminal } else { ReplayMode::FreshTerminal };
             let role = if grant_controller { "controller" } else { "watcher" };
             let seat_controller =
@@ -2028,6 +2506,16 @@ fn handle_http_request(
             };
             let _ = fs::remove_file(state.layout.foreground_path(&id));
             if hosted.active_client.is_some() {
+                hosted.actor.record_detach()?;
+            }
+            if let Some(controller) = hosted.packet_controller.take() {
+                if let Some(client) = state.packet_clients.iter_mut().find(|client| client.id == controller.client_id) {
+                    client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+                        channel: controller.channel,
+                        message: format!("session {id} detached"),
+                    })?;
+                    client.channels.remove(&controller.channel);
+                }
                 hosted.actor.record_detach()?;
             }
             hosted.actor.set_client_presence(false)?;
@@ -2392,7 +2880,9 @@ struct PacketClient {
 struct PacketSessionChannel {
     session_id: String,
     role: ChannelRole,
+    requested_role: ChannelRole,
     identity: AttachmentIdentity,
+    denial_reason: Option<RoleDenialReason>,
     in_flight_generation: Option<u64>,
     last_sent_generation: u64,
 }
@@ -2558,9 +3048,11 @@ fn release_packet_client_roles(
     let mut affected: Vec<&String> = Vec::new();
     for (channel, session_channel) in &removed.channels {
         if let Some(hosted) = sessions.get_mut(&session_channel.session_id) {
+            let previously_had_controller = hosted.active_client.is_some() || hosted.packet_controller.is_some();
             if hosted.packet_controller == Some(PacketChannelRef { client_id: removed.id, channel: *channel }) {
                 hosted.packet_controller = None;
             }
+            let _ = sync_packet_controller_presence(layout, hosted, previously_had_controller);
         }
         affected.push(&session_channel.session_id);
     }
@@ -2604,34 +3096,35 @@ fn grant_packet_role(
     requester: PacketChannelRef,
     role: ChannelRole,
     take: bool,
-) -> Result<ChannelRole, String> {
+) -> Result<(ChannelRole, Option<RoleDenialReason>), String> {
     match role {
         ChannelRole::Watcher => {
             if hosted.packet_controller == Some(requester) {
                 hosted.packet_controller = None;
             }
-            Ok(ChannelRole::Watcher)
+            Ok((ChannelRole::Watcher, None))
         }
         ChannelRole::Controller => {
             if hosted.active_client.is_some() {
                 if !take {
-                    return Ok(ChannelRole::Watcher);
+                    return Ok((ChannelRole::Watcher, Some(RoleDenialReason { held_by: ControllerHolder::Stream })));
                 }
                 if let Some(controller) = hosted.active_client.take() {
+                    let mut controller = controller;
+                    controller.denial_reason = Some(RoleDenialReason { held_by: ControllerHolder::Packet });
                     hosted.watchers.push(controller);
-                    hosted.actor.set_client_presence(false)?;
                 }
             }
             vacate_dead_packet_controller(hosted, packet_clients);
             match hosted.packet_controller {
                 None => {
                     hosted.packet_controller = Some(requester);
-                    Ok(ChannelRole::Controller)
+                    Ok((ChannelRole::Controller, None))
                 }
-                Some(current) if current == requester => Ok(ChannelRole::Controller),
+                Some(current) if current == requester => Ok((ChannelRole::Controller, None)),
                 Some(current) => {
                     if !take {
-                        return Ok(ChannelRole::Watcher);
+                        return Ok((ChannelRole::Watcher, Some(RoleDenialReason { held_by: ControllerHolder::Packet })));
                     }
                     for client in packet_clients.iter_mut() {
                         if client.id != current.client_id {
@@ -2639,11 +3132,12 @@ fn grant_packet_role(
                         }
                         if let Some(session_channel) = client.channels.get_mut(&current.channel) {
                             session_channel.role = ChannelRole::Watcher;
+                            session_channel.denial_reason = Some(RoleDenialReason { held_by: ControllerHolder::Packet });
                         }
                         break;
                     }
                     hosted.packet_controller = Some(requester);
-                    Ok(ChannelRole::Controller)
+                    Ok((ChannelRole::Controller, None))
                 }
             }
         }
@@ -2668,9 +3162,11 @@ fn handle_packet_frame(
             let client_id = packet_clients[index].id;
             if let Some(removed) = packet_clients[index].channels.remove(&close.channel) {
                 if let Some(hosted) = sessions.get_mut(&removed.session_id) {
+                    let previously_had_controller = hosted.active_client.is_some() || hosted.packet_controller.is_some();
                     if hosted.packet_controller == Some(PacketChannelRef { client_id, channel: close.channel }) {
                         hosted.packet_controller = None;
                     }
+                    sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
                     announce_seat_state(hosted, packet_clients)?;
                     updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
                 }
@@ -2753,17 +3249,21 @@ fn apply_packet_role_request(
         return Ok(());
     };
     let previous_controller = (hosted.active_client.is_some(), hosted.packet_controller);
+    let previously_had_controller = previous_controller.0 || previous_controller.1.is_some();
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel };
-    let granted = grant_packet_role(hosted, packet_clients, requester, request.role, request.take)?;
+    let (granted, denial_reason) = grant_packet_role(hosted, packet_clients, requester, request.role, request.take)?;
     let controller = controller_identity(hosted, packet_clients);
     let client = &mut packet_clients[index];
     if let Some(session_channel) = client.channels.get_mut(&channel) {
         session_channel.role = granted;
+        session_channel.requested_role = request.role;
+        session_channel.denial_reason = denial_reason;
     }
     client.enqueue_frame(
-        &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState { role: granted, controller })
+        &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState { role: granted, controller, denial_reason })
             .map_err(|err| format!("encode role state packet: {err}"))?,
     )?;
+    sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
     if let Some(hosted) = sessions.get(&session_id) {
         updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
     }
@@ -2814,8 +3314,9 @@ fn open_packet_channel(
         }
     };
     let previous_controller = (hosted.active_client.is_some(), hosted.packet_controller);
+    let previously_had_controller = previous_controller.0 || previous_controller.1.is_some();
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel: open.channel };
-    let granted = grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?;
+    let (granted, denial_reason) = grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?;
     let session_id = open.session_id;
     let generation = update.render_generation;
     let controller =
@@ -2823,7 +3324,7 @@ fn open_packet_channel(
     hosted.packet_render_cache.store(update.clone());
     let client = &mut packet_clients[index];
     client.enqueue_frame(
-        &PacketFrame::new(open.channel, MSG_SESSION_ROLE, &RoleState { role: granted, controller })
+        &PacketFrame::new(open.channel, MSG_SESSION_ROLE, &RoleState { role: granted, controller, denial_reason })
             .map_err(|err| format!("encode role state packet: {err}"))?,
     )?;
     client.enqueue_frame(
@@ -2833,10 +3334,13 @@ fn open_packet_channel(
     client.channels.insert(open.channel, PacketSessionChannel {
         session_id: session_id.clone(),
         role: granted,
+        requested_role: open.role,
         identity: open.identity,
+        denial_reason,
         in_flight_generation: Some(generation),
         last_sent_generation: generation,
     });
+    sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
     if let Some(hosted) = sessions.get(&session_id) {
         updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
     }
@@ -3107,12 +3611,21 @@ struct ActiveClient {
     input_buffer: Vec<u8>,
     capabilities: vt::ClientCapabilities,
     identity: AttachmentIdentity,
+    denial_reason: Option<RoleDenialReason>,
 }
 
 impl ActiveClient {
     fn new(stream: SessionStream, capabilities: vt::ClientCapabilities, identity: AttachmentIdentity) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
-        Ok(Self { stream, pending_output: PendingOutput::new(), input_reader, input_buffer: Vec::new(), capabilities, identity })
+        Ok(Self {
+            stream,
+            pending_output: PendingOutput::new(),
+            input_reader,
+            input_buffer: Vec::new(),
+            capabilities,
+            identity,
+            denial_reason: None,
+        })
     }
 
     fn drain_input_frames(&mut self, pending: &mut VecDeque<Frame>, timeout: Duration) -> Result<bool, std::io::Error> {
@@ -3389,6 +3902,25 @@ mod tests {
         assert!(!output.contains('\u{7}'));
         assert!(!output.contains('\n'));
         assert!(output.contains("watching — controller: bad]2;injectedname"));
+    }
+
+    #[test]
+    fn control_taken_chrome_names_the_taker() {
+        let mut output = Vec::new();
+        super::render_control_taken_chrome_at_rows(
+            &mut output,
+            &crate::protocol::SeatState {
+                role: "watcher".to_string(),
+                controller: Some(crate::protocol::AttachmentIdentity {
+                    kind: crate::protocol::AttachmentKind::Supervisor,
+                    name: "governor".to_string(),
+                }),
+            },
+            24,
+        )
+        .expect("render control-taken chrome");
+
+        assert!(String::from_utf8(output).expect("control notice is utf8").contains("watching — control taken by governor"));
     }
 
     #[test]

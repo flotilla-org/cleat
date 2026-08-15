@@ -94,6 +94,8 @@ pub struct AttachmentInspect {
     pub role: String,
     #[serde(default)]
     pub identity: AttachmentIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<crate::packet::RoleDenialReason>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

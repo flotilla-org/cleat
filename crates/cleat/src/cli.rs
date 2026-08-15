@@ -1341,7 +1341,7 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
             .attachments
             .iter()
             .map(|attachment| {
-                let denial = attachment.denial_reason.map(|reason| format!(", denied: held_by={:?}", reason.held_by).to_lowercase());
+                let denial = attachment.denial_reason.map(|reason| format!(", denied: held_by={}", reason.held_by.as_str()));
                 format!(
                     "{}: {} ({}){}",
                     attachment.role,

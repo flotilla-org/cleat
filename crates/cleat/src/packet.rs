@@ -164,6 +164,15 @@ pub enum ControllerHolder {
     Stream,
 }
 
+impl ControllerHolder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Packet => "packet",
+            Self::Stream => "stream",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseChannel {
     pub channel: u32,

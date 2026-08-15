@@ -558,43 +558,41 @@ fn render_control_taken_chrome(writer: &mut impl Write, state: &SeatState) -> Re
 }
 
 fn render_control_taken_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: u16) -> Result<(), String> {
-    if rows == 0 {
-        return Ok(());
-    }
-    writer.write_all(b"\x1b7").map_err(|err| format!("save cursor for control notice: {err}"))?;
-    if rows > 1 {
-        write!(writer, "\x1b[1;{}r", rows - 1).map_err(|err| format!("reserve control notice row: {err}"))?;
-    }
-    write!(writer, "\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("position control notice: {err}"))?;
     let controller = state
         .controller
         .as_ref()
         .map(|identity| sanitize_attachment_name(identity.display_name()))
         .unwrap_or_else(|| "another client".to_string());
-    write!(writer, "\x1b[7m watching — control taken by {controller} \x1b[0m").map_err(|err| format!("write control notice: {err}"))?;
-    writer.write_all(b"\x1b8").map_err(|err| format!("restore cursor after control notice: {err}"))
+    render_watcher_message_at_rows(writer, rows, &format!("watching — control taken by {controller}"))
 }
 
 fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: u16) -> Result<(), String> {
     if rows == 0 {
         return Ok(());
     }
-    writer.write_all(b"\x1b7").map_err(|err| format!("save cursor for watcher banner: {err}"))?;
     if state.role == "watcher" {
-        if rows > 1 {
-            write!(writer, "\x1b[1;{}r", rows - 1).map_err(|err| format!("reserve watcher banner row: {err}"))?;
-        }
-        write!(writer, "\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("position watcher banner: {err}"))?;
         let controller = state
             .controller
             .as_ref()
             .map(|identity| sanitize_attachment_name(identity.display_name()))
             .unwrap_or_else(|| "none".to_string());
-        write!(writer, "\x1b[7m watching — controller: {controller} \x1b[0m").map_err(|err| format!("write watcher banner: {err}"))?;
-    } else {
-        write!(writer, "\x1b[r\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("clear watcher banner: {err}"))?;
+        return render_watcher_message_at_rows(writer, rows, &format!("watching — controller: {controller}"));
     }
+
+    writer.write_all(b"\x1b7").map_err(|err| format!("save cursor for watcher banner: {err}"))?;
+    write!(writer, "\x1b[r\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("clear watcher banner: {err}"))?;
     writer.write_all(b"\x1b8").map_err(|err| format!("restore cursor after watcher banner: {err}"))
+}
+
+fn render_watcher_message_at_rows(writer: &mut impl Write, rows: u16, message: &str) -> Result<(), String> {
+    if rows == 0 {
+        return Ok(());
+    }
+    writer.write_all(b"\x1b7").map_err(|err| format!("save cursor for watcher banner: {err}"))?;
+    if rows > 1 {
+        write!(writer, "\x1b[1;{}r", rows - 1).map_err(|err| format!("reserve watcher banner row: {err}"))?;
+    }
+    write!(writer, "\x1b[{};1H\x1b[2K\x1b[7m {message} \x1b[0m\x1b8", rows).map_err(|err| format!("write watcher banner: {err}"))
 }
 
 fn normalize_attachment_identity(mut identity: AttachmentIdentity) -> AttachmentIdentity {

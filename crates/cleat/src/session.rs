@@ -367,6 +367,7 @@ struct PacketTerminalRenderer {
     rows: u16,
     cells: Vec<Vec<crate::provider::TerminalRenderCell>>,
     terminal_modes: vt::TerminalModeState,
+    needs_full_repaint: bool,
 }
 
 impl PacketTerminalRenderer {
@@ -376,11 +377,12 @@ impl PacketTerminalRenderer {
             rows,
             cells: vec![vec![crate::provider::TerminalRenderCell::default(); cols as usize]; rows as usize],
             terminal_modes: vt::TerminalModeState::default(),
+            needs_full_repaint: true,
         }
     }
 
     fn apply_and_render(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
-        // Packet rendering reconstructs a complete terminal frame from grid
+        // Packet rendering reconstructs terminal rows from retained grid
         // state. Keep the synthesized cursor moves invisible just as the
         // source application did with synchronized output: terminals that
         // implement mode 2026 present the repaint atomically, while hiding the
@@ -395,33 +397,46 @@ impl PacketTerminalRenderer {
     }
 
     fn render_frame(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
-        if self.cols != update.cols || self.rows != update.rows {
+        let resized = self.cols != update.cols || self.rows != update.rows;
+        let modes_changed = self.terminal_modes != update.terminal_modes;
+        if resized {
             self.cols = update.cols;
             self.rows = update.rows;
             self.cells = vec![vec![crate::provider::TerminalRenderCell::default(); self.cols as usize]; self.rows as usize];
         }
         render_packet_terminal_modes(writer, self.terminal_modes, update.terminal_modes)?;
         self.terminal_modes = update.terminal_modes;
+        let mut dirty_rows = std::collections::BTreeSet::new();
+        if self.needs_full_repaint || resized || modes_changed {
+            dirty_rows.extend(0..self.rows);
+        }
         for op in &update.ops {
             match op.kind {
                 crate::provider::TerminalRenderUpdateOpKind::FullVisibleReplace => {
                     self.cells = vec![vec![crate::provider::TerminalRenderCell::default(); self.cols as usize]; self.rows as usize];
                     self.replace_rows(&op.rows);
+                    dirty_rows.extend(0..self.rows);
                 }
-                crate::provider::TerminalRenderUpdateOpKind::RowReplace => self.replace_rows(&op.rows),
+                crate::provider::TerminalRenderUpdateOpKind::RowReplace => {
+                    self.replace_rows(&op.rows);
+                    dirty_rows.extend(op.rows.iter().map(|row| row.row).filter(|row| *row < self.rows));
+                }
                 crate::provider::TerminalRenderUpdateOpKind::ScrollCopy => {
                     let copied =
                         (0..op.row_count).filter_map(|offset| self.cells.get((op.src_row + offset) as usize).cloned()).collect::<Vec<_>>();
                     for (offset, row) in copied.into_iter().enumerate() {
-                        if let Some(target) = self.cells.get_mut(op.dst_row as usize + offset) {
+                        let target_index = op.dst_row as usize + offset;
+                        if let Some(target) = self.cells.get_mut(target_index) {
                             *target = row;
+                            dirty_rows.insert(target_index as u16);
                         }
                     }
                 }
             }
         }
-        writer.write_all(b"\x1b[H").map_err(|err| format!("position packet render: {err}"))?;
-        for (row_index, row) in self.cells.iter().enumerate() {
+        self.needs_full_repaint = false;
+        for row_index in dirty_rows {
+            let row = &self.cells[row_index as usize];
             write!(writer, "\x1b[{};1H\x1b[2K", row_index + 1).map_err(|err| format!("position packet row: {err}"))?;
             for cell in row {
                 render_packet_cell(writer, cell)?;
@@ -3812,7 +3827,7 @@ mod tests {
     use crate::{
         http_uds::read_http_request_for_test,
         protocol::AttachmentIdentity,
-        provider::{TerminalCursor, TerminalRenderUpdate},
+        provider::{TerminalCursor, TerminalRenderRow, TerminalRenderUpdate, TerminalRenderUpdateOp, TerminalRenderUpdateOpKind},
         runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
         vt::{self, VtEngine},
     };
@@ -3835,6 +3850,85 @@ mod tests {
         let cursor_restore = output.windows(b"\x1b[?25h".len()).position(|bytes| bytes == b"\x1b[?25h").expect("cursor restore");
         let last_row_repaint = output.windows(b"\x1b[2;1H".len()).position(|bytes| bytes == b"\x1b[2;1H").expect("last row repaint");
         assert!(cursor_restore > last_row_repaint, "cursor must stay hidden throughout synthesized row movement");
+    }
+
+    #[test]
+    fn packet_render_repaints_only_replaced_rows() {
+        let mut renderer = PacketTerminalRenderer::new(8, 4);
+        let initial = TerminalRenderUpdate { cols: 8, rows: 4, ..TerminalRenderUpdate::default() };
+        let mut initial_output = Vec::new();
+        renderer.apply_and_render(&mut initial_output, &initial).expect("render initial packet update");
+
+        let update = TerminalRenderUpdate {
+            cols: 8,
+            rows: 4,
+            ops: vec![TerminalRenderUpdateOp {
+                kind: TerminalRenderUpdateOpKind::RowReplace,
+                rows: vec![TerminalRenderRow { row: 2, ..TerminalRenderRow::default() }],
+                ..TerminalRenderUpdateOp::default()
+            }],
+            ..TerminalRenderUpdate::default()
+        };
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).expect("render dirty packet row");
+
+        assert_eq!(output.windows(b"\x1b[2K".len()).filter(|bytes| *bytes == b"\x1b[2K").count(), 1, "{output:?}");
+        assert!(output.windows(b"\x1b[3;1H".len()).any(|bytes| bytes == b"\x1b[3;1H"), "{output:?}");
+        assert!(output.len() < initial_output.len() / 2, "single-row output should be proportional to one row");
+    }
+
+    #[test]
+    fn packet_render_repaints_only_scroll_copy_destinations() {
+        let mut renderer = PacketTerminalRenderer::new(2, 4);
+        let base = TerminalRenderUpdate { cols: 2, rows: 4, ..TerminalRenderUpdate::default() };
+        renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");
+        let update = TerminalRenderUpdate {
+            ops: vec![TerminalRenderUpdateOp {
+                kind: TerminalRenderUpdateOpKind::ScrollCopy,
+                src_row: 0,
+                dst_row: 1,
+                row_count: 2,
+                ..TerminalRenderUpdateOp::default()
+            }],
+            ..base
+        };
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).expect("render scroll copy");
+
+        assert_eq!(output.windows(b"\x1b[2K".len()).filter(|bytes| *bytes == b"\x1b[2K").count(), 2, "{output:?}");
+        assert!(output.windows(b"\x1b[2;1H".len()).any(|bytes| bytes == b"\x1b[2;1H"), "{output:?}");
+        assert!(output.windows(b"\x1b[3;1H".len()).any(|bytes| bytes == b"\x1b[3;1H"), "{output:?}");
+    }
+
+    #[test]
+    fn packet_render_repaints_every_row_for_full_repaint_triggers() {
+        fn erased_rows(output: &[u8]) -> usize {
+            output.windows(b"\x1b[2K".len()).filter(|bytes| *bytes == b"\x1b[2K").count()
+        }
+
+        let base = TerminalRenderUpdate { cols: 2, rows: 2, ..TerminalRenderUpdate::default() };
+
+        let mut resized_renderer = PacketTerminalRenderer::new(1, 1);
+        let mut resized_output = Vec::new();
+        resized_renderer.apply_and_render(&mut resized_output, &base).expect("render resize");
+        assert_eq!(erased_rows(&resized_output), 2);
+
+        let mut mode_renderer = PacketTerminalRenderer::new(2, 2);
+        mode_renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");
+        let mut mode_update = base.clone();
+        mode_update.terminal_modes.application_cursor_keys = true;
+        let mut mode_output = Vec::new();
+        mode_renderer.apply_and_render(&mut mode_output, &mode_update).expect("render mode change");
+        assert_eq!(erased_rows(&mode_output), 2);
+
+        let mut full_renderer = PacketTerminalRenderer::new(2, 2);
+        full_renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");
+        let mut full_update = base;
+        full_update.ops =
+            vec![TerminalRenderUpdateOp { kind: TerminalRenderUpdateOpKind::FullVisibleReplace, ..TerminalRenderUpdateOp::default() }];
+        let mut full_output = Vec::new();
+        full_renderer.apply_and_render(&mut full_output, &full_update).expect("render full replacement");
+        assert_eq!(erased_rows(&full_output), 2);
     }
 
     #[cfg(unix)]

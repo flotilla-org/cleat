@@ -44,7 +44,7 @@ use crate::{
 };
 
 const DETACH_CLEANUP_SEQUENCE: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
+    b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SESSION_DAEMON_SERVICING_TICK: Duration = Duration::from_millis(10);
@@ -380,6 +380,21 @@ impl PacketTerminalRenderer {
     }
 
     fn apply_and_render(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
+        // Packet rendering reconstructs a complete terminal frame from grid
+        // state. Keep the synthesized cursor moves invisible just as the
+        // source application did with synchronized output: terminals that
+        // implement mode 2026 present the repaint atomically, while hiding the
+        // cursor also prevents visible thrash on terminals that ignore it.
+        writer.write_all(b"\x1b[?2026h\x1b[?25l").map_err(|err| format!("begin synchronized packet render: {err}"))?;
+        // Always attempt to close the synchronized batch: an early return that
+        // leaves mode 2026 set can freeze the attached terminal until
+        // something else resets it.
+        let rendered = self.render_frame(writer, update);
+        let finished = writer.write_all(b"\x1b[?2026l").map_err(|err| format!("finish synchronized packet render: {err}"));
+        rendered.and(finished)
+    }
+
+    fn render_frame(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
         if self.cols != update.cols || self.rows != update.rows {
             self.cols = update.cols;
             self.rows = update.rows;
@@ -3791,14 +3806,36 @@ mod tests {
 
     use super::{
         apply_attach_state, attach_foreground, attach_init_capabilities, default_vt_engine, record_pty_output, session_socket_path,
-        AttachCleanupGuard, ScreenStableFingerprint, ScreenStableState, TestReplayProbeVtEngine, SCREEN_STABLE_CHANGED_CELL_TOLERANCE,
+        AttachCleanupGuard, PacketTerminalRenderer, ScreenStableFingerprint, ScreenStableState, TestReplayProbeVtEngine,
+        SCREEN_STABLE_CHANGED_CELL_TOLERANCE,
     };
     use crate::{
         http_uds::read_http_request_for_test,
         protocol::AttachmentIdentity,
+        provider::{TerminalCursor, TerminalRenderUpdate},
         runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
         vt::{self, VtEngine},
     };
+
+    #[test]
+    fn packet_render_batches_repaint_with_cursor_hidden() {
+        let mut renderer = PacketTerminalRenderer::new(2, 2);
+        let update = TerminalRenderUpdate {
+            cols: 2,
+            rows: 2,
+            cursor: TerminalCursor { col: 1, row: 1, visible: true, ..TerminalCursor::default() },
+            ..TerminalRenderUpdate::default()
+        };
+        let mut output = Vec::new();
+
+        renderer.apply_and_render(&mut output, &update).expect("render packet update");
+
+        assert!(output.starts_with(b"\x1b[?2026h\x1b[?25l"), "repaint must start atomically with the cursor hidden: {output:?}");
+        assert!(output.ends_with(b"\x1b[?25h\x1b[?2026l"), "cursor restoration must remain inside the synchronized batch: {output:?}");
+        let cursor_restore = output.windows(b"\x1b[?25h".len()).position(|bytes| bytes == b"\x1b[?25h").expect("cursor restore");
+        let last_row_repaint = output.windows(b"\x1b[2;1H".len()).position(|bytes| bytes == b"\x1b[2;1H").expect("last row repaint");
+        assert!(cursor_restore > last_row_repaint, "cursor must stay hidden throughout synthesized row movement");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3848,7 +3885,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
+            b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 
@@ -3862,7 +3899,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
+            b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 

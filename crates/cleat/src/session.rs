@@ -44,7 +44,7 @@ use crate::{
 };
 
 const DETACH_CLEANUP_SEQUENCE: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
+    b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SESSION_DAEMON_SERVICING_TICK: Duration = Duration::from_millis(10);
@@ -386,6 +386,15 @@ impl PacketTerminalRenderer {
         // implement mode 2026 present the repaint atomically, while hiding the
         // cursor also prevents visible thrash on terminals that ignore it.
         writer.write_all(b"\x1b[?2026h\x1b[?25l").map_err(|err| format!("begin synchronized packet render: {err}"))?;
+        // Always attempt to close the synchronized batch: an early return that
+        // leaves mode 2026 set can freeze the attached terminal until
+        // something else resets it.
+        let rendered = self.render_frame(writer, update);
+        let finished = writer.write_all(b"\x1b[?2026l").map_err(|err| format!("finish synchronized packet render: {err}"));
+        rendered.and(finished)
+    }
+
+    fn render_frame(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
         if self.cols != update.cols || self.rows != update.rows {
             self.cols = update.cols;
             self.rows = update.rows;
@@ -430,8 +439,7 @@ impl PacketTerminalRenderer {
         write!(writer, "\x1b[{cursor_style} q").map_err(|err| format!("set packet cursor style: {err}"))?;
         writer
             .write_all(if update.cursor.visible { b"\x1b[?25h" } else { b"\x1b[?25l" })
-            .map_err(|err| format!("set packet cursor visibility: {err}"))?;
-        writer.write_all(b"\x1b[?2026l").map_err(|err| format!("finish synchronized packet render: {err}"))
+            .map_err(|err| format!("set packet cursor visibility: {err}"))
     }
 
     fn replace_rows(&mut self, rows: &[crate::provider::TerminalRenderRow]) {

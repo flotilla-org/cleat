@@ -380,6 +380,12 @@ impl PacketTerminalRenderer {
     }
 
     fn apply_and_render(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
+        // Packet rendering reconstructs a complete terminal frame from grid
+        // state. Keep the synthesized cursor moves invisible just as the
+        // source application did with synchronized output: terminals that
+        // implement mode 2026 present the repaint atomically, while hiding the
+        // cursor also prevents visible thrash on terminals that ignore it.
+        writer.write_all(b"\x1b[?2026h\x1b[?25l").map_err(|err| format!("begin synchronized packet render: {err}"))?;
         if self.cols != update.cols || self.rows != update.rows {
             self.cols = update.cols;
             self.rows = update.rows;
@@ -424,7 +430,8 @@ impl PacketTerminalRenderer {
         write!(writer, "\x1b[{cursor_style} q").map_err(|err| format!("set packet cursor style: {err}"))?;
         writer
             .write_all(if update.cursor.visible { b"\x1b[?25h" } else { b"\x1b[?25l" })
-            .map_err(|err| format!("set packet cursor visibility: {err}"))
+            .map_err(|err| format!("set packet cursor visibility: {err}"))?;
+        writer.write_all(b"\x1b[?2026l").map_err(|err| format!("finish synchronized packet render: {err}"))
     }
 
     fn replace_rows(&mut self, rows: &[crate::provider::TerminalRenderRow]) {
@@ -3791,14 +3798,36 @@ mod tests {
 
     use super::{
         apply_attach_state, attach_foreground, attach_init_capabilities, default_vt_engine, record_pty_output, session_socket_path,
-        AttachCleanupGuard, ScreenStableFingerprint, ScreenStableState, TestReplayProbeVtEngine, SCREEN_STABLE_CHANGED_CELL_TOLERANCE,
+        AttachCleanupGuard, PacketTerminalRenderer, ScreenStableFingerprint, ScreenStableState, TestReplayProbeVtEngine,
+        SCREEN_STABLE_CHANGED_CELL_TOLERANCE,
     };
     use crate::{
         http_uds::read_http_request_for_test,
         protocol::AttachmentIdentity,
+        provider::{TerminalCursor, TerminalRenderUpdate},
         runtime::{RuntimeLayout, SessionMetadata, TerminalSize},
         vt::{self, VtEngine},
     };
+
+    #[test]
+    fn packet_render_batches_repaint_with_cursor_hidden() {
+        let mut renderer = PacketTerminalRenderer::new(2, 2);
+        let update = TerminalRenderUpdate {
+            cols: 2,
+            rows: 2,
+            cursor: TerminalCursor { col: 1, row: 1, visible: true, ..TerminalCursor::default() },
+            ..TerminalRenderUpdate::default()
+        };
+        let mut output = Vec::new();
+
+        renderer.apply_and_render(&mut output, &update).expect("render packet update");
+
+        assert!(output.starts_with(b"\x1b[?2026h\x1b[?25l"), "repaint must start atomically with the cursor hidden: {output:?}");
+        assert!(output.ends_with(b"\x1b[?25h\x1b[?2026l"), "cursor restoration must remain inside the synchronized batch: {output:?}");
+        let cursor_restore = output.windows(b"\x1b[?25h".len()).position(|bytes| bytes == b"\x1b[?25h").expect("cursor restore");
+        let last_row_repaint = output.windows(b"\x1b[2;1H".len()).position(|bytes| bytes == b"\x1b[2;1H").expect("last row repaint");
+        assert!(cursor_restore > last_row_repaint, "cursor must stay hidden throughout synthesized row movement");
+    }
 
     #[cfg(unix)]
     #[test]

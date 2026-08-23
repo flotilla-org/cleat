@@ -1227,14 +1227,14 @@ fn decode_png_rgba(data: &[u8]) -> Result<DecodedPng, String> {
         png::ColorType::Rgba => bytes.to_vec(),
         png::ColorType::Rgb => {
             let mut out = Vec::with_capacity(pixel_count(info.width, info.height)? * 4);
-            for rgb in bytes.chunks_exact(3) {
+            for rgb in bytes.as_chunks::<3>().0 {
                 out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
             }
             out
         }
         png::ColorType::GrayscaleAlpha => {
             let mut out = Vec::with_capacity(pixel_count(info.width, info.height)? * 4);
-            for gray_alpha in bytes.chunks_exact(2) {
+            for gray_alpha in bytes.as_chunks::<2>().0 {
                 out.extend_from_slice(&[gray_alpha[0], gray_alpha[0], gray_alpha[0], gray_alpha[1]]);
             }
             out

@@ -51,12 +51,18 @@ cleat kill build                     # ends it; recording survives
 | Type text | `send <id> "text"` (appends Enter), `send --no-enter`, `send-keys <id> C-c Enter ...` |
 | **Submit into a TUI composer** | `send <id> --submit "prompt"` — paste-encoded + delayed Enter. Plain `send` text+Enter gets swallowed by paste heuristics (codex, claude). |
 | Wait for readiness | `wait <id> --text "str" --screen-stable 30 --idle-time 5 --timeout 600` — conditions OR together |
-| Structured state | `inspect <id>` — size, leader pid, **foreground pgid** (`fg_pgid != leader_pid` ⇒ a command is running), attachments, recording |
+| Structured state | `inspect <id>` — size, leader pid, **foreground pgid**, attachments, recording |
 | Recorded output since a point | `mark <id> name` … `transcript <id> --since-marker name` ; `expect <id> "text"` blocks on recorded output |
 | Interactive use (human) | `attach <id>` (controller, or automatic watcher fallback), `attach --take <id>` (claim control), `watch <id>` (read-only) |
 | Signals | `interrupt <id>` (byte Ctrl-C) vs `signal <id> INT` (real signal, `--target foreground|leader`; `tree` not yet implemented) |
 | End it | `kill <id>` — **recording is preserved**; `kill --purge` discards |
 | Enumerate | `list [--selector k=v]... [--watch] [--all]` |
+
+For a shell-led session, `fg_pgid != leader_pid` means a child command
+currently owns the foreground. Agent-led sessions commonly make the agent
+itself the session leader, so `fg_pgid == leader_pid` is normal there. A
+surviving session proves that its leader is alive: never diagnose "agent
+exited" from foreground/leader equality.
 
 ### Choosing a wait condition
 

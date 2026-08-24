@@ -23,7 +23,10 @@ raw terminal escapes.
 - Wait: `cleat wait <id> --text "str" | --screen-stable 30 |
   --idle-time 5  --timeout 600` (conditions OR; `--timeout` is bare
   seconds; spinners defeat `--idle-time`, use `--screen-stable` for TUIs).
-- State: `cleat inspect <id>` (`fg_pgid != leader_pid` ⇒ command running).
+- State: `cleat inspect <id>`. `fg_pgid != leader_pid` means a child owns
+  the foreground; equality is normal when an agent is the leader. A
+  surviving session proves the leader is alive, so never infer "agent
+  exited" from equality.
 - Recorded output: `cleat mark <id> m1` … `cleat transcript <id>
   --since-marker m1`; `cleat expect <id> "text"` blocks until it's output.
 - End: `cleat kill <id>` (recording preserved; `--purge` discards).
@@ -37,4 +40,4 @@ raw terminal escapes.
   the remote process, and relaunching replays history but starts a fresh
   ssh (use the hosted agent's own resume to recover).
 
-Full guide: `docs/skills/cleat-sessions/README.md` in the cleat repo.
+Full guide: `skills/cleat-sessions/README.md` in the cleat repo.

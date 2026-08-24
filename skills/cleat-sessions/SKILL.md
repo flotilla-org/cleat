@@ -8,7 +8,7 @@ description: Host interactive/TUI programs in persistent, recorded cleat termina
 Cleat hosts programs in persistent, recorded terminal sessions with a
 structured control plane. Prefer it over backgrounding interactive
 programs or parsing raw escapes. Canonical guide (conventions, gotchas,
-full verb set): `docs/skills/cleat-sessions/README.md` in the cleat repo,
+full verb set): `skills/cleat-sessions/README.md` in the cleat repo,
 if checked out locally.
 
 **Prerequisite probe** (version strings can't distinguish builds yet): the
@@ -40,7 +40,10 @@ cleat kill build                   # recording survives (--purge discards)
 - `wait <id> --text "str" --screen-stable 30 --idle-time 5 --timeout 600`
   — conditions OR together; **`--timeout` is bare seconds**; spinners
   defeat `--idle-time`, use `--screen-stable` for TUIs
-- `inspect <id>` — `fg_pgid != leader_pid` ⇒ a command is running
+- `inspect <id>` — `fg_pgid != leader_pid` means a child command owns the
+  foreground. Equality is normal when an agent is the session leader; a
+  surviving session proves that leader is alive, so never infer "agent
+  exited" from `fg_pgid == leader_pid`.
 - `mark <id> m1` … `transcript <id> --since-marker m1` — recorded output
   slices; `expect <id> "text"` blocks until text is output
 - `interrupt <id>` (Ctrl-C byte) vs `signal <id> INT --target foreground`

@@ -23,10 +23,7 @@ raw terminal escapes.
 - Wait: `cleat wait <id> --text "str" | --screen-stable 30 |
   --idle-time 5  --timeout 600` (conditions OR; `--timeout` is bare
   seconds; spinners defeat `--idle-time`, use `--screen-stable` for TUIs).
-- State: `cleat inspect <id>`. `fg_pgid != leader_pid` means a child owns
-  the foreground; equality is normal when an agent is the leader. A
-  surviving session proves the leader is alive, so never infer "agent
-  exited" from equality.
+- State: `cleat inspect <id>` (`fg_pgid != leader_pid` ⇒ command running).
 - Recorded output: `cleat mark <id> m1` … `cleat transcript <id>
   --since-marker m1`; `cleat expect <id> "text"` blocks until it's output.
 - End: `cleat kill <id>` (recording preserved; `--purge` discards).

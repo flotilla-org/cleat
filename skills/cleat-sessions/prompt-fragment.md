@@ -37,4 +37,4 @@ raw terminal escapes.
   the remote process, and relaunching replays history but starts a fresh
   ssh (use the hosted agent's own resume to recover).
 
-Full guide: `docs/skills/cleat-sessions/README.md` in the cleat repo.
+Full guide: `skills/cleat-sessions/README.md` in the cleat repo.

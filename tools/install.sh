@@ -45,7 +45,7 @@ echo "Installed cleat to $BIN_DIR/cleat"
 # ~/.claude/skills (Claude Code) and ~/.agents/skills (the agentskills.io
 # shared dir that pi and codex read). The repo copy is canonical; this
 # owns sync from here (decision log 2026-07-06).
-SKILL_SRC="$REPO_ROOT/docs/skills/cleat-sessions/SKILL.md"
+SKILL_SRC="$REPO_ROOT/skills/cleat-sessions/SKILL.md"
 if [[ -f "$SKILL_SRC" ]]; then
   for SKILLS_DIR in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
     mkdir -p "$SKILLS_DIR/cleat-sessions"

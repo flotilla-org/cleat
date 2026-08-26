@@ -55,7 +55,10 @@ if [[ -d "$SOURCE_DIR/.git" ]]; then
   git -C "$SOURCE_DIR" fetch origin --prune --tags --force
 else
   rm -rf "$SOURCE_DIR"
-  git clone "$ghostty_repo" "$SOURCE_DIR"
+  git init "$SOURCE_DIR"
+  git -C "$SOURCE_DIR" remote add origin "$ghostty_repo"
+  git -C "$SOURCE_DIR" fetch --depth=1 origin "$ghostty_ref"
+  git -C "$SOURCE_DIR" checkout --detach FETCH_HEAD
 fi
 
 git -C "$SOURCE_DIR" checkout --force "$ghostty_ref"

@@ -477,6 +477,7 @@ mod tests {
             cwd: None,
             cmd: Some("echo ready".into()),
             tags: Vec::new(),
+            environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
             colors: crate::vt::TerminalColors::default(),

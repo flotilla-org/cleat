@@ -327,9 +327,10 @@ mod tests {
 
     #[test]
     fn discover_runtime_root_prefers_xdg_state_home() {
-        let root = discover_runtime_root(None, Some(OsString::from("/xdg/state")), Some(PathBuf::from("/home/test/.local/state")))
+        let state_home = PathBuf::from(if cfg!(windows) { "C:/xdg/state" } else { "/xdg/state" });
+        let root = discover_runtime_root(None, Some(state_home.clone().into_os_string()), Some(PathBuf::from("/home/test/.local/state")))
             .expect("discover XDG state home");
-        assert_eq!(root, PathBuf::from("/xdg/state/cleat"));
+        assert_eq!(root, state_home.join("cleat"));
     }
 
     #[test]

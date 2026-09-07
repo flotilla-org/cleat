@@ -10,6 +10,11 @@ the new full SHA. Fresh preparation fetched that exact SHA from GitHub on
 macOS, Linux, and Windows. The migration can be reproduced from the published
 dependency, subject to the compatibility limits below.
 
+The lifecycle race and Windows IPC source error recorded below were fixed in
+a [subsequent follow-up](attach-and-windows-fixes-2026-09.md). That follow-up
+also identifies an additional Windows Ghostty import-library defect; its
+validation section supersedes the original platform blockers below.
+
 Work started from cleat `dbeeca6` in a separate worktree and branch,
 `maintenance/ghostty-zig-016`. The original checkout and its prepared
 installation were left intact. No branches or releases were pushed.

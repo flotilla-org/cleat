@@ -32,7 +32,7 @@ use crate::{
         MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE,
         PROTOCOL_VERSION,
     },
-    platform::ipc::{try_connect_session_stream, SessionStream},
+    platform::ipc::{shutdown_stream, try_connect_session_stream, SessionStream},
     protocol::AttachmentIdentity,
     provider::{
         DirtyState, TerminalCursor, TerminalInputEvent, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalScrollbarState,
@@ -395,7 +395,7 @@ impl DaemonConnection {
     pub(crate) fn shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(stream) = recover_lock(&self.writer).take() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            shutdown_stream(&stream);
         }
         let handle = recover_lock(&self.reader).take();
         if let Some(handle) = handle {
@@ -611,38 +611,48 @@ pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]
     Ok((stream, directory))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
-    use std::{
-        io::Read,
-        os::unix::net::{UnixListener, UnixStream},
-        sync::atomic::AtomicUsize,
-        time::Instant,
-    };
+    use std::{io::Read, sync::atomic::AtomicUsize, time::Instant};
 
     use super::*;
-    use crate::packet::{Ack, Input, Resize};
+    use crate::{
+        packet::{Ack, Input, Resize},
+        platform::ipc::{bind_session_listener, SessionListener},
+    };
 
     fn test_layout() -> (tempfile::TempDir, RuntimeLayout) {
+        #[cfg(unix)]
         let temp = tempfile::Builder::new().prefix("cleat-pd-").tempdir_in("/tmp").expect("tempdir");
+        #[cfg(windows)]
+        let temp = tempfile::Builder::new().prefix("cleat-pd-").tempdir().expect("tempdir");
         let layout = RuntimeLayout::new(temp.path().to_path_buf());
         layout.ensure_daemon_dirs().expect("daemon dirs");
         (temp, layout)
     }
 
     struct FakeDaemon {
-        listener: UnixListener,
+        listener: SessionListener,
     }
 
     impl FakeDaemon {
         fn bind(layout: &RuntimeLayout) -> Self {
             let _ = std::fs::remove_file(layout.socket_path());
-            Self { listener: UnixListener::bind(layout.socket_path()).expect("bind fake daemon socket") }
+            Self { listener: bind_session_listener(&layout.socket_path()).expect("bind fake daemon socket") }
         }
 
         /// Accept a connection and drive the server half of the upgrade.
-        fn accept(&self, sessions: Vec<DirectoryEntry>) -> UnixStream {
-            let (mut stream, _) = self.listener.accept().expect("accept");
+        fn accept(&self, sessions: Vec<DirectoryEntry>) -> SessionStream {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match self.listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("accept: {err}"),
+                }
+            };
             // Consume the upgrade request: head, then Content-Length body.
             let mut buffer = Vec::new();
             let header_end = loop {
@@ -702,6 +712,28 @@ mod tests {
         while !condition() {
             assert!(Instant::now() < deadline, "condition not met within deadline");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn shutdown_joins_reader_while_daemon_keeps_connection_open() {
+        for _ in 0..20 {
+            let (_temp, layout) = test_layout();
+            let daemon = FakeDaemon::bind(&layout);
+            let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+            let server = daemon.accept(Vec::new());
+            wait_until(|| connection.is_connected());
+            let (done, completed) = std::sync::mpsc::channel();
+            let shutdown = std::thread::spawn(move || {
+                connection.shutdown();
+                done.send(()).unwrap();
+            });
+            let result = completed.recv_timeout(Duration::from_secs(5));
+            // Keep the peer alive until after the deadline; peer closure must
+            // not be what wakes the connection's reader.
+            drop(server);
+            shutdown.join().expect("shutdown thread");
+            result.expect("shutdown must wake and join the reader");
         }
     }
 
@@ -805,6 +837,7 @@ mod tests {
         connection.shutdown();
     }
 
+    #[cfg(unix)] // This test uses a socket read timeout, which named pipes do not implement.
     #[test]
     fn reconnect_skips_closed_channels() {
         let (_temp, layout) = test_layout();

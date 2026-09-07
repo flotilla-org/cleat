@@ -92,3 +92,15 @@ jobs:
             ${{ runner.os }}-cargo-no-vt-
       - run: cargo build -p cleat --locked --no-default-features
       - run: cargo test -p cleat --locked --no-default-features
+
+  windows-core:
+    name: Windows build and core tests
+    runs-on: windows-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Compile the application and exercise named-pipe/provider behavior
+      # without making this portability gate depend on a Ghostty build.
+      - run: cargo build -p cleat --locked --no-default-features
+      - run: cargo test -p cleat --locked --no-default-features --lib

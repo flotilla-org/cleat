@@ -38,9 +38,39 @@ toml_value() {
   ' "$file"
 }
 
-zig_version="$(zig version)"
-if [[ "$zig_version" != "0.15.2" ]]; then
-  printf 'Expected zig version 0.15.2, found %s\n' "$zig_version" >&2
+required_zig_version="$(toml_value zig version "$TOOLCHAIN_FILE")"
+zig="$(command -v zig || true)"
+if [[ -z "$zig" ]] || [[ "$("$zig" version)" != "$required_zig_version" ]]; then
+  case "$(uname -s)" in
+    Darwin) zig_os=macos ;;
+    Linux) zig_os=linux ;;
+    *) echo "Unsupported Zig host OS" >&2; exit 1 ;;
+  esac
+  case "$(uname -m)" in
+    arm64|aarch64) zig_arch=aarch64 ;;
+    x86_64|amd64) zig_arch=x86_64 ;;
+    *) echo "Unsupported Zig host architecture" >&2; exit 1 ;;
+  esac
+  zig_dir="$REPO_ROOT/.tools/zig-$zig_arch-$zig_os-$required_zig_version"
+  zig="$zig_dir/zig"
+  if [[ ! -x "$zig" ]]; then
+    archive="$zig_dir.tar.xz"
+    checksum="$(toml_value zig_sha256 "$zig_arch-$zig_os" "$TOOLCHAIN_FILE")"
+    [[ -n "$checksum" ]] || { echo "Missing Zig checksum" >&2; exit 1; }
+    mkdir -p "$REPO_ROOT/.tools"
+    curl --fail --location --retry 3 "https://ziglang.org/download/$required_zig_version/zig-$zig_arch-$zig_os-$required_zig_version.tar.xz" -o "$archive"
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual_checksum="$(sha256sum "$archive" | awk '{print $1}')"
+    else
+      actual_checksum="$(shasum -a 256 "$archive" | awk '{print $1}')"
+    fi
+    [[ "$actual_checksum" == "$checksum" ]] || { echo "Zig checksum mismatch" >&2; exit 1; }
+    tar -xJf "$archive" -C "$REPO_ROOT/.tools"
+  fi
+fi
+zig_version="$("$zig" version)"
+if [[ "$zig_version" != "$required_zig_version" ]]; then
+  printf 'Expected Zig %s, found %s\n' "$required_zig_version" "$zig_version" >&2
   exit 1
 fi
 
@@ -50,25 +80,21 @@ build_step="$(toml_value ghostty build_step "$TOOLCHAIN_FILE")"
 
 mkdir -p "$REPO_ROOT/.tools"
 
-if [[ -d "$SOURCE_DIR/.git" ]]; then
-  git -C "$SOURCE_DIR" remote set-url origin "$ghostty_repo"
-  git -C "$SOURCE_DIR" fetch origin --prune --tags --force
-else
-  rm -rf "$SOURCE_DIR"
+if [[ ! -d "$SOURCE_DIR/.git" ]]; then
   git init "$SOURCE_DIR"
   git -C "$SOURCE_DIR" remote add origin "$ghostty_repo"
-  git -C "$SOURCE_DIR" fetch --depth=1 origin "$ghostty_ref"
-  git -C "$SOURCE_DIR" checkout --detach FETCH_HEAD
+else
+  git -C "$SOURCE_DIR" remote set-url origin "$ghostty_repo"
 fi
-
-git -C "$SOURCE_DIR" checkout --force "$ghostty_ref"
+git -C "$SOURCE_DIR" fetch --depth=1 origin "$ghostty_ref"
+git -C "$SOURCE_DIR" checkout --detach --force "$ghostty_ref"
 git -C "$SOURCE_DIR" reset --hard "$ghostty_ref"
 
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
 # shellcheck disable=SC2086
-(cd "$SOURCE_DIR" && zig build $build_step --prefix "$INSTALL_DIR")
+(cd "$SOURCE_DIR" && "$zig" build $build_step --prefix "$INSTALL_DIR")
 
 # Produce a co-located .dSYM for the dylib on macOS so the libghostty-vt frames
 # symbolicate when profiling/debugging the embedding app. Zig leaves DWARF in the

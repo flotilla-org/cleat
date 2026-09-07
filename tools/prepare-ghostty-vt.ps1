@@ -51,18 +51,20 @@ if ($buildStep.Trim().Length -gt 0) {
 
 New-Item -ItemType Directory -Force -Path (Join-Path $RepoRoot '.tools') | Out-Null
 
-if (Test-Path (Join-Path $SourceDir '.git')) {
-    git -C $SourceDir remote set-url origin $ghosttyRepo
-    git -C $SourceDir fetch origin --prune --tags --force
+if (!(Test-Path (Join-Path $SourceDir '.git'))) {
+    git init $SourceDir
+    if ($LASTEXITCODE -ne 0) { throw 'Ghostty git init failed' }
+    git -C $SourceDir remote add origin $ghosttyRepo
 } else {
-    if (Test-Path $SourceDir) {
-        Remove-Item -Recurse -Force $SourceDir
-    }
-    git clone $ghosttyRepo $SourceDir
+    git -C $SourceDir remote set-url origin $ghosttyRepo
 }
-
-git -C $SourceDir checkout --force $ghosttyRef
+if ($LASTEXITCODE -ne 0) { throw 'Ghostty remote setup failed' }
+git -C $SourceDir fetch --depth=1 origin $ghosttyRef
+if ($LASTEXITCODE -ne 0) { throw 'Ghostty fetch failed' }
+git -C $SourceDir checkout --detach --force $ghosttyRef
+if ($LASTEXITCODE -ne 0) { throw 'Ghostty checkout failed' }
 git -C $SourceDir reset --hard $ghosttyRef
+if ($LASTEXITCODE -ne 0) { throw 'Ghostty reset failed' }
 
 if (Test-Path $InstallDir) {
     Remove-Item -Recurse -Force $InstallDir
@@ -72,6 +74,7 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Push-Location $SourceDir
 try {
     & $zig build @buildArgs --prefix $InstallDir
+    if ($LASTEXITCODE -ne 0) { throw "Ghostty build failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
 }

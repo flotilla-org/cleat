@@ -3,12 +3,13 @@ version = "0.16.0"
 
 # The fork retains the virtual-placement C API, temporary-file read/deletion
 # policy, raw-file reads without S, empty-source renderer guard, and simdutf
-# MSVC initialization fix. Ordinary relative placements now come from upstream.
+# MSVC initialization fix. Windows import libraries expose only the public API.
+# Ordinary relative placements now come from upstream.
 # Audit all used C bindings whenever this pin changes; headers and option
 # semantics are not stable. See docs/ghostty-migration-2026-09.md.
 [ghostty]
 repo = "https://github.com/rjwittams/ghostty.git"
-ref = "2a4777cd774be6bc59ab9353cab97faef8b215fc"
+ref = "766af569c1317fa80b3ad7afcc79d76c88969fc0"
 # -Doptimize matters: zig defaults to Debug, and a Debug libghostty-vt feeds
 # scroll-heavy output at ~KB/s — slow enough to wedge session actors behind
 # PTY floods. ReleaseSafe keeps bounds checks on untrusted terminal input.

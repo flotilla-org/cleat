@@ -166,8 +166,29 @@ and all 42 active VT tests passed against this source. Zig formatting and
 Git whitespace checks passed. The broader Windows CLI integration issue
 noted above remains outside this packaging fix.
 
-Nothing was pushed and no Ghostty integration refs were rewritten. Cleat's
-tracked pin remains the published migration target. Publishing the Ghostty
-fix and then updating cleat's pin are still required before the normal setup
-helper can fetch this correction. Local validation selected the fixed install
-with `CLEAT_GHOSTTY_PREFIX`.
+Initial validation selected the local fixed install with
+`CLEAT_GHOSTTY_PREFIX`. The user subsequently authorized publication.
+
+## Publication and cleat pin
+
+Published `766af569c1317fa80b3ad7afcc79d76c88969fc0` to
+`rjwittams/ghostty` as `patches/libvt-windows-import-startup` and advanced
+`cleat-integration-staging` to it with a normal fast-forward push.
+`git ls-remote` confirmed both refs. The older `cleat-integration` ref was
+left unchanged.
+
+Cleat's `tools/ghostty-toolchain.toml` now pins this published commit. Zig
+remains `0.16.0` and the dependency URL remains
+`https://github.com/rjwittams/ghostty.git`.
+
+The normal setup helpers fetched and built the new pin on macOS, Linux
+(feta), and Windows (gouda). Each `.tools/ghostty-src` checkout was verified
+at the full published SHA. These runs used the standard install prefix,
+without `CLEAT_GHOSTTY_PREFIX` overrides.
+
+After preparation, macOS passed the exact repository format, Clippy, and
+workspace test commands listed above. macOS and Linux also passed the explicit
+Ghostty feature build and full cleat feature test command. Windows passed the feature
+build (including cleat's DLL), all 164 library tests, all 42 active VT tests,
+and the DLL consumer regression from the fetched Ghostty source. The existing
+Windows CLI integration limitation remains as documented above.

@@ -1,6 +1,6 @@
 # Ghostty migration, 2026-09-07
 
-Cleat now pins Ghostty `2a4777cd774be6bc59ab9353cab97faef8b215fc` and Zig
+The initial migration pinned Ghostty `2a4777cd774be6bc59ab9353cab97faef8b215fc` and Zig
 `0.16.0`. The previous pins were Ghostty
 `64daa599c531e6938bc4c52d9198a91f1e6ce8cf` and Zig `0.15.2`.
 
@@ -12,12 +12,14 @@ dependency, subject to the compatibility limits below.
 
 The lifecycle race and Windows IPC source error recorded below were fixed in
 a [subsequent follow-up](attach-and-windows-fixes-2026-09.md). That follow-up
-also identifies an additional Windows Ghostty import-library defect; its
+also fixes and publishes a Windows Ghostty import-library correction at
+`766af569c1317fa80b3ad7afcc79d76c88969fc0`, now pinned by cleat. Its
 validation section supersedes the original platform blockers below.
 
 Work started from cleat `dbeeca6` in a separate worktree and branch,
 `maintenance/ghostty-zig-016`. The original checkout and its prepared
-installation were left intact. No branches or releases were pushed.
+installation were left intact. The initial migration pushed no branches or
+releases; the follow-up records the later Ghostty publication.
 
 ## Binding changes
 

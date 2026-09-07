@@ -118,10 +118,56 @@ of the public import library; adding CRT flags to unrelated cleat code would
 hide the dependency defect.
 
 No diagnostic import-library rewrite was added to cleat's build or setup
-scripts, and no Ghostty refs were changed. The standard Ghostty-enabled
-Windows DLL build remains blocked by this additional dependency issue.
+scripts. The published dependency remains affected; the local Ghostty fix
+and its validation are recorded below.
 
 Logs and the exported-symbol listing are retained in
 `.tools/migration-validation/` in the migration worktree. The isolated
 Windows prefix and diagnostic scripts remain on gouda for the Ghostty
 maintenance follow-up.
+
+
+## Ghostty packaging fix
+
+Ghostty commit `766af569c1317fa80b3ad7afcc79d76c88969fc0` on local branch
+`patches/libvt-windows-import-startup` fixes the installed Windows import
+library. The worktree is `/Users/robert/dev/ghostty-windows-import-fix`, based
+on the published migration target `2a4777cd774be6bc59ab9353cab97faef8b215fc`.
+
+`GhosttyLibVt.zig` now generates the import definition from the built DLL's
+`ghostty_*` exports and invokes Zig's bundled `dlltool`. The DLL retains its
+startup implementation. The installed import library exposes all 202 public
+API symbols and excludes `_DllMainCRTStartup`. No external MSVC tool is needed
+for this packaging step.
+
+The new `test/windows/test_vt_dll_consumer.cmd` regression builds a C DLL and
+loads it from a separate executable. It checks that the consumer's own
+`DllMain` ran before creating and freeing a Ghostty terminal. With the published
+library it reports `DLL consumer failed: 1`: the DLL loads but its own startup
+is skipped. With the fixed package it passes. Ghostty's Windows CI build now
+runs this regression as well.
+
+Validation on gouda used the normal `zig-out` package from the fixed source,
+with no manual rewriting of generated files:
+
+- Native ReleaseSafe SIMD build passed twice.
+- DLL consumer regression passed, including the exact CI command.
+- Export/import comparison confirmed all 202 API symbols are retained and
+  the startup symbol is absent from the import library.
+- `cargo build -p cleat --locked --features ghostty-vt` passed, including
+  cleat's DLL.
+- `cargo test -p cleat --locked --features ghostty-vt --lib` passed all
+  164 tests.
+- `cargo test -p cleat --locked --features ghostty-vt --test vt` passed
+  all 42 active tests; the existing virtual-parent reproducer remains ignored.
+
+On macOS, the native Ghostty ReleaseSafe SIMD build, cleat feature build,
+and all 42 active VT tests passed against this source. Zig formatting and
+Git whitespace checks passed. The broader Windows CLI integration issue
+noted above remains outside this packaging fix.
+
+Nothing was pushed and no Ghostty integration refs were rewritten. Cleat's
+tracked pin remains the published migration target. Publishing the Ghostty
+fix and then updating cleat's pin are still required before the normal setup
+helper can fetch this correction. Local validation selected the fixed install
+with `CLEAT_GHOSTTY_PREFIX`.

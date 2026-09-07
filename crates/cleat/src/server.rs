@@ -72,6 +72,8 @@ pub struct DaemonInstance {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttachOptions {
+    /// Enable recording before granting the attachment; false preserves its current state.
+    pub record: bool,
     pub identity: AttachmentIdentity,
     pub strict: bool,
     pub take: bool,
@@ -567,8 +569,16 @@ impl SessionService {
                 environment: Vec::new(),
             }
         } else {
-            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions::default())?
+            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions {
+                record: options.record,
+                ..Default::default()
+            })?
         };
+        // Recording is part of setup, before observers can see the foreground
+        // grant and act on it (including killing the session).
+        if options.record {
+            self.record(&session.id, true)?;
+        }
         // Get real config from the daemon before attaching (which takes the foreground slot).
         let info = if let Ok(result) = self.inspect(&session.id) {
             session_info_from_inspect(result, SessionStatus::Attached)

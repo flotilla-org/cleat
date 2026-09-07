@@ -576,16 +576,15 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(handlers) => handlers,
                 Err(e) => return ExecResult::Err(e),
             };
-            let (attached, guard) =
-                match service.attach(id, vt, cwd, cmd, no_create, AttachOptions { identity: attachment.resolve(), strict, take }) {
-                    Ok(v) => v,
-                    Err(e) => return ExecResult::Err(e),
-                };
-            if record.enabled() {
-                if let Err(e) = service.record(&attached.id, true) {
-                    return ExecResult::Err(e);
-                }
-            }
+            let (_attached, guard) = match service.attach(id, vt, cwd, cmd, no_create, AttachOptions {
+                record: record.enabled(),
+                identity: attachment.resolve(),
+                strict,
+                take,
+            }) {
+                Ok(v) => v,
+                Err(e) => return ExecResult::Err(e),
+            };
             match guard.relay_stdio_with_handlers(signal_handlers) {
                 Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),

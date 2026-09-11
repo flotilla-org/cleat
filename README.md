@@ -48,7 +48,7 @@ cargo build -p cleat --locked
 cargo test -p cleat --locked
 ```
 
-The helpers read pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verify or install Zig `0.15.2`, clone or refresh Ghostty into `.tools/ghostty-src`, and install the Ghostty VT headers and libraries into `.tools/ghostty-install`.
+The helpers read pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghostty-toolchain.toml), verify or install Zig `0.16.0`, clone or refresh Ghostty into `.tools/ghostty-src`, and install the Ghostty VT headers and libraries into `.tools/ghostty-install`.
 
 The `ghostty-vt` build path defaults to the repo-local prefix at `.tools/ghostty-install`. You can still override it with `CLEAT_GHOSTTY_PREFIX`. Cleat prefers the static Ghostty VT library on Unix when present (`libghostty-vt.a`) and falls back to the shared library otherwise. On Windows, cleat links against `ghostty-vt.lib` and copies `ghostty-vt.dll` next to the built executable.
 

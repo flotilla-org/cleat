@@ -728,6 +728,26 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn drop_closes_master_fd_and_reaps_live_child() {
+        const ISOLATED: &str = "CLEAT_TEST_ISOLATED_PTY_DROP";
+        if std::env::var_os(ISOLATED).is_none() {
+            // A closed fd number can immediately be reused by another test.
+            // Run alone in a subprocess so F_GETFD below observes this PTY's
+            // closure, not an unrelated descriptor opened by a parallel test.
+            let output = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args(["--exact", "platform::unix::tests::drop_closes_master_fd_and_reaps_live_child", "--nocapture"])
+                .env(ISOLATED, "1")
+                .output()
+                .expect("run isolated PTY drop test");
+            assert!(
+                output.status.success(),
+                "isolated PTY drop test failed: {}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
         let session = SessionMetadata {
             id: "pty-drop".to_string(),
             vt_engine: VtEngineKind::Passthrough,

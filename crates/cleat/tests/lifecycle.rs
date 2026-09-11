@@ -2112,6 +2112,7 @@ fn interactive_packet_attach_is_demoted_by_take_without_losing_recording_state()
     let taker_identity = AttachmentIdentity { kind: AttachmentKind::Supervisor, name: "governor".to_string() };
     let (_session, _first) = service
         .attach(Some("alpha".into()), None, None, None, false, AttachOptions {
+            record: false,
             identity: first_identity.clone(),
             strict: false,
             take: false,
@@ -2119,6 +2120,7 @@ fn interactive_packet_attach_is_demoted_by_take_without_losing_recording_state()
         .expect("first interactive packet attach");
     let (_session, _taker) = service
         .attach(Some("alpha".into()), None, None, None, false, AttachOptions {
+            record: false,
             identity: taker_identity.clone(),
             strict: false,
             take: true,
@@ -2552,6 +2554,7 @@ fn attach_strict_rejects_second_foreground_client_while_one_is_active() {
 
     let (_session, _attach) = service
         .attach(Some("alpha".into()), None, None, Some("sleep 5".into()), false, AttachOptions {
+            record: false,
             identity: AttachmentIdentity { kind: AttachmentKind::Principal, name: "first".to_string() },
             strict: false,
             take: false,
@@ -2559,6 +2562,7 @@ fn attach_strict_rejects_second_foreground_client_while_one_is_active() {
         .expect("first attach");
     let err = service
         .attach(Some("alpha".into()), None, None, None, false, AttachOptions {
+            record: false,
             identity: AttachmentIdentity { kind: AttachmentKind::Principal, name: "second".to_string() },
             strict: true,
             take: false,
@@ -2581,6 +2585,7 @@ fn lifecycle_attach_init_with_capabilities_is_accepted_with_strict_seat_policy()
 
     let err = service
         .attach(Some("alpha".into()), None, None, None, false, AttachOptions {
+            record: false,
             identity: AttachmentIdentity::default(),
             strict: true,
             take: false,
@@ -3221,6 +3226,41 @@ fn attach_no_create_rejects_missing_session() {
     let err = cli::execute(cli, &service).expect_err("missing attach should fail");
 
     assert!(err.contains("missing"));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn attach_recording_policy_is_applied_before_the_attach_event() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for (existing, was_recording, enable_recording) in
+        [(false, false, true), (true, false, true), (true, true, false), (true, false, false)]
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = service_for(temp.path());
+        if existing {
+            service.create(Some("alpha".into()), None, None, Some("sleep 30".into()), was_recording).unwrap();
+        }
+        let (_info, attach) = service
+            .attach(Some("alpha".into()), None, None, Some("sleep 30".into()), existing, AttachOptions {
+                record: enable_recording,
+                ..Default::default()
+            })
+            .expect("attach");
+        let recording = service.inspect("alpha").unwrap().recording.active;
+        assert_eq!(recording, was_recording || enable_recording);
+        if recording {
+            let cast = std::fs::read_to_string(service.session_dir("alpha").join(CAST_FILE_NAME)).expect("recording");
+            assert!(
+                cast.lines().skip(1).any(|line| {
+                    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                    event[1] == "a"
+                }),
+                "recording must contain the initial attach event: {cast}",
+            );
+        }
+        drop(attach);
+        service.kill("alpha").unwrap();
+    }
 }
 
 #[cfg(feature = "ghostty-vt")]

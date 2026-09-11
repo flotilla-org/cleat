@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, ffi::c_void, io::Cursor, ptr, slice, sync::OnceLock};
+use std::{
+    collections::BTreeMap,
+    ffi::{c_char, c_void},
+    io::Cursor,
+    ptr, slice,
+    sync::OnceLock,
+};
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -9,14 +15,23 @@ pub enum GhosttyResult {
     InvalidValue = -2,
     OutOfSpace = -3,
     NoValue = -4,
+    IoError = -5,
+    LimitExceeded = -6,
+    Rejected = -7,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct GhosttyTerminalOptions {
-    pub cols: u16,
-    pub rows: u16,
-    pub max_scrollback: usize,
+pub struct GhosttyTerminalModeConfig {
+    pub mode: GhosttyMode,
+    pub value: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyString {
+    pub ptr: *const u8,
+    pub len: usize,
 }
 
 #[allow(dead_code)]
@@ -107,6 +122,9 @@ pub enum GhosttyTerminalData {
     KittyImageMediumTempFile = 28,
     KittyImageMediumSharedMem = 29,
     KittyGraphics = 30,
+    ScrollbackMaxBytes = 34,
+    ScrollbackMaxLines = 35,
+    Mode = 37,
 }
 
 pub type GhosttyMode = u16;
@@ -126,10 +144,10 @@ pub const GHOSTTY_MODE_BRACKETED_PASTE: GhosttyMode = 2004;
 // bytes, and normalizes newlines, so Cleat never hand-rolls this.
 unsafe extern "C" {
     fn ghostty_paste_encode(
-        data: *mut u8,
+        data: *mut c_char,
         data_len: usize,
         bracketed: bool,
-        out_buf: *mut u8,
+        out_buf: *mut c_char,
         buf_len: usize,
         out_written: *mut usize,
     ) -> GhosttyResult;
@@ -143,14 +161,14 @@ pub fn paste_encode(text: &[u8], bracketed: bool) -> Vec<u8> {
         // Query the required length (out buffer null/0 => out_of_space + size).
         // The Ghostty encoder may sanitize the input buffer while sizing, so
         // always pass owned mutable bytes.
-        match ghostty_paste_encode(input.as_mut_ptr(), input.len(), bracketed, ptr::null_mut(), 0, &mut needed) {
+        match ghostty_paste_encode(input.as_mut_ptr().cast(), input.len(), bracketed, ptr::null_mut(), 0, &mut needed) {
             GhosttyResult::Success if needed == 0 => return Vec::new(),
             GhosttyResult::Success | GhosttyResult::OutOfSpace => {}
             _ => return text.to_vec(),
         }
         let mut out = vec![0u8; needed];
         let mut written: usize = 0;
-        match ghostty_paste_encode(input.as_mut_ptr(), input.len(), bracketed, out.as_mut_ptr(), out.len(), &mut written) {
+        match ghostty_paste_encode(input.as_mut_ptr().cast(), input.len(), bracketed, out.as_mut_ptr().cast(), out.len(), &mut written) {
             GhosttyResult::Success => {
                 out.truncate(written);
                 out
@@ -298,6 +316,7 @@ pub enum GhosttyRenderStateData {
     CursorViewportX = 15,
     CursorViewportY = 16,
     CursorViewportWideTail = 17,
+    Colors = 19,
 }
 
 #[allow(dead_code)]
@@ -528,6 +547,7 @@ pub enum GhosttyTerminalOption {
     KittyImageMediumFile = 16,
     KittyImageMediumTempFile = 17,
     KittyImageMediumSharedMem = 18,
+    ScrollbackMaxBytes = 27,
 }
 
 /// Callback fired synchronously from `ghostty_terminal_vt_write` when the
@@ -779,13 +799,12 @@ pub struct KittyImagePlacementInfo {
 unsafe extern "C" {
     fn ghostty_alloc(allocator: *const GhosttyAllocator, len: usize) -> *mut u8;
     fn ghostty_sys_set(option: GhosttySysOption, value: *const c_void) -> GhosttyResult;
-    fn ghostty_terminal_new(allocator: *const c_void, terminal: *mut GhosttyTerminal, options: GhosttyTerminalOptions) -> GhosttyResult;
+    fn ghostty_terminal_new(allocator: *const GhosttyAllocator, terminal: *mut GhosttyTerminal, cols: u16, rows: u16) -> GhosttyResult;
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> GhosttyResult;
     fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
     fn ghostty_terminal_scroll_viewport(terminal: GhosttyTerminal, behavior: GhosttyTerminalScrollViewport);
     fn ghostty_terminal_get(terminal: GhosttyTerminal, data: GhosttyTerminalData, out: *mut c_void) -> GhosttyResult;
-    fn ghostty_terminal_mode_get(terminal: GhosttyTerminal, mode: GhosttyMode, out_value: *mut bool) -> GhosttyResult;
     fn ghostty_terminal_set(terminal: GhosttyTerminal, option: GhosttyTerminalOption, value: *const c_void) -> GhosttyResult;
     #[allow(dead_code)]
     fn ghostty_kitty_graphics_get(graphics: GhosttyKittyGraphics, data: GhosttyKittyGraphicsData, out: *mut c_void) -> GhosttyResult;
@@ -799,7 +818,7 @@ unsafe extern "C" {
     ) -> GhosttyResult;
     #[allow(dead_code)]
     fn ghostty_kitty_graphics_placement_iterator_new(
-        allocator: *const c_void,
+        allocator: *const GhosttyAllocator,
         out_iterator: *mut GhosttyKittyGraphicsPlacementIterator,
     ) -> GhosttyResult;
     #[allow(dead_code)]
@@ -821,7 +840,7 @@ unsafe extern "C" {
     ) -> GhosttyResult;
     #[allow(dead_code)]
     fn ghostty_kitty_graphics_virtual_placement_iterator_new(
-        allocator: *const c_void,
+        allocator: *const GhosttyAllocator,
         out_iterator: *mut GhosttyKittyGraphicsVirtualPlacementIterator,
     ) -> GhosttyResult;
     #[allow(dead_code)]
@@ -838,7 +857,7 @@ unsafe extern "C" {
     ) -> GhosttyResult;
 
     fn ghostty_formatter_terminal_new(
-        allocator: *const c_void,
+        allocator: *const GhosttyAllocator,
         formatter: *mut GhosttyFormatter,
         terminal: GhosttyTerminal,
         options: GhosttyFormatterTerminalOptions,
@@ -847,15 +866,17 @@ unsafe extern "C" {
     fn ghostty_formatter_free(formatter: GhosttyFormatter);
 
     // --- Render state ---
-    fn ghostty_render_state_new(allocator: *const c_void, state: *mut GhosttyRenderState) -> GhosttyResult;
+    fn ghostty_render_state_new(allocator: *const GhosttyAllocator, state: *mut GhosttyRenderState) -> GhosttyResult;
     fn ghostty_render_state_free(state: GhosttyRenderState);
     fn ghostty_render_state_update(state: GhosttyRenderState, terminal: GhosttyTerminal) -> GhosttyResult;
     fn ghostty_render_state_get(state: GhosttyRenderState, data: GhosttyRenderStateData, out: *mut c_void) -> GhosttyResult;
     fn ghostty_render_state_set(state: GhosttyRenderState, option: GhosttyRenderStateOption, value: *const c_void) -> GhosttyResult;
-    fn ghostty_render_state_colors_get(state: GhosttyRenderState, out_colors: *mut GhosttyRenderStateColors) -> GhosttyResult;
 
     // --- Row iterator ---
-    fn ghostty_render_state_row_iterator_new(allocator: *const c_void, out_iterator: *mut GhosttyRenderStateRowIterator) -> GhosttyResult;
+    fn ghostty_render_state_row_iterator_new(
+        allocator: *const GhosttyAllocator,
+        out_iterator: *mut GhosttyRenderStateRowIterator,
+    ) -> GhosttyResult;
     fn ghostty_render_state_row_iterator_free(iterator: GhosttyRenderStateRowIterator);
     fn ghostty_render_state_row_iterator_next(iterator: GhosttyRenderStateRowIterator) -> bool;
     fn ghostty_render_state_row_get(
@@ -871,7 +892,7 @@ unsafe extern "C" {
     ) -> GhosttyResult;
 
     // --- Row cells ---
-    fn ghostty_render_state_row_cells_new(allocator: *const c_void, out_cells: *mut GhosttyRenderStateRowCells) -> GhosttyResult;
+    fn ghostty_render_state_row_cells_new(allocator: *const GhosttyAllocator, out_cells: *mut GhosttyRenderStateRowCells) -> GhosttyResult;
     fn ghostty_render_state_row_cells_free(cells: GhosttyRenderStateRowCells);
     fn ghostty_render_state_row_cells_next(cells: GhosttyRenderStateRowCells) -> bool;
     #[allow(dead_code)]
@@ -980,18 +1001,18 @@ pub struct MouseEncodeEvent {
 }
 
 unsafe extern "C" {
-    fn ghostty_mouse_encoder_new(allocator: *const c_void, encoder: *mut GhosttyMouseEncoder) -> GhosttyResult;
+    fn ghostty_mouse_encoder_new(allocator: *const GhosttyAllocator, encoder: *mut GhosttyMouseEncoder) -> GhosttyResult;
     fn ghostty_mouse_encoder_free(encoder: GhosttyMouseEncoder);
     fn ghostty_mouse_encoder_setopt(encoder: GhosttyMouseEncoder, option: GhosttyMouseEncoderOption, value: *const c_void);
     fn ghostty_mouse_encoder_setopt_from_terminal(encoder: GhosttyMouseEncoder, terminal: GhosttyTerminal);
     fn ghostty_mouse_encoder_encode(
         encoder: GhosttyMouseEncoder,
         event: GhosttyMouseEvent,
-        out_buf: *mut u8,
+        out_buf: *mut c_char,
         out_buf_size: usize,
         out_len: *mut usize,
     ) -> GhosttyResult;
-    fn ghostty_mouse_event_new(allocator: *const c_void, event: *mut GhosttyMouseEvent) -> GhosttyResult;
+    fn ghostty_mouse_event_new(allocator: *const GhosttyAllocator, event: *mut GhosttyMouseEvent) -> GhosttyResult;
     fn ghostty_mouse_event_free(event: GhosttyMouseEvent);
     fn ghostty_mouse_event_set_action(event: GhosttyMouseEvent, action: GhosttyMouseAction);
     fn ghostty_mouse_event_set_button(event: GhosttyMouseEvent, button: GhosttyMouseButton);
@@ -1061,13 +1082,13 @@ impl MouseEncoder {
 
             let mut buf = [0u8; 64];
             let mut written: usize = 0;
-            match ghostty_mouse_encoder_encode(self.encoder, self.event, buf.as_mut_ptr(), buf.len(), &mut written) {
+            match ghostty_mouse_encoder_encode(self.encoder, self.event, buf.as_mut_ptr().cast(), buf.len(), &mut written) {
                 GhosttyResult::Success => buf[..written.min(buf.len())].to_vec(),
                 GhosttyResult::OutOfSpace => {
                     // Mouse reports never exceed ~20 bytes, but honor the contract.
                     let mut big = vec![0u8; written];
                     let mut w2: usize = 0;
-                    if ghostty_mouse_encoder_encode(self.encoder, self.event, big.as_mut_ptr(), big.len(), &mut w2)
+                    if ghostty_mouse_encoder_encode(self.encoder, self.event, big.as_mut_ptr().cast(), big.len(), &mut w2)
                         == GhosttyResult::Success
                     {
                         big.truncate(w2);
@@ -1265,8 +1286,17 @@ impl TerminalHandle {
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self, String> {
         ensure_sys_callbacks()?;
         let mut raw = ptr::null_mut();
-        let result = unsafe { ghostty_terminal_new(ptr::null(), &mut raw, GhosttyTerminalOptions { cols, rows, max_scrollback }) };
+        let result = unsafe { ghostty_terminal_new(ptr::null(), &mut raw, cols, rows) };
         check_result(result, "ghostty_terminal_new")?;
+        // The old constructor's max_scrollback was bytes despite its C header
+        // calling it lines. Preserve that budget; the new line limit defaults
+        // to unlimited. Zero bytes disables and clears scrollback.
+        let result =
+            unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::ScrollbackMaxBytes, (&max_scrollback as *const usize).cast()) };
+        if let Err(err) = check_result(result, "ghostty_terminal_set(ScrollbackMaxBytes)") {
+            unsafe { ghostty_terminal_free(raw) };
+            return Err(err);
+        }
 
         let mut effects = Box::new(TerminalEffects { reply_buf: Vec::new(), cols, rows, cell_width_px: 1, cell_height_px: 1 });
         let userdata_ptr: *mut c_void = (&mut *effects as *mut TerminalEffects).cast();
@@ -1348,15 +1378,21 @@ impl TerminalHandle {
     /// replace this direct-read path so Cleat owns media access (vfs, remoting,
     /// testing).
     pub fn set_kitty_image_media(&mut self, file: bool, temp_file: bool, shared_memory: bool) -> Result<(), String> {
-        for (option, value) in [
-            (GhosttyTerminalOption::KittyImageMediumFile, file),
-            (GhosttyTerminalOption::KittyImageMediumTempFile, temp_file),
-            (GhosttyTerminalOption::KittyImageMediumSharedMem, shared_memory),
-        ] {
+        for (option, value) in
+            [(GhosttyTerminalOption::KittyImageMediumFile, file), (GhosttyTerminalOption::KittyImageMediumSharedMem, shared_memory)]
+        {
             let result = unsafe { ghostty_terminal_set(self.raw, option, &value as *const bool as *const c_void) };
             check_result(result, "ghostty_terminal_set(KittyImageMedium)")?;
         }
-        Ok(())
+        // Ghostty copies this UTF-8 directory during set. The retained fork
+        // permits temporary-file reads elsewhere but only deletes allowed names
+        // under approved temporary directories.
+        let directory = std::env::temp_dir();
+        let directory = directory.to_str().ok_or("temporary directory is not UTF-8")?;
+        let directory = GhosttyString { ptr: directory.as_ptr(), len: directory.len() };
+        let value = if temp_file { (&directory as *const GhosttyString).cast() } else { ptr::null() };
+        let result = unsafe { ghostty_terminal_set(self.raw, GhosttyTerminalOption::KittyImageMediumTempFile, value) };
+        check_result(result, "ghostty_terminal_set(KittyImageMediumTempFile)")
     }
 
     #[allow(dead_code)]
@@ -1590,10 +1626,11 @@ impl TerminalHandle {
     }
 
     pub fn mode_enabled(&self, mode: GhosttyMode) -> Result<bool, String> {
-        let mut enabled = false;
-        let result = unsafe { ghostty_terminal_mode_get(self.raw, mode, &mut enabled) };
-        check_result(result, "ghostty_terminal_mode_get")?;
-        Ok(enabled)
+        let mut config = GhosttyTerminalModeConfig { mode, value: false };
+        let result =
+            unsafe { ghostty_terminal_get(self.raw, GhosttyTerminalData::Mode, (&mut config as *mut GhosttyTerminalModeConfig).cast()) };
+        check_result(result, "ghostty_terminal_get(Mode)")?;
+        Ok(config.value)
     }
 
     pub fn scroll_viewport(&mut self, behavior: GhosttyTerminalScrollViewport) {
@@ -1760,6 +1797,9 @@ fn check_result(result: GhosttyResult, op: &str) -> Result<(), String> {
         GhosttyResult::InvalidValue => Err(format!("{op} failed: invalid value")),
         GhosttyResult::OutOfSpace => Err(format!("{op} failed: out of space")),
         GhosttyResult::NoValue => Err(format!("{op} failed: no value")),
+        GhosttyResult::IoError => Err(format!("{op} failed: I/O error")),
+        GhosttyResult::LimitExceeded => Err(format!("{op} failed: limit exceeded")),
+        GhosttyResult::Rejected => Err(format!("{op} failed: rejected")),
     }
 }
 
@@ -1814,8 +1854,10 @@ impl RenderStateHandle {
 
     pub fn get_colors(&self) -> Result<GhosttyRenderStateColors, String> {
         let mut colors = GhosttyRenderStateColors::init();
-        let result = unsafe { ghostty_render_state_colors_get(self.raw, &mut colors) };
-        check_result(result, "ghostty_render_state_colors_get")?;
+        let result = unsafe {
+            ghostty_render_state_get(self.raw, GhosttyRenderStateData::Colors, (&mut colors as *mut GhosttyRenderStateColors).cast())
+        };
+        check_result(result, "ghostty_render_state_get(Colors)")?;
         Ok(colors)
     }
 
@@ -2128,6 +2170,84 @@ impl Drop for RowCellsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_preserves_byte_scrollback_budget_and_zero_disables_history() {
+        for budget in [0usize, 1024, 1_000_000] {
+            let mut term = TerminalHandle::new(10, 3, budget).unwrap();
+            let mut configured = usize::MAX;
+            let result =
+                unsafe { ghostty_terminal_get(term.raw, GhosttyTerminalData::ScrollbackMaxBytes, (&mut configured as *mut usize).cast()) };
+            assert_eq!(result, GhosttyResult::Success);
+            assert_eq!(configured, budget);
+            let result =
+                unsafe { ghostty_terminal_get(term.raw, GhosttyTerminalData::ScrollbackMaxLines, (&mut configured as *mut usize).cast()) };
+            assert_eq!(result, GhosttyResult::NoValue, "line limit must remain unlimited");
+            for _ in 0..100 {
+                term.feed(b"line\r\n");
+            }
+            assert_eq!(term.scrollback_rows().unwrap() == 0, budget == 0);
+            term.resize(20, 5, 8, 16).unwrap();
+            assert_eq!(term.scrollback_rows().unwrap() == 0, budget == 0);
+        }
+    }
+
+    #[test]
+    fn terminal_mode_queries_follow_set_reset_and_reject_unknown_modes() {
+        let mut term = TerminalHandle::new(80, 24, 1024).unwrap();
+        for mode in [
+            GHOSTTY_MODE_DECCKM,
+            GHOSTTY_MODE_MOUSE_X10,
+            GHOSTTY_MODE_MOUSE_NORMAL,
+            GHOSTTY_MODE_MOUSE_BUTTON,
+            GHOSTTY_MODE_MOUSE_ANY,
+            GHOSTTY_MODE_SGR_MOUSE,
+            GHOSTTY_MODE_ALT_SCROLL,
+            GHOSTTY_MODE_SGR_PIXELS_MOUSE,
+            GHOSTTY_MODE_BRACKETED_PASTE,
+        ] {
+            term.feed(format!("\x1b[?{mode}h").as_bytes());
+            assert!(term.mode_enabled(mode).unwrap(), "mode {mode}");
+            term.feed(format!("\x1b[?{mode}l").as_bytes());
+            assert!(!term.mode_enabled(mode).unwrap(), "mode {mode}");
+        }
+        assert!(term.mode_enabled(32767).is_err());
+    }
+
+    fn base64_path(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::new();
+        for chunk in bytes.chunks(3) {
+            let value =
+                (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+            for index in 0..4 {
+                encoded.push(if index > chunk.len() { '=' } else { ALPHABET[((value >> (18 - 6 * index)) & 63) as usize] as char });
+            }
+        }
+        encoded
+    }
+
+    #[test]
+    fn temporary_file_media_reads_without_size_and_only_deletes_allowed_names() {
+        for (prefix, deleted) in [("tty-graphics-protocol-", true), ("cleat-retained-", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{prefix}image"));
+            std::fs::write(&path, [255u8, 0, 0]).unwrap();
+            let mut term = TerminalHandle::new(80, 24, 1024).unwrap();
+            term.resize(80, 24, 10, 10).unwrap();
+            term.set_kitty_image_storage_limit(1024 * 1024).unwrap();
+            term.set_kitty_image_media(true, true, true).unwrap();
+            let encoded = base64_path(path.to_str().unwrap().as_bytes());
+            term.feed(format!("\x1b_Ga=T,t=t,f=24,i=1,s=1,v=1,c=1,r=1;{encoded}\x1b\\").as_bytes());
+            let (images, placements) = term.kitty_image_state().unwrap();
+            assert_eq!(images.len(), 1, "{:?}", term.drain_replies());
+            assert_eq!(placements.len(), 1);
+            assert_eq!(path.exists(), !deleted);
+            term.set_kitty_image_media(false, false, false).unwrap();
+            term.feed(format!("\x1b_Ga=T,t=t,f=24,i=2,s=1,v=1;{encoded}\x1b\\").as_bytes());
+            assert!(term.kitty_image_generation(2).unwrap().is_none());
+        }
+    }
 
     #[test]
     fn terminal_captures_dsr_reply_into_drain_buffer() {

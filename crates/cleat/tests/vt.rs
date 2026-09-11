@@ -851,3 +851,35 @@ fn encode_paste_brackets_when_mode_2004_enabled() {
     assert_eq!(engine.encode_paste(b"hello").expect("encode paste"), b"\x1b[200~hello\x1b[201~");
     assert_eq!(engine.encode_paste(b"hel\x1blo\x00world").expect("encode paste"), b"\x1b[200~hel lo world\x1b[201~");
 }
+
+#[cfg(feature = "ghostty-vt")]
+fn relative_placement_update(virtual_parent: bool) -> cleat::provider::TerminalRenderUpdate {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 8);
+    engine.set_cell_size(10, 10).unwrap();
+    engine.feed(b"\x1b[2;3H").unwrap();
+    let virtual_flag = if virtual_parent { ",U=1" } else { "" };
+    engine.feed(format!("\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=1,c=1,r=1{virtual_flag};////\x1b\\").as_bytes()).unwrap();
+    if virtual_parent {
+        engine.feed("\x1b[38;2;0;0;1m\x1b[58;2;0;0;1m\u{10EEEE}\u{0305}\u{0305}\x1b[0m".as_bytes()).unwrap();
+    }
+    engine.feed(b"\x1b_Ga=T,t=d,f=24,i=2,p=2,s=1,v=1,c=1,r=1,P=1,Q=1,H=2,V=1;AAAA\x1b\\").unwrap();
+    engine.render_update(DirtyState::Full).unwrap()
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_relative_placement_uses_ordinary_parent_position() {
+    let update = relative_placement_update(false);
+    let child = update.image_placements.iter().find(|p| p.image_id == 2).expect("relative child");
+    assert_eq!((child.viewport_col, child.viewport_row), (4, 2));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+#[ignore = "Ghostty C viewport helper cannot resolve relative children rooted at virtual placements; see docs/ghostty-migration-2026-09.md"]
+fn vt_ghostty_relative_placement_uses_virtual_parent_position() {
+    let update = relative_placement_update(true);
+    assert!(update.image_placements.iter().any(|p| p.image_id == 1), "virtual parent must be visible");
+    let child = update.image_placements.iter().find(|p| p.image_id == 2).expect("relative child of virtual parent");
+    assert_eq!((child.viewport_col, child.viewport_row), (4, 2));
+}

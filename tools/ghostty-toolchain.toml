@@ -1,21 +1,25 @@
 [zig]
-version = "0.15.2"
+version = "0.16.0"
 
-# We pin a fork rather than upstream ghostty because cleat depends on
-# libghostty-vt work not yet upstreamed: the C VT library emit step
-# (-Demit-lib-vt), the virtual-placement resolver, and Kitty relative-placement
-# resolution (P/Q/H/V + virtual parent). `ref` is the `cleat-integration` head,
-# which merges those feature branches onto ghostty main with --no-ff.
-#
-# Maintenance: bumping `ref` is a pin update, not an API change, as long as the
-# vendored include/ghostty/*.h headers are byte-identical across the bump (the
-# changes are behavioural). If a header diff appears, the FFI bindings in
-# crates/cleat/src/vt/ghostty_ffi.rs must be reviewed before accepting it. As the
-# libvt branches upstream, retire this fork and re-pin to ghostty-org/ghostty.
+# The fork retains the virtual-placement C API, temporary-file read/deletion
+# policy, raw-file reads without S, empty-source renderer guard, and simdutf
+# MSVC initialization fix. Windows import libraries expose only the public API.
+# Ordinary relative placements now come from upstream.
+# Audit all used C bindings whenever this pin changes; headers and option
+# semantics are not stable. See docs/ghostty-migration-2026-09.md.
 [ghostty]
 repo = "https://github.com/rjwittams/ghostty.git"
-ref = "64daa599c531e6938bc4c52d9198a91f1e6ce8cf"
+ref = "766af569c1317fa80b3ad7afcc79d76c88969fc0"
 # -Doptimize matters: zig defaults to Debug, and a Debug libghostty-vt feeds
 # scroll-heavy output at ~KB/s — slow enough to wedge session actors behind
 # PTY floods. ReleaseSafe keeps bounds checks on untrusted terminal input.
 build_step = "-Demit-lib-vt=true -Dsimd=true -Doptimize=ReleaseSafe"
+
+# SHA-256 from the Zig release index.
+[zig_sha256]
+aarch64-macos = "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+x86_64-macos = "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7"
+aarch64-linux = "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
+x86_64-linux = "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+aarch64-windows = "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef"
+x86_64-windows = "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"

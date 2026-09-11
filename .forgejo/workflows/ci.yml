@@ -35,7 +35,6 @@ jobs:
         run: |
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
-          test "$(zig version)" = 0.15.2
           security find-identity -v -p codesigning | grep -Eq '^[[:space:]]*0 valid identities found[[:space:]]*$'
           test ! -e "$HOME/.config/forgejo-runner/.runner"
           test -z "${FLEET_CODESIGN_IDENTITY:-}"

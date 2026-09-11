@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '0.15.2',
+    [string]$Version = '0.16.0',
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 )
 
@@ -22,6 +22,17 @@ if (!(Test-Path (Join-Path $installDir 'zig.exe'))) {
     if (!(Test-Path $zipPath)) {
         Write-Host "Downloading $url"
         Invoke-WebRequest -Uri $url -OutFile $zipPath
+    }
+
+    $checksumKey = "$arch-windows"
+    $checksumLine = Get-Content (Join-Path $RepoRoot 'tools\ghostty-toolchain.toml') |
+        Where-Object { $_ -match "^$checksumKey\s*=" } | Select-Object -First 1
+    if (!$checksumLine -or $checksumLine -notmatch '"([a-f0-9]{64})"') {
+        throw "Missing Zig checksum for $checksumKey"
+    }
+    $expectedChecksum = $Matches[1]
+    if ((Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant() -ne $expectedChecksum) {
+        throw "Zig checksum mismatch for $zipPath"
     }
 
     $extractDir = Join-Path $toolsDir "zig-extract-$Version"

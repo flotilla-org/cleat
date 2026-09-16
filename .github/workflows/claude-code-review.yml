@@ -47,6 +47,14 @@ jobs:
 
             Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
 
+            Review the diff and relevant source directly in this session. Do not invoke
+            /code-review or another review skill. Complete the review and post its
+            comment before returning your final response; a promise to finish later
+            does not complete this CI job.
+
+            Review source only. Dedicated CI jobs run builds, tests, and linters;
+            do not run those commands as part of this review.
+
             AFTER reviewing, 
               * CHECK your findings against the existing comments and replies on the PR. e.g if followup issues are filed or the implementor pushed back, make sure that is 
               correct: drop issues that are already addressed, repeat issues that still need to be dealt with with an explanation.
@@ -56,8 +64,37 @@ jobs:
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://docs.claude.com/en/docs/claude-code/cli-reference for available options
-          claude_args: '--allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+          claude_args: '--disallowed-tools Skill --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
 
+
+      - name: Summarize review permission denials
+        if: always() && steps.claude-review.outputs.execution_file != ''
+        uses: actions/github-script@v7
+        env:
+          REVIEW_EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        with:
+          script: |
+            const fs = require('fs');
+            const messages = JSON.parse(fs.readFileSync(process.env.REVIEW_EXECUTION_FILE, 'utf8'));
+            // Log fixed categories only, never tool arguments, results, or model prose.
+            const toolNames = new Set(['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Skill', 'Agent', 'Task', 'WebFetch', 'WebSearch']);
+            const prefixes = ['gh pr comment', 'gh pr diff', 'gh pr view', 'gh api', 'git diff', 'git show', 'git log', 'cat', 'sed', 'rg', 'grep', 'python3', 'python', 'node', 'ls'];
+            const counts = {};
+            let total = 0;
+            for (const message of messages) {
+              if (message.type !== 'result') continue;
+              for (const denial of message.permission_denials ?? []) {
+                let category = toolNames.has(denial.tool_name) ? denial.tool_name : 'other tool';
+                if (denial.tool_name === 'Bash') {
+                  const command = (denial.tool_input?.command ?? '').trimStart();
+                  const prefix = prefixes.find(value => command === value || command.startsWith(value + ' '));
+                  category = prefix ? `Bash: ${prefix}` : 'Bash: other command';
+                }
+                counts[category] = (counts[category] ?? 0) + 1;
+                total++;
+              }
+            }
+            core.info(JSON.stringify({permission_denials: total, categories: counts}, null, 2));
 
       - name: Require a posted review for this commit
         uses: actions/github-script@v7

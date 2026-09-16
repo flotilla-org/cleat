@@ -1420,7 +1420,14 @@ impl TerminalHandle {
     }
 
     pub fn kitty_image_state(&self) -> Result<(Vec<KittyImageResourceInfo>, Vec<KittyImagePlacementInfo>), String> {
-        let graphics = match self.kitty_graphics()? {
+        self.kitty_image_state_for_anchor(None)
+    }
+
+    pub fn kitty_image_state_for_anchor(
+        &self,
+        anchor: Option<&HistoryAnchor>,
+    ) -> Result<(Vec<KittyImageResourceInfo>, Vec<KittyImagePlacementInfo>), String> {
+        let graphics = match self.kitty_graphics_for_anchor(anchor)? {
             Some(graphics) => graphics,
             None => return Ok((Vec::new(), Vec::new())),
         };
@@ -1455,7 +1462,14 @@ impl TerminalHandle {
 
             let resource = image_resource_info(image)?;
             let mut render_info = GhosttyKittyGraphicsPlacementRenderInfo::init();
-            let result = unsafe { ghostty_kitty_graphics_placement_render_info(iterator.raw, image, self.raw, &mut render_info) };
+            let result = unsafe {
+                match anchor {
+                    Some(anchor) => {
+                        ghostty_kitty_graphics_placement_render_info_for_ref(iterator.raw, image, self.raw, anchor.raw, &mut render_info)
+                    }
+                    None => ghostty_kitty_graphics_placement_render_info(iterator.raw, image, self.raw, &mut render_info),
+                }
+            };
             check_result(result, "ghostty_kitty_graphics_placement_render_info")?;
             if !render_info.viewport_visible {
                 continue;
@@ -1498,7 +1512,12 @@ impl TerminalHandle {
         }
 
         let virtual_iterator = VirtualPlacementIteratorHandle::new()?;
-        let result = unsafe { ghostty_kitty_graphics_virtual_placement_iterator_reset(virtual_iterator.raw, self.raw) };
+        let result = unsafe {
+            match anchor {
+                Some(anchor) => ghostty_kitty_graphics_virtual_placement_iterator_reset_for_ref(virtual_iterator.raw, self.raw, anchor.raw),
+                None => ghostty_kitty_graphics_virtual_placement_iterator_reset(virtual_iterator.raw, self.raw),
+            }
+        };
         match result {
             GhosttyResult::Success => loop {
                 let mut info = GhosttyKittyGraphicsVirtualPlacementInfo::init();
@@ -1549,7 +1568,17 @@ impl TerminalHandle {
     }
 
     pub fn with_kitty_image_data(&self, image_id: u32, generation: u64, callback: &mut dyn FnMut(&[u8]) -> bool) -> Result<bool, String> {
-        let graphics = match self.kitty_graphics()? {
+        self.with_kitty_image_data_for_anchor(None, image_id, generation, callback)
+    }
+
+    pub fn with_kitty_image_data_for_anchor(
+        &self,
+        anchor: Option<&HistoryAnchor>,
+        image_id: u32,
+        generation: u64,
+        callback: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, String> {
+        let graphics = match self.kitty_graphics_for_anchor(anchor)? {
             Some(graphics) => graphics,
             None => return Ok(false),
         };
@@ -1565,6 +1594,9 @@ impl TerminalHandle {
         let result = unsafe {
             ghostty_kitty_graphics_image_get(image, GhosttyKittyGraphicsImageData::DataPtr, &mut data_ptr as *mut *const u8 as *mut c_void)
         };
+        if result == GhosttyResult::NoValue {
+            return Ok(false); // Pending image data is not a capture error.
+        }
         check_result(result, "ghostty_kitty_graphics_image_get(DataPtr)")?;
         let mut data_len = 0usize;
         let result = unsafe {
@@ -2041,6 +2073,9 @@ impl RowCellsHandle {
         let grapheme_len = match fetch_row_cell(raw, &mut self.inline_grapheme_utf8, &mut cell, &mut style) {
             Ok(len) => len,
             Err((GhosttyResult::OutOfSpace, 2, required)) => {
+                self.overflow_grapheme_utf8
+                    .try_reserve(required.saturating_sub(self.overflow_grapheme_utf8.len()))
+                    .map_err(|e| e.to_string())?;
                 self.overflow_grapheme_utf8.resize(required, 0);
                 fetch_row_cell(raw, &mut self.overflow_grapheme_utf8, &mut cell, &mut style).map_err(|(result, written, _)| {
                     format!("ghostty_render_state_row_cells_get_multi failed after {written} values: {result:?}")
@@ -2059,6 +2094,7 @@ impl RowCellsHandle {
         let grapheme_text =
             std::str::from_utf8(grapheme_bytes).map_err(|err| format!("ghostty render-state grapheme was not valid utf-8: {err}"))?;
         graphemes.clear();
+        graphemes.try_reserve(grapheme_text.chars().count()).map_err(|e| e.to_string())?;
         graphemes.extend(grapheme_text.chars().map(u32::from));
 
         let mut content_tag = GhosttyCellContentTag::Codepoint;
@@ -2170,6 +2206,27 @@ impl Drop for RowCellsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn scoped_history_c_layouts() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<HistoryState>(), 48);
+        assert_eq!(offset_of!(HistoryState, screen_incarnation), 8);
+        assert_eq!(offset_of!(HistoryState, reset_serial), 16);
+        assert_eq!(offset_of!(HistoryState, history_clear_serial), 24);
+        assert_eq!(offset_of!(HistoryState, total_rows), 32);
+        assert_eq!(offset_of!(HistoryState, cols), 40);
+        assert_eq!(offset_of!(HistoryState, rows), 42);
+        assert_eq!(size_of::<GridPoint>(), 24);
+        assert_eq!(offset_of!(GridPoint, value), 8);
+        assert_eq!(size_of::<GridCoordinate>(), 8);
+        assert_eq!(offset_of!(GridCoordinate, y), 4);
+        assert_eq!(size_of::<GridRef>(), 24);
+        assert_eq!(offset_of!(GridRef, node), 8);
+        assert_eq!(offset_of!(GridRef, x), 16);
+        assert_eq!(offset_of!(GridRef, y), 18);
+    }
 
     #[test]
     fn terminal_preserves_byte_scrollback_budget_and_zero_disables_history() {
@@ -2316,5 +2373,176 @@ mod tests {
         let second = term.kitty_image_generation(1).expect("second image generation").expect("second image exists");
 
         assert_ne!(first, second);
+    }
+}
+
+// Scoped capture bindings. Tracked references may outlive their terminal;
+// Ghostty invalidates them on terminal destruction and still permits freeing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HistoryState {
+    size: usize,
+    pub screen_incarnation: u64,
+    pub reset_serial: u64,
+    pub history_clear_serial: u64,
+    pub total_rows: u64,
+    pub cols: u16,
+    pub rows: u16,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GridCoordinate {
+    x: u16,
+    y: u32,
+}
+#[repr(C)]
+union GridPointValue {
+    coordinate: GridCoordinate,
+    padding: [u64; 2],
+}
+#[repr(C)]
+struct GridPoint {
+    tag: i32,
+    value: GridPointValue,
+}
+impl GridPoint {
+    fn screen(x: u16, y: u32) -> Self {
+        Self { tag: 2, value: GridPointValue { coordinate: GridCoordinate { x, y } } }
+    }
+}
+#[repr(C)]
+struct GridRef {
+    size: usize,
+    node: *mut c_void,
+    x: u16,
+    y: u16,
+}
+
+pub struct HistoryAnchor {
+    raw: *mut c_void,
+}
+impl Drop for HistoryAnchor {
+    fn drop(&mut self) {
+        unsafe { ghostty_tracked_grid_ref_free(self.raw) };
+    }
+}
+unsafe extern "C" {
+    fn ghostty_terminal_history_state(terminal: GhosttyTerminal, screen: GhosttyTerminalScreen, out: *mut HistoryState) -> GhosttyResult;
+    fn ghostty_terminal_grid_ref_track_on_screen(
+        terminal: GhosttyTerminal,
+        screen: GhosttyTerminalScreen,
+        point: GridPoint,
+        out: *mut *mut c_void,
+    ) -> GhosttyResult;
+    fn ghostty_tracked_grid_ref_set_on_screen(
+        anchor: *mut c_void,
+        terminal: GhosttyTerminal,
+        screen: GhosttyTerminalScreen,
+        point: GridPoint,
+    ) -> GhosttyResult;
+    fn ghostty_tracked_grid_ref_free(anchor: *mut c_void);
+    fn ghostty_terminal_viewport_for_ref(
+        terminal: GhosttyTerminal,
+        anchor: *mut c_void,
+        out: *mut GhosttyTerminalScrollbar,
+    ) -> GhosttyResult;
+    fn ghostty_render_state_capture(state: GhosttyRenderState, terminal: GhosttyTerminal, anchor: *mut c_void) -> GhosttyResult;
+    fn ghostty_terminal_grid_ref_on_screen(
+        terminal: GhosttyTerminal,
+        screen: GhosttyTerminalScreen,
+        point: GridPoint,
+        out: *mut GridRef,
+    ) -> GhosttyResult;
+    fn ghostty_grid_ref_hyperlink_uri(reference: *const GridRef, buf: *mut u8, len: usize, out_len: *mut usize) -> GhosttyResult;
+    fn ghostty_terminal_kitty_graphics_for_ref(
+        terminal: GhosttyTerminal,
+        anchor: *mut c_void,
+        out: *mut GhosttyKittyGraphics,
+    ) -> GhosttyResult;
+    fn ghostty_kitty_graphics_placement_render_info_for_ref(
+        iter: GhosttyKittyGraphicsPlacementIterator,
+        image: GhosttyKittyGraphicsImage,
+        terminal: GhosttyTerminal,
+        anchor: *mut c_void,
+        out: *mut GhosttyKittyGraphicsPlacementRenderInfo,
+    ) -> GhosttyResult;
+    fn ghostty_kitty_graphics_virtual_placement_iterator_reset_for_ref(
+        iter: GhosttyKittyGraphicsVirtualPlacementIterator,
+        terminal: GhosttyTerminal,
+        anchor: *mut c_void,
+    ) -> GhosttyResult;
+}
+impl TerminalHandle {
+    pub fn history_state(&self, screen: GhosttyTerminalScreen) -> Result<Option<HistoryState>, String> {
+        let mut state = HistoryState { size: std::mem::size_of::<HistoryState>(), ..HistoryState::default() };
+        let result = unsafe { ghostty_terminal_history_state(self.raw, screen, &mut state) };
+        if result == GhosttyResult::NoValue {
+            return Ok(None);
+        }
+        check_result(result, "ghostty_terminal_history_state")?;
+        Ok(Some(state))
+    }
+    pub fn history_anchor(&self, screen: GhosttyTerminalScreen, row: u32) -> Result<HistoryAnchor, String> {
+        let mut raw = ptr::null_mut();
+        check_result(
+            unsafe { ghostty_terminal_grid_ref_track_on_screen(self.raw, screen, GridPoint::screen(0, row), &mut raw) },
+            "ghostty_terminal_grid_ref_track_on_screen",
+        )?;
+        Ok(HistoryAnchor { raw })
+    }
+    pub fn move_history_anchor(&self, anchor: &mut HistoryAnchor, screen: GhosttyTerminalScreen, row: u32) -> Result<(), String> {
+        check_result(
+            unsafe { ghostty_tracked_grid_ref_set_on_screen(anchor.raw, self.raw, screen, GridPoint::screen(0, row)) },
+            "ghostty_tracked_grid_ref_set_on_screen",
+        )
+    }
+    pub fn history_viewport(&self, anchor: &HistoryAnchor) -> Result<Option<GhosttyTerminalScrollbar>, String> {
+        let mut out = GhosttyTerminalScrollbar { total: 0, offset: 0, len: 0 };
+        let result = unsafe { ghostty_terminal_viewport_for_ref(self.raw, anchor.raw, &mut out) };
+        if result == GhosttyResult::NoValue {
+            return Ok(None);
+        }
+        check_result(result, "ghostty_terminal_viewport_for_ref")?;
+        Ok(Some(out))
+    }
+    pub fn history_link(&self, screen: GhosttyTerminalScreen, x: u16, y: u32, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let mut reference = GridRef { size: std::mem::size_of::<GridRef>(), node: ptr::null_mut(), x: 0, y: 0 };
+        check_result(
+            unsafe { ghostty_terminal_grid_ref_on_screen(self.raw, screen, GridPoint::screen(x, y), &mut reference) },
+            "ghostty_terminal_grid_ref_on_screen",
+        )?;
+        let mut len = 0;
+        let result = unsafe { ghostty_grid_ref_hyperlink_uri(&reference, ptr::null_mut(), 0, &mut len) };
+        if result != GhosttyResult::OutOfSpace {
+            check_result(result, "ghostty_grid_ref_hyperlink_uri(size)")?;
+        }
+        if len > max_bytes {
+            return Err("history capture exceeds resource budget".into());
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|e| e.to_string())?;
+        bytes.resize(len, 0);
+        check_result(
+            unsafe { ghostty_grid_ref_hyperlink_uri(&reference, bytes.as_mut_ptr(), len, &mut len) },
+            "ghostty_grid_ref_hyperlink_uri",
+        )?;
+        Ok(bytes)
+    }
+    fn kitty_graphics_for_anchor(&self, anchor: Option<&HistoryAnchor>) -> Result<Option<GhosttyKittyGraphics>, String> {
+        let Some(anchor) = anchor else {
+            return self.kitty_graphics();
+        };
+        let mut raw = ptr::null_mut();
+        let result = unsafe { ghostty_terminal_kitty_graphics_for_ref(self.raw, anchor.raw, &mut raw) };
+        if result == GhosttyResult::NoValue {
+            return Ok(None);
+        }
+        check_result(result, "ghostty_terminal_kitty_graphics_for_ref")?;
+        Ok((!raw.is_null()).then_some(raw))
+    }
+}
+impl RenderStateHandle {
+    pub fn capture(&mut self, terminal: &TerminalHandle, anchor: &HistoryAnchor) -> Result<(), String> {
+        check_result(unsafe { ghostty_render_state_capture(self.raw, terminal.raw, anchor.raw) }, "ghostty_render_state_capture")
     }
 }

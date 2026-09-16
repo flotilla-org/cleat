@@ -361,7 +361,7 @@ pub(crate) enum SessionCommand {
     MarkObserved { generation: u64, reply: mpsc::Sender<bool> },
     ScrollbackExtent { reply: mpsc::Sender<TerminalScrollbackExtent> },
     ScrollbarState { reply: mpsc::Sender<TerminalScrollbarState> },
-    SetClientPresence { active: bool, reply: mpsc::Sender<Result<(), String>> },
+    SetQueryPassthrough { enabled: bool, reply: mpsc::Sender<Result<(), String>> },
     SubscribeRawOutput { reply: mpsc::Sender<RawOutputTap> },
     RecoverRawOutput { capabilities: Vec<vt::ClientCapabilities>, reply: mpsc::Sender<Result<RawOutputRecovery, String>> },
     Stop { terminate: bool },
@@ -694,8 +694,10 @@ impl SessionActor {
         }
     }
 
-    pub(crate) fn set_client_presence(&self, active: bool) -> Result<(), String> {
-        self.request_result(|reply| SessionCommand::SetClientPresence { active, reply })
+    /// Enable only when a raw-stream controller receives and answers terminal queries.
+    /// Packet clients render structured state and leave query answering to the engine.
+    pub(crate) fn set_query_passthrough(&self, enabled: bool) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::SetQueryPassthrough { enabled, reply })
     }
 
     pub(crate) fn subscribe_raw_output(&self) -> Result<RawOutputTap, String> {
@@ -884,7 +886,7 @@ struct SessionActorLoopState {
     observation: ObservationState,
     exited: bool,
     exit_code: Option<i32>,
-    has_active_client: bool,
+    queries_forwarded_to_client: bool,
     raw_output_taps: Vec<SyncSender<RawOutputChunk>>,
     last_raw_output_sequence: u64,
 }
@@ -893,7 +895,7 @@ fn pump_session_runtime(
     runtime: &mut SessionRuntime,
     exited: &mut bool,
     exit_code: &mut Option<i32>,
-    has_active_client: bool,
+    queries_forwarded_to_client: bool,
 ) -> Result<PumpResult, String> {
     let mut exited_now = false;
     if !*exited {
@@ -905,11 +907,11 @@ fn pump_session_runtime(
         }
     }
     let output = if exited_now {
-        runtime.drain_output_after_exit(has_active_client)?
+        runtime.drain_output_after_exit(queries_forwarded_to_client)?
     } else if *exited {
         PtyOutput { chunks: Vec::new() }
     } else {
-        runtime.read_available_output(has_active_client)?
+        runtime.read_available_output(queries_forwarded_to_client)?
     };
     let outcome = if exited_now {
         PumpOutcome::Full
@@ -954,7 +956,7 @@ fn session_actor_loop(
         observation: ObservationState::new_with_mirror(rows, Some(mirror)),
         exited: false,
         exit_code: None,
-        has_active_client: false,
+        queries_forwarded_to_client: false,
         raw_output_taps: Vec::new(),
         last_raw_output_sequence: 0,
     };
@@ -1213,8 +1215,8 @@ fn session_actor_handle_command(
             });
             let _ = reply.send(scrollbar);
         }
-        SessionCommand::SetClientPresence { active, reply } => {
-            state.has_active_client = active;
+        SessionCommand::SetQueryPassthrough { enabled, reply } => {
+            state.queries_forwarded_to_client = enabled;
             let _ = reply.send(Ok(()));
         }
         SessionCommand::SubscribeRawOutput { reply } => {
@@ -1259,7 +1261,7 @@ fn maybe_panic_actor_for_test(session_id: &str) {
 }
 
 fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoopState, wake: &WakeCallback) {
-    match pump_session_runtime(runtime, &mut state.exited, &mut state.exit_code, state.has_active_client) {
+    match pump_session_runtime(runtime, &mut state.exited, &mut state.exit_code, state.queries_forwarded_to_client) {
         Ok(result) => {
             // Fires only on pumps that read output, so session creation
             // (whose command handling also pumps) completes first.

@@ -2252,7 +2252,7 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
         Ok(runtime)
     })
     .map_err(|err| err.replace("session actor", "in-process session actor"))?;
-    actor.set_client_presence(false)?;
+    actor.set_query_passthrough(false)?;
     Ok(InProcessSession { actor })
 }
 

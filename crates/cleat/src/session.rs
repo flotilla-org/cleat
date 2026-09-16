@@ -1380,7 +1380,7 @@ fn enqueue_output_chunk(
         if client.enqueue_output(chunk).is_err() {
             let _ = fs::remove_file(layout.foreground_path(id));
             let _ = actor.record_detach();
-            let _ = actor.set_client_presence(false);
+            let _ = actor.set_query_passthrough(false);
             *active_client = None;
         }
     }
@@ -1580,7 +1580,7 @@ fn recover_raw_output_tap(
         if recipient_frames.next().is_some_and(|frames| enqueue_frames(client, &frames).is_err()) {
             let _ = fs::remove_file(layout.foreground_path(id));
             let _ = actor.record_detach();
-            let _ = actor.set_client_presence(false);
+            let _ = actor.set_query_passthrough(false);
             *active_client = None;
         }
     }
@@ -1904,16 +1904,17 @@ fn sync_packet_geometry(hosted: &mut HostedSession) -> Result<(), String> {
 
 fn sync_packet_controller_presence(layout: &RuntimeLayout, hosted: &HostedSession, previously_had_controller: bool) -> Result<(), String> {
     let has_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
+    // Query authority follows the transport, not the number of drivers.
+    // Also update on raw-to-packet takeover, when controller presence stays true.
+    hosted.actor.set_query_passthrough(hosted.active_client.is_some())?;
     if has_controller == previously_had_controller {
         return Ok(());
     }
     if has_controller {
         let _ = fs::write(layout.foreground_path(&hosted.metadata.id), b"1");
-        hosted.actor.set_client_presence(true)?;
         hosted.actor.record_attach()
     } else {
         let _ = fs::remove_file(layout.foreground_path(&hosted.metadata.id));
-        hosted.actor.set_client_presence(false)?;
         hosted.actor.record_detach()
     }
 }
@@ -2252,7 +2253,7 @@ fn service_hosted_session(
         if client_disconnected && hosted.active_client.is_some() {
             let _ = fs::remove_file(layout.foreground_path(id));
             hosted.actor.record_detach()?;
-            hosted.actor.set_client_presence(false)?;
+            hosted.actor.set_query_passthrough(false)?;
             hosted.active_client = None;
             did_work = true;
         }
@@ -2265,7 +2266,7 @@ fn service_hosted_session(
     if !client_writable {
         let _ = fs::remove_file(layout.foreground_path(id));
         hosted.actor.record_detach()?;
-        hosted.actor.set_client_presence(false)?;
+        hosted.actor.set_query_passthrough(false)?;
         hosted.active_client = None;
         did_work = true;
     }
@@ -2730,7 +2731,7 @@ fn handle_http_request(
             }
             let activation = (|| {
                 if grant_controller {
-                    hosted.actor.set_client_presence(true)?;
+                    hosted.actor.set_query_passthrough(true)?;
                     hosted.actor.record_attach()?;
                 }
                 announce_seat_state(hosted, state.packet_clients)?;
@@ -2739,7 +2740,7 @@ fn handle_http_request(
             if let Err(err) = activation {
                 if grant_controller {
                     hosted.active_client = None;
-                    let _ = hosted.actor.set_client_presence(false);
+                    let _ = hosted.actor.set_query_passthrough(false);
                     let _ = fs::remove_file(state.layout.foreground_path(&id));
                 } else {
                     hosted.watchers.pop();
@@ -2800,7 +2801,7 @@ fn handle_http_request(
                     client.channels.remove(&controller.channel);
                 }
             }
-            hosted.actor.set_client_presence(false)?;
+            hosted.actor.set_query_passthrough(false)?;
             hosted.active_client = None;
             announce_seat_state(hosted, state.packet_clients)?;
             broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;

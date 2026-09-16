@@ -3040,6 +3040,43 @@ fn detached_session_answers_da_queries() {
     assert!(output.contains("\x1b[?62;22c"), "detached session should inject DA1 response in recorded output, got: {output:?}");
 }
 
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_attachments_receive_one_cursor_position_reply() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for (roles, take_raw) in [
+        (vec![ChannelRole::Controller], false),
+        (vec![ChannelRole::Controller, ChannelRole::Controller, ChannelRole::Watcher], false),
+        (vec![ChannelRole::Watcher], false),
+        (vec![ChannelRole::Controller], true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let service = service_for(temp.path());
+        // Query only after attachments are installed, then reject extra replies.
+        let command = r#"bash --noprofile --norc -c 'stty raw -echo; printf READY; IFS= read -r -n 1 trigger; printf "\033[3;7H\033[6n"; IFS= read -r -d R -t 2 reply; expected=$(printf "\033[3;7"); if [ "$reply" = "$expected" ]; then if IFS= read -r -n 1 -t 0.2 extra; then printf CPR_DUPLICATED; else printf CPR_OK; fi; else printf CPR_FAILED; fi; sleep 30'"#;
+        service.create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some(command.into()), false).unwrap();
+        wait_until("probe ready", || service.capture("alpha").unwrap().contains("READY"));
+        let _raw = take_raw.then(|| http_attach_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback()));
+        let mut streams = Vec::new();
+        for role in &roles {
+            let mut stream = http_packet_stream(temp.path(), "alpha");
+            PacketFrame::read(&mut stream).unwrap();
+            PacketFrame::read(&mut stream).unwrap();
+            packet_open_channel_role(&mut stream, 1, "alpha", *role, take_raw);
+            let mut reader = PacketReader::new(&mut stream);
+            assert_eq!(reader.role(1, Duration::from_secs(2)), *role);
+            let initial = reader.render(1, Duration::from_secs(2));
+            packet_ack(reader.stream, 1, initial.render_generation);
+            streams.push(stream);
+        }
+        service.send_keys("alpha", b"x").unwrap();
+        wait_until("cursor query result", || service.capture("alpha").unwrap().contains("CPR_"));
+        let output = service.capture("alpha").unwrap();
+        service.kill("alpha").unwrap();
+        assert!(output.contains("CPR_OK"), "cursor query failed for {roles:?}, take_raw={take_raw}: {output:?}");
+    }
+}
+
 /// When a client IS attached, the daemon should NOT inject synthetic DA responses —
 /// the real terminal handles them.
 ///

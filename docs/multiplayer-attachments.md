@@ -29,6 +29,11 @@ views hide it. Clients own local selection. Disconnecting an attachment leaves
 the session running. Reconnecting library clients request their last granted
 role without taking exclusivity. Offline input is rejected and never replayed.
 
+Packet clients leave terminal query responses, including cursor-position reports,
+to the session engine. Only a raw-stream controller forwards those queries to its
+outer terminal. Query authority changes on takeover even when a driver remains
+attached throughout.
+
 The old raw-stream attach endpoint retains its exclusive compatibility policy.
 Ghostty CLI attach/watch and daemon library sessions use packet attachments.
 

@@ -161,6 +161,44 @@ pub struct TerminalImageResource {
     pub data_len: usize,
 }
 
+/// Owned bytes accompanying a historical frame. Live image transport remains
+/// separate; these bytes cannot change when the terminal replaces an image.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalImageBytes {
+    pub image_id: u32,
+    pub generation: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalViewLink {
+    pub col: u16,
+    pub row: u16,
+    pub uri: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewStatus {
+    #[default]
+    Live,
+    History,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewState {
+    pub status: ViewStatus,
+    pub notice: Option<String>,
+}
+
+pub struct CapturedView {
+    pub update: TerminalRenderUpdate,
+    pub images: Vec<TerminalImageBytes>,
+    pub links: Vec<TerminalViewLink>,
+    pub discarded: bool,
+}
+
 pub const TERMINAL_IMAGE_PLACEMENT_VIRTUAL: u32 = 1 << 0;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

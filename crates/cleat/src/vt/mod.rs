@@ -347,6 +347,9 @@ pub trait VtEngine {
     fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {
         Ok(text.to_vec())
     }
+    fn encode_focus(&self, _focused: bool) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
     fn supports_replay(&self) -> bool;
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;
     fn screen_text(&self) -> Result<String, String>;
@@ -367,6 +370,13 @@ pub trait VtEngine {
     fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
         Ok(TerminalModeState::default())
     }
+    fn set_attachment_view(&mut self, _id: u128, _command: ViewportCommand) -> Result<bool, String> {
+        Err("independent history is unsupported by this VT engine".into())
+    }
+    fn capture_attachment_view(&mut self, _id: u128) -> Result<Option<crate::provider::CapturedView>, String> {
+        Ok(None)
+    }
+    fn release_attachment_view(&mut self, _id: u128) {}
     fn scrollback_extent(&self) -> Result<TerminalScrollbackExtent, String> {
         let (_, rows) = self.size();
         Ok(TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: rows, alternate_screen: false })

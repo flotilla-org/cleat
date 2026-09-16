@@ -33,6 +33,8 @@ const DEFAULT_KITTY_IMAGE_STORAGE_LIMIT: u64 = 320 * 1000 * 1000;
 pub struct GhosttyVtEngine {
     terminal: TerminalHandle,
     history_reader: Option<HistoryReader>,
+    attachment_views: BTreeMap<u128, HistoryView>,
+    history_cache: BTreeMap<(HistoryScreen, u64), Arc<HistoryFrame>>,
     history_images: BTreeMap<u64, Weak<HistoryImage>>,
     render_state: RenderStateHandle,
     row_iter: RowIteratorHandle,
@@ -70,6 +72,8 @@ impl GhosttyVtEngine {
         Self {
             terminal,
             history_reader: None,
+            attachment_views: BTreeMap::new(),
+            history_cache: BTreeMap::new(),
             history_images: BTreeMap::new(),
             render_state,
             row_iter,
@@ -263,6 +267,7 @@ fn rgb_to_ghostty(rgb: Rgb) -> ghostty_ffi::GhosttyColorRgb {
 
 impl VtEngine for GhosttyVtEngine {
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.history_cache.clear();
         self.terminal.feed(bytes);
         if !bytes.is_empty() {
             self.saw_output = true;
@@ -279,6 +284,7 @@ impl VtEngine for GhosttyVtEngine {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+        self.history_cache.clear();
         self.terminal.resize(cols, rows, self.cell_width_px, self.cell_height_px)?;
         self.cols = cols;
         self.rows = rows;
@@ -287,6 +293,7 @@ impl VtEngine for GhosttyVtEngine {
     }
 
     fn set_cell_size(&mut self, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
+        self.history_cache.clear();
         self.cell_width_px = cell_width_px.max(1);
         self.cell_height_px = cell_height_px.max(1);
         self.terminal.resize(self.cols, self.rows, self.cell_width_px, self.cell_height_px)?;
@@ -326,6 +333,147 @@ impl VtEngine for GhosttyVtEngine {
     fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {
         let bracketed = self.terminal.mode_enabled(GHOSTTY_MODE_BRACKETED_PASTE)?;
         Ok(ghostty_ffi::paste_encode(text, bracketed))
+    }
+
+    fn set_attachment_view(&mut self, id: u128, command: ViewportCommand) -> Result<bool, String> {
+        if command == ViewportCommand::Bottom {
+            self.release_attachment_view(id);
+            return Ok(false);
+        }
+        let state = self.terminal.history_state(GhosttyTerminalScreen::Primary)?.ok_or("primary screen absent")?;
+        let bottom = state.total_rows.saturating_sub(u64::from(state.rows));
+        let current = self
+            .attachment_views
+            .get(&id)
+            .map(|view| self.terminal.history_viewport(&view.anchor))
+            .transpose()?
+            .flatten()
+            .map(|v| v.offset)
+            .unwrap_or(bottom);
+        let target = match command {
+            ViewportCommand::Top => 0,
+            ViewportCommand::DeltaRows(delta) => current.saturating_add_signed(delta).min(bottom),
+            ViewportCommand::Bottom => unreachable!(),
+        };
+        if target == bottom {
+            self.release_attachment_view(id);
+            return Ok(false);
+        }
+        if !self.attachment_views.contains_key(&id) && self.attachment_views.len() >= 128 {
+            return Err("session history-view limit reached".into());
+        }
+        let view = self.history_view(HistoryScreen::Primary, u32::try_from(target).map_err(|e| e.to_string())?)?;
+        self.attachment_views.insert(id, view);
+        Ok(true)
+    }
+
+    fn release_attachment_view(&mut self, id: u128) {
+        self.attachment_views.remove(&id);
+        if self.attachment_views.is_empty() {
+            self.history_cache.clear();
+        }
+    }
+
+    fn capture_attachment_view(&mut self, id: u128) -> Result<Option<crate::provider::CapturedView>, String> {
+        let Some(mut view) = self.attachment_views.remove(&id) else {
+            return Ok(None);
+        };
+        let result: Result<Option<Arc<HistoryFrame>>, String> = (|| {
+            let now = self.terminal.history_state(view.screen.raw())?.ok_or("history screen absent")?;
+            let viewport = self.terminal.history_viewport(&view.anchor)?;
+            let key = viewport.map(|v| (view.screen, v.offset));
+            let reusable = now.screen_incarnation == view.observed.screen_incarnation
+                && now.reset_serial == view.observed.reset_serial
+                && now.history_clear_serial == view.observed.history_clear_serial
+                && !view.discarded_pending;
+            if reusable {
+                if let Some(frame) = key.and_then(|key| self.history_cache.get(&key)) {
+                    return Ok(Some(Arc::clone(frame)));
+                }
+            }
+            match self.capture_history(&mut view, HistoryCaptureLimits { max_cells: 32_768, max_resource_bytes: 1024 * 1024 })? {
+                HistoryCapture::ReturnToLive => Ok(None),
+                HistoryCapture::Frame(frame) => {
+                    let retained = frame.grid.cells.iter().fold(
+                        std::mem::size_of::<HistoryFrame>()
+                            .saturating_add(frame.grid.cells.capacity().saturating_mul(std::mem::size_of::<ResolvedCell>()))
+                            .saturating_add(frame.grid.dirty_rows.capacity().saturating_mul(std::mem::size_of::<u16>()))
+                            .saturating_add(frame.links.capacity().saturating_mul(std::mem::size_of::<HistoryLink>()))
+                            .saturating_add(frame.images.capacity().saturating_mul(std::mem::size_of::<Arc<HistoryImage>>()))
+                            .saturating_add(frame.placements.capacity().saturating_mul(std::mem::size_of::<TerminalImagePlacement>())),
+                        |sum, cell| sum.saturating_add(cell.graphemes.capacity().saturating_mul(4)),
+                    );
+                    let retained = frame.links.iter().fold(retained, |sum, link| sum.saturating_add(link.uri.capacity()));
+                    let retained = frame.images.iter().fold(retained, |sum, image| {
+                        sum.saturating_add(std::mem::size_of::<HistoryImage>()).saturating_add(image.bytes.capacity())
+                    });
+                    if retained > 8 * 1024 * 1024 {
+                        return Err("history frame exceeds retention budget".into());
+                    }
+                    let frame = Arc::new(frame);
+                    // Bound retained base captures. On terminal mutation the
+                    // whole cache is invalidated; identical ranges share it.
+                    if self.history_cache.len() >= 4 {
+                        self.history_cache.clear();
+                    }
+                    if !frame.history_discarded {
+                        self.history_cache.insert((frame.screen, frame.offset), Arc::clone(&frame));
+                    }
+                    Ok(Some(frame))
+                }
+            }
+        })();
+        if !matches!(result, Ok(None)) {
+            self.attachment_views.insert(id, view);
+        }
+        let Some(frame) = result? else {
+            return Ok(None);
+        };
+        let mut update =
+            TerminalRenderUpdate::from_snapshot(crate::provider::TerminalSnapshot::from_screen_grid(frame.grid.clone(), DirtyState::Full));
+        update.viewport_kind = TerminalViewportKind::NormalScrollback;
+        update.scrollbar = TerminalScrollbarState::new(update.viewport_kind, frame.total_rows, frame.grid.rows, frame.offset);
+        update.scrollback_offset_rows = frame.offset;
+        update.terminal_modes = self.terminal_mode_state()?;
+        update.image_placements = frame.placements.clone();
+        update.image_resources = frame
+            .images
+            .iter()
+            .map(|image| TerminalImageResource {
+                image_id: image.image_id,
+                generation: image.generation,
+                width_px: image.width_px,
+                height_px: image.height_px,
+                format: image.format,
+                compression: image.compression,
+                data_len: image.bytes.len(),
+            })
+            .collect();
+        Ok(Some(crate::provider::CapturedView {
+            update,
+            discarded: frame.history_discarded,
+            images: frame
+                .images
+                .iter()
+                .map(|image| crate::provider::TerminalImageBytes {
+                    image_id: image.image_id,
+                    generation: image.generation,
+                    bytes: image.bytes.clone(),
+                })
+                .collect(),
+            links: frame
+                .links
+                .iter()
+                .map(|link| crate::provider::TerminalViewLink { col: link.col, row: link.row, uri: link.uri.clone() })
+                .collect(),
+        }))
+    }
+
+    fn encode_focus(&self, focused: bool) -> Result<Vec<u8>, String> {
+        if !self.terminal.mode_enabled(1004)? {
+            return Ok(Vec::new());
+        }
+        Ok(if focused { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() })
     }
 
     fn supports_replay(&self) -> bool {
@@ -866,7 +1014,7 @@ fn provider_cursor_from_vt(cursor: CursorState) -> ProviderCursor {
 }
 
 /// Screen whose retained content a history view follows.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum HistoryScreen {
     Primary,
     Alternate,
@@ -1126,6 +1274,37 @@ mod history_tests {
     }
     fn text(frame: &HistoryFrame) -> String {
         frame.grid.cells.iter().flat_map(|cell| cell.graphemes.iter().copied()).filter_map(char::from_u32).collect()
+    }
+
+    #[test]
+    fn attachment_captures_are_lazy_shared_and_invalidated_by_output() {
+        let mut engine = GhosttyVtEngine::new(20, 3);
+        engine.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive").unwrap();
+        engine.screen_grid().unwrap();
+        assert!(engine.history_reader.is_none());
+        engine.set_attachment_view(1, ViewportCommand::Top).unwrap();
+        engine.set_attachment_view(2, ViewportCommand::Top).unwrap();
+        engine.capture_attachment_view(1).unwrap().unwrap();
+        let first = Arc::clone(engine.history_cache.values().next().unwrap());
+        engine.capture_attachment_view(2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, engine.history_cache.values().next().unwrap()));
+        engine.feed(b"\r\nsix").unwrap();
+        assert!(engine.history_cache.is_empty());
+        engine.capture_attachment_view(2).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, engine.history_cache.values().next().unwrap()));
+        engine.release_attachment_view(1);
+        engine.release_attachment_view(2);
+        assert!(engine.history_cache.is_empty());
+        assert!(engine.capture_attachment_view(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn application_focus_reports_follow_mode_1004() {
+        let mut engine = GhosttyVtEngine::new(10, 3);
+        assert!(engine.encode_focus(true).unwrap().is_empty());
+        engine.feed(b"\x1b[?1004h").unwrap();
+        assert_eq!(engine.encode_focus(true).unwrap(), b"\x1b[I");
+        assert_eq!(engine.encode_focus(false).unwrap(), b"\x1b[O");
     }
 
     #[test]

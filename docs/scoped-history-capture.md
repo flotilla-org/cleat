@@ -2,8 +2,9 @@
 
 Cleat pins Ghostty `c3dbb925e6cbcfceafba5749f81a486dd2275099`, published on
 `rjwittams/ghostty` branch `patches/libvt-scoped-capture`. This adds the capture
-foundation for independent attachment views. Attachment scheduling, transport,
-roles, command mode and chrome are separate work.
+foundation for independent attachment views. The first attachment host,
+transport, roles and CLI command mode are described in
+[multiplayer attachments](multiplayer-attachments.md).
 
 `GhosttyVtEngine::history_view` tracks a position on a chosen screen.
 `capture_history` captures a terminal-sized view starting there, moving the
@@ -35,8 +36,9 @@ returns `ReturnToLive`. Foreign-engine views are rejected.
 Callers provide per-capture cell and resource budgets. The resource budget
 counts URI and ready image bytes, including shared image bytes, rather than
 total allocator usage. It does not bound grapheme storage, placement metadata,
-Ghostty scratch allocations, or frames retained by callers. The future
-attachment host must bound retained frames and schedule captures fairly.
+Ghostty scratch allocations, or frames retained by callers. The
+attachment host adds retained-data limits and fair capture scheduling; callers
+using this lower-level API remain responsible for their own retained frames.
 Fallible allocations and Ghostty errors are returned without publishing a
 partial frame; this is not a guarantee of recovery from every Rust allocation
 failure. Callers can keep their last successful frame after an error.

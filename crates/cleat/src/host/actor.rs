@@ -320,10 +320,15 @@ pub(crate) struct SessionMouseEvent {
 }
 
 pub(crate) enum SessionCommand {
+    SetAttachmentView { id: u128, command: ViewportCommand, reply: mpsc::Sender<Result<bool, String>> },
+    CaptureAttachmentView { id: u128, reply: mpsc::Sender<Result<Option<crate::provider::CapturedView>, String>> },
+    ReleaseAttachmentView { id: u128 },
+    Focus { focused: bool, reply: mpsc::Sender<Result<(), String>> },
     Resize { cols: u16, rows: u16, reply: mpsc::Sender<Result<(), String>> },
     SetCellSize { cell_width_px: u32, cell_height_px: u32, reply: mpsc::Sender<Result<(), String>> },
     WriteInput { bytes: Vec<u8>, reply: mpsc::Sender<Result<(), String>> },
     Wheel { event: SessionWheelEvent, reply: mpsc::Sender<Result<usize, String>> },
+    ApplicationWheel { event: SessionWheelEvent, reply: mpsc::Sender<Result<usize, String>> },
     Mouse { event: SessionMouseEvent, reply: mpsc::Sender<Result<usize, String>> },
     Paste { text: Vec<u8>, reply: mpsc::Sender<Result<usize, String>> },
     ScrollViewport { command: ViewportCommand, reply: mpsc::Sender<Result<ViewportCommandOutcome, String>> },
@@ -723,8 +728,8 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::WriteInput { bytes, reply })
     }
 
-    pub(crate) fn wheel(&self, event: SessionWheelEvent) -> Result<usize, String> {
-        self.request_result(|reply| SessionCommand::Wheel { event, reply })
+    pub(crate) fn application_wheel(&self, event: SessionWheelEvent) -> Result<usize, String> {
+        self.request_result(|reply| SessionCommand::ApplicationWheel { event, reply })
     }
 
     pub(crate) fn mouse(&self, event: SessionMouseEvent) -> Result<usize, String> {
@@ -769,6 +774,10 @@ impl SessionActor {
 
     pub(crate) fn last_pty_output_at(&self) -> Result<Option<Instant>, String> {
         self.request_result(|reply| SessionCommand::LastPtyOutputAt { reply })
+    }
+
+    pub(crate) fn release_attachment_view(&self, id: u128) {
+        let _ = self.tx.send(SessionCommand::ReleaseAttachmentView { id });
     }
 
     pub(crate) fn enqueue_screen_activity_flush(&self) -> Result<(), String> {
@@ -1033,11 +1042,31 @@ fn session_actor_handle_command(
             });
             let _ = reply.send(result);
         }
+        SessionCommand::SetAttachmentView { id, command, reply } => {
+            let _ = reply.send(runtime.set_attachment_view(id, command));
+        }
+        SessionCommand::CaptureAttachmentView { id, reply } => {
+            let result = runtime.capture_attachment_view(id).map(|frame| {
+                frame.map(|mut frame| {
+                    frame.update.render_generation = state.observation.render_generation;
+                    frame
+                })
+            });
+            let _ = reply.send(result);
+        }
+        SessionCommand::ReleaseAttachmentView { id } => runtime.release_attachment_view(id),
+        SessionCommand::Focus { focused, reply } => {
+            let _ = reply.send(runtime.focus(focused));
+        }
         SessionCommand::WriteInput { bytes, reply } => {
             let _ = reply.send(runtime.write_input(&bytes));
         }
         SessionCommand::Wheel { event, reply } => {
-            let result = route_wheel_event_on_actor(wake, runtime, &mut state.observation, event);
+            let result = route_wheel_event_on_actor(wake, runtime, &mut state.observation, event, true);
+            let _ = reply.send(result);
+        }
+        SessionCommand::ApplicationWheel { event, reply } => {
+            let result = route_wheel_event_on_actor(wake, runtime, &mut state.observation, event, false);
             let _ = reply.send(result);
         }
         SessionCommand::Mouse { event, reply } => {
@@ -1297,6 +1326,7 @@ fn route_wheel_event_on_actor(
     runtime: &mut SessionRuntime,
     observation: &mut ObservationState,
     event: SessionWheelEvent,
+    scroll_fallback: bool,
 ) -> Result<usize, String> {
     let modes = runtime.terminal_mode_state()?;
     if modes.mouse_tracking {
@@ -1315,6 +1345,10 @@ fn route_wheel_event_on_actor(
         }
         runtime.write_input(&bytes)?;
         return Ok(1);
+    }
+
+    if !scroll_fallback {
+        return Ok(0);
     }
 
     let delta_rows = viewport_delta_rows_from_wheel(event);

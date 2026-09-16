@@ -47,10 +47,6 @@ pub(crate) type WakeFn = Arc<dyn Fn() + Send + Sync + 'static>;
 const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(100);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const BACKOFF_POLL_STEP: Duration = Duration::from_millis(10);
-/// Input events queued while the connection is down (they flush after the
-/// session channels are re-opened). Beyond this the send reports failure.
-const MAX_QUEUED_INPUT_FRAMES: usize = 1024;
-
 /// A panic in one client callback must not turn every later provider call into
 /// another panic. The protected values use exception-safe standard collection
 /// operations, so retain their state and let the normal disconnected paths
@@ -129,6 +125,10 @@ pub(crate) struct ChannelSlot {
     /// Latest un-consumed render packet. The ack-gated protocol guarantees at
     /// most one arrives before we ack, and we ack on consumption.
     pub pending: Option<TerminalRenderUpdate>,
+    pub pending_images: Vec<crate::provider::TerminalImageBytes>,
+    pub pending_links: Vec<crate::provider::TerminalViewLink>,
+    pub view_state: crate::provider::ViewState,
+    pub role_state: Option<crate::packet::RoleState>,
     pub last: LastKnown,
     /// Size the caller wants; re-asserted after every reconnect.
     pub desired_cols: u16,
@@ -197,7 +197,6 @@ struct ConnectionState {
     next_channel: u32,
     channels: HashMap<u32, Arc<Mutex<ChannelSlot>>>,
     directory: DirectoryState,
-    queued_input: Vec<PacketFrame>,
 }
 
 /// One multiplexed packet connection to a named daemon, shared by every
@@ -229,7 +228,6 @@ impl DaemonConnection {
                 next_channel: 1,
                 channels: HashMap::new(),
                 directory: DirectoryState::default(),
-                queued_input: Vec::new(),
             }),
             reader: Mutex::new(None),
         });
@@ -269,6 +267,10 @@ impl DaemonConnection {
         let slot = Arc::new(Mutex::new(ChannelSlot {
             session_id: session_id.clone(),
             pending: None,
+            pending_images: Vec::new(),
+            pending_links: Vec::new(),
+            view_state: Default::default(),
+            role_state: None,
             last: LastKnown::new(cols, rows),
             desired_cols: cols,
             desired_rows: rows,
@@ -294,8 +296,8 @@ impl DaemonConnection {
         (channel, slot)
     }
 
-    /// Request a role change on an open channel (take=true preempts another
-    /// packet controller). The grant arrives asynchronously as a RoleState.
+    /// Request a role change (take=true requests exclusive control and demotes
+    /// the other controllers). The grant arrives asynchronously as a RoleState.
     pub(crate) fn request_role(&self, channel: u32, role: ChannelRole, take: bool) -> Result<(), String> {
         {
             let state = recover_lock(&self.state);
@@ -321,26 +323,35 @@ impl DaemonConnection {
     }
 
     pub(crate) fn send_input(&self, channel: u32, event: TerminalInputEvent) -> Result<(), String> {
-        let frame = PacketFrame::new(channel, MSG_SESSION_INPUT, &crate::packet::Input { event })
-            .map_err(|err| format!("encode packet frame: {err}"))?;
-        {
-            // Queue while disconnected: the reader flushes the queue right
-            // after it re-opens the session channels, so input typed across a
-            // brief reconnect is not lost.
-            let mut state = recover_lock(&self.state);
-            if !state.connected {
-                if state.queued_input.len() >= MAX_QUEUED_INPUT_FRAMES {
-                    return Err("daemon connection is down and the input queue is full".to_string());
-                }
-                state.queued_input.push(frame);
-                return Ok(());
-            }
+        let state = recover_lock(&self.state);
+        if !state.connected {
+            return Err("daemon connection is down; input was not sent".into());
         }
-        self.send_frame_result(Ok(frame))
+        let slot = state.channels.get(&channel).ok_or("session channel is closed")?;
+        let slot = recover_lock(slot);
+        if !matches!(
+            event,
+            TerminalInputEvent::Focus(_)
+                | TerminalInputEvent::Resize(_)
+                | TerminalInputEvent::Mouse(crate::provider::TerminalMouseEvent {
+                    kind: crate::provider::TerminalMouseEventKind::Wheel,
+                    ..
+                })
+        ) && slot.granted_role != Some(ChannelRole::Controller)
+        {
+            return Err("session is not driving; input was not sent".into());
+        }
+        drop(slot);
+        drop(state);
+        self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_INPUT, &crate::packet::Input { event }))
     }
 
     pub(crate) fn send_resize(&self, channel: u32, cols: u16, rows: u16) -> Result<(), String> {
         self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_RESIZE, &crate::packet::Resize { cols, rows }))
+    }
+
+    pub(crate) fn size_policy(&self, channel: u32, fixed: Option<crate::packet::Resize>) -> Result<(), String> {
+        self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_SIZE_POLICY, &fixed))
     }
 
     pub(crate) fn send_viewport(&self, channel: u32, command: crate::provider::ViewportCommand) -> Result<(), String> {
@@ -432,7 +443,7 @@ impl DaemonConnection {
             let mut writer = recover_lock(&self.writer);
             *writer = Some(writer_stream);
         }
-        let (reopen, queued_input) = {
+        let reopen = {
             let mut state = recover_lock(&self.state);
             state.connected = true;
             state.directory.replace(snapshot);
@@ -449,6 +460,9 @@ impl DaemonConnection {
                     }
                     // the old grant died with the connection
                     slot.granted_role = None;
+                    slot.pending = None;
+                    slot.pending_images.clear();
+                    slot.pending_links.clear();
                     Some((
                         *channel,
                         slot.session_id.clone(),
@@ -459,13 +473,10 @@ impl DaemonConnection {
                     ))
                 })
                 .collect();
-            (reopen, std::mem::take(&mut state.queued_input))
+            reopen
         };
         for (channel, session_id, cols, rows, role, identity) in reopen {
             let _ = self.send_open_frame(channel, &session_id, cols, rows, role, &identity);
-        }
-        for frame in queued_input {
-            let _ = self.send_frame_result(Ok(frame));
         }
         (self.wake)();
         true
@@ -521,8 +532,20 @@ impl DaemonConnection {
                     };
                     if let Some(slot) = slot {
                         let mut slot = recover_lock(&slot);
+                        slot.pending_images = packet.images;
+                        slot.pending_links = packet.links;
+                        slot.view_state = packet.view;
                         slot.pending = Some(packet.update);
                         drop(slot);
+                        (self.wake)();
+                    }
+                }
+            }
+            (channel, crate::packet::MSG_SESSION_VIEW_STATE) if channel != CHANNEL_CONTROL => {
+                if let Ok(view) = frame.decode::<crate::provider::ViewState>() {
+                    let slot = recover_lock(&self.state).channels.get(&channel).cloned();
+                    if let Some(slot) = slot {
+                        recover_lock(&slot).view_state = view;
                         (self.wake)();
                     }
                 }
@@ -534,7 +557,11 @@ impl DaemonConnection {
                         state.channels.get(&channel).cloned()
                     };
                     if let Some(slot) = slot {
-                        recover_lock(&slot).granted_role = Some(role_state.role);
+                        let mut slot = recover_lock(&slot);
+                        slot.granted_role = Some(role_state.role);
+                        slot.desired_role = role_state.role;
+                        slot.role_state = Some(role_state);
+                        drop(slot);
                         (self.wake)();
                     }
                 }
@@ -770,7 +797,7 @@ mod tests {
         assert_eq!((resize.channel, resize.msg_type), (channel, MSG_SESSION_RESIZE));
         assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 100, rows: 40 });
 
-        PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket { update: render_update(7) })
+        PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket::live(render_update(7)))
             .expect("render frame")
             .write(&mut server)
             .expect("write render");
@@ -796,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_reopens_channels_reasserts_size_and_flushes_queued_input() {
+    fn reconnect_reopens_channels_and_rejects_offline_input() {
         let (_temp, layout) = test_layout();
         let daemon = FakeDaemon::bind(&layout);
         let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
@@ -809,14 +836,17 @@ mod tests {
         let _resize = PacketFrame::read(&mut server).expect("resize frame");
 
         // Daemon connection drops (e.g. lid close); input typed while down is
-        // queued, and a resize records the new desired size.
+        // rejected, while a resize records the new desired size.
         drop(server);
         wait_until(|| !connection.is_connected());
         if let Ok(mut slot) = slot.lock() {
             slot.desired_cols = 120;
             slot.desired_rows = 50;
+            slot.pending = Some(render_update(99));
+            slot.pending_images.push(crate::provider::TerminalImageBytes { image_id: 1, generation: 1, bytes: vec![1] });
+            slot.pending_links.push(crate::provider::TerminalViewLink { col: 0, row: 0, uri: b"https://example.com".to_vec() });
         }
-        connection.send_input(channel, TerminalInputEvent::RawBytes(b"queued".to_vec())).expect("queue input while down");
+        assert!(connection.send_input(channel, TerminalInputEvent::RawBytes(b"discarded".to_vec())).is_err());
 
         let mut server = daemon.accept(vec![directory_entry("alpha")]);
         wait_until(|| connection.is_connected());
@@ -828,11 +858,30 @@ mod tests {
             take: false,
             identity: AttachmentIdentity::default(),
         });
+        {
+            let slot = recover_lock(&slot);
+            assert!(slot.pending.is_none());
+            assert!(slot.pending_images.is_empty());
+            assert!(slot.pending_links.is_empty());
+        }
         let resize = PacketFrame::read(&mut server).expect("resize frame");
         assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 120, rows: 50 });
-        let input = PacketFrame::read(&mut server).expect("queued input frame");
+        PacketFrame::new(channel, MSG_SESSION_ROLE, &crate::packet::RoleState {
+            role: ChannelRole::Controller,
+            controller: None,
+            denial_reason: None,
+            participants: Vec::new(),
+            exclusive: None,
+            fixed_size: None,
+        })
+        .unwrap()
+        .write(&mut server)
+        .unwrap();
+        wait_until(|| recover_lock(&slot).granted_role == Some(ChannelRole::Controller));
+        connection.send_input(channel, TerminalInputEvent::RawBytes(b"fresh".to_vec())).unwrap();
+        let input = PacketFrame::read(&mut server).expect("fresh input frame");
         assert_eq!((input.channel, input.msg_type), (channel, MSG_SESSION_INPUT));
-        assert_eq!(input.decode::<Input>().expect("input payload"), Input { event: TerminalInputEvent::RawBytes(b"queued".to_vec()) });
+        assert_eq!(input.decode::<Input>().expect("input payload"), Input { event: TerminalInputEvent::RawBytes(b"fresh".to_vec()) });
 
         connection.shutdown();
     }

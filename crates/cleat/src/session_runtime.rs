@@ -243,6 +243,24 @@ impl SessionRuntime {
         self.vt_engine.scrollbar_state()
     }
 
+    pub(crate) fn set_attachment_view(&mut self, id: u128, command: ViewportCommand) -> Result<bool, String> {
+        self.vt_engine.set_attachment_view(id, command)
+    }
+    pub(crate) fn capture_attachment_view(&mut self, id: u128) -> Result<Option<crate::provider::CapturedView>, String> {
+        self.vt_engine.capture_attachment_view(id)
+    }
+    pub(crate) fn release_attachment_view(&mut self, id: u128) {
+        self.vt_engine.release_attachment_view(id);
+    }
+
+    pub(crate) fn focus(&mut self, focused: bool) -> Result<(), String> {
+        let bytes = self.vt_engine.encode_focus(focused)?;
+        if !bytes.is_empty() {
+            self.write_input(&bytes)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
         self.vt_engine.scroll_viewport(command)
     }

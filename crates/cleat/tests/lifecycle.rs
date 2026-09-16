@@ -1628,7 +1628,8 @@ fn daemon_provider_keeps_session_alive_after_provider_close() {
             ..CleatSessionDesc::default()
         });
         assert!(!session.is_null());
-        assert!(cleat_session_write_bytes(session, b"ignored\n".as_ptr(), b"ignored\n".len()));
+        // Passthrough cannot grant a render channel, so ungranted input is rejected.
+        assert!(!cleat_session_write_bytes(session, b"ignored\n".as_ptr(), b"ignored\n".len()));
 
         cleat_session_destroy(session);
         cleat_provider_close(provider);
@@ -1749,9 +1750,51 @@ fn daemon_provider_ffi_attach_roles_directory_and_close() {
         assert!(!watcher.is_null());
         wait_until("watcher role grant", || cleat_session_role(watcher) == CLEAT_ROLE_WATCHER);
 
+        // A real CLI process and the library use the same shared session.
+        let mut cli = Command::new(std::env::var("CARGO_BIN_EXE_cleat").unwrap())
+            .args(["--runtime-root", root.as_ref(), "attach", "ffi-alpha"])
+            .env_remove("CLEAT_COMMAND_PREFIX")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut cli_input = cli.stdin.take().unwrap();
+        wait_until("CLI and library drive together", || {
+            service_for(temp.path()).inspect("ffi-alpha").unwrap().attachments.iter().filter(|a| a.role == "controller").count() == 2
+        });
+        cli_input.write_all(b"from-cli\n").unwrap();
+        assert!(cleat_session_write_bytes(controller, b"from-library\n".as_ptr(), 13));
+        wait_until("both adapters write to one PTY", || {
+            let text = service_for(temp.path()).capture("ffi-alpha").unwrap();
+            text.contains("from-cli") && text.contains("from-library")
+        });
+        assert!(!cleat_session_write_bytes(watcher, b"discarded".as_ptr(), 9));
+
         assert!(cleat_session_take_control(watcher));
         wait_until("take-control grant", || cleat_session_role(watcher) == CLEAT_ROLE_CONTROLLER);
         wait_until("preempted controller demoted", || cleat_session_role(controller) == CLEAT_ROLE_WATCHER);
+
+        assert!(cleat::provider_ffi::cleat_session_set_role(watcher, CLEAT_ROLE_CONTROLLER, false));
+        wait_until("library reports released exclusivity", || {
+            let mut length = 0;
+            if !cleat::provider_ffi::cleat_session_attachment_state_json(watcher, std::ptr::null_mut(), 0, &mut length) {
+                return false;
+            }
+            let mut bytes = vec![0u8; length];
+            if !cleat::provider_ffi::cleat_session_attachment_state_json(watcher, bytes.as_mut_ptr(), bytes.len(), &mut length) {
+                return false;
+            }
+            let value: serde_json::Value = serde_json::from_slice(&bytes[..length]).unwrap();
+            value["role"]["exclusive"].is_null() && value["role"]["participants"].as_array().unwrap().len() == 3
+        });
+        cli_input.write_all(b"\x1dg").unwrap();
+        wait_until("CLI command resumes shared driving", || {
+            service_for(temp.path()).inspect("ffi-alpha").unwrap().attachments.iter().filter(|a| a.role == "controller").count() == 2
+        });
+        cli_input.write_all(b"\x1dd").unwrap();
+        wait_until("CLI command detaches only its attachment", || cli.try_wait().unwrap().is_some());
+        assert!(service_for(temp.path()).inspect("ffi-alpha").is_ok());
 
         // Kill the session out of band: both attachments must observe the
         // channel close rather than reporting stale STREAMING forever.
@@ -1995,6 +2038,184 @@ fn packet_channel_initial_render_and_packet_input_flow() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
+fn packet_history_is_independent_and_typing_returns_only_its_driver_live() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh -c 'i=0; while [ $i -lt 60 ]; do echo line-$i; i=$((i+1)); done; exec cat'".into()),
+            false,
+        )
+        .unwrap();
+    wait_until("history seeded", || service.capture("alpha").unwrap().contains("line-59"));
+    let mut streams: Vec<_> = (0..2)
+        .map(|_| {
+            let mut stream = http_packet_stream(temp.path(), "alpha");
+            PacketFrame::read(&mut stream).unwrap();
+            PacketFrame::read(&mut stream).unwrap();
+            stream
+        })
+        .collect();
+    let (first, second) = streams.split_at_mut(1);
+    packet_open_channel_role(&mut first[0], 1, "alpha", ChannelRole::Controller, false);
+    packet_open_channel_role(&mut second[0], 1, "alpha", ChannelRole::Watcher, false);
+    let mut driver = PacketReader::new(&mut first[0]);
+    let mut watcher = PacketReader::new(&mut second[0]);
+    let initial = driver.render(1, Duration::from_secs(2));
+    packet_ack(driver.stream, 1, initial.render_generation);
+    let initial = watcher.render(1, Duration::from_secs(2));
+    packet_ack(watcher.stream, 1, initial.render_generation);
+    driver.settle_renders(1, Duration::from_millis(100), Duration::from_secs(2));
+    watcher.settle_renders(1, Duration::from_millis(100), Duration::from_secs(2));
+    packet_write(watcher.stream, 1, cleat::packet::MSG_SESSION_VIEWPORT, &cleat::packet::Viewport {
+        command: cleat::provider::ViewportCommand::Top,
+    });
+    let history = watcher.render(1, Duration::from_secs(2));
+    assert_eq!(history.viewport_kind, cleat::provider::TerminalViewportKind::NormalScrollback);
+    assert_eq!(history.scrollbar.viewport_top_row, 0);
+    assert!(!history.cursor.visible);
+    let watcher_history_generation = history.render_generation;
+    packet_ack(watcher.stream, 1, history.render_generation);
+    driver.expect_no_render(1, Duration::from_millis(200));
+    packet_write(driver.stream, 1, cleat::packet::MSG_SESSION_VIEWPORT, &cleat::packet::Viewport {
+        command: cleat::provider::ViewportCommand::Top,
+    });
+    let history = driver.render(1, Duration::from_secs(2));
+    assert_eq!(history.viewport_kind, cleat::provider::TerminalViewportKind::NormalScrollback);
+    packet_ack(driver.stream, 1, history.render_generation);
+    packet_input(driver.stream, 1, TerminalInputEvent::Paste(TerminalPasteEvent { text: "new-live-line\n".into() }));
+    let live = driver.render(1, Duration::from_secs(2));
+    assert_eq!(live.viewport_kind, cleat::provider::TerminalViewportKind::LiveNormal);
+    packet_ack(driver.stream, 1, live.render_generation);
+    let still_history = watcher.render(1, Duration::from_secs(2));
+    assert_eq!(still_history.viewport_kind, cleat::provider::TerminalViewportKind::NormalScrollback);
+    assert_eq!(still_history.scrollbar.viewport_top_row, 0);
+    assert!(still_history.render_generation > watcher_history_generation);
+    assert!(service.capture("alpha").unwrap().contains("new-live-line"));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_history_budget_failure_keeps_channel_usable() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service
+        .create_with_size(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh -c 'i=0; while [ $i -lt 220 ]; do echo line-$i; i=$((i+1)); done; exec cat'".into()),
+            false,
+            TerminalSize { cols: 200, rows: 200 },
+        )
+        .unwrap();
+    wait_until("history seeded", || service.capture("alpha").unwrap().contains("line-219"));
+    let mut stream = http_packet_stream(temp.path(), "alpha");
+    PacketFrame::read(&mut stream).unwrap();
+    PacketFrame::read(&mut stream).unwrap();
+    packet_open_channel_role(&mut stream, 1, "alpha", ChannelRole::Controller, false);
+    let mut reader = PacketReader::new(&mut stream);
+    let initial = reader.render(1, Duration::from_secs(5));
+    packet_ack(reader.stream, 1, initial.render_generation);
+    reader.settle_renders(1, Duration::from_millis(100), Duration::from_secs(2));
+    packet_write(reader.stream, 1, cleat::packet::MSG_SESSION_VIEWPORT, &cleat::packet::Viewport {
+        command: cleat::provider::ViewportCommand::Top,
+    });
+    let state = reader
+        .next_matching(
+            Duration::from_secs(5),
+            |frame| frame.channel == 1 && frame.msg_type == cleat::packet::MSG_SESSION_VIEW_STATE,
+            "stale history status",
+        )
+        .decode::<cleat::provider::ViewState>()
+        .unwrap();
+    assert_eq!(state.status, cleat::provider::ViewStatus::Stale);
+    assert!(state.notice.unwrap().contains("cell budget"));
+    packet_write(reader.stream, 1, cleat::packet::MSG_SESSION_VIEWPORT, &cleat::packet::Viewport {
+        command: cleat::provider::ViewportCommand::Bottom,
+    });
+    let recovered = reader.render(1, Duration::from_secs(5));
+    assert_eq!(recovered.viewport_kind, cleat::provider::TerminalViewportKind::LiveNormal);
+    packet_ack(reader.stream, 1, recovered.render_generation);
+    packet_input(reader.stream, 1, TerminalInputEvent::Paste(TerminalPasteEvent { text: "still-connected\n".into() }));
+    wait_until("input after failed capture", || service.capture("alpha").unwrap().contains("still-connected"));
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_shared_drivers_intersect_geometry_and_keep_watchers_connected() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service.create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some("cat".into()), false).unwrap();
+    let mut streams = Vec::new();
+    for (role, cols, rows) in [(ChannelRole::Controller, 100, 20), (ChannelRole::Controller, 80, 40), (ChannelRole::Watcher, 10, 5)] {
+        let mut stream = http_packet_stream(temp.path(), "alpha");
+        PacketFrame::read(&mut stream).unwrap();
+        PacketFrame::read(&mut stream).unwrap();
+        packet_open_channel_role(&mut stream, 1, "alpha", role, false);
+        let mut reader = PacketReader::new(&mut stream);
+        let grant = reader.role_state(1, Duration::from_secs(2));
+        assert_eq!(grant.role, role);
+        assert!(grant.exclusive.is_none());
+        assert_eq!(grant.participants.len(), streams.len() + 1);
+        let initial = reader.render(1, Duration::from_secs(2));
+        packet_ack(reader.stream, 1, initial.render_generation);
+        packet_write(reader.stream, 1, cleat::packet::MSG_SESSION_RESIZE, &cleat::packet::Resize { cols, rows });
+        streams.push(stream);
+    }
+    wait_until("controller size intersection", || {
+        let size = service.inspect("alpha").unwrap().terminal;
+        (size.cols, size.rows) == (80, 20)
+    });
+    packet_write(&mut streams[0], 1, cleat::packet::MSG_SESSION_SIZE_POLICY, &Some(cleat::packet::Resize { cols: 90, rows: 30 }));
+    wait_until("fixed geometry", || service.inspect("alpha").unwrap().terminal.cols == 90);
+    packet_write(&mut streams[0], 1, cleat::packet::MSG_SESSION_SIZE_POLICY, &None::<cleat::packet::Resize>);
+    wait_until("controller sizing restored", || {
+        let size = service.inspect("alpha").unwrap().terminal;
+        (size.cols, size.rows) == (80, 20)
+    });
+    let inspect = service.inspect("alpha").unwrap();
+    assert_eq!(inspect.attachments.iter().filter(|a| a.role == "controller").count(), 2);
+    for (index, text) in [(0, "first-driver\n"), (1, "second-driver\n")] {
+        packet_input(&mut streams[index], 1, TerminalInputEvent::Paste(TerminalPasteEvent { text: text.into() }));
+    }
+    wait_until("both drivers reach the PTY", || {
+        let text = service.capture("alpha").unwrap();
+        text.contains("first-driver") && text.contains("second-driver")
+    });
+    packet_write(&mut streams[1], 1, MSG_SESSION_ROLE, &RoleRequest { role: ChannelRole::Controller, take: true });
+    wait_until("exclusive geometry", || {
+        let inspect = service.inspect("alpha").unwrap();
+        inspect.terminal.cols == 80
+            && inspect.terminal.rows == 40
+            && inspect.attachments.iter().filter(|a| a.role == "controller").count() == 1
+    });
+    service.send_keys("alpha", b"out-of-band\n").unwrap();
+    wait_until("send-keys bypasses attachment exclusivity", || service.capture("alpha").unwrap().contains("out-of-band"));
+    packet_write(&mut streams[1], 1, MSG_SESSION_ROLE, &RoleRequest { role: ChannelRole::Controller, take: false });
+    packet_write(&mut streams[1], 1, cleat::packet::MSG_SESSION_RESIZE, &cleat::packet::Resize { cols: 80, rows: 39 });
+    wait_until("exclusive release processed before peer promotion", || service.inspect("alpha").unwrap().terminal.rows == 39);
+    packet_write(&mut streams[0], 1, MSG_SESSION_ROLE, &RoleRequest { role: ChannelRole::Controller, take: false });
+    wait_until("shared control restored explicitly", || service.inspect("alpha").unwrap().terminal.rows == 20);
+    streams.remove(0);
+    wait_until("departed controller size removed", || service.inspect("alpha").unwrap().terminal.rows == 39);
+    streams.remove(0);
+    wait_until("only watcher remains", || {
+        let inspect = service.inspect("alpha").unwrap();
+        inspect.attachments.len() == 1
+            && inspect.attachments[0].role == "watcher"
+            && (inspect.terminal.cols, inspect.terminal.rows) == (80, 39)
+    });
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
 fn packet_roles_gate_input_and_take_control_demotes() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2014,15 +2235,16 @@ fn packet_roles_gate_input_and_take_control_demotes() {
     packet_write(controller.stream, 1, MSG_SESSION_ACK, &Ack { generation: initial.render_generation });
     std::thread::sleep(Duration::from_millis(500));
 
-    // second client also asks for control without take: granted watcher
+    // second client explicitly watches
     let mut watcher_stream = http_packet_stream(temp.path(), "alpha");
     let _hello = PacketFrame::read(&mut watcher_stream).expect("read hello");
     let _directory = PacketFrame::read(&mut watcher_stream).expect("read directory");
-    packet_open_channel_role(&mut watcher_stream, 1, "alpha", ChannelRole::Controller, false);
+    packet_open_channel_role(&mut watcher_stream, 1, "alpha", ChannelRole::Watcher, false);
     let mut watcher = PacketReader::new(&mut watcher_stream);
     let denied = watcher.role_state(1, Duration::from_secs(2));
     assert_eq!(denied.role, ChannelRole::Watcher);
-    assert_eq!(denied.denial_reason, Some(cleat::packet::RoleDenialReason { held_by: cleat::packet::ControllerHolder::Packet }));
+    assert_eq!(denied.denial_reason, None);
+    assert_eq!(controller.role(1, Duration::from_secs(2)), ChannelRole::Controller);
     let watcher_initial = watcher.render(1, Duration::from_secs(2));
     packet_write(watcher.stream, 1, MSG_SESSION_ACK, &Ack { generation: watcher_initial.render_generation });
 
@@ -2547,7 +2769,7 @@ fn attach_falls_back_strictly_refuses_and_take_demotes_without_losing_session_st
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
-fn attach_strict_rejects_second_foreground_client_while_one_is_active() {
+fn attach_strict_rejects_second_driver_while_exclusive_holder_is_active() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
@@ -2557,7 +2779,7 @@ fn attach_strict_rejects_second_foreground_client_while_one_is_active() {
             record: false,
             identity: AttachmentIdentity { kind: AttachmentKind::Principal, name: "first".to_string() },
             strict: false,
-            take: false,
+            take: true,
         })
         .expect("first attach");
     let err = service
@@ -2816,6 +3038,43 @@ fn detached_session_answers_da_queries() {
         service.capture_slice_raw("alpha", StartBound::Offset(offset), EndBound::EndOfRecording).expect("capture slice");
 
     assert!(output.contains("\x1b[?62;22c"), "detached session should inject DA1 response in recorded output, got: {output:?}");
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_attachments_receive_one_cursor_position_reply() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for (roles, take_raw) in [
+        (vec![ChannelRole::Controller], false),
+        (vec![ChannelRole::Controller, ChannelRole::Controller, ChannelRole::Watcher], false),
+        (vec![ChannelRole::Watcher], false),
+        (vec![ChannelRole::Controller], true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let service = service_for(temp.path());
+        // Query only after attachments are installed, then reject extra replies.
+        let command = r#"bash --noprofile --norc -c 'stty raw -echo; printf READY; IFS= read -r -n 1 trigger; printf "\033[3;7H\033[6n"; IFS= read -r -d R -t 2 reply; expected=$(printf "\033[3;7"); if [ "$reply" = "$expected" ]; then if IFS= read -r -n 1 -t 0.2 extra; then printf CPR_DUPLICATED; else printf CPR_OK; fi; else printf CPR_FAILED; fi; sleep 30'"#;
+        service.create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some(command.into()), false).unwrap();
+        wait_until("probe ready", || service.capture("alpha").unwrap().contains("READY"));
+        let _raw = take_raw.then(|| http_attach_stream(temp.path(), "alpha", 80, 24, ClientCapabilities::conservative_fallback()));
+        let mut streams = Vec::new();
+        for role in &roles {
+            let mut stream = http_packet_stream(temp.path(), "alpha");
+            PacketFrame::read(&mut stream).unwrap();
+            PacketFrame::read(&mut stream).unwrap();
+            packet_open_channel_role(&mut stream, 1, "alpha", *role, take_raw);
+            let mut reader = PacketReader::new(&mut stream);
+            assert_eq!(reader.role(1, Duration::from_secs(2)), *role);
+            let initial = reader.render(1, Duration::from_secs(2));
+            packet_ack(reader.stream, 1, initial.render_generation);
+            streams.push(stream);
+        }
+        service.send_keys("alpha", b"x").unwrap();
+        wait_until("cursor query result", || service.capture("alpha").unwrap().contains("CPR_"));
+        let output = service.capture("alpha").unwrap();
+        service.kill("alpha").unwrap();
+        assert!(output.contains("CPR_OK"), "cursor query failed for {roles:?}, take_raw={take_raw}: {output:?}");
+    }
 }
 
 /// When a client IS attached, the daemon should NOT inject synthetic DA responses —

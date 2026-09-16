@@ -202,7 +202,7 @@ pub struct CleatSessionDesc {
     pub tag_count: usize,
     /// Requested attachment role for daemon sessions: CLEAT_ROLE_UNKNOWN /
     /// CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
-    /// another controller holds the session); CLEAT_ROLE_WATCHER attaches
+    /// another controller holds exclusive control); CLEAT_ROLE_WATCHER attaches
     /// read-only. Ignored by other backends.
     pub role: u32,
     /// UTF-8 name used in seat status and watcher banners.
@@ -673,6 +673,8 @@ struct DaemonSession {
     connection: Arc<DaemonConnection>,
     channel: u32,
     slot: Arc<Mutex<ChannelSlot>>,
+    images: Vec<crate::provider::TerminalImageBytes>,
+    links: Vec<crate::provider::TerminalViewLink>,
 }
 
 impl Drop for DaemonSession {
@@ -1329,8 +1331,7 @@ pub unsafe extern "C" fn cleat_session_role(session: *const CleatSession) -> u32
     }
 }
 
-/// Request the controller role, preempting another packet controller if one
-/// holds the session (a legacy stream controller is never preempted). The
+/// Request exclusive control, demoting other driving attachments to watchers. The
 /// grant lands asynchronously: poll `cleat_session_role` after the wake
 /// callback fires. Returns false if the request could not be sent.
 ///
@@ -1349,6 +1350,88 @@ pub unsafe extern "C" fn cleat_session_take_control(session: *mut CleatSession) 
             daemon.connection.request_role(daemon.channel, crate::packet::ChannelRole::Controller, true).is_ok()
         }
     }
+}
+
+/// Request shared driving, watching, or exclusive control (`take=true`).
+/// The grant is asynchronous. Releasing exclusivity uses Controller/false.
+/// # Safety
+/// `session` must be a valid session pointer.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_set_role(session: *mut CleatSession, role: u32, take: bool) -> bool {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return false;
+    };
+    let role = match role {
+        CLEAT_ROLE_CONTROLLER => crate::packet::ChannelRole::Controller,
+        CLEAT_ROLE_WATCHER => crate::packet::ChannelRole::Watcher,
+        _ => return false,
+    };
+    match &session.backend {
+        SessionBackend::Daemon(daemon) => daemon.connection.request_role(daemon.channel, role, take).is_ok(),
+        _ => role == crate::packet::ChannelRole::Controller,
+    }
+}
+
+/// Set a shared fixed grid, or restore controller sizing with zero/zero.
+/// Requires a driving daemon attachment; the resulting resize is asynchronous.
+/// # Safety
+/// `session` must be a valid session pointer.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_set_fixed_size(session: *mut CleatSession, cols: u16, rows: u16) -> bool {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return false;
+    };
+    let SessionBackend::Daemon(daemon) = &session.backend else {
+        return false;
+    };
+    if daemon.slot.lock().ok().and_then(|slot| slot.granted_role) != Some(crate::packet::ChannelRole::Controller) {
+        return false;
+    }
+    let fixed = if cols == 0 && rows == 0 {
+        None
+    } else if cols > 0 && rows > 0 {
+        Some(crate::packet::Resize { cols, rows })
+    } else {
+        return false;
+    };
+    daemon.connection.size_policy(daemon.channel, fixed).is_ok()
+}
+
+/// Copy attachment presence, view status and current frame's links as UTF-8 JSON.
+/// A null buffer queries the required byte count (no trailing NUL).
+/// # Safety
+/// `session` and `out_len` must be valid; a non-null buffer must hold `capacity` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_attachment_state_json(
+    session: *const CleatSession,
+    buffer: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> bool {
+    let (Some(session), Some(out_len)) = (unsafe { session.as_ref() }, unsafe { out_len.as_mut() }) else {
+        return false;
+    };
+    let SessionBackend::Daemon(daemon) = &session.backend else {
+        return false;
+    };
+    let Ok(slot) = daemon.slot.lock() else {
+        return false;
+    };
+    let Ok(bytes) = serde_json::to_vec(&serde_json::json!({ "role": slot.role_state, "view": slot.view_state, "links": daemon.links }))
+    else {
+        return false;
+    };
+    *out_len = bytes.len();
+    if buffer.is_null() {
+        return true;
+    }
+    if capacity < bytes.len() {
+        return false;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+    }
+    true
 }
 
 /// Connection state of the session's transport. In-process and mock sessions
@@ -1933,6 +2016,8 @@ pub unsafe extern "C" fn cleat_session_render_update(session: *mut CleatSession,
                 };
                 match slot.pending.take() {
                     Some(update) => {
+                        daemon.images = std::mem::take(&mut slot.pending_images);
+                        daemon.links = std::mem::take(&mut slot.pending_links);
                         slot.last.absorb(&update);
                         Some(update)
                     }
@@ -1984,7 +2069,12 @@ pub unsafe extern "C" fn cleat_session_with_image_resource_data(
         None => return false,
     };
     match &mut session.backend {
-        SessionBackend::Mock(_) | SessionBackend::Daemon(_) => false,
+        SessionBackend::Mock(_) => false,
+        SessionBackend::Daemon(daemon) => daemon
+            .images
+            .iter()
+            .find(|image| image.image_id == image_id && image.generation == generation)
+            .is_some_and(|image| unsafe { callback(user_data, image.bytes.as_ptr(), image.bytes.len()) }),
         SessionBackend::InProcess(in_process) => {
             let user_data = user_data as usize;
             in_process
@@ -2162,7 +2252,7 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
         Ok(runtime)
     })
     .map_err(|err| err.replace("session actor", "in-process session actor"))?;
-    actor.set_client_presence(false)?;
+    actor.set_query_passthrough(false)?;
     Ok(InProcessSession { actor })
 }
 
@@ -2190,7 +2280,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         channel_role_from_ffi(desc.role)?,
         attachment_identity_from_desc(desc)?,
     );
-    Ok(DaemonSession { id: metadata.id, connection: Arc::clone(connection), channel, slot })
+    Ok(DaemonSession { id: metadata.id, connection: Arc::clone(connection), channel, slot, images: Vec::new(), links: Vec::new() })
 }
 
 fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
@@ -2205,7 +2295,7 @@ fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         channel_role_from_ffi(desc.role)?,
         attachment_identity_from_desc(desc)?,
     );
-    Ok(DaemonSession { id, connection: Arc::clone(connection), channel, slot })
+    Ok(DaemonSession { id, connection: Arc::clone(connection), channel, slot, images: Vec::new(), links: Vec::new() })
 }
 
 fn channel_role_from_ffi(role: u32) -> Result<crate::packet::ChannelRole, String> {

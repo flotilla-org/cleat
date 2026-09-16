@@ -145,11 +145,12 @@ pub enum Command {
                            Unlike launch, attach enters interactive foreground mode — your terminal\n\
                            is connected to the session's PTY until you detach.\n\
                            \n\
-                           If another attachment holds control, attach falls back to read-only watch\n\
-                           mode. Use --strict to refuse instead, or --take to demote the holder and\n\
-                           claim control. --identity and --identity-kind name the attachment.\n\
+                           Controllers share input and use the intersection of their content sizes.\n\
+                           If another attachment holds exclusive control, attach falls back to watch\n\
+                           mode. Use --strict to refuse instead, or --take to demote other drivers and\n\
+                           claim exclusive control. --identity and --identity-kind name the attachment.\n\
                            \n\
-                           To detach, run 'cleat detach <ID>' from another terminal.")]
+                           Press Ctrl-] then d to detach this attachment. Ctrl-] shows other commands.")]
     Attach {
         #[arg(value_name = "ID")]
         id: Option<String>,
@@ -161,9 +162,9 @@ pub enum Command {
         cwd: Option<PathBuf>,
         #[arg(long, help = "Command to run (default: user's shell)")]
         cmd: Option<String>,
-        #[arg(long, conflicts_with = "take", help = "Fail when another attachment holds the controller seat")]
+        #[arg(long, conflicts_with = "take", help = "Fail when exclusive control prevents driving")]
         strict: bool,
-        #[arg(long, conflicts_with = "strict", help = "Take control and demote the current controller to watcher")]
+        #[arg(long, conflicts_with = "strict", help = "Take exclusive control and demote other drivers to watchers")]
         take: bool,
         #[command(flatten)]
         attachment: AttachmentFlags,
@@ -172,7 +173,7 @@ pub enum Command {
     },
     /// Watch a session read-only
     #[command(after_long_help = "Attaches as a read-only watcher. The session keeps its existing\n\
-                           controller, if any; watcher input and resize events are ignored.")]
+                           controllers; watcher typing is discarded and its size does not affect the PTY.")]
     Watch {
         #[arg(value_name = "ID")]
         id: String,

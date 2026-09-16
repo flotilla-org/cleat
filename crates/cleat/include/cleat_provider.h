@@ -201,7 +201,7 @@ typedef struct cleat_session_desc {
     /*
      * Daemon-backend only: requested attachment role. CLEAT_ROLE_UNKNOWN and
      * CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
-     * another controller holds the session); CLEAT_ROLE_WATCHER attaches
+     * another controller holds exclusive control); CLEAT_ROLE_WATCHER attaches
      * read-only. The granted role is reported by cleat_session_role.
      */
     uint32_t role;
@@ -548,11 +548,16 @@ uint32_t cleat_session_connection_state(const cleat_session *session);
  */
 uint32_t cleat_session_role(const cleat_session *session);
 /*
- * Request the controller role, preempting another packet client's control if
- * needed (a legacy `cleat attach` stream controller is never preempted). The
+ * Request exclusive control, demoting other driving attachments to watchers. The
  * grant lands asynchronously; poll cleat_session_role after wake.
  */
 bool cleat_session_take_control(cleat_session *session);
+/* Shared driving or watching; take=true requests exclusive control. */
+bool cleat_session_set_role(cleat_session *session, uint32_t role, bool take);
+/* Set fixed shared geometry; zero/zero restores controller-intersection sizing. */
+bool cleat_session_set_fixed_size(cleat_session *session, uint16_t cols, uint16_t rows);
+/* UTF-8 JSON, no NUL. NULL buffer queries size; caller owns the buffer. */
+bool cleat_session_attachment_state_json(const cleat_session *session, uint8_t *buffer, size_t capacity, size_t *out_len);
 
 /* Updates row/column terminal size. Pixel geometry is updated separately. */
 bool cleat_session_resize(cleat_session *session, uint16_t cols, uint16_t rows);

@@ -14,7 +14,9 @@ The lifecycle race and Windows IPC source error recorded below were fixed in
 a [subsequent follow-up](attach-and-windows-fixes-2026-09.md). That follow-up
 also fixes and publishes a Windows Ghostty import-library correction at
 `766af569c1317fa80b3ad7afcc79d76c88969fc0`, now pinned by cleat. Its
-validation section supersedes the original platform blockers below.
+validation section supersedes the original platform blockers below. The later
+[scoped history capture patch](scoped-history-capture.md) records the current
+pin and its additional bindings.
 
 Work started from cleat `dbeeca6` in a separate worktree and branch,
 `maintenance/ghostty-zig-016`. The original checkout and its prepared
@@ -85,8 +87,8 @@ caller-owned. Iterator handles are freed by their existing RAII wrappers.
 
 The new image DATA_PTR documentation permits NO_VALUE for a pending restored
 payload. Cleat does not call the snapshot decoder/compression APIs that produce
-that state; its existing getter reports an error rather than dereferencing
-a missing pointer. Animation continues to use Ghostty's image generation
+that state; the scoped-capture follow-up treats missing data as not ready, without
+dereferencing a missing pointer. Animation continues to use Ghostty's image generation
 stamps. This pass adds no snapshot restoration or animation scheduler.
 
 No runtime metadata dependency or binding generator was added to cleat.

@@ -243,6 +243,24 @@ impl SessionRuntime {
         self.vt_engine.scrollbar_state()
     }
 
+    pub(crate) fn set_attachment_view(&mut self, id: u128, command: ViewportCommand) -> Result<bool, String> {
+        self.vt_engine.set_attachment_view(id, command)
+    }
+    pub(crate) fn capture_attachment_view(&mut self, id: u128) -> Result<Option<crate::provider::CapturedView>, String> {
+        self.vt_engine.capture_attachment_view(id)
+    }
+    pub(crate) fn release_attachment_view(&mut self, id: u128) {
+        self.vt_engine.release_attachment_view(id);
+    }
+
+    pub(crate) fn focus(&mut self, focused: bool) -> Result<(), String> {
+        let bytes = self.vt_engine.encode_focus(focused)?;
+        if !bytes.is_empty() {
+            self.write_input(&bytes)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
         self.vt_engine.scroll_viewport(command)
     }
@@ -422,12 +440,12 @@ impl SessionRuntime {
         Ok(())
     }
 
-    pub(crate) fn read_available_output(&mut self, has_active_client: bool) -> Result<PtyOutput, String> {
-        self.read_available_output_inner(has_active_client, false)
+    pub(crate) fn read_available_output(&mut self, queries_forwarded_to_client: bool) -> Result<PtyOutput, String> {
+        self.read_available_output_inner(queries_forwarded_to_client, false)
     }
 
-    pub(crate) fn drain_output_after_exit(&mut self, has_active_client: bool) -> Result<PtyOutput, String> {
-        self.read_available_output_inner(has_active_client, true)
+    pub(crate) fn drain_output_after_exit(&mut self, queries_forwarded_to_client: bool) -> Result<PtyOutput, String> {
+        self.read_available_output_inner(queries_forwarded_to_client, true)
     }
 
     pub(crate) fn exit_code_if_exited(&self) -> Result<Option<i32>, String> {
@@ -451,7 +469,7 @@ impl SessionRuntime {
         &self.session.id
     }
 
-    fn read_available_output_inner(&mut self, has_active_client: bool, after_exit: bool) -> Result<PtyOutput, String> {
+    fn read_available_output_inner(&mut self, queries_forwarded_to_client: bool, after_exit: bool) -> Result<PtyOutput, String> {
         let mut chunks = Vec::new();
         let mut budget = PTY_READ_BUDGET_PER_PUMP;
         loop {
@@ -474,10 +492,11 @@ impl SessionRuntime {
                     self.record_output(bytes);
 
                     // Drain engine replies every iteration so the buffer never accumulates
-                    // stale replies across an attach-to-detach transition. When attached, the
-                    // host terminal is authoritative for query responses, so we discard.
+                    // stale replies across authority changes. Only a raw-stream controller
+                    // forwards queries to its terminal. Packet clients receive rendered
+                    // state, so the engine must answer regardless of their driving roles.
                     let engine_reply = self.vt_engine.drain_replies();
-                    if !has_active_client {
+                    if !queries_forwarded_to_client {
                         self.write_detached_replies(bytes, &engine_reply)?;
                     }
                     chunks.push(Arc::from(bytes));

@@ -8,8 +8,8 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 6 adds controller-denial reasons to role state.
-pub const PROTOCOL_VERSION: u16 = 6;
+/// Version 7 adds shared presence, independent views and owned history resources.
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -27,6 +27,8 @@ pub const MSG_SESSION_INPUT: u8 = 18;
 pub const MSG_SESSION_RESIZE: u8 = 19;
 pub const MSG_SESSION_VIEWPORT: u8 = 20;
 pub const MSG_SESSION_ROLE: u8 = 21;
+pub const MSG_SESSION_VIEW_STATE: u8 = 22;
+pub const MSG_SESSION_SIZE_POLICY: u8 = 23;
 
 const HEADER_LEN: usize = 9;
 pub const MAX_PACKET_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
@@ -109,9 +111,8 @@ pub enum ActivityEvent {
     MembershipRemoved { session_id: String, tags: Vec<String>, changed_at_unix_ms: u64 },
 }
 
-/// Attachment role of a session channel. One controller per session across
-/// packet and legacy stream clients: the controller's input, resize, and
-/// viewport commands are routed; watchers are read-only and never resize.
+/// Packet controllers share input and intersect their content sizes.
+/// Watchers do not send application input or contribute to PTY geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChannelRole {
     Watcher,
@@ -147,6 +148,18 @@ pub struct RoleState {
     pub controller: Option<AttachmentIdentity>,
     #[serde(default)]
     pub denial_reason: Option<RoleDenialReason>,
+    pub participants: Vec<Participant>,
+    pub exclusive: Option<AttachmentIdentity>,
+    pub fixed_size: Option<Resize>,
+}
+
+/// Presence is descriptive; transport-local IDs distinguish equal labels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Participant {
+    pub connection: u64,
+    pub channel: u32,
+    pub identity: AttachmentIdentity,
+    pub role: ChannelRole,
 }
 
 /// Why a controller request was granted as a watcher instead. This stays
@@ -188,6 +201,15 @@ pub struct ControlError {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RenderPacket {
     pub update: TerminalRenderUpdate,
+    pub images: Vec<crate::provider::TerminalImageBytes>,
+    pub links: Vec<crate::provider::TerminalViewLink>,
+    pub view: crate::provider::ViewState,
+}
+
+impl RenderPacket {
+    pub fn live(update: TerminalRenderUpdate) -> Self {
+        Self { update, images: Vec::new(), links: Vec::new(), view: Default::default() }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +341,19 @@ impl<S: Read + Write> PacketClient<S> {
         self.write(channel, MSG_SESSION_RESIZE, &Resize { cols, rows })
     }
 
+    /// None restores controller-intersection sizing.
+    pub fn size_policy(&mut self, channel: u32, fixed: Option<Resize>) -> std::io::Result<()> {
+        self.write(channel, MSG_SESSION_SIZE_POLICY, &fixed)
+    }
+
+    pub fn viewport(&mut self, channel: u32, command: crate::provider::ViewportCommand) -> std::io::Result<()> {
+        self.write(channel, MSG_SESSION_VIEWPORT, &Viewport { command })
+    }
+
+    pub fn request_role(&mut self, channel: u32, role: ChannelRole, take: bool) -> std::io::Result<()> {
+        self.write(channel, MSG_SESSION_ROLE, &RoleRequest { role, take })
+    }
+
     pub fn read_frame(&mut self) -> std::io::Result<PacketFrame> {
         loop {
             if let Some(frame) = PacketFrame::read_from_buffer(&mut self.buffer)? {
@@ -392,8 +427,8 @@ mod tests {
     }
 
     #[test]
-    fn denial_reason_semantics_start_at_protocol_version_six() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn shared_presence_requires_protocol_version_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]

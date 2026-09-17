@@ -125,7 +125,8 @@ pub(crate) struct ChannelSlot {
     /// Latest un-consumed render packet. The ack-gated protocol guarantees at
     /// most one arrives before we ack, and we ack on consumption.
     pub pending: Option<TerminalRenderUpdate>,
-    pub pending_images: Vec<crate::provider::TerminalImageBytes>,
+    images: crate::image_delivery::ImageReceiver,
+    pub pending_images: Vec<crate::image_delivery::Image>,
     pub pending_links: Vec<crate::provider::TerminalViewLink>,
     pub view_state: crate::provider::ViewState,
     pub role_state: Option<crate::packet::RoleState>,
@@ -267,6 +268,7 @@ impl DaemonConnection {
         let slot = Arc::new(Mutex::new(ChannelSlot {
             session_id: session_id.clone(),
             pending: None,
+            images: Default::default(),
             pending_images: Vec::new(),
             pending_links: Vec::new(),
             view_state: Default::default(),
@@ -462,6 +464,7 @@ impl DaemonConnection {
                     slot.granted_role = None;
                     slot.pending = None;
                     slot.pending_images.clear();
+                    slot.images = Default::default();
                     slot.pending_links.clear();
                     Some((
                         *channel,
@@ -524,6 +527,32 @@ impl DaemonConnection {
                     }
                 }
             }
+            (channel, crate::packet::MSG_SESSION_IMAGE_FILE) if channel != CHANNEL_CONTROL => {
+                if let Ok(file) = frame.decode::<crate::packet::ImageFile>() {
+                    let slot = recover_lock(&self.state).channels.get(&channel).cloned();
+                    if let Some(slot) = slot {
+                        let acquired = recover_lock(&slot).images.file(&file);
+                        let _ = self.send_frame_result(PacketFrame::new(
+                            channel,
+                            crate::packet::MSG_SESSION_IMAGE_FILE_RESULT,
+                            &crate::packet::ImageFileResult { image_id: file.image_id, generation: file.generation, acquired },
+                        ));
+                    }
+                }
+            }
+            (channel, crate::packet::MSG_SESSION_IMAGE) if channel != CHANNEL_CONTROL => {
+                let slot = recover_lock(&self.state).channels.get(&channel).cloned();
+                if let Some(slot) = slot {
+                    let mut slot = recover_lock(&slot);
+                    let result = frame.decode().map_err(|e| e.to_string()).and_then(|chunk| slot.images.chunk(chunk));
+                    if let Err(error) = result {
+                        slot.closed = Some(error);
+                        slot.images = Default::default();
+                        drop(slot);
+                        (self.wake)();
+                    }
+                }
+            }
             (channel, MSG_SESSION_RENDER) if channel != CHANNEL_CONTROL => {
                 if let Ok(packet) = frame.decode::<RenderPacket>() {
                     let slot = {
@@ -532,7 +561,16 @@ impl DaemonConnection {
                     };
                     if let Some(slot) = slot {
                         let mut slot = recover_lock(&slot);
-                        slot.pending_images = packet.images;
+                        match slot.images.commit(&packet.update.image_resources) {
+                            Ok(images) => slot.pending_images = images,
+                            Err(error) => {
+                                slot.closed = Some(error);
+                                slot.images = Default::default();
+                                drop(slot);
+                                (self.wake)();
+                                return;
+                            }
+                        }
                         slot.pending_links = packet.links;
                         slot.view_state = packet.view;
                         slot.pending = Some(packet.update);
@@ -843,7 +881,11 @@ mod tests {
             slot.desired_cols = 120;
             slot.desired_rows = 50;
             slot.pending = Some(render_update(99));
-            slot.pending_images.push(crate::provider::TerminalImageBytes { image_id: 1, generation: 1, bytes: vec![1] });
+            slot.pending_images.push(crate::image_backing::RetainedImage::from_owned(crate::provider::TerminalImageBytes {
+                image_id: 1,
+                generation: 1,
+                bytes: vec![1],
+            }));
             slot.pending_links.push(crate::provider::TerminalViewLink { col: 0, row: 0, uri: b"https://example.com".to_vec() });
         }
         assert!(connection.send_input(channel, TerminalInputEvent::RawBytes(b"discarded".to_vec())).is_err());

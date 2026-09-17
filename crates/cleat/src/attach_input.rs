@@ -21,6 +21,7 @@ pub(crate) enum Command {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Action {
     Raw(Vec<u8>),
+    GraphicsReply(Vec<u8>),
     Paste(String),
     Command(Command),
     Hint(&'static str),
@@ -104,6 +105,18 @@ impl InputDecoder {
             }
             if !self.escape.is_empty() {
                 self.escape.push(byte);
+                let apc = self.escape.get(1) == Some(&b'_');
+                if apc {
+                    if self.escape.ends_with(b"\x1b\\") {
+                        let sequence = std::mem::take(&mut self.escape);
+                        actions.push(Action::GraphicsReply(sequence));
+                    } else if self.escape.len() > 512 {
+                        // Keep consuming through ST without retaining an unbounded reply.
+                        let last = *self.escape.last().unwrap();
+                        self.escape = vec![0x1b, b'_', last];
+                    }
+                    continue;
+                }
                 let complete = if self.escape.get(1) == Some(&b'[') {
                     self.escape.len() >= 3 && (0x40..=0x7e).contains(&byte)
                 } else if self.escape.get(1) == Some(&b'O') {
@@ -292,6 +305,13 @@ fn push_raw(actions: &mut Vec<Action>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn graphics_replies_are_consumed_separately_even_when_fragmented() {
+        let mut decoder = InputDecoder::new(0x1d);
+        assert!(decoder.feed(b"\x1b_Gi=7;").is_empty());
+        assert_eq!(decoder.feed(b"OK\x1b\\x"), vec![Action::GraphicsReply(b"\x1b_Gi=7;OK\x1b\\".to_vec()), Action::Raw(b"x".to_vec())]);
+    }
+
     #[test]
     fn prefixed_commands_remain_available_while_panning() {
         for (key, command) in [(b'c', Command::Chrome), (b'd', Command::Detach), (b'g', Command::Drive), (b'r', Command::RevealCursor)] {

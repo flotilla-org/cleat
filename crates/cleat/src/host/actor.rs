@@ -334,7 +334,7 @@ pub(crate) enum SessionCommand {
     ScrollViewport { command: ViewportCommand, reply: mpsc::Sender<Result<ViewportCommandOutcome, String>> },
     Snapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     RenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
-    FullRenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
+    PacketRender { full: bool, reply: mpsc::Sender<Result<crate::image_delivery::RenderBundle, String>> },
     FullSnapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     ImageResourceData { image_id: u32, generation: u64, callback: ImageResourceDataCallback, reply: mpsc::Sender<Result<bool, String>> },
     Inspect { has_controller: bool, watcher_count: usize, reply: mpsc::Sender<Result<InspectResult, String>> },
@@ -750,12 +750,8 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::FullSnapshot { reply })
     }
 
-    pub(crate) fn render_update(&self) -> Result<TerminalRenderUpdate, String> {
-        self.request_result(|reply| SessionCommand::RenderUpdate { reply })
-    }
-
-    pub(crate) fn full_render_update(&self) -> Result<TerminalRenderUpdate, String> {
-        self.request_result(|reply| SessionCommand::FullRenderUpdate { reply })
+    pub(crate) fn packet_render(&self, full: bool) -> Result<crate::image_delivery::RenderBundle, String> {
+        self.request_result(|reply| SessionCommand::PacketRender { full, reply })
     }
 
     pub(crate) fn mark_observed(&self, generation: u64) -> bool {
@@ -883,6 +879,7 @@ struct PumpResult {
 }
 
 struct SessionActorLoopState {
+    images: crate::image_delivery::CaptureImages,
     observation: ObservationState,
     exited: bool,
     exit_code: Option<i32>,
@@ -953,6 +950,7 @@ fn session_actor_loop(
     #[cfg(unix)] command_wake: CommandWakeReader,
 ) {
     let mut state = SessionActorLoopState {
+        images: Default::default(),
         observation: ObservationState::new_with_mirror(rows, Some(mirror)),
         exited: false,
         exit_code: None,
@@ -1102,14 +1100,22 @@ fn session_actor_handle_command(
             });
             let _ = reply.send(result);
         }
-        SessionCommand::FullRenderUpdate { reply } => {
-            session_actor_pump(runtime, state, wake);
+        SessionCommand::PacketRender { full, reply } => {
+            if full {
+                session_actor_pump(runtime, state, wake);
+            }
             sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
-            let result = runtime.render_update(DirtyState::Full).map(|mut update| {
-                update.render_generation = state.observation.render_generation;
-                update.dirty = DirtyState::Full;
-                update
-            });
+            let result = (|| {
+                let mut update = runtime.render_update(if full { DirtyState::Full } else { state.observation.dirty() })?;
+                state.observation.annotate_render_update(&mut update);
+                if full {
+                    update.dirty = DirtyState::Full;
+                }
+                let images = state.images.capture(&update.image_resources, |id, generation, callback| {
+                    runtime.with_image_resource_data(id, generation, callback)
+                })?;
+                Ok(crate::image_delivery::RenderBundle::live(update, images))
+            })();
             let _ = reply.send(result);
         }
         SessionCommand::FullSnapshot { reply } => {

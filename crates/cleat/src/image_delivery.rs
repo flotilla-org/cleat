@@ -113,6 +113,10 @@ impl ImageTransfer {
         self.local = enabled;
         self
     }
+    /// Waiting for file acquisition is input work, not writable socket work.
+    pub fn ready(&self) -> bool {
+        !self.waiting && !self.complete()
+    }
     pub fn complete(&self) -> bool {
         self.render.is_none()
     }

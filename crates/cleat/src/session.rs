@@ -654,12 +654,12 @@ impl PacketTerminalRenderer {
         // source application did with synchronized output: terminals that
         // implement mode 2026 present the repaint atomically, while hiding the
         // cursor also prevents visible thrash on terminals that ignore it.
-        writer.write_all(b"\x1b[?2026h\x1b[?25l").map_err(|err| format!("begin synchronized packet render: {err}"))?;
+        writer.write_all(b"\x1b[?2026h\x1b[?25l\x1b[?7l").map_err(|err| format!("begin synchronized packet render: {err}"))?;
         // Always attempt to close the synchronized batch: an early return that
         // leaves mode 2026 set can freeze the attached terminal until
         // something else resets it.
         let rendered = self.render_frame(writer, update);
-        let finished = writer.write_all(b"\x1b[?2026l").map_err(|err| format!("finish synchronized packet render: {err}"));
+        let finished = writer.write_all(b"\x1b[?7h\x1b[?2026l").map_err(|err| format!("finish synchronized packet render: {err}"));
         rendered.and(finished)
     }
 
@@ -720,6 +720,13 @@ impl PacketTerminalRenderer {
                 if cell.style.width == crate::provider::TerminalCellWidth::Wide && col + 1 >= visible_cols as usize {
                     break;
                 }
+                if cell.style.width == crate::provider::TerminalCellWidth::SpacerTail && col > 0 {
+                    continue;
+                }
+                // The host can assign a different width to a grapheme (for
+                // example VS16 emoji with mode 2027). Grid coordinates, not
+                // the host's advancing cursor, determine the next cell.
+                write!(writer, "\x1b[{};{}H", row_index + 1, col + 1).map_err(|err| format!("position packet cell: {err}"))?;
                 if col == 0
                     && self.geometry.x > 0
                     && row.get(self.geometry.x as usize - 1).is_some_and(|c| c.style.width == crate::provider::TerminalCellWidth::Wide)
@@ -4420,7 +4427,10 @@ mod tests {
         renderer.apply_and_render(&mut output, &update).expect("render packet update");
 
         assert!(output.starts_with(b"\x1b[?2026h\x1b[?25l"), "repaint must start atomically with the cursor hidden: {output:?}");
-        assert!(output.ends_with(b"\x1b[?25h\x1b[?2026l"), "cursor restoration must remain inside the synchronized batch: {output:?}");
+        assert!(
+            output.ends_with(b"\x1b[?25h\x1b[?7h\x1b[?2026l"),
+            "cursor restoration must remain inside the synchronized batch: {output:?}"
+        );
         let cursor_restore = output.windows(b"\x1b[?25h".len()).position(|bytes| bytes == b"\x1b[?25h").expect("cursor restore");
         let last_row_repaint = output.windows(b"\x1b[2;1H".len()).position(|bytes| bytes == b"\x1b[2;1H").expect("last row repaint");
         assert!(cursor_restore > last_row_repaint, "cursor must stay hidden throughout synthesized row movement");
@@ -4607,8 +4617,68 @@ mod tests {
         let mut output = Vec::new();
         renderer.repaint(&mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("\x1b[2K ") && output.contains("mX"), "{output:?}");
+        assert!(output.contains("\x1b[1;1H ") && output.contains("mX"), "{output:?}");
         assert!(!output.contains('界'));
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_render_prompt_stays_inside_shared_grid_border() {
+        use crate::vt::{ghostty::GhosttyVtEngine, VtEngine};
+        for (cols, prompt) in
+            [(4, "☁️☁️r@"), (73, "~/dev/cleat on 🌱 main [⇡] via 🦀 v1.98.0 on ☁️  (eu-west-2) on ☁️  robert@changedirection.org")]
+        {
+            let mut source = GhosttyVtEngine::new(cols, 4);
+            source.feed(prompt.as_bytes()).unwrap();
+            let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
+            let host_cols = cols + 17;
+            let mut renderer = PacketTerminalRenderer::new(cols, 4);
+            renderer.set_viewport((host_cols, 6));
+            renderer.bounds = true;
+            let mut output = Vec::new();
+            renderer.apply_and_render(&mut output, &update).unwrap();
+            let mut host = GhosttyVtEngine::new(host_cols, 6);
+            host.feed(b"\x1b[?2027h").unwrap();
+            host.feed(&output).unwrap();
+            let grid = host.screen_grid().unwrap();
+            let expected = source.screen_grid().unwrap();
+            for row in 0..4usize {
+                for col in 0..usize::from(cols) {
+                    let expected_cell = &expected.cells[row * usize::from(cols) + col];
+                    if expected_cell.graphemes.iter().any(|c| (33..127).contains(c)) {
+                        assert_eq!(
+                            grid.cells[row * usize::from(host_cols) + col].graphemes,
+                            expected_cell.graphemes,
+                            "ASCII shifted at ({col}, {row})"
+                        );
+                    }
+                }
+                for col in usize::from(cols + 1)..usize::from(host_cols) {
+                    let cell = &grid.cells[row * usize::from(host_cols) + col];
+                    assert!(
+                        cell.graphemes.iter().all(|c| *c == 0 || *c == 32),
+                        "text escaped the border at ({col}, {row}): {:?}",
+                        cell.graphemes
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_render_wider_host_grapheme_at_bottom_right_does_not_scroll() {
+        use crate::vt::{ghostty::GhosttyVtEngine, VtEngine};
+        let mut source = GhosttyVtEngine::new(4, 2);
+        source.feed("safe\r\nabc☁️".as_bytes()).unwrap();
+        let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
+        let mut renderer = PacketTerminalRenderer::new(4, 2);
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).unwrap();
+        let mut host = GhosttyVtEngine::new(4, 2);
+        host.feed(b"\x1b[?2027h").unwrap();
+        host.feed(&output).unwrap();
+        assert_eq!(host.screen_grid().unwrap().row_text(0), "safe");
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub(crate) struct InputDecoder {
     overflow: bool,
     driving: bool,
     paste_authorized: bool,
+    paste_started_in_pan: bool,
 }
 
 impl InputDecoder {
@@ -52,6 +53,7 @@ impl InputDecoder {
             overflow: false,
             driving: true,
             paste_authorized: true,
+            paste_started_in_pan: false,
         }
     }
 
@@ -83,7 +85,9 @@ impl InputDecoder {
                 }
                 if self.paste_tail == PASTE_END {
                     let mut paste = self.paste.take().expect("collecting paste");
-                    if !self.paste_authorized {
+                    if self.paste_started_in_pan {
+                        actions.push(Action::Hint("Paste discarded; attachment was in pan mode"));
+                    } else if !self.paste_authorized {
                         actions.push(Action::Hint("Paste discarded; attachment was not driving"));
                     } else if self.overflow {
                         actions.push(Action::Hint("Paste exceeds 1 MiB; discarded"));
@@ -111,7 +115,8 @@ impl InputDecoder {
                     let sequence = std::mem::take(&mut self.escape);
                     if sequence == b"\x1b[200~" {
                         self.paste = Some(Vec::new());
-                        self.paste_authorized = self.driving && !self.panning;
+                        self.paste_authorized = self.driving;
+                        self.paste_started_in_pan = self.panning;
                         self.overflow = false;
                         self.armed = false;
                     } else if sequence == b"\x1b[I" {
@@ -171,13 +176,14 @@ impl InputDecoder {
                 } else {
                     actions.push(Action::Hint("Unknown cleat command"));
                 }
-            } else if self.panning {
-                // Pan mode consumes application keystrokes until Escape.
             } else if byte == self.prefix {
                 self.armed = true;
                 actions.push(Action::Hint(
                     "cleat: d detach | g drive | w watch | x exclusive | c chrome | a auto size | [ history | ] live | k/j scroll | arrows pan | r reveal cursor | Esc cancel",
                 ));
+            } else if self.panning {
+                // Pan mode consumes application keystrokes until Escape,
+                // while prefixed attachment commands remain available.
             } else {
                 push_raw(&mut actions, &[byte]);
             }
@@ -286,6 +292,36 @@ fn push_raw(actions: &mut Vec<Action>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefixed_commands_remain_available_while_panning() {
+        for (key, command) in [(b'c', Command::Chrome), (b'd', Command::Detach), (b'g', Command::Drive), (b'r', Command::RevealCursor)] {
+            let mut decoder = InputDecoder::new(0x1d);
+            decoder.feed(b"\x1d\x1b[C");
+            assert!(decoder.is_panning());
+            assert!(matches!(decoder.feed(b"\x1d").as_slice(), [Action::Hint(_)]));
+            assert_eq!(decoder.feed(&[key]), vec![Action::Command(command)]);
+            assert!(decoder.is_panning());
+            assert_eq!(decoder.feed(b"\x1b[B"), vec![Action::Command(Command::Pan(0, 1))]);
+            assert!(decoder.feed(b"typing").is_empty());
+        }
+    }
+
+    #[test]
+    fn paste_during_pan_reports_pan_mode_and_never_replays_bytes() {
+        let bytes = b"\x1b[200~discard\x1dc\x1b[201~";
+        for split in 0..=bytes.len() {
+            let mut decoder = InputDecoder::new(0x1d);
+            decoder.feed(b"\x1d\x1b[C");
+            let mut actions = decoder.feed(&bytes[..split]);
+            actions.extend(decoder.feed(&bytes[split..]));
+            assert_eq!(actions, vec![Action::Hint("Paste discarded; attachment was in pan mode")], "split {split}");
+            assert!(decoder.is_panning());
+            decoder.feed(b"\x1b");
+            decoder.idle();
+            assert_eq!(decoder.feed(b"\x1b[200~accepted\x1b[201~"), vec![Action::Paste("accepted".into())]);
+        }
+    }
+
     #[test]
     fn pan_mode_handles_fragmented_normal_and_application_arrows() {
         for arrow in [b"\x1b[C".as_slice(), b"\x1bOC".as_slice()] {

@@ -77,6 +77,9 @@ and bottom borders occupy spare cells immediately outside the shared grid;
 they reserve no extra rows or columns. Prefix then `c` hides the strip, borders
 and command hints while leaving pan commands usable. Escape leaves pan mode;
 ordinary typing and bracketed paste are consumed while that mode is active.
+Prefixed commands remain available while panning, so you can toggle chrome,
+change roles, reveal the cursor or detach without pressing Escape first. These
+commands leave pan mode active until Escape.
 
 Offsets clamp after geometry changes. Cursor visibility and mouse coordinates
 use the same crop as rendering, and borders and visible chrome reject mouse

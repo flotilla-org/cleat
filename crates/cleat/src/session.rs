@@ -4641,6 +4641,8 @@ mod tests {
             host.feed(b"\x1b[?2027h").unwrap();
             host.feed(&output).unwrap();
             let grid = host.screen_grid().unwrap();
+            let cloud_count = grid.cells.iter().filter(|cell| cell.graphemes.contains(&0x2601)).count();
+            assert_eq!(cloud_count, 2, "both cloud glyphs must survive rendering");
             let expected = source.screen_grid().unwrap();
             for row in 0..4usize {
                 for col in 0..usize::from(cols) {
@@ -4670,6 +4672,7 @@ mod tests {
     fn packet_render_wider_host_grapheme_at_bottom_right_does_not_scroll() {
         use crate::vt::{ghostty::GhosttyVtEngine, VtEngine};
         let mut source = GhosttyVtEngine::new(4, 2);
+        source.feed(b"\x1b[?2027l").unwrap();
         source.feed("safe\r\nabc☁️".as_bytes()).unwrap();
         let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
         let mut renderer = PacketTerminalRenderer::new(4, 2);

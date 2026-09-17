@@ -548,6 +548,7 @@ pub enum GhosttyTerminalOption {
     KittyImageMediumTempFile = 17,
     KittyImageMediumSharedMem = 18,
     ScrollbackMaxBytes = 27,
+    ModeDefault = 33,
 }
 
 /// Callback fired synchronously from `ghostty_terminal_vt_write` when the
@@ -1349,6 +1350,19 @@ impl TerminalHandle {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         unsafe { ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len()) };
+    }
+
+    pub fn set_grapheme_cluster_default(&mut self, enabled: bool) -> Result<(), String> {
+        // GhosttyTerminalModeConfig has a frozen C layout. DEC private modes
+        // use the numeric identifier directly (the high ANSI bit is clear).
+        #[repr(C)]
+        struct ModeConfig {
+            mode: u16,
+            value: bool,
+        }
+        let config = ModeConfig { mode: 2027, value: enabled };
+        let result = unsafe { ghostty_terminal_set(self.raw, GhosttyTerminalOption::ModeDefault, (&config as *const ModeConfig).cast()) };
+        check_result(result, "ghostty_terminal_set(ModeDefault grapheme_cluster)")
     }
 
     pub fn set_default_foreground(&mut self, color: Option<GhosttyColorRgb>) -> Result<(), String> {

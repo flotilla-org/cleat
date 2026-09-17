@@ -673,7 +673,7 @@ struct DaemonSession {
     connection: Arc<DaemonConnection>,
     channel: u32,
     slot: Arc<Mutex<ChannelSlot>>,
-    images: Vec<crate::provider::TerminalImageBytes>,
+    images: Vec<crate::image_delivery::Image>,
     links: Vec<crate::provider::TerminalViewLink>,
 }
 
@@ -2074,7 +2074,7 @@ pub unsafe extern "C" fn cleat_session_with_image_resource_data(
             .images
             .iter()
             .find(|image| image.image_id == image_id && image.generation == generation)
-            .is_some_and(|image| unsafe { callback(user_data, image.bytes.as_ptr(), image.bytes.len()) }),
+            .is_some_and(|image| unsafe { callback(user_data, image.bytes().as_ptr(), image.bytes().len()) }),
         SessionBackend::InProcess(in_process) => {
             let user_data = user_data as usize;
             in_process

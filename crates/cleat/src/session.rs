@@ -19,6 +19,7 @@ use http::StatusCode;
 use crate::{
     host::actor::{RawOutputRecovery, RawOutputReplay, RawOutputTap, SessionActor, SessionMouseEvent, SessionWheelEvent},
     http_uds,
+    image_delivery::{ImageReceiver, ImageTransfer, RenderBundle},
     packet::{
         Ack, ActivityEvent, ActivitySession, ActivitySnapshot, ChannelRole, CloseChannel, ControlError, ControlHello, ControllerHolder,
         DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame, RenderPacket, Resize, RoleDenialReason,
@@ -44,7 +45,7 @@ use crate::{
 };
 
 const DETACH_CLEANUP_SEQUENCE: &[u8] =
-    b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
+    b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SESSION_DAEMON_SERVICING_TICK: Duration = Duration::from_millis(10);
@@ -71,6 +72,7 @@ struct PacketForegroundAttach {
     stream: Arc<Mutex<SessionStream>>,
     channel: u32,
     initial_update: TerminalRenderUpdate,
+    images: ImageReceiver,
     initial_role: RoleState,
 }
 
@@ -335,11 +337,14 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let write_stream = Arc::clone(&packet.stream);
     let channel = packet.channel;
     let initial_update = packet.initial_update;
+    let mut images = packet.images;
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut read_stream = read_handle;
         {
             let mut stdout = std::io::stdout().lock();
-            chrome_out.lock().map_err(|_| "chrome poisoned")?.paint(&mut stdout, Some(&initial_update))?;
+            let mut chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
+            chrome.renderer.images.set_assets(images.commit(&initial_update.image_resources)?);
+            chrome.paint(&mut stdout, Some(&initial_update))?;
             stdout.write_all(b"\x1b[?2004h\x1b[?1004h").map_err(|e| e.to_string())?;
             stdout.flush().map_err(|e| e.to_string())?;
         }
@@ -357,6 +362,21 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             };
             let mut stdout = std::io::stdout().lock();
             match (frame.channel, frame.msg_type) {
+                (id, crate::packet::MSG_SESSION_IMAGE_FILE) if id == channel => {
+                    let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| e.to_string())?;
+                    let acquired = images.file(&file);
+                    write_packet_frame(
+                        &write_stream,
+                        PacketFrame::new(channel, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT, &crate::packet::ImageFileResult {
+                            image_id: file.image_id,
+                            generation: file.generation,
+                            acquired,
+                        }),
+                    )?;
+                }
+                (id, crate::packet::MSG_SESSION_IMAGE) if id == channel => {
+                    images.chunk(frame.decode().map_err(|e| e.to_string())?)?;
+                }
                 (id, MSG_SESSION_RENDER) if id == channel => {
                     let mut packet = frame.decode::<RenderPacket>().map_err(|e| e.to_string())?;
                     if packet.view.status == crate::provider::ViewStatus::History {
@@ -367,6 +387,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                         chrome.hint = Some((notice.clone(), Instant::now() + Duration::from_secs(3)));
                     }
                     chrome.view = packet.view;
+                    chrome.renderer.images.set_assets(images.commit(&packet.update.image_resources)?);
                     chrome.paint(&mut stdout, Some(&packet.update))?;
                     write_packet_frame(
                         &write_stream,
@@ -461,6 +482,12 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 }),
             )?;
         }
+        {
+            let mut stdout = std::io::stdout().lock();
+            let mut chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
+            chrome.renderer.images.expire(&mut stdout)?;
+            stdout.flush().map_err(|e| e.to_string())?;
+        }
         decoder.set_driving(controller.load(Ordering::SeqCst));
         let actions = match terminal.read_input(Duration::from_millis(100), &mut buf) {
             Ok(None) => decoder.idle(),
@@ -475,6 +502,13 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             let mut command = None;
             let mut hint = None;
             match action {
+                Action::GraphicsReply(bytes) => {
+                    let mut stdout = std::io::stdout().lock();
+                    let mut chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
+                    chrome.renderer.images.reply(&mut stdout, &bytes)?;
+                    chrome.paint(&mut stdout, None)?;
+                    stdout.flush().map_err(|e| e.to_string())?;
+                }
                 Action::Raw(bytes) => event = Some(TerminalInputEvent::RawBytes(bytes)),
                 Action::Paste(text) => event = Some(TerminalInputEvent::Paste(crate::provider::TerminalPasteEvent { text })),
                 Action::Focus(focused) => event = Some(TerminalInputEvent::Focus(crate::provider::TerminalFocusEvent { focused })),
@@ -606,6 +640,7 @@ fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result
 
 #[derive(Debug)]
 struct PacketTerminalRenderer {
+    images: crate::kitty_output::KittyOutput,
     geometry: crate::attachment_view::AttachmentView,
     bounds: bool,
     last_update: Option<TerminalRenderUpdate>,
@@ -620,6 +655,7 @@ struct PacketTerminalRenderer {
 impl PacketTerminalRenderer {
     fn new(cols: u16, rows: u16) -> Self {
         Self {
+            images: Default::default(),
             geometry: crate::attachment_view::AttachmentView::new((cols, rows), (cols, rows)),
             bounds: false,
             last_update: None,
@@ -670,6 +706,9 @@ impl PacketTerminalRenderer {
             rows: update.rows,
             cursor: update.cursor,
             terminal_modes: update.terminal_modes,
+            geometry: update.geometry,
+            image_resources: update.image_resources.clone(),
+            image_placements: update.image_placements.clone(),
             ..Default::default()
         });
         self.geometry.resize((update.cols, update.rows), self.viewport.unwrap_or((update.cols, update.rows)));
@@ -738,6 +777,7 @@ impl PacketTerminalRenderer {
             }
         }
         writer.write_all(b"\x1b[0m").map_err(|err| format!("reset packet render style: {err}"))?;
+        self.images.render(writer, update, (self.geometry.x, self.geometry.y), (visible_cols, visible_rows))?;
         if self.bounds {
             let right = self.cols.saturating_sub(self.geometry.x);
             let bottom = self.rows.saturating_sub(self.geometry.y);
@@ -859,7 +899,7 @@ fn render_packet_cell(writer: &mut impl Write, cell: &crate::provider::TerminalR
     let bg = cell.style.resolved_bg;
     write!(writer, "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m", fg.r, fg.g, fg.b, bg.r, bg.g, bg.b)
         .map_err(|err| format!("write packet cell colours: {err}"))?;
-    if cell.graphemes.is_empty() {
+    if cell.graphemes.is_empty() || cell.graphemes.contains(&0x10eeee) {
         writer.write_all(b" ").map_err(|err| format!("write packet blank cell: {err}"))?;
     } else {
         for codepoint in &cell.graphemes {
@@ -1123,6 +1163,7 @@ pub fn attach_packet_foreground(
         .write(&mut stream)
         .map_err(|err| format!("resize foreground packet channel: {err}"))?;
 
+    let mut images = ImageReceiver::default();
     let mut initial_role = None;
     let mut initial_update = None;
     while initial_role.is_none() || initial_update.is_none() {
@@ -1130,6 +1171,21 @@ pub fn attach_packet_foreground(
         match (frame.channel, frame.msg_type) {
             (FOREGROUND_CHANNEL, MSG_SESSION_ROLE) => {
                 initial_role = Some(frame.decode::<RoleState>().map_err(|err| format!("decode foreground role: {err}"))?);
+            }
+            (FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE_FILE) => {
+                let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| e.to_string())?;
+                let acquired = images.file(&file);
+                PacketFrame::new(FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT, &crate::packet::ImageFileResult {
+                    image_id: file.image_id,
+                    generation: file.generation,
+                    acquired,
+                })
+                .map_err(|e| e.to_string())?
+                .write(&mut stream)
+                .map_err(|e| e.to_string())?;
+            }
+            (FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE) => {
+                images.chunk(frame.decode().map_err(|e| e.to_string())?)?;
             }
             (FOREGROUND_CHANNEL, MSG_SESSION_RENDER) => {
                 initial_update = Some(frame.decode::<RenderPacket>().map_err(|err| format!("decode foreground render: {err}"))?.update);
@@ -1158,6 +1214,7 @@ pub fn attach_packet_foreground(
             channel: FOREGROUND_CHANNEL,
             initial_update: initial_update.expect("render checked above"),
             initial_role,
+            images,
         })),
     })
 }
@@ -3300,24 +3357,27 @@ struct PacketSessionChannel {
     view_changed: bool,
     view_state: crate::provider::ViewState,
     next_capture: Instant,
+    local_images: bool,
+    image_resident: HashSet<crate::image_delivery::ImageKey>,
+    image_transfer: Option<ImageTransfer>,
 }
 
 #[derive(Default)]
 struct PacketRenderCache {
-    latest: Option<TerminalRenderUpdate>,
+    latest: Option<RenderBundle>,
     history_cursor: u128,
 }
 
 impl PacketRenderCache {
-    fn store(&mut self, update: TerminalRenderUpdate) {
+    fn store(&mut self, update: RenderBundle) {
         self.latest = Some(update);
     }
 
     fn latest_generation(&self) -> Option<u64> {
-        self.latest.as_ref().map(|update| update.render_generation)
+        self.latest.as_ref().map(|update| update.packet.update.render_generation)
     }
 
-    fn latest(&self) -> Option<&TerminalRenderUpdate> {
+    fn latest(&self) -> Option<&RenderBundle> {
         self.latest.as_ref()
     }
 }
@@ -3395,6 +3455,24 @@ impl PacketClient {
     }
 
     fn flush_pending_output(&mut self) -> Result<bool, String> {
+        if self.pending_output.len() < MAX_PENDING_CLIENT_OUTPUT_BYTES / 2 {
+            let channels: Vec<_> = self.channels.keys().copied().collect();
+            for id in channels {
+                if self.pending_output.len() >= MAX_PENDING_CLIENT_OUTPUT_BYTES / 2 {
+                    break;
+                }
+                let channel = self.channels.get_mut(&id).expect("channel exists");
+                if let Some(transfer) = &mut channel.image_transfer {
+                    match transfer.next(id)? {
+                        Some(frame) => self.enqueue_frame(&frame)?,
+                        None if transfer.complete() => {
+                            channel.image_transfer = None;
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
         while !self.pending_output.is_empty() {
             match retry_interrupted(|| self.stream.write(self.pending_output.as_slice())) {
                 Ok(0) => return Ok(false),
@@ -3563,6 +3641,17 @@ fn handle_packet_frame(
                 }
             }
         }
+        (channel, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT) if channel != CHANNEL_CONTROL => {
+            if let Some(session) = packet_clients[index].channels.get_mut(&channel) {
+                if let Some(transfer) = &mut session.image_transfer {
+                    let result = frame.decode::<crate::packet::ImageFileResult>().map_err(|e| e.to_string())?;
+                    if !result.acquired {
+                        session.local_images = false;
+                    }
+                    transfer.file_result(result)?;
+                }
+            }
+        }
         (channel, MSG_SESSION_ACK) if channel != CHANNEL_CONTROL => {
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
             let client = &mut packet_clients[index];
@@ -3603,7 +3692,7 @@ fn handle_packet_frame(
                             sync_packet_geometry(hosted)?;
                         }
                         TerminalInputEvent::Mouse(mut event) => {
-                            let modes = hosted.packet_render_cache.latest().map(|u| u.terminal_modes).unwrap_or_default();
+                            let modes = hosted.packet_render_cache.latest().map(|u| u.packet.update.terminal_modes).unwrap_or_default();
                             let local_wheel = event.kind == TerminalMouseEventKind::Wheel
                                 && (session.history
                                     || session.role == ChannelRole::Watcher
@@ -3818,7 +3907,7 @@ fn open_packet_channel(
     // Probe render state before granting a role: a session whose VT engine
     // cannot serve it (e.g. the passthrough placeholder) must fail this one
     // channel, not demote the current controller or tear down the daemon.
-    let update = match hosted.actor.full_render_update() {
+    let update = match hosted.actor.packet_render(true) {
         Ok(update) => update,
         Err(err) => {
             packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
@@ -3832,7 +3921,7 @@ fn open_packet_channel(
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel: open.channel };
     let (granted, denial_reason) = grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?;
     let session_id = open.session_id;
-    let generation = update.render_generation;
+    let generation = update.packet.update.render_generation;
     let controller =
         if granted == ChannelRole::Controller { Some(open.identity.clone()) } else { controller_identity(hosted, packet_clients) };
     hosted.packet_render_cache.store(update.clone());
@@ -3850,6 +3939,9 @@ fn open_packet_channel(
         view_changed: false,
         view_state: Default::default(),
         next_capture: Instant::now(),
+        local_images: true,
+        image_resident: HashSet::new(),
+        image_transfer: None,
     });
     let (participants, exclusive) = packet_presence(hosted, packet_clients);
     let client = &mut packet_clients[index];
@@ -3864,10 +3956,8 @@ fn open_packet_channel(
         })
         .map_err(|err| format!("encode role state packet: {err}"))?,
     )?;
-    client.enqueue_frame(
-        &PacketFrame::new(open.channel, MSG_SESSION_RENDER, &RenderPacket::live(update))
-            .map_err(|err| format!("encode initial render packet: {err}"))?,
-    )?;
+    let channel = client.channels.get_mut(&open.channel).expect("opened channel");
+    channel.image_transfer = Some(ImageTransfer::new(open.channel, update, &mut channel.image_resident)?);
     sync_packet_geometry(hosted)?;
     sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
     if let Some(hosted) = sessions.get(&session_id) {
@@ -3890,12 +3980,26 @@ fn push_due_packet_renders(
     }
 
     if actor.observation().dirty() != DirtyState::Clean {
-        let update = if has_packet_channel_lagging_cached_generation(session_id, packet_clients, render_cache) {
-            actor.full_render_update()?
-        } else {
-            actor.render_update()?
-        };
-        render_cache.store(update);
+        let result = actor.packet_render(has_packet_channel_lagging_cached_generation(session_id, packet_clients, render_cache));
+        match result {
+            Ok(update) => render_cache.store(update),
+            Err(error) => {
+                for client in packet_clients.iter_mut() {
+                    let channels: Vec<_> = client.channels.iter().filter(|(_, c)| c.session_id == session_id).map(|(id, _)| *id).collect();
+                    for id in channels {
+                        let channel = client.channels.get_mut(&id).expect("channel exists");
+                        let state = crate::provider::ViewState { status: crate::provider::ViewStatus::Stale, notice: Some(error.clone()) };
+                        if channel.view_state != state {
+                            channel.view_state = state.clone();
+                            client.enqueue_frame(
+                                &PacketFrame::new(id, crate::packet::MSG_SESSION_VIEW_STATE, &state).map_err(|e| e.to_string())?,
+                            )?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
     }
 
     let Some(latest_generation) = render_cache.latest_generation() else {
@@ -3932,38 +4036,41 @@ fn push_due_packet_renders(
             render_cache.history_cursor = key.view_id();
             actor.request_result(|reply| crate::host::actor::SessionCommand::CaptureAttachmentView { id: key.view_id(), reply }).and_then(
                 |capture| match capture {
-                    Some(frame) => Ok(RenderPacket {
-                        update: frame.update,
-                        images: frame.images,
-                        links: frame.links,
-                        view: crate::provider::ViewState {
-                            status: crate::provider::ViewStatus::History,
-                            notice: frame.discarded.then(|| "Earlier history was discarded".into()),
+                    Some(frame) => Ok(RenderBundle {
+                        images: frame.images.into_iter().map(crate::image_backing::RetainedImage::from_owned).collect(),
+                        packet: RenderPacket {
+                            update: frame.update,
+                            links: frame.links,
+                            view: crate::provider::ViewState {
+                                status: crate::provider::ViewStatus::History,
+                                notice: frame.discarded.then(|| "Earlier history was discarded".into()),
+                            },
                         },
                     }),
-                    None => actor.full_render_update().map(|update| {
-                        let mut packet = RenderPacket::live(update);
-                        packet.view.notice = Some("History was cleared; returned to live".into());
+                    None => actor.packet_render(true).map(|mut packet| {
+                        packet.packet.view.notice = Some("History was cleared; returned to live".into());
                         packet
                     }),
                 },
             )
         } else if session.view_changed {
-            actor.full_render_update().map(RenderPacket::live)
+            actor.packet_render(true)
         } else {
-            Ok(RenderPacket::live(update.clone()))
+            Ok(update.clone())
         };
         let next_generation = session.last_sent_generation.saturating_add(1);
         let result = result.and_then(|mut packet| {
-            packet.update.render_generation = next_generation;
-            let frame = PacketFrame::new(key.channel, MSG_SESSION_RENDER, &packet).map_err(|e| e.to_string())?;
-            Ok((frame, packet.view))
+            packet.packet.update.render_generation = next_generation;
+            let view = packet.packet.view.clone();
+            let session = packet_clients[index].channels.get_mut(&key.channel).expect("due channel");
+            let transfer = ImageTransfer::new(key.channel, packet, &mut session.image_resident)?.local_files(session.local_images);
+            Ok((transfer, view))
         });
         match result {
-            Ok((frame, view)) => {
+            Ok((transfer, view)) => {
                 let client = &mut packet_clients[index];
-                client.enqueue_frame(&frame)?;
                 let session = client.channels.get_mut(&key.channel).expect("due channel");
+                session.image_transfer = Some(transfer);
                 session.history = view.status == crate::provider::ViewStatus::History;
                 session.view_state = view;
                 session.view_changed = false;
@@ -4413,6 +4520,115 @@ mod tests {
         vt::{self, VtEngine},
     };
 
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_images_round_trip_file_upload_replacement_and_pan_through_terminal_engine() {
+        use crate::{
+            image_delivery::CaptureImages,
+            vt::{ghostty::GhosttyVtEngine, VtEngine},
+        };
+        let mut source = GhosttyVtEngine::new(10, 10);
+        source.set_cell_size(10, 20).unwrap();
+        let mut host = GhosttyVtEngine::new(12, 12);
+        host.set_cell_size(10, 20).unwrap();
+        let mut capture = CaptureImages::default();
+        let mut renderer = PacketTerminalRenderer::new(10, 10);
+        renderer.set_viewport((8, 8));
+        for value in [17, 29] {
+            let pixels = vec![value; 10 * 10 * 4];
+            source
+                .feed(
+                    format!("\x1b[H\x1b_Ga=T,C=1,i=7,p=1,f=32,s=10,v=10,c=10,r=10;{}\x1b\\", crate::kitty_output::base64(&pixels))
+                        .as_bytes(),
+                )
+                .unwrap();
+            let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
+            assert_eq!(update.image_resources.len(), 1);
+            let images = capture
+                .capture(&update.image_resources, |id, generation, callback| source.with_image_resource_data(id, generation, callback))
+                .unwrap();
+            renderer.images.set_assets(images);
+            let mut output = Vec::new();
+            renderer.apply_and_render(&mut output, &update).unwrap();
+            host.feed(&output).unwrap();
+            let replies = host.drain_replies();
+            let mut decoder = crate::attach_input::InputDecoder::new(0x1d);
+            for action in decoder.feed(&replies) {
+                if let crate::attach_input::Action::GraphicsReply(reply) = action {
+                    renderer.images.reply(&mut Vec::new(), &reply).unwrap();
+                } else {
+                    panic!("unexpected reply {action:?}");
+                }
+            }
+            output.clear();
+            renderer.repaint(&mut output).unwrap();
+            host.feed(&output).unwrap();
+            let displayed = host.render_update(crate::provider::DirtyState::Full).unwrap();
+            assert_eq!(displayed.image_placements.len(), 1);
+            let resource = &displayed.image_resources[0];
+            let mut actual = Vec::new();
+            assert!(host
+                .with_image_resource_data(resource.image_id, resource.generation, &mut |data| {
+                    actual.extend_from_slice(data);
+                    true
+                })
+                .unwrap());
+            assert_eq!(actual, pixels);
+            renderer.geometry.pan(2, 2);
+            output.clear();
+            renderer.repaint(&mut output).unwrap();
+            host.feed(&output).unwrap();
+            let displayed = host.render_update(crate::provider::DirtyState::Full).unwrap();
+            assert_eq!(displayed.image_placements[0].source_x, 2);
+            assert_eq!(displayed.image_placements[0].source_y, 2);
+        }
+        source.feed(b"\x1b_Ga=d,d=I,i=7;\x1b\\").unwrap();
+        let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
+        renderer.images.set_assets(vec![]);
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).unwrap();
+        host.feed(&output).unwrap();
+        assert!(host.render_update(crate::provider::DirtyState::Full).unwrap().image_placements.is_empty());
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_placeholder_cells_become_resolved_image_placements() {
+        use crate::{
+            image_delivery::CaptureImages,
+            vt::{ghostty::GhosttyVtEngine, VtEngine},
+        };
+        let mut source = GhosttyVtEngine::new(10, 10);
+        source.set_cell_size(10, 20).unwrap();
+        source.feed(b"\x1b_Ga=t,i=7,f=32,s=1,v=1;ESIz/w==\x1b\\\x1b_Ga=p,i=7,p=1,U=1,c=1,r=1;\x1b\\").unwrap();
+        source.feed("\x1b[38;2;0;0;7m\u{10eeee}\u{0305}\u{0305}\x1b[0m".as_bytes()).unwrap();
+        let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
+        assert_eq!(update.image_placements.len(), 1);
+        assert_ne!(update.image_placements[0].flags & crate::provider::TERMINAL_IMAGE_PLACEMENT_VIRTUAL, 0);
+        let images = CaptureImages::default()
+            .capture(&update.image_resources, |id, generation, copy| source.with_image_resource_data(id, generation, copy))
+            .unwrap();
+        let mut renderer = PacketTerminalRenderer::new(10, 10);
+        renderer.images.set_assets(images);
+        let mut host = GhosttyVtEngine::new(10, 10);
+        host.set_cell_size(10, 20).unwrap();
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).unwrap();
+        host.feed(&output).unwrap();
+        let mut decoder = crate::attach_input::InputDecoder::new(0x1d);
+        for reply in decoder.feed(&host.drain_replies()) {
+            if let crate::attach_input::Action::GraphicsReply(reply) = reply {
+                renderer.images.reply(&mut Vec::new(), &reply).unwrap();
+            }
+        }
+        output.clear();
+        renderer.repaint(&mut output).unwrap();
+        host.feed(&output).unwrap();
+        let actual = host.render_update(crate::provider::DirtyState::Full).unwrap();
+        assert_eq!(actual.image_placements.len(), 1);
+        assert!(host.screen_grid().unwrap().cells.iter().all(|cell| !cell.graphemes.contains(&0x10eeee)));
+    }
+
     #[test]
     fn packet_render_batches_repaint_with_cursor_hidden() {
         let mut renderer = PacketTerminalRenderer::new(2, 2);
@@ -4835,7 +5051,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
+            b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 
@@ -4849,7 +5065,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
+            b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 

@@ -28,9 +28,9 @@ use crate::{
     http_uds,
     packet::{
         ChannelRole, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, OpenChannel, PacketFrame, RenderPacket,
-        CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO,
-        MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE,
-        PROTOCOL_VERSION,
+        CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR,
+        MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE,
+        MSG_SESSION_ROLE, PROTOCOL_VERSION,
     },
     platform::ipc::{shutdown_stream, try_connect_session_stream, SessionStream},
     protocol::AttachmentIdentity,
@@ -125,7 +125,8 @@ pub(crate) struct ChannelSlot {
     /// Latest un-consumed render packet. The ack-gated protocol guarantees at
     /// most one arrives before we ack, and we ack on consumption.
     pub pending: Option<TerminalRenderUpdate>,
-    pub pending_images: Vec<crate::provider::TerminalImageBytes>,
+    images: crate::image_delivery::ImageReceiver,
+    pub pending_images: Vec<crate::image_delivery::Image>,
     pub pending_links: Vec<crate::provider::TerminalViewLink>,
     pub view_state: crate::provider::ViewState,
     pub role_state: Option<crate::packet::RoleState>,
@@ -267,6 +268,7 @@ impl DaemonConnection {
         let slot = Arc::new(Mutex::new(ChannelSlot {
             session_id: session_id.clone(),
             pending: None,
+            images: Default::default(),
             pending_images: Vec::new(),
             pending_links: Vec::new(),
             view_state: Default::default(),
@@ -462,6 +464,7 @@ impl DaemonConnection {
                     slot.granted_role = None;
                     slot.pending = None;
                     slot.pending_images.clear();
+                    slot.images = Default::default();
                     slot.pending_links.clear();
                     Some((
                         *channel,
@@ -494,6 +497,24 @@ impl DaemonConnection {
         }
     }
 
+    /// Close the failed asset channel on both peers, releasing pending transfers.
+    fn fail_image_channel(&self, channel: u32, message: String) {
+        let slot = recover_lock(&self.state).channels.get(&channel).cloned();
+        if let Some(slot) = slot {
+            let mut slot = recover_lock(&slot);
+            slot.closed = Some(message.clone());
+            slot.pending = None;
+            slot.pending_images.clear();
+            slot.pending_links.clear();
+            slot.images = Default::default();
+        }
+        let _ = self.send_frame_result(PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, &crate::packet::CloseChannel {
+            channel,
+            reason: Some(message),
+        }));
+        (self.wake)();
+    }
+
     fn dispatch_frame(&self, frame: PacketFrame) {
         match (frame.channel, frame.msg_type) {
             (CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT) => {
@@ -524,6 +545,41 @@ impl DaemonConnection {
                     }
                 }
             }
+            (channel, crate::packet::MSG_SESSION_IMAGE_FILE) if channel != CHANNEL_CONTROL => {
+                let result = (|| {
+                    let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| format!("invalid image file offer: {e}"))?;
+                    let slot = recover_lock(&self.state).channels.get(&channel).cloned().ok_or("image offer for unknown channel")?;
+                    let acquired = {
+                        let mut slot = recover_lock(&slot);
+                        if slot.closed.is_some() {
+                            return Err("image offer for closed channel".into());
+                        }
+                        slot.images.file(&file)
+                    };
+                    self.send_frame_result(PacketFrame::new(
+                        channel,
+                        crate::packet::MSG_SESSION_IMAGE_FILE_RESULT,
+                        &crate::packet::ImageFileResult { image_id: file.image_id, generation: file.generation, acquired },
+                    ))
+                })();
+                if let Err(error) = result {
+                    self.fail_image_channel(channel, error);
+                }
+            }
+            (channel, crate::packet::MSG_SESSION_IMAGE) if channel != CHANNEL_CONTROL => {
+                let result = (|| {
+                    let chunk = frame.decode().map_err(|e| format!("invalid image chunk: {e}"))?;
+                    let slot = recover_lock(&self.state).channels.get(&channel).cloned().ok_or("image chunk for unknown channel")?;
+                    let mut slot = recover_lock(&slot);
+                    if slot.closed.is_some() {
+                        return Err("image chunk for closed channel".into());
+                    }
+                    slot.images.chunk(chunk)
+                })();
+                if let Err(error) = result {
+                    self.fail_image_channel(channel, error);
+                }
+            }
             (channel, MSG_SESSION_RENDER) if channel != CHANNEL_CONTROL => {
                 if let Ok(packet) = frame.decode::<RenderPacket>() {
                     let slot = {
@@ -532,7 +588,17 @@ impl DaemonConnection {
                     };
                     if let Some(slot) = slot {
                         let mut slot = recover_lock(&slot);
-                        slot.pending_images = packet.images;
+                        if slot.closed.is_some() {
+                            return;
+                        }
+                        match slot.images.commit(&packet.update.image_resources) {
+                            Ok(images) => slot.pending_images = images,
+                            Err(error) => {
+                                drop(slot);
+                                self.fail_image_channel(channel, error);
+                                return;
+                            }
+                        }
                         slot.pending_links = packet.links;
                         slot.view_state = packet.view;
                         slot.pending = Some(packet.update);
@@ -823,6 +889,87 @@ mod tests {
     }
 
     #[test]
+    fn image_dispatch_replies_or_closes_only_the_affected_channel() {
+        use crate::packet::{
+            CloseChannel, ImageChunk, ImageFile, ImageFileResult, MSG_SESSION_IMAGE, MSG_SESSION_IMAGE_FILE, MSG_SESSION_IMAGE_FILE_RESULT,
+        };
+        for invalid_type in [MSG_SESSION_IMAGE_FILE, MSG_SESSION_IMAGE] {
+            let (_temp, layout) = test_layout();
+            let daemon = FakeDaemon::bind(&layout);
+            let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+            let mut server = daemon.accept(vec![directory_entry("alpha")]);
+            wait_until(|| connection.is_connected());
+            let (channel, slot) =
+                connection.open_session_channel("alpha".into(), 80, 24, ChannelRole::Watcher, AttachmentIdentity::default());
+            let _ = PacketFrame::read(&mut server).unwrap();
+            let _ = PacketFrame::read(&mut server).unwrap();
+            let (other, sibling) =
+                connection.open_session_channel("alpha".into(), 80, 24, ChannelRole::Watcher, AttachmentIdentity::default());
+            let _ = PacketFrame::read(&mut server).unwrap();
+            let _ = PacketFrame::read(&mut server).unwrap();
+            PacketFrame::new(channel, MSG_SESSION_IMAGE_FILE, &ImageFile {
+                image_id: 7,
+                generation: 1,
+                len: 3,
+                path: "/missing-cleat-image".into(),
+            })
+            .unwrap()
+            .write(&mut server)
+            .unwrap();
+            let response = PacketFrame::read(&mut server).unwrap();
+            assert_eq!(response.msg_type, MSG_SESSION_IMAGE_FILE_RESULT);
+            let response = response.decode::<ImageFileResult>().unwrap();
+            assert_eq!((response.image_id, response.generation, response.acquired), (7, 1, false));
+            PacketFrame::new(channel, MSG_SESSION_IMAGE, &ImageChunk {
+                image_id: 7,
+                generation: 1,
+                total_len: 3,
+                offset: 0,
+                bytes: vec![1, 2, 3],
+            })
+            .unwrap()
+            .write(&mut server)
+            .unwrap();
+            let mut update = render_update(1);
+            update.image_resources.push(crate::provider::TerminalImageResource {
+                image_id: 7,
+                generation: 1,
+                data_len: 3,
+                ..Default::default()
+            });
+            PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket::live(update)).unwrap().write(&mut server).unwrap();
+            wait_until(|| recover_lock(&slot).pending.is_some());
+            assert_eq!(recover_lock(&slot).pending_images[0].bytes(), &[1, 2, 3]);
+            PacketFrame { channel, msg_type: invalid_type, payload: Vec::new() }.write(&mut server).unwrap();
+            let close = PacketFrame::read(&mut server).unwrap();
+            assert_eq!((close.channel, close.msg_type), (CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL));
+            assert_eq!(close.decode::<CloseChannel>().unwrap().channel, channel);
+            {
+                let slot = recover_lock(&slot);
+                assert!(slot.closed.is_some());
+                assert!(slot.pending.is_none());
+                assert!(slot.pending_images.is_empty());
+            }
+            PacketFrame::new(other, MSG_SESSION_RENDER, &RenderPacket::live(render_update(2))).unwrap().write(&mut server).unwrap();
+            wait_until(|| recover_lock(&sibling).pending.is_some());
+            assert!(recover_lock(&sibling).closed.is_none());
+            connection.close_session_channel(channel);
+            let _ = PacketFrame::read(&mut server).unwrap();
+            PacketFrame::new(channel, MSG_SESSION_IMAGE_FILE, &ImageFile {
+                image_id: 7,
+                generation: 2,
+                len: 3,
+                path: "/missing-cleat-image".into(),
+            })
+            .unwrap()
+            .write(&mut server)
+            .unwrap();
+            assert_eq!(PacketFrame::read(&mut server).unwrap().msg_type, MSG_CONTROL_CLOSE_CHANNEL);
+            connection.shutdown();
+        }
+    }
+
+    #[test]
     fn reconnect_reopens_channels_and_rejects_offline_input() {
         let (_temp, layout) = test_layout();
         let daemon = FakeDaemon::bind(&layout);
@@ -843,7 +990,11 @@ mod tests {
             slot.desired_cols = 120;
             slot.desired_rows = 50;
             slot.pending = Some(render_update(99));
-            slot.pending_images.push(crate::provider::TerminalImageBytes { image_id: 1, generation: 1, bytes: vec![1] });
+            slot.pending_images.push(crate::image_backing::RetainedImage::from_owned(crate::provider::TerminalImageBytes {
+                image_id: 1,
+                generation: 1,
+                bytes: vec![1],
+            }));
             slot.pending_links.push(crate::provider::TerminalViewLink { col: 0, row: 0, uri: b"https://example.com".to_vec() });
         }
         assert!(connection.send_input(channel, TerminalInputEvent::RawBytes(b"discarded".to_vec())).is_err());

@@ -8,8 +8,8 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 7 adds shared presence, independent views and owned history resources.
-pub const PROTOCOL_VERSION: u16 = 7;
+/// Version 8 separates generation-keyed image chunks from render packets.
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -29,6 +29,34 @@ pub const MSG_SESSION_VIEWPORT: u8 = 20;
 pub const MSG_SESSION_ROLE: u8 = 21;
 pub const MSG_SESSION_VIEW_STATE: u8 = 22;
 pub const MSG_SESSION_SIZE_POLICY: u8 = 23;
+pub const MSG_SESSION_IMAGE: u8 = 24;
+pub const MSG_SESSION_IMAGE_FILE: u8 = 25;
+pub const MSG_SESSION_IMAGE_FILE_RESULT: u8 = 26;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageFile {
+    pub image_id: u32,
+    pub generation: u64,
+    pub len: u64,
+    pub path: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageFileResult {
+    pub image_id: u32,
+    pub generation: u64,
+    pub acquired: bool,
+}
+
+/// Ordered chunks for an immutable image, scoped to this session channel.
+/// All chunks precede the render update that references the completed asset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageChunk {
+    pub image_id: u32,
+    pub generation: u64,
+    pub total_len: u64,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
 
 const HEADER_LEN: usize = 9;
 pub const MAX_PACKET_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
@@ -201,14 +229,13 @@ pub struct ControlError {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RenderPacket {
     pub update: TerminalRenderUpdate,
-    pub images: Vec<crate::provider::TerminalImageBytes>,
     pub links: Vec<crate::provider::TerminalViewLink>,
     pub view: crate::provider::ViewState,
 }
 
 impl RenderPacket {
     pub fn live(update: TerminalRenderUpdate) -> Self {
-        Self { update, images: Vec::new(), links: Vec::new(), view: Default::default() }
+        Self { update, links: Vec::new(), view: Default::default() }
     }
 }
 
@@ -427,8 +454,9 @@ mod tests {
     }
 
     #[test]
-    fn shared_presence_requires_protocol_version_seven() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn retained_image_delivery_requires_protocol_version_eight() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        assert!(!ControlHello::current().accepts(7));
     }
 
     #[test]

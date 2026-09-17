@@ -58,6 +58,10 @@ impl GhosttyVtEngine {
     pub fn new_with_colors(cols: u16, rows: u16, colors: TerminalColors) -> Self {
         let terminal = TerminalHandle::new(cols, rows, DEFAULT_MAX_SCROLLBACK).expect("create ghostty terminal");
         let mut terminal = terminal;
+        // Match Ghostty's Unicode width policy rather than libvt's bare legacy
+        // default. VS16 and joined emoji must receive their full cell width;
+        // configuring the reset default also preserves this policy after RIS.
+        terminal.set_grapheme_cluster_default(true).expect("configure ghostty grapheme widths");
         apply_colors(&mut terminal, colors).expect("configure ghostty terminal colors");
         terminal.set_kitty_image_storage_limit(DEFAULT_KITTY_IMAGE_STORAGE_LIMIT).expect("configure ghostty kitty image storage");
         // In-process backend: the VT runs co-located with the program, so file /

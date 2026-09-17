@@ -1,6 +1,7 @@
 pub mod asciicast;
 mod attach_input;
 mod attachment_control;
+mod attachment_view;
 pub mod cast_reader;
 pub mod cli;
 pub mod da;

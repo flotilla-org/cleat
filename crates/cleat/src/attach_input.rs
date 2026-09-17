@@ -5,6 +5,8 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
+    Pan(i16, i16),
+    RevealCursor,
     Detach,
     AutoSize,
     Watch,
@@ -29,12 +31,14 @@ pub(crate) enum Action {
 pub(crate) struct InputDecoder {
     prefix: u8,
     armed: bool,
+    panning: bool,
     escape: Vec<u8>,
     paste: Option<Vec<u8>>,
     paste_tail: Vec<u8>,
     overflow: bool,
     driving: bool,
     paste_authorized: bool,
+    paste_started_in_pan: bool,
 }
 
 impl InputDecoder {
@@ -42,13 +46,19 @@ impl InputDecoder {
         Self {
             prefix,
             armed: false,
+            panning: false,
             escape: Vec::new(),
             paste: None,
             paste_tail: Vec::new(),
             overflow: false,
             driving: true,
             paste_authorized: true,
+            paste_started_in_pan: false,
         }
+    }
+
+    pub fn is_panning(&self) -> bool {
+        self.panning
     }
 
     pub fn set_driving(&mut self, driving: bool) {
@@ -75,7 +85,9 @@ impl InputDecoder {
                 }
                 if self.paste_tail == PASTE_END {
                     let mut paste = self.paste.take().expect("collecting paste");
-                    if !self.paste_authorized {
+                    if self.paste_started_in_pan {
+                        actions.push(Action::Hint("Paste discarded; attachment was in pan mode"));
+                    } else if !self.paste_authorized {
                         actions.push(Action::Hint("Paste discarded; attachment was not driving"));
                     } else if self.overflow {
                         actions.push(Action::Hint("Paste exceeds 1 MiB; discarded"));
@@ -92,20 +104,41 @@ impl InputDecoder {
             }
             if !self.escape.is_empty() {
                 self.escape.push(byte);
-                let complete =
-                    if self.escape.get(1) == Some(&b'[') { self.escape.len() >= 3 && (0x40..=0x7e).contains(&byte) } else { true };
+                let complete = if self.escape.get(1) == Some(&b'[') {
+                    self.escape.len() >= 3 && (0x40..=0x7e).contains(&byte)
+                } else if self.escape.get(1) == Some(&b'O') {
+                    self.escape.len() >= 3
+                } else {
+                    true
+                };
                 if complete || self.escape.len() >= 128 {
                     let sequence = std::mem::take(&mut self.escape);
                     if sequence == b"\x1b[200~" {
                         self.paste = Some(Vec::new());
                         self.paste_authorized = self.driving;
+                        self.paste_started_in_pan = self.panning;
                         self.overflow = false;
                         self.armed = false;
                     } else if sequence == b"\x1b[I" {
                         actions.push(Action::Focus(true));
                     } else if sequence == b"\x1b[O" {
                         actions.push(Action::Focus(false));
-                    } else if self.armed {
+                    } else if (self.armed || self.panning)
+                        && matches!(
+                            sequence.as_slice(),
+                            b"\x1b[A" | b"\x1b[B" | b"\x1b[C" | b"\x1b[D" | b"\x1bOA" | b"\x1bOB" | b"\x1bOC" | b"\x1bOD"
+                        )
+                    {
+                        self.armed = false;
+                        self.panning = true;
+                        let (x, y) = match sequence[2] {
+                            b'A' => (0, -1),
+                            b'B' => (0, 1),
+                            b'C' => (1, 0),
+                            _ => (-1, 0),
+                        };
+                        actions.push(Action::Command(Command::Pan(x, y)));
+                    } else if self.armed || self.panning {
                         self.armed = false;
                         actions.push(Action::Hint("Unknown cleat command"));
                     } else if let Some(mouse) = decode_mouse(&sequence) {
@@ -123,6 +156,7 @@ impl InputDecoder {
             if self.armed {
                 self.armed = false;
                 let command = match byte {
+                    b'r' => Some(Command::RevealCursor),
                     b'd' => Some(Command::Detach),
                     b'a' => Some(Command::AutoSize),
                     b'w' => Some(Command::Watch),
@@ -145,8 +179,11 @@ impl InputDecoder {
             } else if byte == self.prefix {
                 self.armed = true;
                 actions.push(Action::Hint(
-                    "cleat: d detach | g drive | w watch | x exclusive | c chrome | a auto size | [ history | ] live | k/j scroll | Esc cancel",
+                    "cleat: d detach | g drive | w watch | x exclusive | c chrome | a auto size | [ history | ] live | k/j scroll | arrows pan | r reveal cursor | Esc cancel",
                 ));
+            } else if self.panning {
+                // Pan mode consumes application keystrokes until Escape,
+                // while prefixed attachment commands remain available.
             } else {
                 push_raw(&mut actions, &[byte]);
             }
@@ -159,8 +196,9 @@ impl InputDecoder {
     pub fn idle(&mut self) -> Vec<Action> {
         if self.escape == [0x1b] {
             self.escape.clear();
-            if self.armed {
+            if self.armed || self.panning {
                 self.armed = false;
+                self.panning = false;
                 vec![Action::Hint("")]
             } else {
                 vec![Action::Raw(vec![0x1b])]
@@ -254,6 +292,57 @@ fn push_raw(actions: &mut Vec<Action>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefixed_commands_remain_available_while_panning() {
+        for (key, command) in [(b'c', Command::Chrome), (b'd', Command::Detach), (b'g', Command::Drive), (b'r', Command::RevealCursor)] {
+            let mut decoder = InputDecoder::new(0x1d);
+            decoder.feed(b"\x1d\x1b[C");
+            assert!(decoder.is_panning());
+            assert!(matches!(decoder.feed(b"\x1d").as_slice(), [Action::Hint(_)]));
+            assert_eq!(decoder.feed(&[key]), vec![Action::Command(command)]);
+            assert!(decoder.is_panning());
+            assert_eq!(decoder.feed(b"\x1b[B"), vec![Action::Command(Command::Pan(0, 1))]);
+            assert!(decoder.feed(b"typing").is_empty());
+        }
+    }
+
+    #[test]
+    fn paste_during_pan_reports_pan_mode_and_never_replays_bytes() {
+        let bytes = b"\x1b[200~discard\x1dc\x1b[201~";
+        for split in 0..=bytes.len() {
+            let mut decoder = InputDecoder::new(0x1d);
+            decoder.feed(b"\x1d\x1b[C");
+            let mut actions = decoder.feed(&bytes[..split]);
+            actions.extend(decoder.feed(&bytes[split..]));
+            assert_eq!(actions, vec![Action::Hint("Paste discarded; attachment was in pan mode")], "split {split}");
+            assert!(decoder.is_panning());
+            decoder.feed(b"\x1b");
+            decoder.idle();
+            assert_eq!(decoder.feed(b"\x1b[200~accepted\x1b[201~"), vec![Action::Paste("accepted".into())]);
+        }
+    }
+
+    #[test]
+    fn pan_mode_handles_fragmented_normal_and_application_arrows() {
+        for arrow in [b"\x1b[C".as_slice(), b"\x1bOC".as_slice()] {
+            for split in 0..=arrow.len() {
+                let mut decoder = InputDecoder::new(0x1d);
+                decoder.set_driving(false);
+                decoder.feed(b"\x1d");
+                let mut actions = decoder.feed(&arrow[..split]);
+                actions.extend(decoder.feed(&arrow[split..]));
+                assert_eq!(actions, vec![Action::Command(Command::Pan(1, 0))]);
+                assert_eq!(decoder.feed(b"\x1b[B"), vec![Action::Command(Command::Pan(0, 1))]);
+                assert!(decoder.feed(b"typed").is_empty());
+                decoder.feed(b"\x1b");
+                assert_eq!(decoder.idle(), vec![Action::Hint("")]);
+                assert_eq!(decoder.feed(b"z"), vec![Action::Raw(vec![b'z'])]);
+                decoder.feed(b"\x1d");
+                assert_eq!(decoder.feed(b"r"), vec![Action::Command(Command::RevealCursor)]);
+            }
+        }
+    }
+
     #[test]
     fn commands_and_escape_survive_read_boundaries() {
         let mut decoder = InputDecoder::new(0x1d);

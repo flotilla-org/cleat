@@ -204,6 +204,8 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
 }
 
 struct AttachChrome {
+    renderer: PacketTerminalRenderer,
+    panning: bool,
     visible: bool,
     hidden: bool,
     role: RoleState,
@@ -212,14 +214,58 @@ struct AttachChrome {
 }
 
 impl AttachChrome {
+    fn paint(&mut self, writer: &mut impl Write, update: Option<&TerminalRenderUpdate>) -> Result<(), String> {
+        self.paint_at_size(writer, update, current_terminal_size())
+    }
+
+    fn paint_at_size(&mut self, writer: &mut impl Write, update: Option<&TerminalRenderUpdate>, size: (u16, u16)) -> Result<(), String> {
+        let grid = update.map(|u| (u.cols, u.rows)).unwrap_or((self.renderer.cols, self.renderer.rows));
+        if !self.hidden && (grid.0 > size.0 || grid.1 > size.1) {
+            self.visible = true;
+        }
+        self.renderer.set_viewport(self.content_size_for(size));
+        if self.renderer.bounds == self.hidden {
+            self.renderer.bounds = !self.hidden;
+            self.renderer.needs_full_repaint = true;
+        }
+        if let Some(update) = update {
+            self.renderer.apply_and_render(writer, update)?;
+        } else {
+            self.renderer.repaint(writer)?;
+        }
+        self.render_at_size(writer, size)
+    }
+
     fn content_size(&self) -> (u16, u16) {
-        let (cols, rows) = current_terminal_size();
+        self.content_size_for(current_terminal_size())
+    }
+
+    fn content_size_for(&self, (cols, rows): (u16, u16)) -> (u16, u16) {
         (cols.max(1), rows.saturating_sub(u16::from(self.visible)).max(1))
     }
 
-    fn render(&self, writer: &mut impl Write) -> Result<(), String> {
-        let (cols, rows) = current_terminal_size();
-        let message = if let Some((hint, _)) = &self.hint {
+    fn translate_mouse(
+        &self,
+        mut mouse: crate::provider::TerminalMouseEvent,
+        terminal_rows: u16,
+    ) -> Option<crate::provider::TerminalMouseEvent> {
+        let strip_row = self.visible || (self.hint.is_some() && !self.hidden);
+        if strip_row && mouse.cell_row == terminal_rows.saturating_sub(1) {
+            return None;
+        }
+        let (col, row) = self.renderer.geometry.to_grid(mouse.cell_col, mouse.cell_row)?;
+        mouse.cell_col = col;
+        mouse.cell_row = row;
+        // CLI SGR reports use cell centres, with a one-pixel source cell size.
+        mouse.x_px = f32::from(col) + 0.5;
+        mouse.y_px = f32::from(row) + 0.5;
+        Some(mouse)
+    }
+
+    fn render_at_size(&self, writer: &mut impl Write, (cols, rows): (u16, u16)) -> Result<(), String> {
+        let message = if self.hidden {
+            String::new()
+        } else if let Some((hint, _)) = &self.hint {
             hint.clone()
         } else if self.visible {
             let drivers = self.role.participants.iter().filter(|p| p.role == ChannelRole::Controller).count();
@@ -233,7 +279,11 @@ impl AttachChrome {
                 crate::provider::ViewStatus::Unavailable => "unavailable",
             };
             let size = self.role.fixed_size.as_ref().map(|size| format!(" | fixed {}x{}", size.cols, size.rows)).unwrap_or_default();
-            format!("cleat {role} | {drivers} drivers, {watchers} watchers | {view}{exclusive}{size}")
+            format!(
+                "{}{}cleat {role} | {drivers} drivers, {watchers} watchers | {view}{exclusive}{size}",
+                self.renderer.geometry.description(),
+                if self.panning { "pan (Esc exits) | " } else { "" }
+            )
         } else {
             String::new()
         };
@@ -254,7 +304,7 @@ impl AttachChrome {
         } else {
             writer.write_all(b"\x1b[r").map_err(|e| e.to_string())?;
         }
-        if self.visible || self.hint.is_some() {
+        if self.visible || (self.hint.is_some() && !self.hidden) {
             write!(writer, "\x1b[{rows};1H\x1b[2K\x1b[7m {clipped}\x1b[0m").map_err(|e| e.to_string())?;
         }
         writer.write_all(b"\x1b8").map_err(|e| e.to_string())?;
@@ -271,6 +321,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let alive = Arc::new(AtomicBool::new(true));
     let controller = Arc::new(AtomicBool::new(packet.initial_role.role == ChannelRole::Controller));
     let chrome = Arc::new(Mutex::new(AttachChrome {
+        renderer: PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows),
+        panning: false,
         visible: packet.initial_role.participants.len() > 1,
         hidden: false,
         role: packet.initial_role,
@@ -285,13 +337,10 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let initial_update = packet.initial_update;
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut read_stream = read_handle;
-        let mut renderer = PacketTerminalRenderer::new(initial_update.cols, initial_update.rows);
         {
             let mut stdout = std::io::stdout().lock();
-            renderer.set_viewport(chrome_out.lock().map_err(|_| "chrome poisoned")?.content_size());
-            renderer.apply_and_render(&mut stdout, &initial_update)?;
+            chrome_out.lock().map_err(|_| "chrome poisoned")?.paint(&mut stdout, Some(&initial_update))?;
             stdout.write_all(b"\x1b[?2004h\x1b[?1004h").map_err(|e| e.to_string())?;
-            chrome_out.lock().map_err(|_| "chrome poisoned")?.render(&mut stdout)?;
             stdout.flush().map_err(|e| e.to_string())?;
         }
         write_packet_frame(
@@ -313,14 +362,12 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     if packet.view.status == crate::provider::ViewStatus::History {
                         packet.update.terminal_modes.mouse_tracking_mode = vt::MouseTrackingMode::None;
                     }
-                    renderer.set_viewport(chrome_out.lock().map_err(|_| "chrome poisoned")?.content_size());
-                    renderer.apply_and_render(&mut stdout, &packet.update)?;
                     let mut chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
                     if let Some(notice) = &packet.view.notice {
                         chrome.hint = Some((notice.clone(), Instant::now() + Duration::from_secs(3)));
                     }
                     chrome.view = packet.view;
-                    chrome.render(&mut stdout)?;
+                    chrome.paint(&mut stdout, Some(&packet.update))?;
                     write_packet_frame(
                         &write_stream,
                         PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: packet.update.render_generation }),
@@ -334,7 +381,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                         chrome.visible = true;
                     }
                     chrome.role = state;
-                    chrome.render(&mut stdout)?;
+                    chrome.paint(&mut stdout, None)?;
                 }
                 (id, crate::packet::MSG_SESSION_VIEW_STATE) if id == channel => {
                     let view = frame.decode::<crate::provider::ViewState>().map_err(|e| e.to_string())?;
@@ -343,7 +390,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                         chrome.hint = Some((notice.clone(), Instant::now() + Duration::from_secs(3)));
                     }
                     chrome.view = view;
-                    chrome.render(&mut stdout)?;
+                    chrome.paint(&mut stdout, None)?;
                 }
                 (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
                     let error = frame.decode::<ControlError>().map_err(|e| e.to_string())?;
@@ -365,6 +412,11 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
         while alive_resize.load(Ordering::SeqCst) {
             let next = chrome_resize.lock().map_err(|_| "chrome poisoned")?.content_size();
             if last != Some(next) {
+                {
+                    let mut stdout = std::io::stdout().lock();
+                    chrome_resize.lock().map_err(|_| "chrome poisoned")?.paint(&mut stdout, None)?;
+                    stdout.flush().map_err(|e| e.to_string())?;
+                }
                 write_packet_frame(&resize_stream, PacketFrame::new(channel, MSG_SESSION_RESIZE, &Resize { cols: next.0, rows: next.1 }))?;
                 write_packet_frame(
                     &resize_stream,
@@ -427,10 +479,27 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 Action::Paste(text) => event = Some(TerminalInputEvent::Paste(crate::provider::TerminalPasteEvent { text })),
                 Action::Focus(focused) => event = Some(TerminalInputEvent::Focus(crate::provider::TerminalFocusEvent { focused })),
                 Action::Mouse(mouse) => {
-                    let (_, rows) = chrome.lock().map_err(|_| "chrome poisoned")?.content_size();
-                    if mouse.cell_row < rows || mouse.kind == TerminalMouseEventKind::Release {
-                        event = Some(TerminalInputEvent::Mouse(mouse));
+                    let chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
+                    event = chrome.translate_mouse(mouse, current_terminal_size().1).map(TerminalInputEvent::Mouse);
+                }
+                Action::Command(action @ (Command::Pan(_, _) | Command::RevealCursor)) => {
+                    let mut stdout = std::io::stdout().lock();
+                    let mut chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
+                    let size = chrome.content_size();
+                    chrome.renderer.set_viewport(size);
+                    chrome.panning = decoder.is_panning();
+                    if let Command::Pan(x, y) = action {
+                        chrome.renderer.geometry.pan(x, y);
+                    } else if chrome.view.status == crate::provider::ViewStatus::Live {
+                        let cursor = chrome.renderer.last_update.as_ref().map(|u| (u.cursor.col, u.cursor.row));
+                        if let Some((col, row)) = cursor {
+                            chrome.renderer.geometry.reveal(col, row);
+                        }
                     }
+                    chrome.renderer.needs_full_repaint = true;
+                    chrome.hint = None;
+                    chrome.paint(&mut stdout, None)?;
+                    stdout.flush().map_err(|e| e.to_string())?;
                 }
                 Action::Hint(text) => hint = Some(text.to_string()),
                 Action::Command(Command::Detach) => break 'input Ok(()),
@@ -491,13 +560,14 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             if let Some(hint) = hint {
                 let mut stdout = std::io::stdout().lock();
                 let mut chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
+                chrome.panning = decoder.is_panning();
                 let restore = hint.is_empty() && chrome.hint.is_some() && !chrome.visible;
                 chrome.hint = if hint.is_empty() {
                     None
                 } else {
                     Some((hint.clone(), Instant::now() + Duration::from_secs(if hint.starts_with("cleat:") { 3600 } else { 3 })))
                 };
-                chrome.render(&mut stdout)?;
+                chrome.paint(&mut stdout, None)?;
                 stdout.flush().map_err(|e| e.to_string())?;
                 drop(chrome);
                 drop(stdout);
@@ -536,6 +606,9 @@ fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result
 
 #[derive(Debug)]
 struct PacketTerminalRenderer {
+    geometry: crate::attachment_view::AttachmentView,
+    bounds: bool,
+    last_update: Option<TerminalRenderUpdate>,
     cols: u16,
     rows: u16,
     cells: Vec<Vec<crate::provider::TerminalRenderCell>>,
@@ -547,6 +620,9 @@ struct PacketTerminalRenderer {
 impl PacketTerminalRenderer {
     fn new(cols: u16, rows: u16) -> Self {
         Self {
+            geometry: crate::attachment_view::AttachmentView::new((cols, rows), (cols, rows)),
+            bounds: false,
+            last_update: None,
             cols,
             rows,
             cells: vec![vec![crate::provider::TerminalRenderCell::default(); cols as usize]; rows as usize],
@@ -556,7 +632,16 @@ impl PacketTerminalRenderer {
         }
     }
 
+    fn repaint(&mut self, writer: &mut impl Write) -> Result<(), String> {
+        if let Some(update) = self.last_update.clone() {
+            self.needs_full_repaint = true;
+            self.apply_and_render(writer, &update)?;
+        }
+        Ok(())
+    }
+
     fn set_viewport(&mut self, size: (u16, u16)) {
+        self.geometry.resize((self.cols, self.rows), size);
         if self.viewport != Some(size) {
             self.viewport = Some(size);
             self.needs_full_repaint = true;
@@ -569,16 +654,25 @@ impl PacketTerminalRenderer {
         // source application did with synchronized output: terminals that
         // implement mode 2026 present the repaint atomically, while hiding the
         // cursor also prevents visible thrash on terminals that ignore it.
-        writer.write_all(b"\x1b[?2026h\x1b[?25l").map_err(|err| format!("begin synchronized packet render: {err}"))?;
+        writer.write_all(b"\x1b[?2026h\x1b[?25l\x1b[?7l").map_err(|err| format!("begin synchronized packet render: {err}"))?;
         // Always attempt to close the synchronized batch: an early return that
         // leaves mode 2026 set can freeze the attached terminal until
         // something else resets it.
         let rendered = self.render_frame(writer, update);
-        let finished = writer.write_all(b"\x1b[?2026l").map_err(|err| format!("finish synchronized packet render: {err}"));
+        let finished = writer.write_all(b"\x1b[?7h\x1b[?2026l").map_err(|err| format!("finish synchronized packet render: {err}"));
         rendered.and(finished)
     }
 
     fn render_frame(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
+        // Retain only the frame metadata needed to repaint the cached cells.
+        self.last_update = Some(TerminalRenderUpdate {
+            cols: update.cols,
+            rows: update.rows,
+            cursor: update.cursor,
+            terminal_modes: update.terminal_modes,
+            ..Default::default()
+        });
+        self.geometry.resize((update.cols, update.rows), self.viewport.unwrap_or((update.cols, update.rows)));
         let resized = self.cols != update.cols || self.rows != update.rows;
         let modes_changed = self.terminal_modes != update.terminal_modes;
         if resized {
@@ -590,7 +684,7 @@ impl PacketTerminalRenderer {
         self.terminal_modes = update.terminal_modes;
         let mut dirty_rows = std::collections::BTreeSet::new();
         if self.needs_full_repaint || resized || modes_changed {
-            dirty_rows.extend(0..self.viewport.map_or(self.rows, |size| size.1));
+            dirty_rows.extend(self.geometry.y..self.geometry.y.saturating_add(self.viewport.map_or(self.rows, |size| size.1)));
         }
         for op in &update.ops {
             match op.kind {
@@ -618,22 +712,52 @@ impl PacketTerminalRenderer {
         }
         self.needs_full_repaint = false;
         let (visible_cols, visible_rows) = self.viewport.unwrap_or((self.cols, self.rows));
-        for row_index in dirty_rows.into_iter().filter(|row| *row < visible_rows) {
+        for grid_row in dirty_rows.into_iter().filter(|row| *row >= self.geometry.y && *row - self.geometry.y < visible_rows) {
+            let row_index = grid_row - self.geometry.y;
             write!(writer, "\x1b[{};1H\x1b[2K", row_index + 1).map_err(|err| format!("position packet row: {err}"))?;
-            let Some(row) = self.cells.get(row_index as usize) else { continue };
-            for (col, cell) in row.iter().take(visible_cols as usize).enumerate() {
+            let Some(row) = self.cells.get(grid_row as usize) else { continue };
+            for (col, cell) in row.iter().skip(self.geometry.x as usize).take(visible_cols as usize).enumerate() {
                 if cell.style.width == crate::provider::TerminalCellWidth::Wide && col + 1 >= visible_cols as usize {
                     break;
                 }
-                render_packet_cell(writer, cell)?;
+                if cell.style.width == crate::provider::TerminalCellWidth::SpacerTail && col > 0 {
+                    continue;
+                }
+                // The host can assign a different width to a grapheme (for
+                // example VS16 emoji with mode 2027). Grid coordinates, not
+                // the host's advancing cursor, determine the next cell.
+                write!(writer, "\x1b[{};{}H", row_index + 1, col + 1).map_err(|err| format!("position packet cell: {err}"))?;
+                if col == 0
+                    && self.geometry.x > 0
+                    && row.get(self.geometry.x as usize - 1).is_some_and(|c| c.style.width == crate::provider::TerminalCellWidth::Wide)
+                {
+                    writer.write_all(b" ").map_err(|e| e.to_string())?;
+                } else {
+                    render_packet_cell(writer, cell)?;
+                }
             }
         }
         writer.write_all(b"\x1b[0m").map_err(|err| format!("reset packet render style: {err}"))?;
+        if self.bounds {
+            let right = self.cols.saturating_sub(self.geometry.x);
+            let bottom = self.rows.saturating_sub(self.geometry.y);
+            if right < visible_cols {
+                for row in 0..bottom.min(visible_rows) {
+                    write!(writer, "\x1b[{};{}H│", row + 1, right + 1).map_err(|e| e.to_string())?;
+                }
+            }
+            if bottom < visible_rows {
+                write!(writer, "\x1b[{};1H{}", bottom + 1, "─".repeat(right.min(visible_cols) as usize)).map_err(|e| e.to_string())?;
+                if right < visible_cols {
+                    write!(writer, "┘").map_err(|e| e.to_string())?;
+                }
+            }
+        }
         write!(
             writer,
             "\x1b[{};{}H",
-            update.cursor.row.min(visible_rows.saturating_sub(1)).saturating_add(1),
-            update.cursor.col.min(visible_cols.saturating_sub(1)).saturating_add(1)
+            update.cursor.row.saturating_sub(self.geometry.y).min(visible_rows.saturating_sub(1)).saturating_add(1),
+            update.cursor.col.saturating_sub(self.geometry.x).min(visible_cols.saturating_sub(1)).saturating_add(1)
         )
         .map_err(|err| format!("position packet cursor: {err}"))?;
         let cursor_style = match update.cursor.style {
@@ -644,7 +768,7 @@ impl PacketTerminalRenderer {
         };
         write!(writer, "\x1b[{cursor_style} q").map_err(|err| format!("set packet cursor style: {err}"))?;
         writer
-            .write_all(if update.cursor.visible && update.cursor.col < visible_cols && update.cursor.row < visible_rows {
+            .write_all(if update.cursor.visible && self.geometry.contains(update.cursor.col, update.cursor.row) {
                 b"\x1b[?25h"
             } else {
                 b"\x1b[?25l"
@@ -4303,7 +4427,10 @@ mod tests {
         renderer.apply_and_render(&mut output, &update).expect("render packet update");
 
         assert!(output.starts_with(b"\x1b[?2026h\x1b[?25l"), "repaint must start atomically with the cursor hidden: {output:?}");
-        assert!(output.ends_with(b"\x1b[?25h\x1b[?2026l"), "cursor restoration must remain inside the synchronized batch: {output:?}");
+        assert!(
+            output.ends_with(b"\x1b[?25h\x1b[?7h\x1b[?2026l"),
+            "cursor restoration must remain inside the synchronized batch: {output:?}"
+        );
         let cursor_restore = output.windows(b"\x1b[?25h".len()).position(|bytes| bytes == b"\x1b[?25h").expect("cursor restore");
         let last_row_repaint = output.windows(b"\x1b[2;1H".len()).position(|bytes| bytes == b"\x1b[2;1H").expect("last row repaint");
         assert!(cursor_restore > last_row_repaint, "cursor must stay hidden throughout synthesized row movement");
@@ -4346,6 +4473,239 @@ mod tests {
         assert!(!output.contains('Z'));
         assert!(!output.contains("\x1b[2;1H"));
         assert!(!output.contains("\x1b[?25h"));
+    }
+
+    #[test]
+    fn attachment_chrome_clamps_pan_and_maps_mouse_after_visibility_and_role_changes() {
+        use crate::{
+            packet::{ChannelRole, RoleState},
+            provider::{TerminalModifiers, TerminalMouseButtons, TerminalMouseEvent, TerminalMouseEventKind},
+        };
+        let mut chrome = super::AttachChrome {
+            renderer: PacketTerminalRenderer::new(120, 40),
+            panning: false,
+            visible: false,
+            hidden: false,
+            role: RoleState {
+                role: ChannelRole::Controller,
+                controller: None,
+                denial_reason: None,
+                participants: vec![],
+                exclusive: None,
+                fixed_size: Some(crate::packet::Resize { cols: 120, rows: 40 }),
+            },
+            view: Default::default(),
+            hint: None,
+        };
+        let update = TerminalRenderUpdate { cols: 120, rows: 40, ..Default::default() };
+        chrome.paint_at_size(&mut Vec::new(), Some(&update), (80, 24)).unwrap();
+        assert!(chrome.visible, "a clipped solo fixed-size driver needs indicators");
+        chrome.renderer.geometry.pan(100, 100);
+        assert_eq!((chrome.renderer.geometry.x, chrome.renderer.geometry.y), (40, 17));
+        let mouse = |kind, col, row| TerminalMouseEvent {
+            kind,
+            cell_col: col,
+            cell_row: row,
+            x_px: 0.5,
+            y_px: 0.5,
+            button: None,
+            buttons: TerminalMouseButtons::empty(),
+            modifiers: TerminalModifiers::empty(),
+            wheel_delta_x: 0.0,
+            wheel_delta_y: 0.0,
+        };
+        for kind in
+            [TerminalMouseEventKind::Press, TerminalMouseEventKind::Release, TerminalMouseEventKind::Move, TerminalMouseEventKind::Wheel]
+        {
+            assert!(chrome.translate_mouse(mouse(kind, 1, 23), 24).is_none());
+            let mapped = chrome.translate_mouse(mouse(kind, 1, 2), 24).unwrap();
+            assert_eq!((mapped.cell_col, mapped.cell_row), (41, 19));
+            assert_eq!((mapped.x_px, mapped.y_px), (41.5, 19.5));
+        }
+        chrome.visible = false;
+        chrome.hidden = true;
+        chrome.hint = Some(("hidden hint".into(), Instant::now()));
+        let mut output = Vec::new();
+        chrome.paint_at_size(&mut output, None, (80, 24)).unwrap();
+        assert!(!String::from_utf8(output).unwrap().contains("hidden hint"));
+        assert_eq!((chrome.renderer.geometry.x, chrome.renderer.geometry.y), (40, 16));
+        assert_eq!(chrome.translate_mouse(mouse(TerminalMouseEventKind::Press, 79, 23), 24).unwrap().cell_row, 39);
+        chrome.role.role = ChannelRole::Watcher;
+        chrome.paint_at_size(&mut Vec::new(), None, (130, 50)).unwrap();
+        assert_eq!((chrome.renderer.geometry.x, chrome.renderer.geometry.y), (0, 0));
+        assert!(chrome.translate_mouse(mouse(TerminalMouseEventKind::Press, 120, 0), 50).is_none());
+        assert!(chrome.translate_mouse(mouse(TerminalMouseEventKind::Release, 0, 40), 50).is_none());
+    }
+
+    #[test]
+    fn packet_render_pan_uses_cached_rows_and_translates_dirty_rows_and_cursor() {
+        use crate::provider::{TerminalRenderCell, TerminalViewportKind};
+        // The same crop applies to live, alternate-screen and retained history rows.
+        for kind in [TerminalViewportKind::LiveNormal, TerminalViewportKind::LiveAlternate, TerminalViewportKind::NormalScrollback] {
+            let mut renderer = PacketTerminalRenderer::new(4, 3);
+            renderer.set_viewport((2, 1));
+            let update = TerminalRenderUpdate {
+                cols: 4,
+                rows: 3,
+                viewport_kind: kind,
+                cursor: TerminalCursor { col: 3, row: 2, visible: true, ..Default::default() },
+                ops: vec![TerminalRenderUpdateOp {
+                    kind: TerminalRenderUpdateOpKind::FullVisibleReplace,
+                    rows: vec![TerminalRenderRow {
+                        row: 2,
+                        cells: "ABCD".chars().map(|c| TerminalRenderCell { graphemes: vec![c as u32], ..Default::default() }).collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            renderer.apply_and_render(&mut Vec::new(), &update).unwrap();
+            renderer.geometry.pan(2, 2);
+            let mut output = Vec::new();
+            renderer.repaint(&mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("mC") && output.contains("mD"), "{output:?}");
+            assert!(output.contains("\x1b[1;2H"));
+            assert!(output.contains("\x1b[?25h"));
+            assert_eq!((renderer.geometry.x, renderer.geometry.y), (2, 2));
+
+            let mut changed = update.clone();
+            changed.ops[0].kind = TerminalRenderUpdateOpKind::RowReplace;
+            changed.ops[0].rows[0].cells[2].graphemes = vec!['Z' as u32];
+            let mut output = Vec::new();
+            renderer.apply_and_render(&mut output, &changed).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("\x1b[1;1H\x1b[2K"));
+            assert!(output.contains("mZ"));
+            assert!(!output.contains("\x1b[3;1H"));
+            assert_eq!((renderer.geometry.x, renderer.geometry.y), (2, 2));
+        }
+    }
+
+    #[test]
+    fn packet_render_blanks_wide_characters_cut_at_either_edge() {
+        use crate::provider::{TerminalCellWidth, TerminalRenderCell};
+        let mut wide = TerminalRenderCell { graphemes: vec!['界' as u32], ..Default::default() };
+        wide.style.width = TerminalCellWidth::Wide;
+        let mut tail = TerminalRenderCell::default();
+        tail.style.width = TerminalCellWidth::SpacerTail;
+        let mut renderer = PacketTerminalRenderer::new(5, 1);
+        renderer.set_viewport((3, 1));
+        let update = TerminalRenderUpdate {
+            cols: 5,
+            rows: 1,
+            ops: vec![TerminalRenderUpdateOp {
+                kind: TerminalRenderUpdateOpKind::FullVisibleReplace,
+                rows: vec![TerminalRenderRow {
+                    row: 0,
+                    cells: vec![
+                        wide.clone(),
+                        tail.clone(),
+                        TerminalRenderCell { graphemes: vec!['X' as u32], ..Default::default() },
+                        wide,
+                        tail,
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        renderer.apply_and_render(&mut Vec::new(), &update).unwrap();
+        renderer.geometry.pan(1, 0);
+        let mut output = Vec::new();
+        renderer.repaint(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1;1H ") && output.contains("mX"), "{output:?}");
+        assert!(!output.contains('界'));
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_render_prompt_stays_inside_shared_grid_border() {
+        use crate::vt::{ghostty::GhosttyVtEngine, VtEngine};
+        for (cols, prompt) in
+            [(4, "☁️☁️r@"), (73, "~/dev/cleat on 🌱 main [⇡] via 🦀 v1.98.0 on ☁️  (eu-west-2) on ☁️  robert@changedirection.org")]
+        {
+            let mut source = GhosttyVtEngine::new(cols, 4);
+            source.feed(prompt.as_bytes()).unwrap();
+            let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
+            let host_cols = cols + 17;
+            let mut renderer = PacketTerminalRenderer::new(cols, 4);
+            renderer.set_viewport((host_cols, 6));
+            renderer.bounds = true;
+            let mut output = Vec::new();
+            renderer.apply_and_render(&mut output, &update).unwrap();
+            let mut host = GhosttyVtEngine::new(host_cols, 6);
+            host.feed(b"\x1b[?2027h").unwrap();
+            host.feed(&output).unwrap();
+            let grid = host.screen_grid().unwrap();
+            let cloud_count = grid.cells.iter().filter(|cell| cell.graphemes.contains(&0x2601)).count();
+            assert_eq!(cloud_count, 2, "both cloud glyphs must survive rendering");
+            let expected = source.screen_grid().unwrap();
+            for row in 0..4usize {
+                for col in 0..usize::from(cols) {
+                    let expected_cell = &expected.cells[row * usize::from(cols) + col];
+                    if expected_cell.graphemes.iter().any(|c| (33..127).contains(c)) {
+                        assert_eq!(
+                            grid.cells[row * usize::from(host_cols) + col].graphemes,
+                            expected_cell.graphemes,
+                            "ASCII shifted at ({col}, {row})"
+                        );
+                    }
+                }
+                for col in usize::from(cols + 1)..usize::from(host_cols) {
+                    let cell = &grid.cells[row * usize::from(host_cols) + col];
+                    assert!(
+                        cell.graphemes.iter().all(|c| *c == 0 || *c == 32),
+                        "text escaped the border at ({col}, {row}): {:?}",
+                        cell.graphemes
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_render_wider_host_grapheme_at_bottom_right_does_not_scroll() {
+        use crate::vt::{ghostty::GhosttyVtEngine, VtEngine};
+        let mut source = GhosttyVtEngine::new(4, 2);
+        source.feed(b"\x1b[?2027l").unwrap();
+        source.feed("safe\r\nabc☁️".as_bytes()).unwrap();
+        let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
+        let mut renderer = PacketTerminalRenderer::new(4, 2);
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).unwrap();
+        let mut host = GhosttyVtEngine::new(4, 2);
+        host.feed(b"\x1b[?2027h").unwrap();
+        host.feed(&output).unwrap();
+        assert_eq!(host.screen_grid().unwrap().row_text(0), "safe");
+    }
+
+    #[test]
+    fn packet_render_bounds_use_only_spare_cells_and_can_be_hidden() {
+        let mut renderer = PacketTerminalRenderer::new(2, 1);
+        renderer.bounds = true;
+        renderer.set_viewport((3, 2));
+        let update = TerminalRenderUpdate { cols: 2, rows: 1, ..Default::default() };
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1;3H│"));
+        assert!(output.contains("\x1b[2;1H──┘"));
+        renderer.bounds = false;
+        let mut output = Vec::new();
+        renderer.repaint(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[2;1H\x1b[2K"));
+        assert!(!output.contains(['│', '─', '┘']));
+        renderer.bounds = true;
+        renderer.set_viewport((2, 1));
+        let mut output = Vec::new();
+        renderer.repaint(&mut output).unwrap();
+        assert!(!String::from_utf8(output).unwrap().contains(['│', '─', '┘']));
     }
 
     #[test]

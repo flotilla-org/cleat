@@ -883,3 +883,21 @@ fn vt_ghostty_relative_placement_uses_virtual_parent_position() {
     let child = update.image_placements.iter().find(|p| p.image_id == 2).expect("relative child of virtual parent");
     assert_eq!((child.viewport_col, child.viewport_row), (4, 2));
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn vt_ghostty_unicode_widths_survive_reset_and_allow_explicit_legacy_mode() {
+    let mut engine = cleat::vt::ghostty::GhosttyVtEngine::new(20, 4);
+    for reset in [b"".as_slice(), b"\x1b[?2027l\x1bc".as_slice()] {
+        engine.feed(reset).unwrap();
+        engine.feed("\x1b[H☁️X".as_bytes()).unwrap();
+        let grid = engine.screen_grid().unwrap();
+        assert_eq!(grid.cell(0, 0).unwrap().graphemes, vec![0x2601, 0xfe0f]);
+        assert_eq!(grid.cell(0, 0).unwrap().width, cleat::vt::CellWidth::Wide);
+        assert_eq!(grid.cell(2, 0).unwrap().graphemes, vec!['X' as u32]);
+    }
+    engine.feed("\x1b[?2027l\x1b[2;1H☁️X".as_bytes()).unwrap();
+    let grid = engine.screen_grid().unwrap();
+    assert_eq!(grid.cell(0, 1).unwrap().width, cleat::vt::CellWidth::Narrow);
+    assert_eq!(grid.cell(1, 1).unwrap().graphemes, vec!['X' as u32]);
+}

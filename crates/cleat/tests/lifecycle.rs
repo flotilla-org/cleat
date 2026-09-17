@@ -3531,23 +3531,24 @@ fn cleat_attach_exits_when_session_is_killed() {
     service.create(Some("alpha".into()), None, None, Some("sleep 30".into()), false).expect("create alpha");
 
     let cleat_bin = std::env::var("CARGO_BIN_EXE_cleat").expect("cleat bin");
+    let output = tempfile::tempfile().expect("attach output");
     let mut child = Command::new(cleat_bin)
         .arg("--runtime-root")
         .arg(temp.path())
         .arg("attach")
         .arg("alpha")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(output.try_clone().expect("clone attach output"))
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn cleat attach");
     let _stdin = child.stdin.take().expect("attach stdin");
 
-    let attach_deadline = Instant::now() + Duration::from_secs(2);
-    while !foreground_path(temp.path(), "alpha").exists() && Instant::now() < attach_deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(foreground_path(temp.path(), "alpha").exists(), "attach should establish a foreground client before kill");
+    // The foreground marker is written when the controller seat is granted,
+    // before the packet handshake finishes. Wait for the client to render its
+    // initial frame so this tests killing an established attach, not opening a
+    // channel to a session that has already disappeared.
+    wait_until("attach initial render", || output.metadata().expect("attach output metadata").len() > 0);
 
     service.kill("alpha").expect("kill session");
 

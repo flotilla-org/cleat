@@ -55,13 +55,36 @@ its receipt.
 | `c` | Toggle the status strip |
 | `a` | Restore automatic controller-intersection sizing |
 | `[` / `]` | Oldest history / live view |
-| `k` / `j` | Move up / down ten rows |
+| `k` / `j` | Move up / down ten history rows |
+| Arrow | Enter pan mode and move one cell; further arrows pan until Escape |
+| `r` | Reveal the application cursor in the live view |
 
-A one-row text status strip appears when another attachment joins and stays
-visible until hidden. It reports roles, participant counts, view state and size
+A one-row text status strip appears when another attachment joins or the shared
+grid exceeds the client window, and stays visible until hidden. It reports roles, participant counts, view state and size
 policy. Its row is subtracted from the CLI's geometry vote. Library clients
-provide their own chrome. A smaller CLI watcher clips the shared grid at its
-right and bottom edges and hides an offscreen application cursor.
+provide their own chrome.
+
+Panning moves only this attachment's window across the current shared grid.
+It works for watchers and fixed-size drivers, including alternate-screen programs
+and retained history. It leaves the PTY size, other attachments and history
+positions unchanged. There is no automatic cursor following; prefix then `r`
+moves the live view just far enough to reveal the application cursor. In history,
+return to live with prefix then `]` before revealing it.
+
+The strip puts clipping directions (`<`, `>`, `^`, `v`) and the zero-based origin
+(`@column,row`) first, followed by the visible and shared grid dimensions. Right
+and bottom borders occupy spare cells immediately outside the shared grid;
+they reserve no extra rows or columns. Prefix then `c` hides the strip, borders
+and command hints while leaving pan commands usable. Escape leaves pan mode;
+ordinary typing and bracketed paste are consumed while that mode is active.
+Prefixed commands remain available while panning, so you can toggle chrome,
+change roles, reveal the cursor or detach without pressing Escape first. These
+commands leave pan mode active until Escape.
+
+Offsets clamp after geometry changes. Cursor visibility and mouse coordinates
+use the same crop as rendering, and borders and visible chrome reject mouse
+events, including releases. Hiding chrome returns its row to the local view;
+for an automatically sized driver it also updates that driver's geometry vote.
 
 ## Captures and transport
 

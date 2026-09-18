@@ -48,6 +48,10 @@ const DETACH_CLEANUP_SEQUENCE: &[u8] =
     b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+// Leave room for control messages without prefetching megabytes of images.
+const IMAGE_OUTPUT_HIGH_WATER: usize = 256 * 1024;
+const PACKET_OUTPUT_WRITE_BUDGET: usize = 256 * 1024;
+const PACKET_OUTPUT_TIME_BUDGET: Duration = Duration::from_millis(1);
 const SESSION_DAEMON_SERVICING_TICK: Duration = Duration::from_millis(10);
 const SESSION_DAEMON_IDLE_LINGER: Duration = Duration::from_secs(120);
 const SESSION_HTTP_HANDSHAKE_DEADLINE: Duration = Duration::from_millis(250);
@@ -3327,6 +3331,7 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 }
 
 struct PacketClient {
+    image_output_cursor: u32,
     id: u64,
     stream: SessionStream,
     pending_output: PendingOutput,
@@ -3396,6 +3401,7 @@ impl PacketClient {
             id,
             stream,
             pending_output: PendingOutput::new(),
+            image_output_cursor: 0,
             input_reader,
             input_buffer: Vec::new(),
             channels: HashMap::new(),
@@ -3454,30 +3460,76 @@ impl PacketClient {
         Ok(true)
     }
 
-    fn flush_pending_output(&mut self) -> Result<bool, String> {
-        if self.pending_output.len() < MAX_PENDING_CLIENT_OUTPUT_BYTES / 2 {
-            let channels: Vec<_> = self.channels.keys().copied().collect();
-            for id in channels {
-                if self.pending_output.len() >= MAX_PENDING_CLIENT_OUTPUT_BYTES / 2 {
-                    break;
-                }
-                let channel = self.channels.get_mut(&id).expect("channel exists");
-                if let Some(transfer) = &mut channel.image_transfer {
-                    match transfer.next(id)? {
-                        Some(frame) => self.enqueue_frame(&frame)?,
-                        None if transfer.complete() => {
-                            channel.image_transfer = None;
-                        }
-                        None => {}
+    #[cfg(unix)]
+    fn has_pending_output(&self) -> bool {
+        !self.pending_output.is_empty()
+            || self.channels.values().any(|channel| channel.image_transfer.as_ref().is_some_and(ImageTransfer::ready))
+    }
+
+    /// Rotate after every frame, including across calls when backpressure or a
+    /// time budget stops a round. HashMap iteration order must not pick winners.
+    fn queue_image_frames(&mut self, mut elapsed: impl FnMut() -> Duration) -> Result<(), String> {
+        if self.pending_output.len() >= IMAGE_OUTPUT_HIGH_WATER {
+            return Ok(());
+        }
+        let mut channels: Vec<_> = self
+            .channels
+            .iter()
+            .filter(|(_, channel)| channel.image_transfer.as_ref().is_some_and(ImageTransfer::ready))
+            .map(|(id, _)| *id)
+            .collect();
+        channels.sort_unstable();
+        if channels.is_empty() {
+            return Ok(());
+        }
+        let mut index = channels.partition_point(|id| *id <= self.image_output_cursor) % channels.len();
+        let mut idle = 0;
+        let mut visited = false;
+        // Always allow one frame, even if scheduling or sorting exhausted the
+        // soft time budget, so repeated preemption cannot prevent progress.
+        while idle < channels.len()
+            && self.pending_output.len() < IMAGE_OUTPUT_HIGH_WATER
+            && (!visited || elapsed() < PACKET_OUTPUT_TIME_BUDGET)
+        {
+            visited = true;
+            let id = channels[index];
+            index = (index + 1) % channels.len();
+            self.image_output_cursor = id;
+            let channel = self.channels.get_mut(&id).expect("channel exists");
+            let frame = match &mut channel.image_transfer {
+                Some(transfer) => {
+                    let frame = transfer.next(id)?;
+                    if transfer.complete() {
+                        channel.image_transfer = None;
                     }
+                    frame
                 }
+                None => None,
+            };
+            if let Some(frame) = frame {
+                self.enqueue_frame(&frame)?;
+                idle = 0;
+            } else {
+                idle += 1;
             }
         }
-        while !self.pending_output.is_empty() {
-            match retry_interrupted(|| self.stream.write(self.pending_output.as_slice())) {
+        Ok(())
+    }
+
+    fn flush_pending_output(&mut self) -> Result<bool, String> {
+        let started = Instant::now();
+        self.queue_image_frames(|| started.elapsed())?;
+        let mut written = 0;
+        while !self.pending_output.is_empty()
+            && written < PACKET_OUTPUT_WRITE_BUDGET
+            && (written == 0 || started.elapsed() < PACKET_OUTPUT_TIME_BUDGET)
+        {
+            let count = self.pending_output.len().min(PACKET_OUTPUT_WRITE_BUDGET - written);
+            match retry_interrupted(|| self.stream.write(&self.pending_output.as_slice()[..count])) {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
                     self.pending_output.consume(n);
+                    written += n;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(err) if is_graceful_socket_shutdown(&err) => return Ok(false),
@@ -4219,7 +4271,9 @@ fn packet_named_key_bytes(key: TerminalNamedKey) -> Vec<u8> {
 /// controller role the client held.
 /// Large history frames can fill a Unix socket's send buffer. Sleeping a
 /// whole servicing tick between each partial write adds latency to every
-/// channel on that connection. Wait for writable space without busy-polling.
+/// channel on that connection. Include ready, not-yet-encoded asset frames:
+/// draining the byte buffer must not impose a 10ms sleep between image batches.
+/// File offers awaiting acquisition replies are deliberately excluded.
 fn wait_packet_output(clients: &[PacketClient]) {
     #[cfg(unix)]
     {
@@ -4228,7 +4282,7 @@ fn wait_packet_output(clients: &[PacketClient]) {
         use nix::poll::{poll, PollFd, PollFlags};
         let mut pending: Vec<_> = clients
             .iter()
-            .filter(|client| !client.dead && !client.pending_output.is_empty())
+            .filter(|client| !client.dead && client.has_pending_output())
             .map(|client| PollFd::new(client.stream.as_fd(), PollFlags::POLLOUT))
             .collect();
         if !pending.is_empty() && poll(&mut pending, SESSION_DAEMON_SERVICING_TICK.as_millis() as u16).is_ok() {
@@ -5505,3 +5559,7 @@ mod tests {
         assert_eq!(replay, None);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "session_packet_output_tests.rs"]
+mod packet_output_tests;

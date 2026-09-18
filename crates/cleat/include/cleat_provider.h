@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 8u
+#define CLEAT_PROVIDER_ABI_VERSION 9u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -36,6 +36,8 @@ extern "C" {
 #define CLEAT_INPUT_RESIZE 6u
 #define CLEAT_KEY_UNICODE_SCALAR 1u
 #define CLEAT_KEY_NAMED 2u
+/* Functional W3C code in text/text_len, e.g. NumpadEnter or ShiftLeft. */
+#define CLEAT_KEY_CODE 3u
 #define CLEAT_KEY_ENTER 1u
 #define CLEAT_KEY_ESCAPE 2u
 #define CLEAT_KEY_BACKSPACE 3u
@@ -70,6 +72,8 @@ extern "C" {
 #define CLEAT_MOD_CTRL 2u
 #define CLEAT_MOD_ALT 4u
 #define CLEAT_MOD_SUPER 8u
+#define CLEAT_MOD_CAPS_LOCK 16u
+#define CLEAT_MOD_NUM_LOCK 32u
 #define CLEAT_MOUSE_PRESS 1u
 #define CLEAT_MOUSE_RELEASE 2u
 #define CLEAT_MOUSE_MOVE 3u
@@ -457,6 +461,9 @@ typedef struct cleat_input_event {
     const uint8_t *generated_text;
     size_t generated_text_len;
     uint32_t platform_keycode;
+    /* Optional W3C physical code, e.g. KeyW. No platform scancode conversion. */
+    const uint8_t *physical_key;
+    size_t physical_key_len;
     uint32_t mouse_kind;
     uint32_t mouse_button;
     uint16_t mouse_buttons;

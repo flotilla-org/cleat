@@ -25,7 +25,7 @@ use crate::{
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 8;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 9;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -50,6 +50,8 @@ pub const CLEAT_INPUT_PASTE: u32 = 5;
 pub const CLEAT_INPUT_RESIZE: u32 = 6;
 pub const CLEAT_KEY_UNICODE_SCALAR: u32 = 1;
 pub const CLEAT_KEY_NAMED: u32 = 2;
+/// Extended W3C functional key name supplied in text/text_len.
+pub const CLEAT_KEY_CODE: u32 = 3;
 pub const CLEAT_KEY_ENTER: u32 = 1;
 pub const CLEAT_KEY_ESCAPE: u32 = 2;
 pub const CLEAT_KEY_BACKSPACE: u32 = 3;
@@ -84,6 +86,8 @@ pub const CLEAT_MOD_SHIFT: u16 = 1;
 pub const CLEAT_MOD_CTRL: u16 = 2;
 pub const CLEAT_MOD_ALT: u16 = 4;
 pub const CLEAT_MOD_SUPER: u16 = 8;
+pub const CLEAT_MOD_CAPS_LOCK: u16 = 16;
+pub const CLEAT_MOD_NUM_LOCK: u16 = 32;
 pub const CLEAT_MOUSE_PRESS: u32 = 1;
 pub const CLEAT_MOUSE_RELEASE: u32 = 2;
 pub const CLEAT_MOUSE_MOVE: u32 = 3;
@@ -472,6 +476,8 @@ pub struct CleatInputEvent {
     pub generated_text: *const u8,
     pub generated_text_len: usize,
     pub platform_keycode: u32,
+    pub physical_key: *const u8,
+    pub physical_key_len: usize,
     pub mouse_kind: u32,
     pub mouse_button: u32,
     pub mouse_buttons: u16,
@@ -1656,6 +1662,10 @@ fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> Opti
             Ok(None) => Some(0),
             Err(_) => None,
         },
+        SessionBackend::InProcess(in_process) if event.kind == CLEAT_INPUT_KEY => match structured_key_event(event).ok()? {
+            Some(event) => in_process.actor.key(0, event).ok(),
+            None => Some(0),
+        },
         SessionBackend::InProcess(in_process) => match input_event_bytes(event) {
             Ok(Some(bytes)) => in_process.actor.request_result(|reply| SessionCommand::WriteInput { bytes, reply }).ok().map(|_| 1),
             Ok(None) if is_wheel_event(event) => route_in_process_wheel_event(in_process, event),
@@ -2364,7 +2374,7 @@ fn packet_input_event(event: &CleatInputEvent) -> Result<Option<TerminalInputEve
     match event.kind {
         CLEAT_INPUT_TEXT => read_event_text(event).map(|text| Some(TerminalInputEvent::Text(TerminalTextEvent { text }))),
         CLEAT_INPUT_PASTE => read_event_text(event).map(|text| Some(TerminalInputEvent::Paste(TerminalPasteEvent { text }))),
-        CLEAT_INPUT_KEY => key_event_bytes(event).map(|bytes| bytes.map(TerminalInputEvent::RawBytes)),
+        CLEAT_INPUT_KEY => structured_key_event(event).map(|key| key.map(TerminalInputEvent::Key)),
         CLEAT_INPUT_MOUSE => Ok(packet_mouse_event(event)),
         CLEAT_INPUT_FOCUS => Ok(Some(TerminalInputEvent::Focus(TerminalFocusEvent { focused: event.focused }))),
         CLEAT_INPUT_RESIZE => Ok(Some(TerminalInputEvent::Resize(crate::provider::TerminalResizeEvent {
@@ -2439,6 +2449,55 @@ fn read_generated_text_bytes(event: &CleatInputEvent) -> Result<Option<Vec<u8>>,
     std::str::from_utf8(bytes).map(|_| Some(bytes.to_vec()))
 }
 
+fn structured_key_event(event: &CleatInputEvent) -> Result<Option<crate::provider::TerminalKeyEvent>, Utf8Error> {
+    use crate::provider::{TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalNamedKey};
+    let key = match event.key_kind {
+        CLEAT_KEY_UNICODE_SCALAR if char::from_u32(event.key_code).is_some() => TerminalKey::UnicodeScalar(event.key_code),
+        CLEAT_KEY_CODE => TerminalKey::Code(read_event_text(event)?),
+        CLEAT_KEY_NAMED => TerminalKey::Named(match event.key_code {
+            CLEAT_KEY_ENTER => TerminalNamedKey::Enter,
+            CLEAT_KEY_ESCAPE => TerminalNamedKey::Escape,
+            CLEAT_KEY_BACKSPACE => TerminalNamedKey::Backspace,
+            CLEAT_KEY_TAB => TerminalNamedKey::Tab,
+            CLEAT_KEY_DELETE => TerminalNamedKey::Delete,
+            CLEAT_KEY_INSERT => TerminalNamedKey::Insert,
+            CLEAT_KEY_HOME => TerminalNamedKey::Home,
+            CLEAT_KEY_END => TerminalNamedKey::End,
+            CLEAT_KEY_PAGE_UP => TerminalNamedKey::PageUp,
+            CLEAT_KEY_PAGE_DOWN => TerminalNamedKey::PageDown,
+            CLEAT_KEY_ARROW_UP => TerminalNamedKey::ArrowUp,
+            CLEAT_KEY_ARROW_DOWN => TerminalNamedKey::ArrowDown,
+            CLEAT_KEY_ARROW_LEFT => TerminalNamedKey::ArrowLeft,
+            CLEAT_KEY_ARROW_RIGHT => TerminalNamedKey::ArrowRight,
+            101..=125 => TerminalNamedKey::Function((event.key_code - CLEAT_KEY_FUNCTION_BASE) as u8),
+            _ => return Ok(None),
+        }),
+        _ => return Ok(None),
+    };
+    let action = match event.key_action {
+        0 | CLEAT_KEY_ACTION_PRESS => TerminalKeyAction::Press,
+        CLEAT_KEY_ACTION_REPEAT => TerminalKeyAction::Repeat,
+        CLEAT_KEY_ACTION_RELEASE => TerminalKeyAction::Release,
+        _ => return Ok(None),
+    };
+    let physical_key = if event.physical_key.is_null() || event.physical_key_len == 0 {
+        None
+    } else {
+        Some(std::str::from_utf8(unsafe { slice::from_raw_parts(event.physical_key, event.physical_key_len) })?.to_owned())
+    };
+    Ok(Some(TerminalKeyEvent {
+        key,
+        action,
+        physical_key,
+        modifiers: TerminalModifiers::from_bits_truncate(event.modifiers),
+        consumed_modifiers: TerminalModifiers::from_bits_truncate(event.consumed_modifiers),
+        generated_text: read_generated_text_bytes(event)?.map(|b| String::from_utf8(b).expect("validated UTF-8")),
+        platform_keycode: event.platform_keycode,
+    }))
+}
+
+// Byte projection for the mock backend and legacy encoder contracts only.
+// Real providers preserve the structured event through the session actor.
 fn key_event_bytes(event: &CleatInputEvent) -> Result<Option<Vec<u8>>, Utf8Error> {
     if event.key_action == CLEAT_KEY_ACTION_RELEASE {
         return Ok(None);
@@ -3180,6 +3239,61 @@ mod tests {
     }
 
     #[test]
+    fn ffi_key_actions_reach_actor_and_packet_without_byte_encoding() {
+        let (tx, rx) = mpsc::channel::<SessionCommand>();
+        let observation = Arc::new(ObservationMirror::new());
+        let mut session = CleatSession {
+            backend: SessionBackend::InProcess(Box::new(InProcessSession { actor: SessionActor::from_parts(tx, observation, None) })),
+            geometry: TerminalGeometry::default(),
+            next_input_sequence: 1,
+            wake: Arc::new(Mutex::new(WakeCallback::default())),
+            last_snapshot: None,
+            last_render_update: None,
+        };
+        let worker = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    SessionCommand::Key { source, event, reply } => {
+                        assert_eq!(source, 0);
+                        received.push(*event);
+                        reply.send(Ok(1)).unwrap();
+                    }
+                    _ => panic!("key was converted to a different actor operation"),
+                }
+            }
+            received
+        });
+        let mut expected = Vec::new();
+        for action in [CLEAT_KEY_ACTION_PRESS, CLEAT_KEY_ACTION_REPEAT, CLEAT_KEY_ACTION_RELEASE] {
+            let event = CleatInputEvent {
+                kind: CLEAT_INPUT_KEY,
+                key_kind: CLEAT_KEY_UNICODE_SCALAR,
+                key_code: 'z' as u32,
+                key_action: action,
+                modifiers: CLEAT_MOD_SHIFT,
+                consumed_modifiers: CLEAT_MOD_SHIFT,
+                generated_text: b"Z".as_ptr(),
+                generated_text_len: 1,
+                physical_key: b"KeyW".as_ptr(),
+                physical_key_len: 4,
+                platform_keycode: 123,
+                ..Default::default()
+            };
+            let TerminalInputEvent::Key(key) = packet_input_event(&event).unwrap().unwrap() else { panic!("expected key") };
+            assert_eq!(key.physical_key.as_deref(), Some("KeyW"));
+            assert_eq!(key.generated_text.as_deref(), Some("Z"));
+            assert_eq!(key.consumed_modifiers, TerminalModifiers::SHIFT);
+            let wire = TerminalInputEvent::Key(key.clone());
+            let encoded = postcard::to_allocvec(&wire).unwrap();
+            assert_eq!(postcard::from_bytes::<TerminalInputEvent>(&encoded).unwrap(), wire);
+            expected.push(key);
+            assert_eq!(send_input_event(&mut session, &event), Some(1));
+        }
+        assert_eq!(worker.join().unwrap(), expected);
+    }
+
+    #[test]
     fn packet_input_event_maps_ffi_text_named_key_and_mouse_events() {
         let text = b"hello";
         let text_event =
@@ -3191,7 +3305,10 @@ mod tests {
 
         let key_event =
             CleatInputEvent { kind: CLEAT_INPUT_KEY, key_kind: CLEAT_KEY_NAMED, key_code: CLEAT_KEY_ENTER, ..CleatInputEvent::default() };
-        assert_eq!(packet_input_event(&key_event).expect("key input"), Some(TerminalInputEvent::RawBytes(b"\r".to_vec())));
+        assert_eq!(
+            packet_input_event(&key_event).expect("key input"),
+            structured_key_event(&key_event).unwrap().map(TerminalInputEvent::Key)
+        );
 
         let wheel_event = CleatInputEvent {
             kind: CLEAT_INPUT_MOUSE,

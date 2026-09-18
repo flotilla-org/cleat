@@ -624,7 +624,10 @@ pub struct TerminalKeyEvent {
     pub consumed_modifiers: TerminalModifiers,
     pub action: TerminalKeyAction,
     pub generated_text: Option<String>,
+    /// Opaque source diagnostic; never interpreted as a portable key identity.
     pub platform_keycode: u32,
+    /// Optional layout-independent W3C code (e.g. KeyW, ShiftLeft).
+    pub physical_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -639,6 +642,8 @@ pub enum TerminalKeyAction {
 pub enum TerminalKey {
     UnicodeScalar(u32),
     Named(TerminalNamedKey),
+    /// Extended functional key, using the W3C code vocabulary (e.g. NumpadEnter).
+    Code(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -667,6 +672,8 @@ bitflags::bitflags! {
         const CTRL = 1 << 1;
         const ALT = 1 << 2;
         const SUPER = 1 << 3;
+        const CAPS_LOCK = 1 << 4;
+        const NUM_LOCK = 1 << 5;
     }
 }
 
@@ -870,6 +877,7 @@ mod tests {
             action: TerminalKeyAction::Press,
             generated_text: None,
             platform_keycode: 36,
+            physical_key: None,
         });
         let mouse = TerminalInputEvent::Mouse(TerminalMouseEvent {
             kind: TerminalMouseEventKind::Press,

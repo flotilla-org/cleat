@@ -10,6 +10,7 @@ mod host;
 mod http_uds;
 mod image_backing;
 mod image_delivery;
+mod keyboard;
 pub mod keys;
 mod kitty_output;
 pub mod packet;

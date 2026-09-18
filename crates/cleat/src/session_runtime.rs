@@ -40,6 +40,7 @@ pub(crate) struct SessionRuntime {
     detached_da: Option<DeviceAttributeTracker>,
     recorder: Option<SessionRecorder>,
     markers: HashMap<String, u64>,
+    held_keys: crate::keyboard::HeldKeys,
     epoch: Instant,
     last_pty_output_at: Option<Instant>,
     screen_activity: ScreenActivityTracker,
@@ -129,6 +130,7 @@ impl SessionRuntime {
             detached_da,
             recorder,
             markers: HashMap::new(),
+            held_keys: Default::default(),
             epoch: Instant::now(),
             last_pty_output_at: None,
             screen_activity: ScreenActivityTracker::new(unix_timestamp_millis(SystemTime::now())),
@@ -244,7 +246,11 @@ impl SessionRuntime {
     }
 
     pub(crate) fn set_attachment_view(&mut self, id: u128, command: ViewportCommand) -> Result<bool, String> {
-        self.vt_engine.set_attachment_view(id, command)
+        let history = self.vt_engine.set_attachment_view(id, command)?;
+        if history {
+            self.release_keys(id)?;
+        }
+        Ok(history)
     }
     pub(crate) fn capture_attachment_view(&mut self, id: u128) -> Result<Option<crate::provider::CapturedView>, String> {
         self.vt_engine.capture_attachment_view(id)
@@ -262,7 +268,11 @@ impl SessionRuntime {
     }
 
     pub(crate) fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
-        self.vt_engine.scroll_viewport(command)
+        let outcome = self.vt_engine.scroll_viewport(command)?;
+        if outcome == ViewportCommandOutcome::Moved {
+            self.release_keys(0)?;
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
@@ -279,6 +289,40 @@ impl SessionRuntime {
         y_px: f32,
     ) -> Result<Vec<u8>, String> {
         self.vt_engine.encode_mouse(action, button, any_button_pressed, modifiers, x_px, y_px)
+    }
+
+    pub(crate) fn key(&mut self, source: u128, event: crate::provider::TerminalKeyEvent) -> Result<usize, String> {
+        // Validate and encode before changing ownership. Encoder failures must
+        // not leave phantom holds in the session.
+        let bytes = self.vt_engine.encode_key(&event)?;
+        let Some(delivery) = self.held_keys.event(source, event.clone())? else {
+            return Ok(0);
+        };
+        let bytes = if delivery != event { self.vt_engine.encode_key(&delivery)? } else { bytes };
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.write_input(&bytes)?;
+        Ok(1)
+    }
+
+    pub(crate) fn retain_key_sources(&mut self, sources: &[u128]) -> Result<(), String> {
+        for source in self.held_keys.sources() {
+            if !sources.contains(&source) {
+                self.release_keys(source)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_keys(&mut self, source: u128) -> Result<(), String> {
+        for event in self.held_keys.release(source) {
+            let bytes = self.vt_engine.encode_key(&event)?;
+            if !bytes.is_empty() {
+                self.write_input(&bytes)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {

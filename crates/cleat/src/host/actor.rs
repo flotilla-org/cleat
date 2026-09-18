@@ -320,6 +320,9 @@ pub(crate) struct SessionMouseEvent {
 }
 
 pub(crate) enum SessionCommand {
+    RetainKeySources { sources: Vec<u128>, reply: mpsc::Sender<Result<(), String>> },
+    Key { source: u128, event: Box<crate::provider::TerminalKeyEvent>, reply: mpsc::Sender<Result<usize, String>> },
+    ReleaseKeys { source: u128, reply: mpsc::Sender<Result<(), String>> },
     SetAttachmentView { id: u128, command: ViewportCommand, reply: mpsc::Sender<Result<bool, String>> },
     CaptureAttachmentView { id: u128, reply: mpsc::Sender<Result<Option<crate::provider::CapturedView>, String>> },
     ReleaseAttachmentView { id: u128 },
@@ -734,6 +737,16 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::ApplicationWheel { event, reply })
     }
 
+    pub(crate) fn key(&self, source: u128, event: crate::provider::TerminalKeyEvent) -> Result<usize, String> {
+        self.request_result(|reply| SessionCommand::Key { source, event: Box::new(event), reply })
+    }
+    pub(crate) fn retain_key_sources(&self, sources: Vec<u128>) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::RetainKeySources { sources, reply })
+    }
+    pub(crate) fn release_keys(&self, source: u128) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::ReleaseKeys { source, reply })
+    }
+
     pub(crate) fn mouse(&self, event: SessionMouseEvent) -> Result<usize, String> {
         self.request_result(|reply| SessionCommand::Mouse { event, reply })
     }
@@ -1068,6 +1081,15 @@ fn session_actor_handle_command(
         SessionCommand::ApplicationWheel { event, reply } => {
             let result = route_wheel_event_on_actor(wake, runtime, &mut state.observation, event, false);
             let _ = reply.send(result);
+        }
+        SessionCommand::RetainKeySources { sources, reply } => {
+            let _ = reply.send(runtime.retain_key_sources(&sources));
+        }
+        SessionCommand::Key { source, event, reply } => {
+            let _ = reply.send(runtime.key(source, *event));
+        }
+        SessionCommand::ReleaseKeys { source, reply } => {
+            let _ = reply.send(runtime.release_keys(source));
         }
         SessionCommand::Mouse { event, reply } => {
             let _ = reply.send(route_mouse_event_on_actor(runtime, event));

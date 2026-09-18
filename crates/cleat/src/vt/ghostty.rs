@@ -44,6 +44,7 @@ pub struct GhosttyVtEngine {
     cell_width_px: u32,
     cell_height_px: u32,
     mouse_encoder: MouseEncoder,
+    key_encoder: super::ghostty_key::KeyEncoder,
     saw_output: bool,
     cached_grid: Option<ScreenGrid>,
     deferred_render_dirty: GhosttyRenderStateDirty,
@@ -87,6 +88,7 @@ impl GhosttyVtEngine {
             cell_width_px: 1,
             cell_height_px: 1,
             mouse_encoder,
+            key_encoder: super::ghostty_key::KeyEncoder::new().expect("create Ghostty key encoder"),
             saw_output: false,
             cached_grid: None,
             deferred_render_dirty: GhosttyRenderStateDirty::False,
@@ -303,6 +305,10 @@ impl VtEngine for GhosttyVtEngine {
         self.terminal.resize(self.cols, self.rows, self.cell_width_px, self.cell_height_px)?;
         self.refresh_mouse_encoder_size();
         Ok(())
+    }
+
+    fn encode_key(&mut self, event: &crate::provider::TerminalKeyEvent) -> Result<Vec<u8>, String> {
+        self.key_encoder.encode(self.terminal.raw_terminal(), event)
     }
 
     fn encode_mouse(

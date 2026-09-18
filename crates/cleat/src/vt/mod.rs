@@ -325,10 +325,13 @@ pub trait VtEngine {
         Ok(())
     }
 
-    /// Encode a mouse event into terminal report bytes, gated by the engine's
-    /// live mouse tracking mode. Returns empty bytes when the event is not
-    /// reported (no mouse mode, deduped motion, out of viewport, ...). Default
-    /// is a no-op for engines without a mouse encoder.
+    /// Encode structured input using the live application's keyboard modes.
+    fn encode_key(&mut self, _event: &crate::provider::TerminalKeyEvent) -> Result<Vec<u8>, String> {
+        Err("VT engine does not support structured keyboard input".into())
+    }
+
+    /// Encode a mouse event using the live tracking mode. Engines without an
+    /// encoder return no report.
     fn encode_mouse(
         &mut self,
         _action: MouseAction,
@@ -552,3 +555,6 @@ mod tests {
         assert_eq!(reply, b"\x1b[5;10R".to_vec());
     }
 }
+
+#[cfg(feature = "ghostty-vt")]
+mod ghostty_key;

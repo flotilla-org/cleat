@@ -37,9 +37,7 @@ use crate::{
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
     },
     protocol::{AttachmentIdentity, Frame, SeatState},
-    provider::{
-        DirtyState, TerminalInputEvent, TerminalKey, TerminalMouseButton, TerminalMouseEventKind, TerminalNamedKey, TerminalRenderUpdate,
-    },
+    provider::{DirtyState, TerminalInputEvent, TerminalMouseButton, TerminalMouseEventKind, TerminalRenderUpdate},
     runtime::{AmbientSessionCoordinates, RuntimeLayout, SessionMetadata, TerminalSize},
     vt::{self, ScreenGrid, VtEngine, VtEngineKind},
 };
@@ -2088,6 +2086,7 @@ fn sync_packet_geometry(hosted: &mut HostedSession) -> Result<(), String> {
 }
 
 fn sync_packet_controller_presence(layout: &RuntimeLayout, hosted: &HostedSession, previously_had_controller: bool) -> Result<(), String> {
+    hosted.actor.retain_key_sources(hosted.packet_control.controllers().map(PacketChannelRef::view_id).collect())?;
     let has_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
     // Query authority follows the transport, not the number of drivers.
     // Also update on raw-to-packet takeover, when controller presence stays true.
@@ -2870,6 +2869,7 @@ fn handle_http_request(
                     hosted.watchers.push(controller);
                 }
                 hosted.packet_control.demote_all();
+                hosted.actor.retain_key_sources(vec![])?;
                 for client in state.packet_clients.iter_mut() {
                     for channel in client.channels.values_mut().filter(|c| c.session_id == id) {
                         channel.role = ChannelRole::Watcher;
@@ -2977,6 +2977,7 @@ fn handle_http_request(
             let controllers: Vec<_> = hosted.packet_control.controllers().collect();
             for controller in controllers {
                 hosted.packet_control.remove(controller);
+                hosted.actor.release_keys(controller.view_id())?;
                 hosted.actor.release_attachment_view(controller.view_id());
                 if let Some(client) = state.packet_clients.iter_mut().find(|client| client.id == controller.client_id) {
                     client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
@@ -3596,7 +3597,9 @@ fn release_packet_client_roles(
         if let Some(hosted) = sessions.get_mut(&session_channel.session_id) {
             let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
             hosted.packet_control.remove(PacketChannelRef { client_id: removed.id, channel: *channel });
-            hosted.actor.release_attachment_view(PacketChannelRef { client_id: removed.id, channel: *channel }.view_id());
+            let id = PacketChannelRef { client_id: removed.id, channel: *channel }.view_id();
+            let _ = hosted.actor.release_keys(id);
+            hosted.actor.release_attachment_view(id);
             let _ = sync_packet_geometry(hosted);
             let _ = sync_packet_controller_presence(layout, hosted, previously_had_controller);
         }
@@ -3800,7 +3803,10 @@ fn handle_packet_frame(
                                 event,
                                 TerminalInputEvent::Text(_)
                                     | TerminalInputEvent::Paste(_)
-                                    | TerminalInputEvent::Key(_)
+                                    | TerminalInputEvent::Key(crate::provider::TerminalKeyEvent {
+                                        action: crate::provider::TerminalKeyAction::Press,
+                                        ..
+                                    })
                                     | TerminalInputEvent::RawBytes(_)
                             ) {
                                 hosted.actor.release_attachment_view(key.view_id());
@@ -3810,7 +3816,7 @@ fn handle_packet_frame(
                                     session.view_changed = true;
                                 }
                             }
-                            route_packet_input_event(&hosted.actor, event)?;
+                            route_packet_input_event(&hosted.actor, key.view_id(), event)?;
                         }
                         _ => {}
                     }
@@ -4162,7 +4168,7 @@ fn has_packet_channel_lagging_cached_generation(
     })
 }
 
-fn route_packet_input_event(actor: &SessionActor, event: TerminalInputEvent) -> Result<(), String> {
+fn route_packet_input_event(actor: &SessionActor, source: u128, event: TerminalInputEvent) -> Result<(), String> {
     match event {
         TerminalInputEvent::Text(event) => actor.write_input(event.text.into_bytes()),
         TerminalInputEvent::Paste(event) => actor.paste(event.text.into_bytes()).map(|_| ()),
@@ -4179,7 +4185,7 @@ fn route_packet_input_event(actor: &SessionActor, event: TerminalInputEvent) -> 
             Ok(())
         }
         TerminalInputEvent::Mouse(event) => route_packet_mouse_event(actor, event),
-        TerminalInputEvent::Key(event) => actor.write_input(packet_key_event_bytes(event)),
+        TerminalInputEvent::Key(event) => actor.key(source, event).map(|_| ()),
         TerminalInputEvent::Focus(_) => Ok(()),
     }
 }
@@ -4226,43 +4232,6 @@ fn packet_mouse_button(button: TerminalMouseButton) -> Option<vt::MouseButton> {
         TerminalMouseButton::Middle => Some(vt::MouseButton::Middle),
         TerminalMouseButton::Right => Some(vt::MouseButton::Right),
         TerminalMouseButton::Back | TerminalMouseButton::Forward => None,
-    }
-}
-
-fn packet_key_event_bytes(event: crate::provider::TerminalKeyEvent) -> Vec<u8> {
-    if let Some(text) = event.generated_text {
-        return text.into_bytes();
-    }
-    match event.key {
-        TerminalKey::UnicodeScalar(codepoint) => char::from_u32(codepoint).map(|ch| ch.to_string().into_bytes()).unwrap_or_default(),
-        TerminalKey::Named(key) => packet_named_key_bytes(key),
-    }
-}
-
-fn packet_named_key_bytes(key: TerminalNamedKey) -> Vec<u8> {
-    match key {
-        TerminalNamedKey::Enter => b"\r".to_vec(),
-        TerminalNamedKey::Escape => b"\x1b".to_vec(),
-        TerminalNamedKey::Backspace => b"\x7f".to_vec(),
-        TerminalNamedKey::Tab => b"\t".to_vec(),
-        TerminalNamedKey::Delete => b"\x1b[3~".to_vec(),
-        TerminalNamedKey::Insert => b"\x1b[2~".to_vec(),
-        TerminalNamedKey::Home => b"\x1b[H".to_vec(),
-        TerminalNamedKey::End => b"\x1b[F".to_vec(),
-        TerminalNamedKey::PageUp => b"\x1b[5~".to_vec(),
-        TerminalNamedKey::PageDown => b"\x1b[6~".to_vec(),
-        TerminalNamedKey::ArrowUp => b"\x1b[A".to_vec(),
-        TerminalNamedKey::ArrowDown => b"\x1b[B".to_vec(),
-        TerminalNamedKey::ArrowLeft => b"\x1b[D".to_vec(),
-        TerminalNamedKey::ArrowRight => b"\x1b[C".to_vec(),
-        TerminalNamedKey::Function(n) => match n {
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5..=12 => format!("\x1b[{}~", u16::from(n) + 10).into_bytes(),
-            _ => Vec::new(),
-        },
     }
 }
 

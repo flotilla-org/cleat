@@ -1,5 +1,6 @@
 pub mod asciicast;
 mod attach_input;
+mod attach_keyboard;
 mod attachment_control;
 mod attachment_view;
 pub mod cast_reader;
@@ -10,6 +11,7 @@ mod host;
 mod http_uds;
 mod image_backing;
 mod image_delivery;
+mod keyboard;
 pub mod keys;
 mod kitty_output;
 pub mod packet;
@@ -27,3 +29,7 @@ pub mod server;
 pub mod session;
 mod session_runtime;
 pub mod vt;
+
+mod mouse;
+
+mod attach_mouse;

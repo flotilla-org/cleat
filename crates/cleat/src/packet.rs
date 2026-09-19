@@ -9,7 +9,7 @@ use crate::{
 };
 
 /// Version 8 separates generation-keyed image chunks from render packets.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn retained_image_delivery_requires_protocol_version_eight() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
         assert!(!ControlHello::current().accepts(7));
     }
 

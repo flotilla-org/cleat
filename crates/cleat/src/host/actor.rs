@@ -320,6 +320,9 @@ pub(crate) struct SessionMouseEvent {
 }
 
 pub(crate) enum SessionCommand {
+    RetainInputSources { sources: Vec<u128>, reply: mpsc::Sender<Result<(), String>> },
+    Key { source: u128, event: Box<crate::provider::TerminalKeyEvent>, reply: mpsc::Sender<Result<usize, String>> },
+    ReleaseInput { source: u128, reply: mpsc::Sender<Result<(), String>> },
     SetAttachmentView { id: u128, command: ViewportCommand, reply: mpsc::Sender<Result<bool, String>> },
     CaptureAttachmentView { id: u128, reply: mpsc::Sender<Result<Option<crate::provider::CapturedView>, String>> },
     ReleaseAttachmentView { id: u128 },
@@ -329,7 +332,7 @@ pub(crate) enum SessionCommand {
     WriteInput { bytes: Vec<u8>, reply: mpsc::Sender<Result<(), String>> },
     Wheel { event: SessionWheelEvent, reply: mpsc::Sender<Result<usize, String>> },
     ApplicationWheel { event: SessionWheelEvent, reply: mpsc::Sender<Result<usize, String>> },
-    Mouse { event: SessionMouseEvent, reply: mpsc::Sender<Result<usize, String>> },
+    Mouse { source: u128, event: SessionMouseEvent, reply: mpsc::Sender<Result<usize, String>> },
     Paste { text: Vec<u8>, reply: mpsc::Sender<Result<usize, String>> },
     ScrollViewport { command: ViewportCommand, reply: mpsc::Sender<Result<ViewportCommandOutcome, String>> },
     Snapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
@@ -734,8 +737,18 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::ApplicationWheel { event, reply })
     }
 
-    pub(crate) fn mouse(&self, event: SessionMouseEvent) -> Result<usize, String> {
-        self.request_result(|reply| SessionCommand::Mouse { event, reply })
+    pub(crate) fn key(&self, source: u128, event: crate::provider::TerminalKeyEvent) -> Result<usize, String> {
+        self.request_result(|reply| SessionCommand::Key { source, event: Box::new(event), reply })
+    }
+    pub(crate) fn retain_input_sources(&self, sources: Vec<u128>) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::RetainInputSources { sources, reply })
+    }
+    pub(crate) fn release_input(&self, source: u128) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::ReleaseInput { source, reply })
+    }
+
+    pub(crate) fn mouse(&self, source: u128, event: SessionMouseEvent) -> Result<usize, String> {
+        self.request_result(|reply| SessionCommand::Mouse { source, event, reply })
     }
 
     pub(crate) fn paste(&self, text: Vec<u8>) -> Result<usize, String> {
@@ -1069,8 +1082,17 @@ fn session_actor_handle_command(
             let result = route_wheel_event_on_actor(wake, runtime, &mut state.observation, event, false);
             let _ = reply.send(result);
         }
-        SessionCommand::Mouse { event, reply } => {
-            let _ = reply.send(route_mouse_event_on_actor(runtime, event));
+        SessionCommand::RetainInputSources { sources, reply } => {
+            let _ = reply.send(runtime.retain_input_sources(&sources));
+        }
+        SessionCommand::Key { source, event, reply } => {
+            let _ = reply.send(runtime.key(source, *event));
+        }
+        SessionCommand::ReleaseInput { source, reply } => {
+            let _ = reply.send(runtime.release_input(source));
+        }
+        SessionCommand::Mouse { source, event, reply } => {
+            let _ = reply.send(runtime.mouse(source, event));
         }
         SessionCommand::Paste { text, reply } => {
             let _ = reply.send(route_paste_on_actor(runtime, &text));
@@ -1320,15 +1342,6 @@ fn route_paste_on_actor(runtime: &mut SessionRuntime, text: &[u8]) -> Result<usi
     Ok(1)
 }
 
-fn route_mouse_event_on_actor(runtime: &mut SessionRuntime, event: SessionMouseEvent) -> Result<usize, String> {
-    let bytes = runtime.encode_mouse(event.action, event.button, event.any_button_pressed, event.modifiers, event.x_px, event.y_px)?;
-    if bytes.is_empty() {
-        return Ok(0);
-    }
-    runtime.write_input(&bytes)?;
-    Ok(1)
-}
-
 fn route_wheel_event_on_actor(
     wake: &WakeCallback,
     runtime: &mut SessionRuntime,
@@ -1453,7 +1466,7 @@ fn append_mouse_report(
     modes: vt::TerminalModeState,
 ) -> Option<()> {
     let (x, y) = if modes.mouse_sgr_pixels {
-        (one_based_coordinate(event.x_px), one_based_coordinate(event.y_px))
+        (pixel_coordinate(event.x_px), pixel_coordinate(event.y_px))
     } else {
         (u32::from(event.cell_col) + 1, u32::from(event.cell_row) + 1)
     };
@@ -1485,13 +1498,13 @@ fn mouse_report_modifier_code(modifiers: vt::MouseModifiers) -> u16 {
     code
 }
 
-fn one_based_coordinate(value: f32) -> u32 {
+fn pixel_coordinate(value: f32) -> u32 {
     if !value.is_finite() || value <= 0.0 {
-        1
+        0
     } else if value >= u32::MAX as f32 {
         u32::MAX
     } else {
-        value.round() as u32 + 1
+        value.round() as u32
     }
 }
 

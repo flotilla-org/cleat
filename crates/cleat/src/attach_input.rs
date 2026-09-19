@@ -1,5 +1,7 @@
 //! Incremental terminal decoding followed by attachment-local command matching.
 //! Neither transport reads nor bracketed paste fragments are input operations.
+use crate::provider::{TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, TerminalNamedKey};
+
 const PASTE_LIMIT: usize = 1024 * 1024;
 const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -21,6 +23,10 @@ pub(crate) enum Command {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Action {
     Raw(Vec<u8>),
+    Key(TerminalKeyEvent),
+    KeyboardFlags(u32),
+    MouseCellSize(u16, u16),
+    EnablePixelMouse,
     GraphicsReply(Vec<u8>),
     Paste(String),
     Command(Command),
@@ -34,6 +40,11 @@ pub(crate) struct InputDecoder {
     armed: bool,
     panning: bool,
     escape: Vec<u8>,
+    discard_escape: bool,
+    keyboard_flags: u32,
+    mouse: crate::attach_mouse::MouseMode,
+    forwarded_buttons: Vec<crate::provider::TerminalMouseEvent>,
+    forwarded_keys: Vec<TerminalKeyEvent>,
     paste: Option<Vec<u8>>,
     paste_tail: Vec<u8>,
     overflow: bool,
@@ -49,6 +60,11 @@ impl InputDecoder {
             armed: false,
             panning: false,
             escape: Vec::new(),
+            discard_escape: false,
+            keyboard_flags: 0,
+            mouse: Default::default(),
+            forwarded_buttons: Vec::new(),
+            forwarded_keys: Vec::new(),
             paste: None,
             paste_tail: Vec::new(),
             overflow: false,
@@ -62,7 +78,19 @@ impl InputDecoder {
         self.panning
     }
 
+    pub fn set_pixel_origin(&mut self, origin: u32) {
+        self.mouse.set_pixel_origin(origin);
+    }
+
+    pub fn set_keyboard_flags(&mut self, flags: u32) {
+        self.keyboard_flags = flags;
+    }
+
     pub fn set_driving(&mut self, driving: bool) {
+        if self.driving && !driving {
+            self.forwarded_keys.clear();
+            self.forwarded_buttons.clear();
+        }
         self.driving = driving;
         if self.paste.is_some() {
             self.paste_authorized &= driving;
@@ -103,6 +131,13 @@ impl InputDecoder {
                 }
                 continue;
             }
+            if self.discard_escape {
+                if (0x40..=0x7e).contains(&byte) {
+                    self.discard_escape = false;
+                    actions.push(Action::Hint("Oversized terminal key report discarded"));
+                }
+                continue;
+            }
             if !self.escape.is_empty() {
                 self.escape.push(byte);
                 let apc = self.escape.get(1) == Some(&b'_');
@@ -124,8 +159,47 @@ impl InputDecoder {
                 } else {
                     true
                 };
-                if complete || self.escape.len() >= 128 {
+                if !complete && self.escape.len() >= 4096 {
+                    self.escape.clear();
+                    self.discard_escape = true;
+                    continue;
+                }
+                if complete {
                     let sequence = std::mem::take(&mut self.escape);
+                    if let Some(replies) = self.mouse.reply(&sequence) {
+                        for reply in replies {
+                            match reply {
+                                crate::attach_mouse::Reply::CellSize(w, h) => actions.push(Action::MouseCellSize(w, h)),
+                                crate::attach_mouse::Reply::EnablePixels => actions.push(Action::EnablePixelMouse),
+                                crate::attach_mouse::Reply::Consumed => {}
+                            }
+                        }
+                        continue;
+                    }
+                    if sequence.starts_with(b"\x1b[<") {
+                        if let Some(mouse) = self.mouse.decode(&sequence) {
+                            self.mouse_event(mouse, &mut actions);
+                        } else {
+                            actions.push(Action::Hint("Invalid mouse report discarded"));
+                        }
+                        continue;
+                    }
+                    match crate::attach_keyboard::decode(&sequence, self.keyboard_flags) {
+                        crate::attach_keyboard::Report::Flags(flags) => {
+                            self.keyboard_flags = flags;
+                            actions.push(Action::KeyboardFlags(flags));
+                            continue;
+                        }
+                        crate::attach_keyboard::Report::Key { event, tap } => {
+                            self.key(event, tap, &mut actions);
+                            continue;
+                        }
+                        crate::attach_keyboard::Report::Unsupported => {
+                            actions.push(Action::Hint("Unsupported terminal key report discarded"));
+                            continue;
+                        }
+                        crate::attach_keyboard::Report::NotKey => {}
+                    }
                     if sequence == b"\x1b[200~" {
                         self.paste = Some(Vec::new());
                         self.paste_authorized = self.driving;
@@ -143,6 +217,9 @@ impl InputDecoder {
                         )
                     {
                         self.armed = false;
+                        if !self.panning {
+                            self.release_forwarded(&mut actions);
+                        }
                         self.panning = true;
                         let (x, y) = match sequence[2] {
                             b'A' => (0, -1),
@@ -154,8 +231,6 @@ impl InputDecoder {
                     } else if self.armed || self.panning {
                         self.armed = false;
                         actions.push(Action::Hint("Unknown cleat command"));
-                    } else if let Some(mouse) = decode_mouse(&sequence) {
-                        actions.push(Action::Mouse(mouse));
                     } else {
                         push_raw(&mut actions, &sequence);
                     }
@@ -168,20 +243,7 @@ impl InputDecoder {
             }
             if self.armed {
                 self.armed = false;
-                let command = match byte {
-                    b'r' => Some(Command::RevealCursor),
-                    b'd' => Some(Command::Detach),
-                    b'a' => Some(Command::AutoSize),
-                    b'w' => Some(Command::Watch),
-                    b'g' => Some(Command::Drive),
-                    b'x' => Some(Command::Exclusive),
-                    b'c' => Some(Command::Chrome),
-                    b'[' => Some(Command::Top),
-                    b']' => Some(Command::Bottom),
-                    b'k' => Some(Command::Up),
-                    b'j' => Some(Command::Down),
-                    _ => None,
-                };
+                let command = local_command(byte);
                 if byte == self.prefix {
                     push_raw(&mut actions, &[byte]);
                 } else if let Some(command) = command {
@@ -191,9 +253,7 @@ impl InputDecoder {
                 }
             } else if byte == self.prefix {
                 self.armed = true;
-                actions.push(Action::Hint(
-                    "cleat: d detach | g drive | w watch | x exclusive | c chrome | a auto size | [ history | ] live | k/j scroll | arrows pan | r reveal cursor | Esc cancel",
-                ));
+                actions.push(Action::Hint(COMMAND_HINT));
             } else if self.panning {
                 // Pan mode consumes application keystrokes until Escape,
                 // while prefixed attachment commands remain available.
@@ -202,6 +262,135 @@ impl InputDecoder {
             }
         }
         actions
+    }
+
+    fn mouse_event(&mut self, mut event: crate::provider::TerminalMouseEvent, actions: &mut Vec<Action>) {
+        use crate::provider::{TerminalMouseButton as Button, TerminalMouseButtons as Buttons, TerminalMouseEventKind as Kind};
+        if (self.armed || self.panning) && event.kind != Kind::Release {
+            return;
+        }
+        let index = self.forwarded_buttons.iter().position(|e| e.button == event.button);
+        for held in &mut self.forwarded_buttons {
+            held.x_px = event.x_px;
+            held.y_px = event.y_px;
+            held.cell_col = event.cell_col;
+            held.cell_row = event.cell_row;
+        }
+        match event.kind {
+            Kind::Press if self.driving && index.is_none() => self.forwarded_buttons.push(event.clone()),
+            Kind::Release => {
+                if let Some(i) = index {
+                    self.forwarded_buttons.remove(i);
+                } else {
+                    return;
+                }
+            }
+            Kind::Move if event.button.is_some() && index.is_none() => return,
+            _ => {}
+        }
+        for held in &self.forwarded_buttons {
+            event.buttons |= match held.button {
+                Some(Button::Left) => Buttons::LEFT,
+                Some(Button::Middle) => Buttons::MIDDLE,
+                Some(Button::Right) => Buttons::RIGHT,
+                Some(Button::Back) => Buttons::BACK,
+                Some(Button::Forward) => Buttons::FORWARD,
+                None => Buttons::empty(),
+            };
+        }
+        actions.push(Action::Mouse(event));
+    }
+
+    fn release_forwarded(&mut self, actions: &mut Vec<Action>) {
+        for mut event in self.forwarded_buttons.drain(..) {
+            event.kind = crate::provider::TerminalMouseEventKind::Release;
+            event.buttons = crate::provider::TerminalMouseButtons::empty();
+            event.modifiers = TerminalModifiers::empty();
+            actions.push(Action::Mouse(event));
+        }
+        for mut event in self.forwarded_keys.drain(..) {
+            event.action = TerminalKeyAction::Release;
+            event.modifiers = TerminalModifiers::empty();
+            event.consumed_modifiers = TerminalModifiers::empty();
+            actions.push(Action::Key(event));
+        }
+    }
+
+    fn key(&mut self, mut event: TerminalKeyEvent, tap: bool, actions: &mut Vec<Action>) {
+        let held = self
+            .forwarded_keys
+            .iter()
+            .position(|key| key.key == event.key || (key.physical_key.is_some() && key.physical_key == event.physical_key));
+        if event.action == TerminalKeyAction::Release {
+            if let Some(index) = held {
+                let original = self.forwarded_keys.remove(index);
+                event.key = original.key;
+                event.physical_key = original.physical_key;
+                event.generated_text = original.generated_text;
+                actions.push(Action::Key(event));
+            }
+            return;
+        }
+        let byte = command_byte(&event);
+        let pan = if event.modifiers.intersects(TerminalModifiers::CTRL | TerminalModifiers::ALT | TerminalModifiers::SUPER) {
+            None
+        } else {
+            match event.key {
+                TerminalKey::Named(TerminalNamedKey::ArrowUp) => Some((0, -1)),
+                TerminalKey::Named(TerminalNamedKey::ArrowDown) => Some((0, 1)),
+                TerminalKey::Named(TerminalNamedKey::ArrowLeft) => Some((-1, 0)),
+                TerminalKey::Named(TerminalNamedKey::ArrowRight) => Some((1, 0)),
+                _ => None,
+            }
+        };
+        if let Some((x, y)) = pan.filter(|_| self.armed || self.panning) {
+            self.armed = false;
+            if !self.panning {
+                self.release_forwarded(actions);
+            }
+            self.panning = true;
+            actions.push(Action::Command(Command::Pan(x, y)));
+            return;
+        }
+        if event.action == TerminalKeyAction::Repeat && held.is_none() {
+            return;
+        }
+        if (self.armed || self.panning) && byte == Some(0x1b) {
+            self.armed = false;
+            self.panning = false;
+            actions.push(Action::Hint(""));
+            return;
+        }
+        if self.armed {
+            self.armed = false;
+            if byte != Some(self.prefix) {
+                let command = byte.and_then(local_command);
+                actions.push(command.map(Action::Command).unwrap_or(Action::Hint("Unknown cleat command")));
+                return;
+            }
+        } else if byte == Some(self.prefix) {
+            self.armed = true;
+            actions.push(Action::Hint(COMMAND_HINT));
+            return;
+        } else if self.panning {
+            return;
+        }
+        if let Some(index) = held {
+            event.key = self.forwarded_keys[index].key.clone();
+            event.physical_key = self.forwarded_keys[index].physical_key.clone();
+        }
+        if !tap && held.is_none() && self.driving {
+            if self.forwarded_keys.len() >= 256 {
+                actions.push(Action::Hint("Too many held keys; key discarded"));
+                return;
+            }
+            self.forwarded_keys.push(event.clone());
+        }
+        actions.push(Action::Key(event.clone()));
+        if tap {
+            event.action = TerminalKeyAction::Release;
+            actions.push(Action::Key(event));
+        }
     }
 
     /// Resolve an isolated Escape after the input timeout. Partial CSI/paste
@@ -220,78 +409,6 @@ impl InputDecoder {
             Vec::new()
         }
     }
-}
-
-fn decode_mouse(sequence: &[u8]) -> Option<crate::provider::TerminalMouseEvent> {
-    use crate::provider::*;
-    let body = sequence.strip_prefix(b"\x1b[<")?;
-    let release = *body.last()? == b'm';
-    if !release && *body.last()? != b'M' {
-        return None;
-    }
-    let text = std::str::from_utf8(&body[..body.len() - 1]).ok()?;
-    let mut fields = text.split(';');
-    let code: u16 = fields.next()?.parse().ok()?;
-    let col: u16 = fields.next()?.parse::<u16>().ok()?.saturating_sub(1);
-    let row: u16 = fields.next()?.parse::<u16>().ok()?.saturating_sub(1);
-    if fields.next().is_some() {
-        return None;
-    }
-    let wheel = code & 64 != 0;
-    let button = match code & 3 {
-        0 => Some(TerminalMouseButton::Left),
-        1 => Some(TerminalMouseButton::Middle),
-        2 => Some(TerminalMouseButton::Right),
-        _ => None,
-    };
-    let buttons = if release || wheel {
-        TerminalMouseButtons::empty()
-    } else {
-        match button {
-            Some(TerminalMouseButton::Left) => TerminalMouseButtons::LEFT,
-            Some(TerminalMouseButton::Middle) => TerminalMouseButtons::MIDDLE,
-            Some(TerminalMouseButton::Right) => TerminalMouseButtons::RIGHT,
-            _ => TerminalMouseButtons::empty(),
-        }
-    };
-    let mut modifiers = TerminalModifiers::empty();
-    if code & 4 != 0 {
-        modifiers |= TerminalModifiers::SHIFT;
-    }
-    if code & 8 != 0 {
-        modifiers |= TerminalModifiers::ALT;
-    }
-    if code & 16 != 0 {
-        modifiers |= TerminalModifiers::CTRL;
-    }
-    Some(TerminalMouseEvent {
-        kind: if wheel {
-            TerminalMouseEventKind::Wheel
-        } else if release {
-            TerminalMouseEventKind::Release
-        } else if code & 32 != 0 {
-            TerminalMouseEventKind::Move
-        } else {
-            TerminalMouseEventKind::Press
-        },
-        button: if wheel { None } else { button },
-        buttons,
-        modifiers,
-        cell_col: col,
-        cell_row: row,
-        x_px: f32::from(col) + 0.5,
-        y_px: f32::from(row) + 0.5,
-        wheel_delta_x: 0.0,
-        wheel_delta_y: if wheel {
-            if code & 1 == 0 {
-                1.0
-            } else {
-                -1.0
-            }
-        } else {
-            0.0
-        },
-    })
 }
 
 fn push_raw(actions: &mut Vec<Action>, bytes: &[u8]) {
@@ -402,5 +519,145 @@ mod tests {
         assert!(decoder.feed(&vec![b'a'; PASTE_LIMIT + 10]).is_empty());
         assert_eq!(decoder.feed(b"\x1b[201~"), vec![Action::Hint("Paste exceeds 1 MiB; discarded")]);
         assert_eq!(decoder.feed(b"ok"), vec![Action::Raw(b"ok".to_vec())]);
+    }
+}
+
+const COMMAND_HINT: &str = "cleat: d detach | g drive | w watch | x exclusive | c chrome | a auto size | [ history | ] live | k/j scroll | arrows pan | r reveal cursor | Esc cancel";
+
+fn local_command(byte: u8) -> Option<Command> {
+    match byte {
+        b'r' => Some(Command::RevealCursor),
+        b'd' => Some(Command::Detach),
+        b'a' => Some(Command::AutoSize),
+        b'w' => Some(Command::Watch),
+        b'g' => Some(Command::Drive),
+        b'x' => Some(Command::Exclusive),
+        b'c' => Some(Command::Chrome),
+        b'[' => Some(Command::Top),
+        b']' => Some(Command::Bottom),
+        b'k' => Some(Command::Up),
+        b'j' => Some(Command::Down),
+        _ => None,
+    }
+}
+
+fn command_byte(event: &TerminalKeyEvent) -> Option<u8> {
+    if event.modifiers.intersects(TerminalModifiers::ALT | TerminalModifiers::SUPER) {
+        return None;
+    }
+    match event.key {
+        TerminalKey::Named(TerminalNamedKey::Escape) if !event.modifiers.contains(TerminalModifiers::CTRL) => Some(0x1b),
+        TerminalKey::UnicodeScalar(c) if c < 128 => {
+            let c = c as u8;
+            if event.modifiers.contains(TerminalModifiers::CTRL) {
+                if (b'@'..=b'_').contains(&c) || c.is_ascii_alphabetic() {
+                    Some(c.to_ascii_uppercase() & 0x1f)
+                } else {
+                    None
+                }
+            } else {
+                Some(
+                    event
+                        .generated_text
+                        .as_deref()
+                        .filter(|s| s.len() == 1 && s.is_ascii())
+                        .map(|s| s.as_bytes()[0])
+                        .unwrap_or_else(|| if event.modifiers.contains(TerminalModifiers::SHIFT) { c.to_ascii_uppercase() } else { c }),
+                )
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+    fn decoder() -> InputDecoder {
+        let mut d = InputDecoder::new(0x1d);
+        d.set_keyboard_flags(31);
+        d
+    }
+    #[test]
+    fn kitty_events_and_replies_survive_every_read_split() {
+        let bytes = b"\x1b[?31u\x1b[122:90:119;2;90u\x1b[122;2:2u\x1b[122;1:3u";
+        let expected = decoder().feed(bytes);
+        assert_eq!(expected.len(), 4);
+        assert_eq!(expected[0], Action::KeyboardFlags(31));
+        let Action::Key(release) = &expected[3] else { panic!("missing key release") };
+        assert_eq!(release.action, TerminalKeyAction::Release);
+        assert_eq!(release.physical_key.as_deref(), Some("KeyW"));
+        for split in 0..=bytes.len() {
+            let mut d = decoder();
+            let mut actual = d.feed(&bytes[..split]);
+            actual.extend(d.feed(&bytes[split..]));
+            assert_eq!(actual, expected, "split {split}");
+        }
+    }
+    #[test]
+    fn local_commands_consume_their_repeats_and_releases() {
+        let mut d = decoder();
+        assert!(matches!(d.feed(b"\x1b[93;5u").as_slice(), [Action::Hint(_)]));
+        assert!(d.feed(b"\x1b[93;5:2u\x1b[93;5:3u").is_empty());
+        assert_eq!(d.feed(b"\x1b[100;;100u"), vec![Action::Command(Command::Detach)]);
+        assert!(d.feed(b"\x1b[100;1:3u").is_empty());
+        let mut d = decoder();
+        d.feed(b"\x1b[93;5u\x1b[93;5:3u");
+        assert!(matches!(d.feed(b"\x1b[93;5u").as_slice(), [Action::Key(_)]));
+        assert!(matches!(d.feed(b"\x1b[93;1:3u").as_slice(), [Action::Key(_)]));
+    }
+    #[test]
+    fn pan_mode_releases_application_holds_and_accepts_local_arrow_repeats() {
+        let mut d = decoder();
+        d.feed(b"\x1b[119;;119u");
+        d.feed(b"\x1b[93;5u");
+        let actions = d.feed(b"\x1b[C");
+        assert!(matches!(&actions[0],Action::Key(k) if k.action==TerminalKeyAction::Release));
+        assert_eq!(actions[1], Action::Command(Command::Pan(1, 0)));
+        assert_eq!(d.feed(b"\x1b[1;1:2C"), vec![Action::Command(Command::Pan(1, 0))]);
+        assert!(d.feed(b"\x1b[119;1:2u\x1b[119;1:3u").is_empty());
+        assert_eq!(d.feed(b"\x1b[27u"), vec![Action::Hint("")]);
+        assert!(!d.is_panning());
+    }
+    #[test]
+    fn paste_and_oversized_reports_do_not_turn_into_commands_or_replies() {
+        let mut d = decoder();
+        assert_eq!(d.feed(b"\x1b[200~\x1b[?31u\x1b[93;5u\x1b[201~"), vec![Action::Paste("\x1b[?31u\x1b[93;5u".into())]);
+        let mut bytes = b"\x1b[".to_vec();
+        bytes.extend(vec![b'1'; 8192]);
+        bytes.extend(b"uok");
+        assert_eq!(d.feed(&bytes), vec![Action::Hint("Oversized terminal key report discarded"), Action::Raw(b"ok".to_vec())]);
+        assert!(d.escape.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+    use crate::provider::{TerminalMouseButtons as Buttons, TerminalMouseEventKind as Kind};
+    #[test]
+    fn fragmented_negotiation_chords_and_pan_release() {
+        let bytes = b"\x1b[6;20;10t\x1b[?1016;2$y\x1b[?1016;1$y\x1b[<0;16;26M\x1b[<2;16;26M\x1b[<0;16;26m";
+        for split in 0..=bytes.len() {
+            let mut decoder = InputDecoder::new(0x1d);
+            let mut actions = decoder.feed(&bytes[..split]);
+            actions.extend(decoder.feed(&bytes[split..]));
+            assert!(matches!(actions[0], Action::MouseCellSize(10, 20)));
+            assert!(matches!(actions[1], Action::EnablePixelMouse));
+            let Action::Mouse(event) = &actions[3] else { panic!("mouse chord") };
+            assert_eq!(event.buttons, Buttons::LEFT | Buttons::RIGHT);
+            assert_eq!((event.x_px, event.y_px), (1.5, 1.25));
+            let Action::Mouse(event) = &actions[4] else { panic!("mouse release") };
+            assert_eq!(event.buttons, Buttons::RIGHT);
+            let pan = decoder.feed(b"\x1d\x1b[C");
+            assert!(pan.iter().any(|a| matches!(a, Action::Mouse(e) if e.kind == Kind::Release)));
+            assert!(decoder.feed(b"\x1b[<34;20;26M\x1b[<2;20;26m").is_empty());
+        }
+    }
+    #[test]
+    fn paste_does_not_negotiate_mouse_and_malformed_mouse_does_not_leak() {
+        let mut decoder = InputDecoder::new(0x1d);
+        assert!(matches!(decoder.feed(b"\x1b[200~\x1b[6;20;10t\x1b[201~").as_slice(), [Action::Paste(_)]));
+        assert!(matches!(decoder.feed(b"\x1b[<0;0;2M").as_slice(), [Action::Hint(_)]));
     }
 }

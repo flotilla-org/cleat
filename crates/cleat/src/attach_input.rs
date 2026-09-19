@@ -25,6 +25,8 @@ pub(crate) enum Action {
     Raw(Vec<u8>),
     Key(TerminalKeyEvent),
     KeyboardFlags(u32),
+    MouseCellSize(u16, u16),
+    EnablePixelMouse,
     GraphicsReply(Vec<u8>),
     Paste(String),
     Command(Command),
@@ -40,6 +42,8 @@ pub(crate) struct InputDecoder {
     escape: Vec<u8>,
     discard_escape: bool,
     keyboard_flags: u32,
+    mouse: crate::attach_mouse::MouseMode,
+    forwarded_buttons: Vec<crate::provider::TerminalMouseEvent>,
     forwarded_keys: Vec<TerminalKeyEvent>,
     paste: Option<Vec<u8>>,
     paste_tail: Vec<u8>,
@@ -58,6 +62,8 @@ impl InputDecoder {
             escape: Vec::new(),
             discard_escape: false,
             keyboard_flags: 0,
+            mouse: Default::default(),
+            forwarded_buttons: Vec::new(),
             forwarded_keys: Vec::new(),
             paste: None,
             paste_tail: Vec::new(),
@@ -72,6 +78,10 @@ impl InputDecoder {
         self.panning
     }
 
+    pub fn set_pixel_origin(&mut self, origin: u32) {
+        self.mouse.set_pixel_origin(origin);
+    }
+
     pub fn set_keyboard_flags(&mut self, flags: u32) {
         self.keyboard_flags = flags;
     }
@@ -79,6 +89,7 @@ impl InputDecoder {
     pub fn set_driving(&mut self, driving: bool) {
         if self.driving && !driving {
             self.forwarded_keys.clear();
+            self.forwarded_buttons.clear();
         }
         self.driving = driving;
         if self.paste.is_some() {
@@ -155,6 +166,24 @@ impl InputDecoder {
                 }
                 if complete {
                     let sequence = std::mem::take(&mut self.escape);
+                    if let Some(replies) = self.mouse.reply(&sequence) {
+                        for reply in replies {
+                            match reply {
+                                crate::attach_mouse::Reply::CellSize(w, h) => actions.push(Action::MouseCellSize(w, h)),
+                                crate::attach_mouse::Reply::EnablePixels => actions.push(Action::EnablePixelMouse),
+                                crate::attach_mouse::Reply::Consumed => {}
+                            }
+                        }
+                        continue;
+                    }
+                    if sequence.starts_with(b"\x1b[<") {
+                        if let Some(mouse) = self.mouse.decode(&sequence) {
+                            self.mouse_event(mouse, &mut actions);
+                        } else {
+                            actions.push(Action::Hint("Invalid mouse report discarded"));
+                        }
+                        continue;
+                    }
                     match crate::attach_keyboard::decode(&sequence, self.keyboard_flags) {
                         crate::attach_keyboard::Report::Flags(flags) => {
                             self.keyboard_flags = flags;
@@ -202,8 +231,6 @@ impl InputDecoder {
                     } else if self.armed || self.panning {
                         self.armed = false;
                         actions.push(Action::Hint("Unknown cleat command"));
-                    } else if let Some(mouse) = decode_mouse(&sequence) {
-                        actions.push(Action::Mouse(mouse));
                     } else {
                         push_raw(&mut actions, &sequence);
                     }
@@ -237,7 +264,50 @@ impl InputDecoder {
         actions
     }
 
+    fn mouse_event(&mut self, mut event: crate::provider::TerminalMouseEvent, actions: &mut Vec<Action>) {
+        use crate::provider::{TerminalMouseButton as Button, TerminalMouseButtons as Buttons, TerminalMouseEventKind as Kind};
+        if (self.armed || self.panning) && event.kind != Kind::Release {
+            return;
+        }
+        let index = self.forwarded_buttons.iter().position(|e| e.button == event.button);
+        for held in &mut self.forwarded_buttons {
+            held.x_px = event.x_px;
+            held.y_px = event.y_px;
+            held.cell_col = event.cell_col;
+            held.cell_row = event.cell_row;
+        }
+        match event.kind {
+            Kind::Press if self.driving && index.is_none() => self.forwarded_buttons.push(event.clone()),
+            Kind::Release => {
+                if let Some(i) = index {
+                    self.forwarded_buttons.remove(i);
+                } else {
+                    return;
+                }
+            }
+            Kind::Move if event.button.is_some() && index.is_none() => return,
+            _ => {}
+        }
+        for held in &self.forwarded_buttons {
+            event.buttons |= match held.button {
+                Some(Button::Left) => Buttons::LEFT,
+                Some(Button::Middle) => Buttons::MIDDLE,
+                Some(Button::Right) => Buttons::RIGHT,
+                Some(Button::Back) => Buttons::BACK,
+                Some(Button::Forward) => Buttons::FORWARD,
+                None => Buttons::empty(),
+            };
+        }
+        actions.push(Action::Mouse(event));
+    }
+
     fn release_forwarded(&mut self, actions: &mut Vec<Action>) {
+        for mut event in self.forwarded_buttons.drain(..) {
+            event.kind = crate::provider::TerminalMouseEventKind::Release;
+            event.buttons = crate::provider::TerminalMouseButtons::empty();
+            event.modifiers = TerminalModifiers::empty();
+            actions.push(Action::Mouse(event));
+        }
         for mut event in self.forwarded_keys.drain(..) {
             event.action = TerminalKeyAction::Release;
             event.modifiers = TerminalModifiers::empty();
@@ -339,78 +409,6 @@ impl InputDecoder {
             Vec::new()
         }
     }
-}
-
-fn decode_mouse(sequence: &[u8]) -> Option<crate::provider::TerminalMouseEvent> {
-    use crate::provider::*;
-    let body = sequence.strip_prefix(b"\x1b[<")?;
-    let release = *body.last()? == b'm';
-    if !release && *body.last()? != b'M' {
-        return None;
-    }
-    let text = std::str::from_utf8(&body[..body.len() - 1]).ok()?;
-    let mut fields = text.split(';');
-    let code: u16 = fields.next()?.parse().ok()?;
-    let col: u16 = fields.next()?.parse::<u16>().ok()?.saturating_sub(1);
-    let row: u16 = fields.next()?.parse::<u16>().ok()?.saturating_sub(1);
-    if fields.next().is_some() {
-        return None;
-    }
-    let wheel = code & 64 != 0;
-    let button = match code & 3 {
-        0 => Some(TerminalMouseButton::Left),
-        1 => Some(TerminalMouseButton::Middle),
-        2 => Some(TerminalMouseButton::Right),
-        _ => None,
-    };
-    let buttons = if release || wheel {
-        TerminalMouseButtons::empty()
-    } else {
-        match button {
-            Some(TerminalMouseButton::Left) => TerminalMouseButtons::LEFT,
-            Some(TerminalMouseButton::Middle) => TerminalMouseButtons::MIDDLE,
-            Some(TerminalMouseButton::Right) => TerminalMouseButtons::RIGHT,
-            _ => TerminalMouseButtons::empty(),
-        }
-    };
-    let mut modifiers = TerminalModifiers::empty();
-    if code & 4 != 0 {
-        modifiers |= TerminalModifiers::SHIFT;
-    }
-    if code & 8 != 0 {
-        modifiers |= TerminalModifiers::ALT;
-    }
-    if code & 16 != 0 {
-        modifiers |= TerminalModifiers::CTRL;
-    }
-    Some(TerminalMouseEvent {
-        kind: if wheel {
-            TerminalMouseEventKind::Wheel
-        } else if release {
-            TerminalMouseEventKind::Release
-        } else if code & 32 != 0 {
-            TerminalMouseEventKind::Move
-        } else {
-            TerminalMouseEventKind::Press
-        },
-        button: if wheel { None } else { button },
-        buttons,
-        modifiers,
-        cell_col: col,
-        cell_row: row,
-        x_px: f32::from(col) + 0.5,
-        y_px: f32::from(row) + 0.5,
-        wheel_delta_x: 0.0,
-        wheel_delta_y: if wheel {
-            if code & 1 == 0 {
-                1.0
-            } else {
-                -1.0
-            }
-        } else {
-            0.0
-        },
-    })
 }
 
 fn push_raw(actions: &mut Vec<Action>, bytes: &[u8]) {
@@ -630,5 +628,36 @@ mod keyboard_tests {
         bytes.extend(b"uok");
         assert_eq!(d.feed(&bytes), vec![Action::Hint("Oversized terminal key report discarded"), Action::Raw(b"ok".to_vec())]);
         assert!(d.escape.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+    use crate::provider::{TerminalMouseButtons as Buttons, TerminalMouseEventKind as Kind};
+    #[test]
+    fn fragmented_negotiation_chords_and_pan_release() {
+        let bytes = b"\x1b[6;20;10t\x1b[?1016;2$y\x1b[?1016;1$y\x1b[<0;16;26M\x1b[<2;16;26M\x1b[<0;16;26m";
+        for split in 0..=bytes.len() {
+            let mut decoder = InputDecoder::new(0x1d);
+            let mut actions = decoder.feed(&bytes[..split]);
+            actions.extend(decoder.feed(&bytes[split..]));
+            assert!(matches!(actions[0], Action::MouseCellSize(10, 20)));
+            assert!(matches!(actions[1], Action::EnablePixelMouse));
+            let Action::Mouse(event) = &actions[3] else { panic!("mouse chord") };
+            assert_eq!(event.buttons, Buttons::LEFT | Buttons::RIGHT);
+            assert_eq!((event.x_px, event.y_px), (1.5, 1.25));
+            let Action::Mouse(event) = &actions[4] else { panic!("mouse release") };
+            assert_eq!(event.buttons, Buttons::RIGHT);
+            let pan = decoder.feed(b"\x1d\x1b[C");
+            assert!(pan.iter().any(|a| matches!(a, Action::Mouse(e) if e.kind == Kind::Release)));
+            assert!(decoder.feed(b"\x1b[<34;20;26M\x1b[<2;20;26m").is_empty());
+        }
+    }
+    #[test]
+    fn paste_does_not_negotiate_mouse_and_malformed_mouse_does_not_leak() {
+        let mut decoder = InputDecoder::new(0x1d);
+        assert!(matches!(decoder.feed(b"\x1b[200~\x1b[6;20;10t\x1b[201~").as_slice(), [Action::Paste(_)]));
+        assert!(matches!(decoder.feed(b"\x1b[<0;0;2M").as_slice(), [Action::Hint(_)]));
     }
 }

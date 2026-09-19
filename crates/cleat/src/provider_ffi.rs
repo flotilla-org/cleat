@@ -1724,7 +1724,7 @@ fn route_in_process_mouse_event(in_process: &InProcessSession, event: &CleatInpu
         x_px: event.x_px,
         y_px: event.y_px,
     };
-    in_process.actor.request_result(|reply| SessionCommand::Mouse { event: mouse, reply }).ok()
+    in_process.actor.request_result(|reply| SessionCommand::Mouse { source: 0, event: mouse, reply }).ok()
 }
 
 fn mouse_modifiers(modifiers: u16) -> vt::MouseModifiers {

@@ -4099,17 +4099,19 @@ fn replay_with_session_and_markers_while_daemon_alive() {
 
 #[cfg(feature = "ghostty-vt")]
 #[test]
-fn packet_shared_keys_release_on_driver_loss_and_history() {
+fn packet_shared_input_releases_on_driver_loss_and_history() {
     use cleat::provider::{TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers};
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-    for cleanup in ["disconnect", "history", "takeover"] {
+    for (mouse, cleanup) in
+        [false, true].into_iter().flat_map(|mouse| ["disconnect", "history", "takeover"].map(|cleanup| (mouse, cleanup)))
+    {
         let temp = tempfile::tempdir().unwrap();
         let service = service_for(temp.path());
-        // Read exactly one Ctrl-A press and one synthetic release, then display
+        // Read exactly one press and one synthetic release, then display
         // their bytes. A premature release or duplicated press changes this output.
-        let expected = b"\x1b[97;5u\x1b[97;1:3u";
+        let expected: &[u8] = if mouse { b"\x1b[<0;3;4M\x1b[<0;3;4m" } else { b"\x1b[97;5u\x1b[97;1:3u" };
         let command = format!(
-        "sh -c 'stty raw -echo; i=0; while [ $i -lt 50 ]; do echo seed; i=$((i+1)); done; printf \"\\033[>3uREADY\\r\\n\"; dd bs=1 count={} 2>/dev/null | od -An -tx1 -v; sleep 30'",
+        "sh -c 'stty raw -echo; i=0; while [ $i -lt 50 ]; do echo seed; i=$((i+1)); done; printf \"\\033[>3u\\033[?1000h\\033[?1006hREADY\\r\\n\"; dd bs=1 count={} 2>/dev/null | od -An -tx1 -v; sleep 30'",
         expected.len()
     );
         service.create(Some("alpha".into()), Some(VtEngineKind::Ghostty), None, Some(command), false).unwrap();
@@ -4128,26 +4130,41 @@ fn packet_shared_keys_release_on_driver_loss_and_history() {
             packet_input(
                 stream,
                 1,
-                TerminalInputEvent::Key(TerminalKeyEvent {
-                    key: TerminalKey::UnicodeScalar('a' as u32),
-                    action: TerminalKeyAction::Press,
-                    modifiers: TerminalModifiers::CTRL,
-                    consumed_modifiers: TerminalModifiers::empty(),
-                    generated_text: None,
-                    platform_keycode: 0,
-                    physical_key: Some("KeyA".into()),
-                }),
+                if mouse {
+                    TerminalInputEvent::Mouse(cleat::provider::TerminalMouseEvent {
+                        kind: cleat::provider::TerminalMouseEventKind::Press,
+                        button: Some(cleat::provider::TerminalMouseButton::Left),
+                        buttons: cleat::provider::TerminalMouseButtons::LEFT,
+                        modifiers: TerminalModifiers::empty(),
+                        cell_col: 2,
+                        cell_row: 3,
+                        x_px: 2.5,
+                        y_px: 3.5,
+                        wheel_delta_x: 0.0,
+                        wheel_delta_y: 0.0,
+                    })
+                } else {
+                    TerminalInputEvent::Key(TerminalKeyEvent {
+                        key: TerminalKey::UnicodeScalar('a' as u32),
+                        action: TerminalKeyAction::Press,
+                        modifiers: TerminalModifiers::CTRL,
+                        consumed_modifiers: TerminalModifiers::empty(),
+                        generated_text: None,
+                        platform_keycode: 0,
+                        physical_key: Some("KeyA".into()),
+                    })
+                },
             );
             // A subsequent resize on this channel fences processing of its press.
             let rows = 23 - index as u16;
             packet_write(stream, 1, cleat::packet::MSG_SESSION_RESIZE, &cleat::packet::Resize { cols: 80, rows });
-            wait_until("driver key processed", || service.inspect("alpha").unwrap().terminal.rows == rows);
+            wait_until("driver input processed", || service.inspect("alpha").unwrap().terminal.rows == rows);
         }
         packet_write(&mut streams[0], 1, MSG_SESSION_ROLE, &RoleRequest { role: ChannelRole::Watcher, take: false });
         wait_until("first driver demoted", || {
             service.inspect("alpha").unwrap().attachments.iter().filter(|a| a.role == "controller").count() == 1
         });
-        assert!(!service.capture("alpha").unwrap().contains("1b 5b"), "a peer still holds the key");
+        assert!(!service.capture("alpha").unwrap().contains("1b 5b"), "a peer still holds the input");
         match cleanup {
             "disconnect" => drop(streams.pop()),
             "history" => packet_write(&mut streams[1], 1, cleat::packet::MSG_SESSION_VIEWPORT, &cleat::packet::Viewport {
@@ -4157,7 +4174,7 @@ fn packet_shared_keys_release_on_driver_loss_and_history() {
             _ => unreachable!(),
         }
         let expected_hex = expected.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-        wait_until("final key release reaches PTY", || {
+        wait_until("final release reaches PTY", || {
             service.capture("alpha").unwrap().split_whitespace().collect::<Vec<_>>().join(" ").contains(&expected_hex)
         });
         service.kill("alpha").unwrap();

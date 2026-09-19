@@ -7,8 +7,8 @@ cursor mode, legacy modifier encoding and Kitty keyboard enhancement flags are
 read from the terminal for each event.
 
 CLI attach negotiates Kitty keyboard input with the outer terminal and feeds
-the same structured event path. SGR pixel mouse input and mouse-button ownership
-cleanup remain subsequent work. Existing raw-byte and text injection remain
+the same structured event path. CLI and native mouse events also share
+per-attachment button ownership and application-mode encoding. Existing raw-byte and text injection remain
 explicit operations; they do not acquire held-key ownership or synthesize
 release events.
 
@@ -78,6 +78,33 @@ releases are ignored. Bracketed paste shields its contents from keyboard report
 and command interpretation. Reports may span reads; oversized reports are
 bounded and drained without forwarding their tails as application input.
 
+## Mouse input
+
+CLI attach queries mode 1016 support and the outer terminal's cell dimensions
+(`CSI 16 t`). It requests SGR pixels only after both replies, then confirms the
+mode before decoding pixel reports. Other terminals retain SGR cell reports.
+Cell dimensions are queried once a second to catch font and display changes.
+Known Kitty/Ghostty outer terminals use zero-based pixels; other terminals use
+xterm's one-based convention. Application pixel reports use Ghostty's zero-based
+convention consistently for buttons, motion and wheels.
+The coordinate format belongs to the attachment and stays independent of the
+application's tracking mode. Detach disables pixel reporting.
+
+Pixel positions retain their fraction within a cell through viewport panning.
+Cleat reports the source cell dimensions to the daemon, which scales positions
+to the application's cell dimensions. Cell reports use cell centres. Presses on
+chrome or outside the visible grid are ignored; releases still reach the daemon
+to end existing holds. Vertical and horizontal wheels and Back/Forward buttons
+are supported. Malformed reports are discarded locally. The wire format follows
+[xterm's SGR-pixel protocol](https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf).
+
+Buttons follow the same attachment lifecycle as keys: disconnect, demotion,
+takeover and history entry release that source's holds. Equal buttons held by
+multiple drivers produce one application press and a final release when the last
+owner lets go. Orphan releases and stale drags do not acquire ownership. CLI pan
+mode releases its held buttons before consuming further input. Native in-process
+clients use source zero and the same ownership rules.
+
 ## Upgrade requirements
 
 Both the C provider ABI and packet protocol are version **9**. Rebuild native
@@ -100,7 +127,7 @@ application cursor mode, modifier keys and differing logical/physical identities
 FFI tests compare in-process actor events with daemon packet events. Ownership
 contracts cover shared holds, layout changes and orphan releases/repeats.
 
-A daemon/PTY contract runs the same two-driver scenario with final disconnect,
+A daemon/PTY contract runs the same two-driver keyboard and mouse scenarios with final disconnect,
 history entry and exclusive takeover. It checks the exact application input
 bytes and verifies that demoting one driver does not release the other's hold.
 
@@ -116,6 +143,7 @@ cargo test -p cleat --locked --features ghostty-vt ghostty_key
 cargo test -p cleat --lib --locked --no-default-features keyboard
 cargo test -p cleat --lib --locked --no-default-features attach_
 cargo test -p cleat --lib --locked --features ghostty-vt packet_keyboard
+cargo test -p cleat --lib --locked --no-default-features mouse
 ```
 
 The full suite includes the Ghostty encoder contracts and daemon/PTY ownership

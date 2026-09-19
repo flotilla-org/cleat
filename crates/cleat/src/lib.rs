@@ -29,3 +29,7 @@ pub mod server;
 pub mod session;
 mod session_runtime;
 pub mod vt;
+
+mod mouse;
+
+mod attach_mouse;

@@ -41,6 +41,7 @@ pub(crate) struct SessionRuntime {
     recorder: Option<SessionRecorder>,
     markers: HashMap<String, u64>,
     held_keys: crate::keyboard::HeldKeys,
+    held_buttons: crate::mouse::HeldButtons,
     epoch: Instant,
     last_pty_output_at: Option<Instant>,
     screen_activity: ScreenActivityTracker,
@@ -131,6 +132,7 @@ impl SessionRuntime {
             recorder,
             markers: HashMap::new(),
             held_keys: Default::default(),
+            held_buttons: Default::default(),
             epoch: Instant::now(),
             last_pty_output_at: None,
             screen_activity: ScreenActivityTracker::new(unix_timestamp_millis(SystemTime::now())),
@@ -248,7 +250,7 @@ impl SessionRuntime {
     pub(crate) fn set_attachment_view(&mut self, id: u128, command: ViewportCommand) -> Result<bool, String> {
         let history = self.vt_engine.set_attachment_view(id, command)?;
         if history {
-            self.release_keys(id)?;
+            self.release_input(id)?;
         }
         Ok(history)
     }
@@ -270,7 +272,7 @@ impl SessionRuntime {
     pub(crate) fn scroll_viewport(&mut self, command: ViewportCommand) -> Result<ViewportCommandOutcome, String> {
         let outcome = self.vt_engine.scroll_viewport(command)?;
         if outcome == ViewportCommandOutcome::Moved {
-            self.release_keys(0)?;
+            self.release_input(0)?;
         }
         Ok(outcome)
     }
@@ -306,16 +308,19 @@ impl SessionRuntime {
         Ok(1)
     }
 
-    pub(crate) fn retain_key_sources(&mut self, sources: &[u128]) -> Result<(), String> {
-        for source in self.held_keys.sources() {
+    pub(crate) fn retain_input_sources(&mut self, sources: &[u128]) -> Result<(), String> {
+        for source in self.held_keys.sources().into_iter().chain(self.held_buttons.sources()) {
             if !sources.contains(&source) {
-                self.release_keys(source)?;
+                self.release_input(source)?;
             }
         }
         Ok(())
     }
 
-    pub(crate) fn release_keys(&mut self, source: u128) -> Result<(), String> {
+    pub(crate) fn release_input(&mut self, source: u128) -> Result<(), String> {
+        for event in self.held_buttons.release(source) {
+            self.deliver_mouse(event)?;
+        }
         for event in self.held_keys.release(source) {
             let bytes = self.vt_engine.encode_key(&event)?;
             if !bytes.is_empty() {
@@ -323,6 +328,22 @@ impl SessionRuntime {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn mouse(&mut self, source: u128, event: crate::host::actor::SessionMouseEvent) -> Result<usize, String> {
+        let Some(event) = self.held_buttons.event(source, event) else {
+            return Ok(0);
+        };
+        self.deliver_mouse(event)
+    }
+
+    fn deliver_mouse(&mut self, event: crate::host::actor::SessionMouseEvent) -> Result<usize, String> {
+        let bytes = self.encode_mouse(event.action, event.button, event.any_button_pressed, event.modifiers, event.x_px, event.y_px)?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.write_input(&bytes)?;
+        Ok(1)
     }
 
     pub(crate) fn encode_paste(&mut self, text: &[u8]) -> Result<Vec<u8>, String> {

@@ -43,7 +43,7 @@ use crate::{
 };
 
 const DETACH_CLEANUP_SEQUENCE: &[u8] =
-    b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
+    b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1016l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l";
 const REATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const MAX_PENDING_CLIENT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 // Leave room for control messages without prefetching megabytes of images.
@@ -254,15 +254,24 @@ impl AttachChrome {
         terminal_rows: u16,
     ) -> Option<crate::provider::TerminalMouseEvent> {
         let strip_row = self.visible || (self.hint.is_some() && !self.hidden);
-        if strip_row && mouse.cell_row == terminal_rows.saturating_sub(1) {
+        let release = mouse.kind == TerminalMouseEventKind::Release;
+        if strip_row && mouse.cell_row == terminal_rows.saturating_sub(1) && !release {
             return None;
         }
-        let (col, row) = self.renderer.geometry.to_grid(mouse.cell_col, mouse.cell_row)?;
+        let (col, row) = if release {
+            (
+                self.renderer.geometry.x.saturating_add(mouse.cell_col).min(self.renderer.cols.saturating_sub(1)),
+                self.renderer.geometry.y.saturating_add(mouse.cell_row).min(self.renderer.rows.saturating_sub(1)),
+            )
+        } else {
+            self.renderer.geometry.to_grid(mouse.cell_col, mouse.cell_row)?
+        };
+        let (w, h) = self.renderer.mouse_cell_size;
+        // Decoder coordinates are in cell units, retaining the sub-cell offset.
+        mouse.x_px = (f32::from(col) + mouse.x_px.fract()) * f32::from(w);
+        mouse.y_px = (f32::from(row) + mouse.y_px.fract()) * f32::from(h);
         mouse.cell_col = col;
         mouse.cell_row = row;
-        // CLI SGR reports use cell centres, with a one-pixel source cell size.
-        mouse.x_px = f32::from(col) + 0.5;
-        mouse.y_px = f32::from(row) + 0.5;
         Some(mouse)
     }
 
@@ -354,6 +363,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             stdout.write_all(b"\x1b[?2004h\x1b[?1004h").map_err(|e| e.to_string())?;
             if chrome.renderer.keyboard.is_some() {
                 stdout.write_all(crate::attach_keyboard::QUERY).map_err(|e| e.to_string())?;
+                stdout.write_all(b"\x1b[?1016l\x1b[?1006h").map_err(|e| e.to_string())?;
+                stdout.write_all(crate::attach_mouse::QUERY).map_err(|e| e.to_string())?;
             }
             stdout.flush().map_err(|e| e.to_string())?;
         }
@@ -439,6 +450,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let chrome_resize = Arc::clone(&chrome);
     let resize_loop = thread::spawn(move || -> Result<(), String> {
         let mut last = None;
+        let mut cell_query = Instant::now();
         while alive_resize.load(Ordering::SeqCst) {
             let next = chrome_resize.lock().map_err(|_| "chrome poisoned")?.content_size();
             if last != Some(next) {
@@ -456,6 +468,12 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 )?;
                 last = Some(next);
             }
+            if cell_query.elapsed() >= Duration::from_secs(1) && stdout_is_tty()? {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(b"\x1b[16t").map_err(|e| e.to_string())?;
+                stdout.flush().map_err(|e| e.to_string())?;
+                cell_query = Instant::now();
+            }
             thread::sleep(Duration::from_millis(100));
         }
         Ok(())
@@ -469,6 +487,10 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
         .filter(|byte| *byte != 0x1b && *byte != 0)
         .unwrap_or(0x1d);
     let mut decoder = InputDecoder::new(prefix);
+    decoder.set_pixel_origin(crate::attach_mouse::pixel_origin(
+        &std::env::var("TERM").unwrap_or_default(),
+        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
+    ));
     let mut buf = [0u8; 4096];
     let stdin_result = 'input: loop {
         if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
@@ -526,6 +548,22 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                         }
                         stdout.flush().map_err(|e| e.to_string())?;
                     }
+                }
+                Action::EnablePixelMouse => {
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(b"\x1b[?1016h\x1b[?1016$p").map_err(|e| e.to_string())?;
+                    stdout.flush().map_err(|e| e.to_string())?;
+                }
+                Action::MouseCellSize(w, h) => {
+                    let mut chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
+                    chrome.renderer.mouse_cell_size = (w, h);
+                    let (cols, rows) = chrome.content_size();
+                    event = Some(TerminalInputEvent::Resize(crate::provider::TerminalResizeEvent {
+                        cols,
+                        rows,
+                        cell_width_px: f32::from(w),
+                        cell_height_px: f32::from(h),
+                    }));
                 }
                 Action::Key(key) => event = Some(TerminalInputEvent::Key(key)),
                 Action::Raw(bytes) => event = Some(TerminalInputEvent::RawBytes(bytes)),
@@ -591,7 +629,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 }
             }
             if let Some(event) = event {
-                let local = matches!(event, TerminalInputEvent::Focus(_) | TerminalInputEvent::Mouse(_));
+                let local = matches!(event, TerminalInputEvent::Focus(_) | TerminalInputEvent::Mouse(_) | TerminalInputEvent::Resize(_));
                 if controller.load(Ordering::SeqCst) || local {
                     if let Err(err) = write_packet_frame(&packet.stream, PacketFrame::new(channel, MSG_SESSION_INPUT, &Input { event })) {
                         break 'input Err(err);
@@ -660,6 +698,7 @@ fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result
 #[derive(Debug)]
 struct PacketTerminalRenderer {
     keyboard: Option<Arc<Mutex<crate::attach_keyboard::KeyboardMode>>>,
+    mouse_cell_size: (u16, u16),
     images: crate::kitty_output::KittyOutput,
     geometry: crate::attachment_view::AttachmentView,
     bounds: bool,
@@ -676,6 +715,7 @@ impl PacketTerminalRenderer {
     fn new(cols: u16, rows: u16) -> Self {
         Self {
             keyboard: None,
+            mouse_cell_size: (1, 1),
             images: Default::default(),
             geometry: crate::attachment_view::AttachmentView::new((cols, rows), (cols, rows)),
             bounds: false,
@@ -874,17 +914,13 @@ fn render_packet_terminal_modes(
         writer.write_all(b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l").map_err(|err| format!("reset packet mouse mode: {err}"))?;
         let enable = match current.mouse_tracking_mode {
             vt::MouseTrackingMode::None => None,
-            vt::MouseTrackingMode::X10 => Some(&b"\x1b[?9h"[..]),
-            vt::MouseTrackingMode::Normal => Some(&b"\x1b[?1000h"[..]),
+            vt::MouseTrackingMode::X10 | vt::MouseTrackingMode::Normal => Some(&b"\x1b[?1000h"[..]),
             vt::MouseTrackingMode::Button => Some(&b"\x1b[?1002h"[..]),
             vt::MouseTrackingMode::Any => Some(&b"\x1b[?1003h"[..]),
         };
         if let Some(enable) = enable {
             writer.write_all(enable).map_err(|err| format!("set packet mouse mode: {err}"))?;
         }
-    }
-    if previous.mouse_tracking_mode != current.mouse_tracking_mode || previous.mouse_report_format != current.mouse_report_format {
-        writer.write_all(b"\x1b[?1016l\x1b[?1006h").map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -2121,7 +2157,7 @@ fn sync_packet_geometry(hosted: &mut HostedSession) -> Result<(), String> {
 }
 
 fn sync_packet_controller_presence(layout: &RuntimeLayout, hosted: &HostedSession, previously_had_controller: bool) -> Result<(), String> {
-    hosted.actor.retain_key_sources(hosted.packet_control.controllers().map(PacketChannelRef::view_id).collect())?;
+    hosted.actor.retain_input_sources(hosted.packet_control.controllers().map(PacketChannelRef::view_id).collect())?;
     let has_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
     // Query authority follows the transport, not the number of drivers.
     // Also update on raw-to-packet takeover, when controller presence stays true.
@@ -2904,7 +2940,7 @@ fn handle_http_request(
                     hosted.watchers.push(controller);
                 }
                 hosted.packet_control.demote_all();
-                hosted.actor.retain_key_sources(vec![])?;
+                hosted.actor.retain_input_sources(vec![])?;
                 for client in state.packet_clients.iter_mut() {
                     for channel in client.channels.values_mut().filter(|c| c.session_id == id) {
                         channel.role = ChannelRole::Watcher;
@@ -3012,7 +3048,7 @@ fn handle_http_request(
             let controllers: Vec<_> = hosted.packet_control.controllers().collect();
             for controller in controllers {
                 hosted.packet_control.remove(controller);
-                hosted.actor.release_keys(controller.view_id())?;
+                hosted.actor.release_input(controller.view_id())?;
                 hosted.actor.release_attachment_view(controller.view_id());
                 if let Some(client) = state.packet_clients.iter_mut().find(|client| client.id == controller.client_id) {
                     client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
@@ -3633,7 +3669,7 @@ fn release_packet_client_roles(
             let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
             hosted.packet_control.remove(PacketChannelRef { client_id: removed.id, channel: *channel });
             let id = PacketChannelRef { client_id: removed.id, channel: *channel }.view_id();
-            let _ = hosted.actor.release_keys(id);
+            let _ = hosted.actor.release_input(id);
             hosted.actor.release_attachment_view(id);
             let _ = sync_packet_geometry(hosted);
             let _ = sync_packet_controller_presence(layout, hosted, previously_had_controller);
@@ -3830,7 +3866,7 @@ fn handle_packet_frame(
                                 event.y_px = event
                                     .y_px
                                     .clamp(0.0, (f32::from(hosted.applied_size.1) * hosted.applied_cell_size.1 as f32 - 1.0).max(0.0));
-                                route_packet_mouse_event(&hosted.actor, event)?;
+                                route_packet_mouse_event(&hosted.actor, key.view_id(), event)?;
                             }
                         }
                         event if session.role == ChannelRole::Controller => {
@@ -4219,13 +4255,13 @@ fn route_packet_input_event(actor: &SessionActor, source: u128, event: TerminalI
             }
             Ok(())
         }
-        TerminalInputEvent::Mouse(event) => route_packet_mouse_event(actor, event),
+        TerminalInputEvent::Mouse(event) => route_packet_mouse_event(actor, source, event),
         TerminalInputEvent::Key(event) => actor.key(source, event).map(|_| ()),
         TerminalInputEvent::Focus(_) => Ok(()),
     }
 }
 
-fn route_packet_mouse_event(actor: &SessionActor, event: crate::provider::TerminalMouseEvent) -> Result<(), String> {
+fn route_packet_mouse_event(actor: &SessionActor, source: u128, event: crate::provider::TerminalMouseEvent) -> Result<(), String> {
     let modifiers = vt::MouseModifiers {
         shift: event.modifiers.contains(crate::provider::TerminalModifiers::SHIFT),
         ctrl: event.modifiers.contains(crate::provider::TerminalModifiers::CTRL),
@@ -4250,7 +4286,7 @@ fn route_packet_mouse_event(actor: &SessionActor, event: crate::provider::Termin
         TerminalMouseEventKind::Move => vt::MouseAction::Motion,
         TerminalMouseEventKind::Wheel => unreachable!("wheel handled above"),
     };
-    actor.mouse(SessionMouseEvent {
+    actor.mouse(source, SessionMouseEvent {
         action,
         button: event.button.and_then(packet_mouse_button),
         any_button_pressed: !event.buttons.is_empty(),
@@ -4266,7 +4302,8 @@ fn packet_mouse_button(button: TerminalMouseButton) -> Option<vt::MouseButton> {
         TerminalMouseButton::Left => Some(vt::MouseButton::Left),
         TerminalMouseButton::Middle => Some(vt::MouseButton::Middle),
         TerminalMouseButton::Right => Some(vt::MouseButton::Right),
-        TerminalMouseButton::Back | TerminalMouseButton::Forward => None,
+        TerminalMouseButton::Back => Some(vt::MouseButton::Eight),
+        TerminalMouseButton::Forward => Some(vt::MouseButton::Nine),
     }
 }
 
@@ -4791,7 +4828,7 @@ mod tests {
         for kind in
             [TerminalMouseEventKind::Press, TerminalMouseEventKind::Release, TerminalMouseEventKind::Move, TerminalMouseEventKind::Wheel]
         {
-            assert!(chrome.translate_mouse(mouse(kind, 1, 23), 24).is_none());
+            assert_eq!(chrome.translate_mouse(mouse(kind, 1, 23), 24).is_none(), kind != TerminalMouseEventKind::Release);
             let mapped = chrome.translate_mouse(mouse(kind, 1, 2), 24).unwrap();
             assert_eq!((mapped.cell_col, mapped.cell_row), (41, 19));
             assert_eq!((mapped.x_px, mapped.y_px), (41.5, 19.5));
@@ -4808,7 +4845,13 @@ mod tests {
         chrome.paint_at_size(&mut Vec::new(), None, (130, 50)).unwrap();
         assert_eq!((chrome.renderer.geometry.x, chrome.renderer.geometry.y), (0, 0));
         assert!(chrome.translate_mouse(mouse(TerminalMouseEventKind::Press, 120, 0), 50).is_none());
-        assert!(chrome.translate_mouse(mouse(TerminalMouseEventKind::Release, 0, 40), 50).is_none());
+        assert_eq!(chrome.translate_mouse(mouse(TerminalMouseEventKind::Release, 0, 40), 50).unwrap().cell_row, 39);
+        chrome.renderer.mouse_cell_size = (10, 20);
+        let mut precise = mouse(TerminalMouseEventKind::Press, 1, 2);
+        precise.x_px = 1.25;
+        precise.y_px = 2.75;
+        let mapped = chrome.translate_mouse(precise, 50).unwrap();
+        assert_eq!((mapped.x_px, mapped.y_px), (12.5, 55.0));
     }
 
     #[test]
@@ -5109,7 +5152,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
+            b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1016l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 
@@ -5123,7 +5166,7 @@ mod tests {
 
         assert_eq!(
             *output.lock().expect("lock output"),
-            b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
+            b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1016l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[r\x1b[0m\x1b[?25h\x1b[2J\x1b[H\x1b[?1049l"
         );
     }
 
@@ -5608,6 +5651,71 @@ mod packet_keyboard_tests {
         outer.feed(&output.lock().unwrap()).unwrap();
         outer.feed(crate::attach_keyboard::QUERY).unwrap();
         assert_eq!(outer.drain_replies(), b"\x1b[?5u");
+    }
+
+    #[test]
+    fn decoded_pixel_positions_encode_for_cell_and_pixel_applications() {
+        let mut mode = crate::attach_mouse::MouseMode::default();
+        mode.set_pixel_origin(0);
+        mode.reply(b"\x1b[6;20;10t");
+        mode.reply(b"\x1b[?1016;2$y");
+        mode.reply(b"\x1b[?1016;1$y");
+        let event = mode.decode(b"\x1b[<0;16;26M").unwrap();
+        for (format, expected) in [(b"\x1b[?1006h".as_slice(), b"\x1b[<0;2;2M".as_slice()), (b"\x1b[?1016h", b"\x1b[<0;16;26M")] {
+            let mut app = GhosttyVtEngine::new(80, 24);
+            app.set_cell_size(10, 20).unwrap();
+            app.feed(b"\x1b[?1000h").unwrap();
+            app.feed(format).unwrap();
+            let bytes = app
+                .encode_mouse(
+                    vt::MouseAction::Press,
+                    Some(vt::MouseButton::Left),
+                    true,
+                    Default::default(),
+                    event.x_px * 10.0,
+                    event.y_px * 20.0,
+                )
+                .unwrap();
+            assert_eq!(bytes, expected);
+            let wheel = crate::host::actor::mouse_report_bytes_from_wheel(
+                SessionWheelEvent {
+                    modifiers: Default::default(),
+                    cell_col: event.cell_col,
+                    cell_row: event.cell_row,
+                    x_px: event.x_px * 10.0,
+                    y_px: event.y_px * 20.0,
+                    wheel_delta_x: 0.0,
+                    wheel_delta_y: 1.0,
+                },
+                app.terminal_mode_state().unwrap(),
+            )
+            .unwrap();
+            let expected_wheel = String::from_utf8(expected.to_vec()).unwrap().replacen("<0;", "<64;", 1);
+            assert_eq!(wheel, expected_wheel.as_bytes());
+        }
+    }
+
+    #[test]
+    fn pixel_mouse_format_survives_application_mode_changes_and_cleanup_disables_it() {
+        let mut outer = GhosttyVtEngine::new(80, 24);
+        outer.feed(b"\x1b[?1006h\x1b[?1016h").unwrap();
+        let mut previous = vt::TerminalModeState::default();
+        for tracking in [vt::MouseTrackingMode::Normal, vt::MouseTrackingMode::Any, vt::MouseTrackingMode::None] {
+            let current = vt::TerminalModeState {
+                mouse_tracking_mode: tracking,
+                active_alternate_screen: !previous.active_alternate_screen,
+                ..Default::default()
+            };
+            let mut bytes = Vec::new();
+            render_packet_terminal_modes(&mut bytes, previous, current).unwrap();
+            outer.feed(&bytes).unwrap();
+            assert_eq!(outer.terminal_mode_state().unwrap().mouse_report_format, vt::MouseReportFormat::SgrPixels);
+            previous = current;
+        }
+        let mut bytes = Vec::new();
+        write_detach_cleanup(&mut bytes).unwrap();
+        outer.feed(&bytes).unwrap();
+        assert!(!outer.terminal_mode_state().unwrap().mouse_sgr_pixels);
     }
 
     #[test]

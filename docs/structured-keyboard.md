@@ -6,11 +6,11 @@ in-process providers and daemon packet clients share this path. Application
 cursor mode, legacy modifier encoding and Kitty keyboard enhancement flags are
 read from the terminal for each event.
 
-This is the application-facing slice. CLI attach still reads legacy terminal
-input; Kitty negotiation/decoding on the outer terminal and SGR pixel mouse
-input are subsequent work. Mouse-button ownership cleanup is also part of that
-mouse slice. Existing raw-byte and text injection remain explicit operations;
-they do not acquire held-key ownership or synthesize release events.
+CLI attach negotiates Kitty keyboard input with the outer terminal and feeds
+the same structured event path. SGR pixel mouse input and mouse-button ownership
+cleanup remain subsequent work. Existing raw-byte and text injection remain
+explicit operations; they do not acquire held-key ownership or synthesize
+release events.
 
 ## Event identity
 
@@ -57,6 +57,27 @@ The ownership layer is independent of the PTY and encoder. Synthetic releases
 use the application's current modes: legacy applications do not receive Kitty
 release sequences merely because cleat tracks a hold.
 
+## CLI terminal input
+
+Packet attach queries the outer terminal for Kitty keyboard support. After a
+valid reply it requests all five enhancement flags (31), then reads back the
+flags supported by that terminal. Terminals that do not reply retain the legacy
+byte path. Cleat owns one keyboard-mode stack entry on the active screen: it
+pops before changing screens, pushes on the new screen, and pops on detach.
+
+The decoder preserves press/repeat/release actions, associated text, shifted
+alternates and an optional physical identity from an explicit base-layout
+alternate. Reports without key-up support become press/release taps. Releases
+and repeats retain the identity of the original press when later reports omit
+alternate fields. Hyper, Meta and functional keys outside the pinned Ghostty
+encoder's vocabulary (including F26–F35) are discarded with a local hint.
+
+Prefix commands and viewport panning consume their own key events. Entering pan
+mode releases application keys held by that attachment; stale repeats and
+releases are ignored. Bracketed paste shields its contents from keyboard report
+and command interpretation. Reports may span reads; oversized reports are
+bounded and drained without forwarding their tails as application input.
+
 ## Upgrade requirements
 
 Both the C provider ABI and packet protocol are version **9**. Rebuild native
@@ -83,7 +104,7 @@ A daemon/PTY contract runs the same two-driver scenario with final disconnect,
 history entry and exclusive takeover. It checks the exact application input
 bytes and verifies that demoting one driver does not release the other's hold.
 
-Local validation passed on macOS:
+Validation commands on macOS:
 
 ```sh
 cargo +nightly-2026-03-12 fmt --check
@@ -93,7 +114,13 @@ cargo test --workspace --locked
 cargo build -p cleat --locked --features ghostty-vt
 cargo test -p cleat --locked --features ghostty-vt ghostty_key
 cargo test -p cleat --lib --locked --no-default-features keyboard
+cargo test -p cleat --lib --locked --no-default-features attach_
+cargo test -p cleat --lib --locked --features ghostty-vt packet_keyboard
 ```
 
 The full suite includes the Ghostty encoder contracts and daemon/PTY ownership
-contract. No live Wheelhouse or Katzensteg GUI input validation is claimed.
+contract. CLI contracts cover fragmented reports, paste isolation, local commands
+and panning. A Ghostty-backed outer terminal test checks keyboard-mode restoration
+after repeated screen switches and detach; another checks the decoded input
+against both legacy and Kitty application modes. No live Wheelhouse, Katzensteg
+or outer-terminal GUI input validation is claimed.

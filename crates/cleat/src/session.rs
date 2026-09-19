@@ -320,12 +320,16 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     use crate::attach_input::{Action, Command, InputDecoder};
     let _signal_handlers = signal_handlers;
     let mut cleanup = AttachCleanupGuard::stdout();
+    let keyboard = cleanup.enabled.then(|| Arc::new(Mutex::new(crate::attach_keyboard::KeyboardMode::default())));
+    cleanup.keyboard = keyboard.clone();
     let mut terminal = ForegroundTerminal::enter()?;
     let read_handle = packet.stream.lock().map_err(|_| "packet stream poisoned")?.try_clone().map_err(|e| e.to_string())?;
     let alive = Arc::new(AtomicBool::new(true));
     let controller = Arc::new(AtomicBool::new(packet.initial_role.role == ChannelRole::Controller));
+    let mut renderer = PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows);
+    renderer.keyboard = keyboard.clone();
     let chrome = Arc::new(Mutex::new(AttachChrome {
-        renderer: PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows),
+        renderer,
         panning: false,
         visible: packet.initial_role.participants.len() > 1,
         hidden: false,
@@ -348,6 +352,9 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             chrome.renderer.images.set_assets(images.commit(&initial_update.image_resources)?);
             chrome.paint(&mut stdout, Some(&initial_update))?;
             stdout.write_all(b"\x1b[?2004h\x1b[?1004h").map_err(|e| e.to_string())?;
+            if chrome.renderer.keyboard.is_some() {
+                stdout.write_all(crate::attach_keyboard::QUERY).map_err(|e| e.to_string())?;
+            }
             stdout.flush().map_err(|e| e.to_string())?;
         }
         write_packet_frame(
@@ -511,6 +518,16 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     chrome.paint(&mut stdout, None)?;
                     stdout.flush().map_err(|e| e.to_string())?;
                 }
+                Action::KeyboardFlags(_) => {
+                    if let Some(keyboard) = &keyboard {
+                        let mut stdout = std::io::stdout().lock();
+                        if keyboard.lock().map_err(|_| "keyboard mode poisoned")?.enable(&mut stdout).map_err(|e| e.to_string())? {
+                            decoder.set_keyboard_flags(crate::attach_keyboard::FLAGS);
+                        }
+                        stdout.flush().map_err(|e| e.to_string())?;
+                    }
+                }
+                Action::Key(key) => event = Some(TerminalInputEvent::Key(key)),
                 Action::Raw(bytes) => event = Some(TerminalInputEvent::RawBytes(bytes)),
                 Action::Paste(text) => event = Some(TerminalInputEvent::Paste(crate::provider::TerminalPasteEvent { text })),
                 Action::Focus(focused) => event = Some(TerminalInputEvent::Focus(crate::provider::TerminalFocusEvent { focused })),
@@ -642,6 +659,7 @@ fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result
 
 #[derive(Debug)]
 struct PacketTerminalRenderer {
+    keyboard: Option<Arc<Mutex<crate::attach_keyboard::KeyboardMode>>>,
     images: crate::kitty_output::KittyOutput,
     geometry: crate::attachment_view::AttachmentView,
     bounds: bool,
@@ -657,6 +675,7 @@ struct PacketTerminalRenderer {
 impl PacketTerminalRenderer {
     fn new(cols: u16, rows: u16) -> Self {
         Self {
+            keyboard: None,
             images: Default::default(),
             geometry: crate::attachment_view::AttachmentView::new((cols, rows), (cols, rows)),
             bounds: false,
@@ -721,8 +740,16 @@ impl PacketTerminalRenderer {
             self.rows = update.rows;
             self.cells = vec![vec![crate::provider::TerminalRenderCell::default(); self.cols as usize]; self.rows as usize];
         }
+        if self.terminal_modes.active_alternate_screen != update.terminal_modes.active_alternate_screen {
+            if let Some(keyboard) = &self.keyboard {
+                keyboard.lock().map_err(|_| "keyboard mode poisoned")?.leave_screen(writer).map_err(|e| e.to_string())?;
+            }
+        }
         render_packet_terminal_modes(writer, self.terminal_modes, update.terminal_modes)?;
         self.terminal_modes = update.terminal_modes;
+        if let Some(keyboard) = &self.keyboard {
+            keyboard.lock().map_err(|_| "keyboard mode poisoned")?.enter_screen(writer).map_err(|e| e.to_string())?;
+        }
         let mut dirty_rows = std::collections::BTreeSet::new();
         if self.needs_full_repaint || resized || modes_changed {
             dirty_rows.extend(self.geometry.y..self.geometry.y.saturating_add(self.viewport.map_or(self.rows, |size| size.1)));
@@ -997,6 +1024,7 @@ enum AttachCleanupTarget {
 }
 
 struct AttachCleanupGuard {
+    keyboard: Option<Arc<Mutex<crate::attach_keyboard::KeyboardMode>>>,
     target: AttachCleanupTarget,
     enabled: bool,
     emitted: bool,
@@ -1004,17 +1032,24 @@ struct AttachCleanupGuard {
 
 impl AttachCleanupGuard {
     fn stdout() -> Self {
-        Self { target: AttachCleanupTarget::Stdout, enabled: stdout_is_tty().unwrap_or(false), emitted: false }
+        Self { keyboard: None, target: AttachCleanupTarget::Stdout, enabled: stdout_is_tty().unwrap_or(false), emitted: false }
     }
 
     #[cfg(test)]
     fn test_buffer(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
-        Self { target: AttachCleanupTarget::Buffer(buffer), enabled: true, emitted: false }
+        Self { keyboard: None, target: AttachCleanupTarget::Buffer(buffer), enabled: true, emitted: false }
     }
 
     #[cfg(test)]
     fn test_buffer_disabled(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
-        Self { target: AttachCleanupTarget::Buffer(buffer), enabled: false, emitted: false }
+        Self { keyboard: None, target: AttachCleanupTarget::Buffer(buffer), enabled: false, emitted: false }
+    }
+
+    fn restore_keyboard(&self, writer: &mut impl Write) -> Result<(), String> {
+        if let Some(keyboard) = &self.keyboard {
+            keyboard.lock().map_err(|_| "keyboard mode poisoned")?.close(writer).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn emit(&mut self) -> Result<(), String> {
@@ -1024,12 +1059,12 @@ impl AttachCleanupGuard {
         let result = match &self.target {
             AttachCleanupTarget::Stdout => {
                 let mut stdout = std::io::stdout().lock();
-                write_detach_cleanup(&mut stdout)
+                self.restore_keyboard(&mut stdout).and_then(|_| write_detach_cleanup(&mut stdout))
             }
             #[cfg(test)]
             AttachCleanupTarget::Buffer(buffer) => {
                 if let Ok(mut buffer) = buffer.lock() {
-                    write_detach_cleanup(&mut *buffer)
+                    self.restore_keyboard(&mut *buffer).and_then(|_| write_detach_cleanup(&mut *buffer))
                 } else {
                     Err("cleanup buffer lock poisoned".to_string())
                 }
@@ -5532,3 +5567,65 @@ mod tests {
 #[cfg(all(test, unix))]
 #[path = "session_packet_output_tests.rs"]
 mod packet_output_tests;
+
+#[cfg(all(test, feature = "ghostty-vt"))]
+mod packet_keyboard_tests {
+    use super::*;
+    use crate::{
+        attach_keyboard::KeyboardMode,
+        vt::{ghostty::GhosttyVtEngine, VtEngine},
+    };
+
+    #[test]
+    fn packet_keyboard_restores_outer_stack_across_screen_changes_and_cleanup() {
+        let mut outer = GhosttyVtEngine::new(80, 24);
+        outer.feed(b"\x1b[>5u").unwrap();
+        let keyboard = Arc::new(Mutex::new(KeyboardMode::default()));
+        let mut renderer = PacketTerminalRenderer::new(80, 24);
+        renderer.keyboard = Some(keyboard.clone());
+        let mut bytes = Vec::new();
+        keyboard.lock().unwrap().enable(&mut bytes).unwrap();
+        outer.feed(&bytes).unwrap();
+        assert_eq!(outer.drain_replies(), b"\x1b[?31u");
+        for alternate in [true, false, true, false, true] {
+            bytes.clear();
+            renderer
+                .apply_and_render(&mut bytes, &TerminalRenderUpdate {
+                    cols: 80,
+                    rows: 24,
+                    terminal_modes: vt::TerminalModeState { active_alternate_screen: alternate, ..Default::default() },
+                    ..Default::default()
+                })
+                .unwrap();
+            outer.feed(&bytes).unwrap();
+            assert_eq!(outer.drain_replies(), b"\x1b[?31u");
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut cleanup = AttachCleanupGuard::test_buffer(output.clone());
+        cleanup.keyboard = Some(keyboard);
+        cleanup.emit().unwrap();
+        cleanup.emit().unwrap();
+        outer.feed(&output.lock().unwrap()).unwrap();
+        outer.feed(crate::attach_keyboard::QUERY).unwrap();
+        assert_eq!(outer.drain_replies(), b"\x1b[?5u");
+    }
+
+    #[test]
+    fn outer_kitty_events_are_reencoded_for_each_applications_current_mode() {
+        use crate::attach_input::{Action, InputDecoder};
+        let mut legacy = GhosttyVtEngine::new(80, 24);
+        let mut kitty = GhosttyVtEngine::new(80, 24);
+        kitty.feed(b"\x1b[>3u").unwrap();
+        let mut decoder = InputDecoder::new(0x1d);
+        decoder.set_keyboard_flags(31);
+        let mut legacy_bytes = Vec::new();
+        let mut kitty_bytes = Vec::new();
+        for action in decoder.feed(b"\x1b[97;5u\x1b[97;5:2u\x1b[97;1:3u") {
+            let Action::Key(event) = action else { panic!("expected key") };
+            legacy_bytes.extend(legacy.encode_key(&event).unwrap());
+            kitty_bytes.extend(kitty.encode_key(&event).unwrap());
+        }
+        assert_eq!(legacy_bytes, b"\x01\x01");
+        assert_eq!(kitty_bytes, b"\x1b[97;5u\x1b[97;5:2u\x1b[97;1:3u");
+    }
+}

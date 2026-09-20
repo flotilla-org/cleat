@@ -8,7 +8,7 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 8 separates generation-keyed image chunks from render packets.
+/// Version 9 adds physical key identity and extended structured keyboard input.
 pub const PROTOCOL_VERSION: u16 = 9;
 pub const CHANNEL_CONTROL: u32 = 0;
 

@@ -47,17 +47,20 @@ impl KeyEncoder {
             }
         }
         let logical = crate::keyboard::functional_name(&input.key);
-        let physical = input.physical_key.as_deref().map(key_code).transpose()?.unwrap_or(0);
         // Ghostty has one key slot, plus an unshifted Unicode scalar. A
         // remapped functional location must not override the logical key.
         // Printable locations can supply Kitty's base-layout alternate value.
         let key = if let Some(name) = logical.as_deref() {
             key_code(name)?
-        } else if matches!(physical, 0..=50 | 63) {
-            // unidentified, writing-system keys, Space
-            physical
         } else {
-            0
+            // Optional metadata may name a physical location this Ghostty
+            // version cannot represent. Preserve the logical keystroke.
+            let physical = input.physical_key.as_deref().and_then(|name| key_code(name).ok()).unwrap_or(0);
+            if matches!(physical, 0..=50 | 63) {
+                physical
+            } else {
+                0
+            }
         };
         let codepoint = match input.key {
             TerminalKey::UnicodeScalar(c) => c,
@@ -312,6 +315,30 @@ mod tests {
             platform_keycode: 0,
         }
     }
+    #[test]
+    fn unsupported_optional_physical_names_preserve_logical_input() {
+        let mut vt = GhosttyVtEngine::new(80, 24);
+        for kitty in [false, true] {
+            if kitty {
+                vt.feed(b"\x1b[>31u").unwrap();
+            }
+            for logical in
+                [TerminalKey::UnicodeScalar('a' as u32), TerminalKey::Named(TerminalNamedKey::Escape), TerminalKey::Code("ArrowUp".into())]
+            {
+                for action in [TerminalKeyAction::Press, TerminalKeyAction::Repeat, TerminalKeyAction::Release] {
+                    let mut event = key(logical.clone(), action, Mods::empty());
+                    let expected = vt.encode_key(&event).unwrap();
+                    for physical in ["Lang1", "FuturePhysicalCode"] {
+                        event.physical_key = Some(physical.into());
+                        assert_eq!(vt.encode_key(&event).unwrap(), expected);
+                    }
+                }
+            }
+        }
+        let invalid = key(TerminalKey::Code("FutureFunctionalKey".into()), TerminalKeyAction::Press, Mods::empty());
+        assert!(vt.encode_key(&invalid).is_err(), "unsupported logical keys remain errors");
+    }
+
     #[test]
     fn live_modes_choose_legacy_or_kitty_and_preserve_actions() {
         let mut vt = GhosttyVtEngine::new(80, 24);

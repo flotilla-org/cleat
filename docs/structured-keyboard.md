@@ -21,7 +21,9 @@ functional names from the pinned Ghostty/W3C code vocabulary, including
 logical Unicode scalar of a printable key.
 
 `physical_key` is an optional layout-independent W3C code such as `KeyW`.
-Sources without physical information leave it absent. `platform_keycode`
+Sources without physical information leave it absent. Physical names unknown
+to the pinned encoder remain available for ownership matching but fall back to
+logical-key encoding; unsupported logical functional names still return errors. `platform_keycode`
 remains diagnostic metadata; cleat never guesses a portable identity from it.
 The internal Ghostty enum values do not cross the public API or packet boundary.
 

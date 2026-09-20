@@ -540,7 +540,14 @@ fn launch_owns_term_when_daemon_environment_is_scrubbed_and_honors_override() {
     let default_launch = Cli::try_parse_from(["cleat", "launch", "default-term", "--no-record", "--cmd", &default_command])
         .expect("parse default TERM launch");
     cli::execute(default_launch, &service).expect("launch with scrubbed TERM");
-    wait_until("default TERM output", || matches!(std::fs::read_to_string(&default_output), Ok(value) if value == "xterm-256color"));
+    wait_until(
+        "default TERM output",
+        || matches!(std::fs::read_to_string(&default_output), Ok(value) if matches!(value.as_str(), "xterm-256color" | "xterm-ghostty")),
+    );
+    let selected = std::fs::read_to_string(&default_output).unwrap();
+    let colors = std::process::Command::new("tput").args(["-T", &selected, "colors"]).output().unwrap();
+    assert!(colors.status.success(), "launched TERM resolves for terminfo consumers");
+    assert_eq!(String::from_utf8_lossy(&colors.stdout).trim(), "256");
 
     let override_output = temp.path().join("override-term");
     let override_command = format!("printf %s \"$TERM\" > {}; sleep 30", override_output.display());

@@ -17,12 +17,21 @@ struct Upload {
     file: bool,
     started: Instant,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct View {
+    grid: (u16, u16),
+    origin: (u16, u16),
+    viewport: (u16, u16),
+    alternate_screen: bool,
+}
 #[derive(Debug, Default)]
 pub(crate) struct KittyOutput {
     assets: HashMap<ImageKey, Image>,
     ids: HashMap<ImageKey, u32>,
     pending: HashMap<u32, Upload>,
     resident: HashSet<u32>,
+    displayed: HashSet<u32>,
+    displayed_view: Option<View>,
     next_id: u32,
     file_failed: bool,
     disabled: bool,
@@ -65,6 +74,7 @@ impl KittyOutput {
             }
             self.disabled = true;
             self.pending.clear();
+            self.retire_except(writer, &HashSet::new())?;
         }
         Ok(())
     }
@@ -76,16 +86,25 @@ impl KittyOutput {
         viewport: (u16, u16),
     ) -> Result<(), String> {
         if self.disabled {
-            return Ok(());
+            return self.retire_except(writer, &HashSet::new());
         }
+        let view =
+            View { grid: (update.cols, update.rows), origin, viewport, alternate_screen: update.terminal_modes.active_alternate_screen };
+        if self.displayed_view.is_some_and(|previous| previous != view) {
+            // A retained placement must not spill outside a resized/panned view
+            // or survive a screen switch while a new upload is pending.
+            for id in &self.displayed {
+                write!(writer, "\x1b_Ga=d,d=i,i={id},q=2;\x1b\\").map_err(|e| e.to_string())?;
+            }
+            self.displayed.clear();
+        }
+        self.displayed_view = Some(view);
         let wanted: HashSet<_> = update.image_resources.iter().map(|r| (r.image_id, r.generation)).collect();
-        let retired: Vec<_> = self.ids.iter().filter(|(key, _)| !wanted.contains(key)).map(|(key, id)| (*key, *id)).collect();
-        for (key, id) in retired {
-            write!(writer, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\").map_err(|e| e.to_string())?;
-            self.ids.remove(&key);
-            self.resident.remove(&id);
-            // Pending uploads keep their file until a reply or timeout.
-        }
+        // Keep the displayed scene until every replacement placement is ready.
+        // An upload acknowledgement arrives after this synchronized repaint ends.
+        let retained: HashSet<_> =
+            wanted.iter().copied().chain(self.ids.iter().filter(|(_, id)| self.displayed.contains(id)).map(|(key, _)| *key)).collect();
+        self.retire_except(writer, &retained)?;
         for resource in &update.image_resources {
             let key = (resource.image_id, resource.generation);
             let Some(image) = self.assets.get(&key) else { continue };
@@ -113,16 +132,28 @@ impl KittyOutput {
                 emit_upload(writer, id, &upload)?;
                 self.pending.insert(id, upload);
             }
-            // Explicit resolved fragments also represent Unicode placeholders;
-            // the cell renderer suppresses placeholder codepoints.
+        }
+        let placements: Vec<_> = update
+            .image_placements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, placement)| {
+                let id = *self.ids.get(&(placement.image_id, placement.generation))?;
+                let rect = clipped(placement, update, origin, viewport)?;
+                Some((index, placement.z, id, rect))
+            })
+            .collect();
+        if placements.iter().any(|(_, _, id, _)| !self.resident.contains(id)) {
+            return Ok(());
+        }
+        self.retire_except(writer, &wanted)?;
+        // Explicit resolved fragments also represent Unicode placeholders;
+        // the cell renderer suppresses placeholder codepoints.
+        for id in self.displayed.union(&self.resident) {
             write!(writer, "\x1b_Ga=d,d=i,i={id},q=2;\x1b\\").map_err(|e| e.to_string())?;
         }
-        for (index, placement) in update.image_placements.iter().enumerate() {
-            let Some(id) = self.ids.get(&(placement.image_id, placement.generation)) else { continue };
-            if !self.resident.contains(id) {
-                continue;
-            }
-            let Some(rect) = clipped(placement, update, origin, viewport) else { continue };
+        self.displayed.clear();
+        for (index, z, id, rect) in placements {
             write!(
                 writer,
                 "\x1b[{};{}H\x1b_Ga=p,C=1,q=2,i={},p={},z={},c={},r={},x={},y={},w={},h={},X={},Y={};\x1b\\",
@@ -130,7 +161,7 @@ impl KittyOutput {
                 rect.col + 1,
                 id,
                 index + 1,
-                placement.z,
+                z,
                 rect.cols,
                 rect.rows,
                 rect.x,
@@ -141,6 +172,19 @@ impl KittyOutput {
                 rect.offset_y
             )
             .map_err(|e| e.to_string())?;
+            self.displayed.insert(id);
+        }
+        Ok(())
+    }
+
+    fn retire_except(&mut self, writer: &mut impl Write, retained: &HashSet<ImageKey>) -> Result<(), String> {
+        let retired: Vec<_> = self.ids.iter().filter(|(key, _)| !retained.contains(key)).map(|(key, id)| (*key, *id)).collect();
+        for (key, id) in retired {
+            write!(writer, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\").map_err(|e| e.to_string())?;
+            self.ids.remove(&key);
+            self.resident.remove(&id);
+            self.displayed.remove(&id);
+            // Pending uploads keep their file until a reply or timeout.
         }
         Ok(())
     }
@@ -273,6 +317,101 @@ mod tests {
         output.render(&mut bytes, &update, (0, 0), (80, 24)).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("a=t"));
     }
+    fn frame(output: &mut KittyOutput, id: u32) -> TerminalRenderUpdate {
+        output.set_assets(vec![RetainedImage::from_owned(TerminalImageBytes { image_id: id, generation: 1, bytes: vec![1, 2, 3] })]);
+        TerminalRenderUpdate {
+            cols: 4,
+            rows: 2,
+            image_resources: vec![TerminalImageResource {
+                image_id: id,
+                generation: 1,
+                format: 0,
+                width_px: 1,
+                height_px: 1,
+                data_len: 3,
+                ..Default::default()
+            }],
+            image_placements: vec![TerminalImagePlacement {
+                image_id: id,
+                generation: 1,
+                grid_cols: 4,
+                grid_rows: 2,
+                source_width: 1,
+                source_height: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn displayed_frame() -> KittyOutput {
+        let mut output = KittyOutput::default();
+        let update = frame(&mut output, 7);
+        output.render(&mut Vec::new(), &update, (0, 0), (4, 2)).unwrap();
+        output.reply(&mut Vec::new(), b"\x1b_Gi=1;OK\x1b\\").unwrap();
+        output.render(&mut Vec::new(), &update, (0, 0), (4, 2)).unwrap();
+        assert_eq!(output.displayed, HashSet::from([1]));
+        output
+    }
+
+    #[test]
+    fn replacement_survives_fallback_and_superseded_reply_then_deletes_cleanly() {
+        let mut output = displayed_frame();
+        let update = frame(&mut output, 8);
+        output.render(&mut Vec::new(), &update, (0, 0), (4, 2)).unwrap();
+        output.reply(&mut Vec::new(), b"\x1b_Gi=2;ENOENT\x1b\\").unwrap();
+        output.render(&mut Vec::new(), &update, (0, 0), (4, 2)).unwrap();
+        assert_eq!(output.displayed, HashSet::from([1]));
+        let update = frame(&mut output, 9);
+        output.render(&mut Vec::new(), &update, (0, 0), (4, 2)).unwrap();
+        output.reply(&mut Vec::new(), b"\x1b_Gi=2;OK\x1b\\").unwrap();
+        assert_eq!(output.displayed, HashSet::from([1]));
+        output.reply(&mut Vec::new(), b"\x1b_Gi=3;OK\x1b\\").unwrap();
+        output.render(&mut Vec::new(), &update, (0, 0), (4, 2)).unwrap();
+        assert_eq!(output.displayed, HashSet::from([3]));
+        assert_eq!(output.resident, HashSet::from([3]));
+        assert_eq!(output.ids.len(), 1);
+        let next = frame(&mut output, 10);
+        output.render(&mut Vec::new(), &next, (0, 0), (4, 2)).unwrap();
+        let empty = TerminalRenderUpdate { cols: 4, rows: 2, ..Default::default() };
+        output.render(&mut Vec::new(), &empty, (0, 0), (4, 2)).unwrap();
+        output.reply(&mut Vec::new(), b"\x1b_Gi=4;OK\x1b\\").unwrap();
+        assert!(output.displayed.is_empty());
+        assert!(output.resident.is_empty());
+        assert!(output.ids.is_empty());
+        assert!(output.pending.is_empty());
+    }
+
+    #[test]
+    fn unresponsive_terminal_keeps_one_scene_with_bounded_uploads_until_timeout() {
+        let mut output = displayed_frame();
+        for id in 8..108 {
+            let update = frame(&mut output, id);
+            output.render(&mut Vec::new(), &update, (0, 0), (4, 2)).unwrap();
+            assert_eq!(output.displayed, HashSet::from([1]));
+            assert!(output.ids.len() <= 2);
+            assert!(output.pending.len() <= 8);
+        }
+        for upload in output.pending.values_mut() {
+            upload.started = Instant::now() - Duration::from_secs(6);
+        }
+        output.expire(&mut Vec::new()).unwrap();
+        assert!(output.disabled);
+        assert!(output.pending.is_empty());
+        assert!(output.displayed.is_empty());
+        assert!(output.ids.is_empty());
+    }
+
+    #[test]
+    fn pending_replacement_does_not_keep_old_placements_outside_changed_viewport() {
+        let mut output = displayed_frame();
+        let update = frame(&mut output, 8);
+        let mut bytes = Vec::new();
+        output.render(&mut bytes, &update, (1, 0), (3, 2)).unwrap();
+        assert!(output.displayed.is_empty());
+        assert!(String::from_utf8_lossy(&bytes).contains("a=d,d=i,i=1"));
+    }
+
     #[test]
     fn crop_tracks_pan_and_clips_to_grid_not_spare_chrome() {
         let update = TerminalRenderUpdate {

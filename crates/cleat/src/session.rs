@@ -4754,6 +4754,52 @@ mod tests {
 
     #[cfg(feature = "ghostty-vt")]
     #[test]
+    fn packet_image_replacement_keeps_previous_frame_until_upload_reply() {
+        use crate::{image_delivery::CaptureImages, provider::DirtyState, vt::ghostty::GhosttyVtEngine};
+        let mut source = GhosttyVtEngine::new(4, 2);
+        let mut host = GhosttyVtEngine::new(4, 2);
+        source.set_cell_size(10, 20).unwrap();
+        host.set_cell_size(10, 20).unwrap();
+        let mut capture = CaptureImages::default();
+        let mut renderer = PacketTerminalRenderer::new(4, 2);
+        for (frame, id) in [7, 7, 8].into_iter().enumerate() {
+            // Katzensteg transmits a fresh image, places it, then deletes the old one.
+            source.feed(format!("\x1b[H\x1b_Ga=T,C=1,i={id},p=1,f=32,s=1,v=1,c=4,r=2,z=-1610612636;ESIz/w==\x1b\\").as_bytes()).unwrap();
+            if id == 8 {
+                source.feed(b"\x1b_Ga=d,d=I,i=7;\x1b\\").unwrap();
+            }
+            let update = source.render_update(DirtyState::Full).unwrap();
+            let assets = capture
+                .capture(&update.image_resources, |id, generation, copy| source.with_image_resource_data(id, generation, copy))
+                .unwrap();
+            renderer.images.set_assets(assets);
+            let mut output = Vec::new();
+            renderer.apply_and_render(&mut output, &update).unwrap();
+            host.feed(&output).unwrap();
+            if frame > 0 {
+                assert_eq!(
+                    host.render_update(DirtyState::Full).unwrap().image_placements.len(),
+                    1,
+                    "replacement upload must not expose a blank frame before its acknowledgement"
+                );
+            }
+            let mut decoder = crate::attach_input::InputDecoder::new(0x1d);
+            for action in decoder.feed(&host.drain_replies()) {
+                if let crate::attach_input::Action::GraphicsReply(reply) = action {
+                    renderer.images.reply(&mut Vec::new(), &reply).unwrap();
+                }
+            }
+            output.clear();
+            renderer.repaint(&mut output).unwrap();
+            host.feed(&output).unwrap();
+            let displayed = host.render_update(DirtyState::Full).unwrap();
+            assert_eq!(displayed.image_placements.len(), 1);
+            assert_eq!(displayed.image_resources.len(), 1, "retired frame must be released after replacement");
+        }
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
     fn packet_placeholder_cells_become_resolved_image_placements() {
         use crate::{
             image_delivery::CaptureImages,

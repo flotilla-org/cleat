@@ -1,10 +1,15 @@
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
+
+#[cfg(windows)]
+#[path = "daemon_windows.rs"]
+mod windows;
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -18,6 +23,16 @@ pub fn daemon_pid_path(root: &Path, daemon_name: &str) -> PathBuf {
 
 pub fn spawn_daemon_process(root: &Path, daemon_name: &str) -> Result<(), String> {
     let exe = resolve_cleat_executable()?;
+    spawn_daemon(&exe, root, daemon_name).map_err(|err| format!("spawn daemon {daemon_name}: {err}"))
+}
+
+#[cfg(windows)]
+fn spawn_daemon(exe: &Path, root: &Path, daemon_name: &str) -> std::io::Result<()> {
+    windows::spawn(exe, root, daemon_name)
+}
+
+#[cfg(not(windows))]
+fn spawn_daemon(exe: &Path, root: &Path, daemon_name: &str) -> std::io::Result<()> {
     let mut command = Command::new(exe);
     command.arg("--runtime-root").arg(root).arg("--server").arg(daemon_name).arg("serve");
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -29,7 +44,7 @@ pub fn spawn_daemon_process(root: &Path, daemon_name: &str) -> Result<(), String
     unsafe {
         command.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::from));
     }
-    command.spawn().map_err(|err| format!("spawn daemon {daemon_name}: {err}"))?;
+    command.spawn()?;
     Ok(())
 }
 

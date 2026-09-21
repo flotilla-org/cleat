@@ -359,14 +359,20 @@ fn overlapped_read_blocking(handle: HANDLE, buf: &mut [u8]) -> io::Result<usize>
     } else {
         match unsafe { GetLastError() } {
             ERROR_IO_PENDING => wait_overlapped(handle, &mut overlapped),
-            ERROR_BROKEN_PIPE | ERROR_OPERATION_ABORTED => Ok(0),
             err => Err(io_error_from_code(err)),
         }
     };
     unsafe {
         CloseHandle(event);
     }
-    result
+    // A pipe may close either during ReadFile or while its overlapped read
+    // is pending. Both paths must have the same Read/EOF semantics.
+    match result {
+        Err(err) if err.raw_os_error().is_some_and(|code| code == ERROR_BROKEN_PIPE as i32 || code == ERROR_OPERATION_ABORTED as i32) => {
+            Ok(0)
+        }
+        result => result,
+    }
 }
 
 fn overlapped_write_blocking(handle: HANDLE, buf: &[u8]) -> io::Result<usize> {
@@ -498,6 +504,37 @@ mod tests {
     use std::{io::Read, thread};
 
     use super::*;
+
+    #[test]
+    fn pending_read_reports_eof_when_peer_closes() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("socket");
+        let listener = bind_session_listener(&socket_path).expect("bind listener");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let client = thread::spawn(move || {
+            let mut stream = connect_session_stream(&socket_path).expect("connect client");
+            let mut response = [0; 4];
+            stream.read_exact(&mut response).expect("read response");
+            assert_eq!(&response, b"done");
+            ready_tx.send(()).unwrap();
+            let mut trailing = Vec::new();
+            stream.read_to_end(&mut trailing).expect("peer closure is EOF");
+            assert!(trailing.is_empty());
+        });
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(value) => break value,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(1)),
+                Err(err) => panic!("accept: {err}"),
+            }
+        };
+        stream.write_all(b"done").expect("write response");
+        ready_rx.recv().unwrap();
+        // Keep the peer open long enough for the client's next read to pend.
+        thread::sleep(Duration::from_millis(50));
+        drop(stream);
+        client.join().expect("client thread");
+    }
 
     #[test]
     fn named_pipe_stream_round_trips_bytes() {

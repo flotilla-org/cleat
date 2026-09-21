@@ -42,5 +42,9 @@ those clipped edges and clearing old content when the session grid shrinks.
   its Ghostty DLL at `C:\dev\windows-parity-plan\cleat-render-bin`.
 - Strict workspace Clippy remains blocked by existing Windows warnings in
   `host/actor.rs`, `session_runtime.rs`, and `platform/{ipc,pty}/windows.rs`.
-- Kiwi SSH visual confirmation is pending. The candidate is an attach-client
-  change; the existing daemon, agent, and terminal can remain running.
+- The operator reattached from kiwi using the staged client and reported that
+  the previous row-flash pattern was no longer occurring. A slight cursor
+  flicker remained, but was also observed in direct Windows Codex. It is not
+  claimed fixed here. The hollow cursor became solid when Ghostty was focused.
+  Cursor defaults and conhost versus Windows Terminal presentation remain
+  separate questions. The agent and daemon were not restarted for this test.

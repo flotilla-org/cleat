@@ -822,12 +822,12 @@ impl PacketTerminalRenderer {
         let (visible_cols, visible_rows) = self.viewport.unwrap_or((self.cols, self.rows));
         for grid_row in dirty_rows.into_iter().filter(|row| *row >= self.geometry.y && *row - self.geometry.y < visible_rows) {
             let row_index = grid_row - self.geometry.y;
-            write!(writer, "\x1b[{};1H\x1b[2K", row_index + 1).map_err(|err| format!("position packet row: {err}"))?;
-            let Some(row) = self.cells.get(grid_row as usize) else { continue };
+            // Overwrite retained cells without first erasing them. An outer
+            // console can expose intermediate output despite mode 2026; EL2
+            // otherwise flashes the current background across the whole row.
+            let row = self.cells.get(grid_row as usize).map(Vec::as_slice).unwrap_or_default();
+            let painted_cols = row.len().saturating_sub(self.geometry.x as usize).min(visible_cols as usize);
             for (col, cell) in row.iter().skip(self.geometry.x as usize).take(visible_cols as usize).enumerate() {
-                if cell.style.width == crate::provider::TerminalCellWidth::Wide && col + 1 >= visible_cols as usize {
-                    break;
-                }
                 if cell.style.width == crate::provider::TerminalCellWidth::SpacerTail && col > 0 {
                     continue;
                 }
@@ -835,14 +835,24 @@ impl PacketTerminalRenderer {
                 // example VS16 emoji with mode 2027). Grid coordinates, not
                 // the host's advancing cursor, determine the next cell.
                 write!(writer, "\x1b[{};{}H", row_index + 1, col + 1).map_err(|err| format!("position packet cell: {err}"))?;
-                if col == 0
+                let clipped_left = col == 0
                     && self.geometry.x > 0
-                    && row.get(self.geometry.x as usize - 1).is_some_and(|c| c.style.width == crate::provider::TerminalCellWidth::Wide)
-                {
-                    writer.write_all(b" ").map_err(|e| e.to_string())?;
+                    && row.get(self.geometry.x as usize - 1).is_some_and(|c| c.style.width == crate::provider::TerminalCellWidth::Wide);
+                let clipped_right = cell.style.width == crate::provider::TerminalCellWidth::Wide && col + 1 >= painted_cols;
+                if clipped_left || clipped_right {
+                    let mut blank = cell.clone();
+                    blank.graphemes.clear();
+                    blank.style.width = crate::provider::TerminalCellWidth::Narrow;
+                    render_packet_cell(writer, &blank)?;
                 } else {
                     render_packet_cell(writer, cell)?;
                 }
+            }
+            if painted_cols < visible_cols as usize {
+                // Clear only the area outside the session grid (including
+                // rows below it after a resize), using the host's background.
+                write!(writer, "\x1b[{};{}H\x1b[0m\x1b[K", row_index + 1, painted_cols + 1)
+                    .map_err(|err| format!("clear packet row margin: {err}"))?;
             }
         }
         writer.write_all(b"\x1b[0m").map_err(|err| format!("reset packet render style: {err}"))?;
@@ -4724,6 +4734,35 @@ mod tests {
         assert!(host.screen_grid().unwrap().cells.iter().all(|cell| !cell.graphemes.contains(&0x10eeee)));
     }
 
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_render_preserves_unchanged_background_during_repaint() {
+        use crate::vt::ghostty::GhosttyVtEngine;
+        let mut source = GhosttyVtEngine::new(8, 2);
+        source.feed(b"\x1b[48;2;17;23;29m\x1b[2J\x1b[2;1H*").unwrap();
+        let mut renderer = PacketTerminalRenderer::new(8, 2);
+        let mut host = GhosttyVtEngine::new(8, 2);
+        let initial = source.render_update(crate::provider::DirtyState::Full).unwrap();
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &initial).unwrap();
+        host.feed(&output).unwrap();
+        let expected = host.screen_grid().unwrap().cells[..8].to_vec();
+
+        source.feed(b"\x1b[2;1H+").unwrap();
+        let update = source.render_update(crate::provider::DirtyState::Full).unwrap();
+        output.clear();
+        renderer.apply_and_render(&mut output, &update).unwrap();
+        // An outer console may not preserve synchronized-output boundaries.
+        // Observe every prefix: repainting must not erase this unchanged row
+        // to the host's default background, even temporarily.
+        let output = String::from_utf8(output).unwrap().replace("\x1b[?2026h", "").replace("\x1b[?2026l", "");
+        for (offset, byte) in output.bytes().enumerate() {
+            host.feed(&[byte]).unwrap();
+            assert_eq!(host.screen_grid().unwrap().cells[..8], expected, "unchanged row flashed at output byte {offset}");
+        }
+        assert_eq!(host.screen_grid().unwrap().cells[8].graphemes, vec!['+' as u32]);
+    }
+
     #[test]
     fn packet_render_batches_repaint_with_cursor_hidden() {
         let mut renderer = PacketTerminalRenderer::new(2, 2);
@@ -4745,6 +4784,30 @@ mod tests {
         let cursor_restore = output.windows(b"\x1b[?25h".len()).position(|bytes| bytes == b"\x1b[?25h").expect("cursor restore");
         let last_row_repaint = output.windows(b"\x1b[2;1H".len()).position(|bytes| bytes == b"\x1b[2;1H").expect("last row repaint");
         assert!(cursor_restore > last_row_repaint, "cursor must stay hidden throughout synthesized row movement");
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_render_clears_old_content_outside_shrunken_grid() {
+        use crate::vt::ghostty::GhosttyVtEngine;
+        let mut source = GhosttyVtEngine::new(4, 3);
+        source.feed(b"\x1b[1;1HXXXX\x1b[2;1HXXXX\x1b[3;1HXXXX").unwrap();
+        let mut renderer = PacketTerminalRenderer::new(4, 3);
+        renderer.set_viewport((4, 3));
+        let mut host = GhosttyVtEngine::new(4, 3);
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &source.render_update(crate::provider::DirtyState::Full).unwrap()).unwrap();
+        host.feed(&output).unwrap();
+
+        let mut source = GhosttyVtEngine::new(2, 1);
+        source.feed(b"OK").unwrap();
+        output.clear();
+        renderer.apply_and_render(&mut output, &source.render_update(crate::provider::DirtyState::Full).unwrap()).unwrap();
+        host.feed(&output).unwrap();
+        let grid = host.screen_grid().unwrap();
+        assert_eq!(grid.cells[0].graphemes, vec!['O' as u32]);
+        assert_eq!(grid.cells[1].graphemes, vec!['K' as u32]);
+        assert!(grid.cells[2..].iter().all(|cell| cell.graphemes.iter().all(|c| *c == 0 || *c == 32)));
     }
 
     #[test]
@@ -4893,7 +4956,7 @@ mod tests {
             let mut output = Vec::new();
             renderer.apply_and_render(&mut output, &changed).unwrap();
             let output = String::from_utf8(output).unwrap();
-            assert!(output.contains("\x1b[1;1H\x1b[2K"));
+            assert!(output.contains("\x1b[1;1H\x1b[0m"));
             assert!(output.contains("mZ"));
             assert!(!output.contains("\x1b[3;1H"));
             assert_eq!((renderer.geometry.x, renderer.geometry.y), (2, 2));
@@ -4934,8 +4997,16 @@ mod tests {
         let mut output = Vec::new();
         renderer.repaint(&mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("\x1b[1;1H ") && output.contains("mX"), "{output:?}");
+        assert!(output.contains("\x1b[1;1H\x1b[0m") && output.contains("mX"), "{output:?}");
         assert!(!output.contains('界'));
+        #[cfg(feature = "ghostty-vt")]
+        {
+            let mut host = crate::vt::ghostty::GhosttyVtEngine::new(3, 1);
+            host.feed(b"old").unwrap();
+            host.feed(output.as_bytes()).unwrap();
+            let grid = host.screen_grid().unwrap();
+            assert_eq!(grid.cells.iter().map(|c| c.graphemes.clone()).collect::<Vec<_>>(), vec![vec![32], vec!['X' as u32], vec![32]]);
+        }
     }
 
     #[cfg(feature = "ghostty-vt")]
@@ -5016,7 +5087,7 @@ mod tests {
         let mut output = Vec::new();
         renderer.repaint(&mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("\x1b[2;1H\x1b[2K"));
+        assert!(output.contains("\x1b[2;1H\x1b[0m\x1b[K"));
         assert!(!output.contains(['│', '─', '┘']));
         renderer.bounds = true;
         renderer.set_viewport((2, 1));
@@ -5045,7 +5116,7 @@ mod tests {
         let mut output = Vec::new();
         renderer.apply_and_render(&mut output, &update).expect("render dirty packet row");
 
-        assert_eq!(output.windows(b"\x1b[2K".len()).filter(|bytes| *bytes == b"\x1b[2K").count(), 1, "{output:?}");
+        assert_eq!(output.windows(b";1H\x1b[0m".len()).filter(|bytes| *bytes == b";1H\x1b[0m").count(), 1, "{output:?}");
         assert!(output.windows(b"\x1b[3;1H".len()).any(|bytes| bytes == b"\x1b[3;1H"), "{output:?}");
         assert!(output.len() < initial_output.len() / 2, "single-row output should be proportional to one row");
     }
@@ -5068,15 +5139,15 @@ mod tests {
         let mut output = Vec::new();
         renderer.apply_and_render(&mut output, &update).expect("render scroll copy");
 
-        assert_eq!(output.windows(b"\x1b[2K".len()).filter(|bytes| *bytes == b"\x1b[2K").count(), 2, "{output:?}");
+        assert_eq!(output.windows(b";1H\x1b[0m".len()).filter(|bytes| *bytes == b";1H\x1b[0m").count(), 2, "{output:?}");
         assert!(output.windows(b"\x1b[2;1H".len()).any(|bytes| bytes == b"\x1b[2;1H"), "{output:?}");
         assert!(output.windows(b"\x1b[3;1H".len()).any(|bytes| bytes == b"\x1b[3;1H"), "{output:?}");
     }
 
     #[test]
     fn packet_render_repaints_every_row_for_full_repaint_triggers() {
-        fn erased_rows(output: &[u8]) -> usize {
-            output.windows(b"\x1b[2K".len()).filter(|bytes| *bytes == b"\x1b[2K").count()
+        fn painted_rows(output: &[u8]) -> usize {
+            output.windows(b";1H\x1b[0m".len()).filter(|bytes| *bytes == b";1H\x1b[0m").count()
         }
 
         let base = TerminalRenderUpdate { cols: 2, rows: 2, ..TerminalRenderUpdate::default() };
@@ -5084,7 +5155,7 @@ mod tests {
         let mut resized_renderer = PacketTerminalRenderer::new(1, 1);
         let mut resized_output = Vec::new();
         resized_renderer.apply_and_render(&mut resized_output, &base).expect("render resize");
-        assert_eq!(erased_rows(&resized_output), 2);
+        assert_eq!(painted_rows(&resized_output), 2);
 
         let mut mode_renderer = PacketTerminalRenderer::new(2, 2);
         mode_renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");
@@ -5092,7 +5163,7 @@ mod tests {
         mode_update.terminal_modes.application_cursor_keys = true;
         let mut mode_output = Vec::new();
         mode_renderer.apply_and_render(&mut mode_output, &mode_update).expect("render mode change");
-        assert_eq!(erased_rows(&mode_output), 2);
+        assert_eq!(painted_rows(&mode_output), 2);
 
         let mut full_renderer = PacketTerminalRenderer::new(2, 2);
         full_renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");
@@ -5101,7 +5172,7 @@ mod tests {
             vec![TerminalRenderUpdateOp { kind: TerminalRenderUpdateOpKind::FullVisibleReplace, ..TerminalRenderUpdateOp::default() }];
         let mut full_output = Vec::new();
         full_renderer.apply_and_render(&mut full_output, &full_update).expect("render full replacement");
-        assert_eq!(erased_rows(&full_output), 2);
+        assert_eq!(painted_rows(&full_output), 2);
     }
 
     #[cfg(unix)]

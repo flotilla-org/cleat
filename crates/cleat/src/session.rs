@@ -71,6 +71,7 @@ enum ForegroundTransport {
 
 #[derive(Debug)]
 struct PacketForegroundAttach {
+    session_name: String,
     stream: Arc<Mutex<SessionStream>>,
     channel: u32,
     initial_update: TerminalRenderUpdate,
@@ -208,6 +209,7 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
 }
 
 struct AttachChrome {
+    session_name: String,
     renderer: PacketTerminalRenderer,
     panning: bool,
     visible: bool,
@@ -293,7 +295,8 @@ impl AttachChrome {
             };
             let size = self.role.fixed_size.as_ref().map(|size| format!(" | fixed {}x{}", size.cols, size.rows)).unwrap_or_default();
             format!(
-                "{}{}cleat {role} | {drivers} drivers, {watchers} watchers | {view}{exclusive}{size}",
+                "cleat {} | {}{}{role} | {drivers} drivers, {watchers} watchers | {view}{exclusive}{size}",
+                self.session_name,
                 self.renderer.geometry.description(),
                 if self.panning { "pan (Esc exits) | " } else { "" }
             )
@@ -338,6 +341,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let mut renderer = PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows);
     renderer.keyboard = keyboard.clone();
     let chrome = Arc::new(Mutex::new(AttachChrome {
+        session_name: packet.session_name,
         renderer,
         panning: false,
         visible: packet.initial_role.participants.len() > 1,
@@ -962,8 +966,13 @@ fn render_packet_cell(writer: &mut impl Write, cell: &crate::provider::TerminalR
     }
     let fg = cell.style.resolved_fg;
     let bg = cell.style.resolved_bg;
-    write!(writer, "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m", fg.r, fg.g, fg.b, bg.r, bg.g, bg.b)
-        .map_err(|err| format!("write packet cell colours: {err}"))?;
+    write!(writer, "\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b).map_err(|err| format!("write packet cell foreground: {err}"))?;
+    // Default backgrounds must stay default: Kitty images with z < -(1 << 30)
+    // are drawn behind explicit cell backgrounds. Background-only cells carry
+    // their colour in the content (palette = 2, RGB = 3), rather than the style.
+    if cell.style.bg_color.tag != crate::provider::TerminalStyleColorTag::None || matches!(cell.style.content_tag, 2 | 3) {
+        write!(writer, "\x1b[48;2;{};{};{}m", bg.r, bg.g, bg.b).map_err(|err| format!("write packet cell background: {err}"))?;
+    }
     if cell.graphemes.is_empty() || cell.graphemes.contains(&0x10eeee) {
         writer.write_all(b" ").map_err(|err| format!("write packet blank cell: {err}"))?;
     } else {
@@ -1283,6 +1292,7 @@ pub fn attach_packet_foreground(
     }
     Ok(ForegroundAttach {
         transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
+            session_name: id.to_owned(),
             stream: Arc::new(Mutex::new(stream)),
             channel: FOREGROUND_CHANNEL,
             initial_update: initial_update.expect("render checked above"),
@@ -4617,6 +4627,62 @@ mod tests {
 
     #[cfg(feature = "ghostty-vt")]
     #[test]
+    fn packet_katzensteg_background_image_keeps_default_cells_transparent() {
+        use crate::{
+            image_delivery::CaptureImages,
+            provider::{DirtyState, TerminalStyleColorTag},
+            vt::ghostty::GhosttyVtEngine,
+        };
+        let mut source = GhosttyVtEngine::new(4, 2);
+        source.set_cell_size(10, 20).unwrap();
+        // Katzensteg places frames below non-default cell backgrounds.
+        source.feed(b"\x1b_Ga=T,C=1,i=7,p=1,f=32,s=1,v=1,c=4,r=2,z=-1610612636;ESIz/w==\x1b\\\x1b[H \x1b[48;2;0;0;0m \x1b[44m \x1b[0m\x1b[2;1H\x1b[48;2;1;2;3m\x1b[K\x1b[0m").unwrap();
+        let update = source.render_update(DirtyState::Full).unwrap();
+        assert_eq!(update.ops[0].rows[0].cells[0].style.bg_color.tag, TerminalStyleColorTag::None);
+        let images = CaptureImages::default()
+            .capture(&update.image_resources, |id, generation, copy| source.with_image_resource_data(id, generation, copy))
+            .unwrap();
+        let mut renderer = PacketTerminalRenderer::new(4, 2);
+        renderer.images.set_assets(images);
+        let mut host = GhosttyVtEngine::new(4, 2);
+        host.set_cell_size(10, 20).unwrap();
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).unwrap();
+        host.feed(&output).unwrap();
+        let mut decoder = crate::attach_input::InputDecoder::new(0x1d);
+        for action in decoder.feed(&host.drain_replies()) {
+            if let crate::attach_input::Action::GraphicsReply(reply) = action {
+                renderer.images.reply(&mut Vec::new(), &reply).unwrap();
+            }
+        }
+        output.clear();
+        renderer.repaint(&mut output).unwrap();
+        host.feed(&output).unwrap();
+        let displayed = host.render_update(DirtyState::Full).unwrap();
+        assert_eq!(displayed.image_placements.len(), 1);
+        assert_eq!(displayed.image_placements[0].z, -1610612636);
+        assert_eq!(
+            displayed.ops[0].rows[0].cells[0].style.bg_color.tag,
+            TerminalStyleColorTag::None,
+            "an explicit background hides Katzensteg's below-background image"
+        );
+        assert_eq!(
+            displayed.ops[0].rows[0].cells[1].style.bg_color.tag,
+            TerminalStyleColorTag::Rgb,
+            "the application's explicit background must still occlude the image"
+        );
+        assert_eq!(displayed.ops[0].rows[0].cells[2].style.resolved_bg, update.ops[0].rows[0].cells[2].style.resolved_bg);
+        for cell in &displayed.ops[0].rows[1].cells {
+            assert_eq!(
+                cell.style.resolved_bg,
+                crate::provider::TerminalRgb { r: 1, g: 2, b: 3 },
+                "erased coloured cells must retain their background"
+            );
+        }
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
     fn packet_images_round_trip_file_upload_replacement_and_pan_through_terminal_engine() {
         use crate::{
             image_delivery::CaptureImages,
@@ -4793,6 +4859,7 @@ mod tests {
             provider::{TerminalModifiers, TerminalMouseButtons, TerminalMouseEvent, TerminalMouseEventKind},
         };
         let mut chrome = super::AttachChrome {
+            session_name: "whatever3".to_owned(),
             renderer: PacketTerminalRenderer::new(120, 40),
             panning: false,
             visible: false,

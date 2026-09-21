@@ -105,3 +105,4 @@ jobs:
       - run: cargo build -p cleat --locked --no-default-features
       - run: cargo test -p cleat --locked --no-default-features --lib
       - run: cargo test -p cleat --locked --no-default-features --test windows_daemon_launch
+      - run: cargo test -p cleat --locked --no-default-features --test attach_existing

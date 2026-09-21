@@ -544,61 +544,48 @@ impl SessionService {
         no_create: bool,
         options: AttachOptions,
     ) -> Result<(SessionInfo, ForegroundAttach), String> {
-        let session = if no_create {
+        let info = if no_create {
             let id = name.ok_or_else(|| "attach --no-create requires a session id".to_string())?;
+            validate_runtime_name(&id)?;
             if !self.layout.session_dir(&id).exists() {
                 return Err(format!("missing session {id}"));
             }
-            if self.inspect(&id).is_err() {
-                if crate::recreate::session_is_recreatable(&self.layout.session_dir(&id)) {
-                    return Err(format!("session {id} has a stale daemon (use attach without --no-create to recreate)"));
-                }
-                let _ = self.layout.remove_session(&id);
-                return Err(format!("session {id} has a stale daemon (cleaned up)"));
-            }
-            let vt_engine = vt_engine.unwrap_or_else(crate::vt::default_vt_engine_kind);
-            crate::runtime::SessionMetadata {
-                id,
-                vt_engine,
-                cwd,
-                cmd,
-                record: false,
-                initial_size: TerminalSize::default(),
-                colors: crate::vt::TerminalColors::default(),
-                tags: Vec::new(),
-                environment: Vec::new(),
-            }
+            // inspect() may auto-start a daemon. An existing-only attachment
+            // must neither start a replacement nor clean up retained state on
+            // a connection, permission, protocol or session lookup failure.
+            let result = self.http_json(&id, Method::GET, &format!("/sessions/{id}"), &())?;
+            session_info_from_inspect(result, SessionStatus::Attached)
         } else {
-            ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions {
+            let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions {
                 record: options.record,
                 ..Default::default()
-            })?
+            })?;
+            // Get real config before taking the foreground slot.
+            if let Ok(result) = self.inspect(&session.id) {
+                session_info_from_inspect(result, SessionStatus::Attached)
+            } else {
+                SessionInfo {
+                    id: session.id.clone(),
+                    vt_engine: session.vt_engine,
+                    vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
+                    functional_vt_available: crate::vt::functional_vt_available(),
+                    cwd: session.cwd,
+                    cmd: session.cmd,
+                    tags: session.tags,
+                    status: SessionStatus::Attached,
+                    screen_activity: crate::protocol::ScreenActivity::Stable,
+                    stable_since: None,
+                    last_output_at: None,
+                    controller: None,
+                    error: None,
+                }
+            }
         };
         // Recording is part of setup, before observers can see the foreground
         // grant and act on it (including killing the session).
         if options.record {
-            self.record(&session.id, true)?;
+            self.record(&info.id, true)?;
         }
-        // Get real config from the daemon before attaching (which takes the foreground slot).
-        let info = if let Ok(result) = self.inspect(&session.id) {
-            session_info_from_inspect(result, SessionStatus::Attached)
-        } else {
-            SessionInfo {
-                id: session.id.clone(),
-                vt_engine: session.vt_engine,
-                vt_engine_status: crate::vt::vt_engine_status(session.vt_engine).to_string(),
-                functional_vt_available: crate::vt::functional_vt_available(),
-                cwd: session.cwd,
-                cmd: session.cmd,
-                tags: session.tags,
-                status: SessionStatus::Attached,
-                screen_activity: crate::protocol::ScreenActivity::Stable,
-                stable_since: None,
-                last_output_at: None,
-                controller: None,
-                error: None,
-            }
-        };
         // Passthrough has no structured render surface, so it remains on the
         // legacy byte stream. Functional interactive terminals use packets.
         let attach = if info.vt_engine == VtEngineKind::Passthrough {

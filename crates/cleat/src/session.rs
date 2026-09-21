@@ -210,6 +210,7 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
 
 struct AttachChrome {
     session_name: String,
+    nested_in: Option<String>,
     renderer: PacketTerminalRenderer,
     panning: bool,
     visible: bool,
@@ -294,8 +295,9 @@ impl AttachChrome {
                 crate::provider::ViewStatus::Unavailable => "unavailable",
             };
             let size = self.role.fixed_size.as_ref().map(|size| format!(" | fixed {}x{}", size.cols, size.rows)).unwrap_or_default();
+            let nesting = self.nested_in.as_ref().map(|source| format!("nested in {source} | ")).unwrap_or_default();
             format!(
-                "cleat {} | {}{}{role} | {drivers} drivers, {watchers} watchers | {view}{exclusive}{size}",
+                "cleat {} | {nesting}{}{}{role} | {drivers} drivers, {watchers} watchers | {view}{exclusive}{size}",
                 self.session_name,
                 self.renderer.geometry.description(),
                 if self.panning { "pan (Esc exits) | " } else { "" }
@@ -340,11 +342,14 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let controller = Arc::new(AtomicBool::new(packet.initial_role.role == ChannelRole::Controller));
     let mut renderer = PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows);
     renderer.keyboard = keyboard.clone();
+    let nested_in =
+        crate::runtime::ambient_session_coordinates()?.map(|source| format!("{}/{}", source.daemon_name(), source.session_id()));
     let chrome = Arc::new(Mutex::new(AttachChrome {
         session_name: packet.session_name,
         renderer,
         panning: false,
-        visible: packet.initial_role.participants.len() > 1,
+        visible: nested_in.is_some() || packet.initial_role.participants.len() > 1,
+        nested_in,
         hidden: false,
         role: packet.initial_role,
         view: Default::default(),
@@ -5057,6 +5062,7 @@ mod tests {
         };
         let mut chrome = super::AttachChrome {
             session_name: "whatever3".to_owned(),
+            nested_in: None,
             renderer: PacketTerminalRenderer::new(120, 40),
             panning: false,
             visible: false,

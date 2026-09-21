@@ -107,6 +107,12 @@ impl AmbientSessionCoordinates {
     }
 }
 
+pub fn ambient_session_coordinates() -> Result<Option<AmbientSessionCoordinates>, String> {
+    let Some(id) = std::env::var(AMBIENT_SESSION_ENV).ok().filter(|id| !id.is_empty()) else { return Ok(None) };
+    let daemon = std::env::var(AMBIENT_DAEMON_ENV).unwrap_or_else(|_| DEFAULT_DAEMON_NAME.to_owned());
+    RuntimeLayout::discover()?.with_daemon(daemon)?.session_coordinates(&id).map(Some)
+}
+
 impl RuntimeLayout {
     pub fn discover() -> Result<Self, String> {
         Ok(Self {

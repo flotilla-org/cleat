@@ -545,6 +545,27 @@ impl ExecResult {
     }
 }
 
+fn check_foreground_nesting(
+    root: &std::path::Path,
+    daemon: &str,
+    id: Option<&str>,
+    ambient: Option<&crate::runtime::AmbientSessionCoordinates>,
+) -> Result<(), String> {
+    let Some(ambient) = ambient else { return Ok(()) };
+    let absolute = |path: &std::path::Path| -> Result<PathBuf, String> {
+        // Existing roots may have symlink aliases. Resolve those before comparing.
+        if let Ok(path) = path.canonicalize() {
+            return Ok(path);
+        }
+        std::path::absolute(path).map_err(|err| format!("resolve runtime root: {err}"))
+    };
+    let source = format!("{} / {}", ambient.daemon_name(), ambient.session_id());
+    if id == Some(ambient.session_id()) && daemon == ambient.daemon_name() && absolute(root)? == absolute(ambient.runtime_root())? {
+        return Err(format!("cannot attach to {source} from inside itself: this would create an output loop. Detach with Ctrl-] then d, or use a fresh terminal tab."));
+    }
+    Ok(())
+}
+
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
     if cli.has_conflicting_daemon_targets() {
         return ExecResult::Err("--server cannot be used with --from".to_string());
@@ -562,6 +583,20 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Err(err) => return ExecResult::Err(err),
     };
     let service = &service;
+    let foreground = match &cli.command {
+        Command::Attach { id, .. } => Some(id.as_deref()),
+        Command::Watch { id, .. } => Some(Some(id.as_str())),
+        _ => None,
+    };
+    if let Some(id) = foreground {
+        let ambient = match crate::runtime::ambient_session_coordinates() {
+            Ok(ambient) => ambient,
+            Err(err) => return ExecResult::Err(err),
+        };
+        if let Err(err) = check_foreground_nesting(service.layout_root(), daemon_target.name(), id, ambient.as_ref()) {
+            return ExecResult::Err(err);
+        }
+    }
     match cli.command {
         Command::Attach { id, no_create, vt, cwd, cmd, strict, take, attachment, record } => {
             // Windows can provide basic sessions through ConPTY plus the
@@ -1425,5 +1460,36 @@ fn parse_repeat(value: &str) -> Result<usize, String> {
         Err("repeat count must be at least 1".to_string())
     } else {
         Ok(repeat)
+    }
+}
+
+#[cfg(test)]
+mod nesting_tests {
+    use super::check_foreground_nesting;
+    use crate::runtime::RuntimeLayout;
+
+    #[test]
+    fn self_attachment_uses_the_complete_session_address() {
+        let root = std::env::temp_dir().join("cleat-nesting-test");
+        let source = RuntimeLayout::new(root.clone()).with_daemon("work".into()).unwrap().session_coordinates("alpha").unwrap();
+        let check = |root: &std::path::Path, daemon, id| check_foreground_nesting(root, daemon, id, Some(&source));
+        assert!(check(&root, "work", Some("alpha")).unwrap_err().contains("output loop"));
+        assert!(check(&root, "work", Some("beta")).is_ok());
+        assert!(check(&root, "other", Some("alpha")).is_ok());
+        assert!(check(&root.join("other"), "work", Some("alpha")).is_ok());
+        assert!(check(&root, "work", None).is_ok());
+        assert!(check_foreground_nesting(&root, "work", Some("alpha"), None).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_root_alias_does_not_bypass_self_attachment_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let source = RuntimeLayout::new(root).session_coordinates("alpha").unwrap();
+        assert!(check_foreground_nesting(&alias, "default", Some("alpha"), Some(&source)).is_err());
     }
 }

@@ -2428,6 +2428,10 @@ fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
     packet_ack(&mut stream, 1, first.render_generation);
     let coalesced = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
     assert!(coalesced.render_generation > first.render_generation);
+    assert!(
+        coalesced.ops.iter().all(|op| op.kind != cleat::provider::TerminalRenderUpdateOpKind::FullVisibleReplace),
+        "catching up a slow client must not force full VT extraction"
+    );
     packet_ack(&mut stream, 1, coalesced.render_generation);
     expect_no_render(&mut stream, &mut buffer, Duration::from_millis(120));
 }

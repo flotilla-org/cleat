@@ -541,7 +541,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     let mut stdout = std::io::stdout().lock();
                     let mut chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
                     chrome.renderer.images.reply(&mut stdout, &bytes)?;
-                    chrome.paint(&mut stdout, None)?;
+                    chrome.renderer.refresh_images(&mut stdout)?;
                     stdout.flush().map_err(|e| e.to_string())?;
                 }
                 Action::KeyboardFlags(_) => {
@@ -736,6 +736,15 @@ impl PacketTerminalRenderer {
     fn repaint(&mut self, writer: &mut impl Write) -> Result<(), String> {
         if let Some(update) = self.last_update.clone() {
             self.needs_full_repaint = true;
+            self.apply_and_render(writer, &update)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_images(&mut self, writer: &mut impl Write) -> Result<(), String> {
+        // last_update has metadata but no cell operations. Preserve the cursor
+        // and synchronize the placement swap without invalidating cached rows.
+        if let Some(update) = self.last_update.clone() {
             self.apply_and_render(writer, &update)?;
         }
         Ok(())
@@ -3453,11 +3462,93 @@ struct PacketSessionChannel {
 struct PacketRenderCache {
     latest: Option<RenderBundle>,
     history_cursor: u128,
+    rows: Vec<crate::provider::TerminalRenderRow>,
+    row_generations: Vec<u64>,
+    reset_generation: u64,
 }
 
 impl PacketRenderCache {
-    fn store(&mut self, update: RenderBundle) {
-        self.latest = Some(update);
+    fn store(&mut self, mut bundle: RenderBundle) {
+        use crate::provider::TerminalRenderUpdateOpKind as Kind;
+        let update = &mut bundle.packet.update;
+        let generation = update.render_generation;
+        if self.latest.as_ref().is_none_or(|previous| {
+            let previous = &previous.packet.update;
+            previous.cols != update.cols
+                || previous.rows != update.rows
+                || previous.terminal_modes.active_alternate_screen != update.terminal_modes.active_alternate_screen
+        }) {
+            self.rows = (0..update.rows)
+                .map(|row| crate::provider::TerminalRenderRow {
+                    row,
+                    col_count: update.cols,
+                    cells: vec![Default::default(); update.cols as usize],
+                    ..Default::default()
+                })
+                .collect();
+            self.row_generations = vec![generation; update.rows as usize];
+            self.reset_generation = generation;
+        }
+        for op in std::mem::take(&mut update.ops) {
+            if op.kind == Kind::FullVisibleReplace {
+                self.reset_generation = generation;
+            }
+            if op.kind == Kind::ScrollCopy {
+                // Snapshot before copying so overlapping scrolls are lossless.
+                let copied: Vec<_> =
+                    (0..op.row_count).filter_map(|offset| self.rows.get(usize::from(op.src_row + offset)).cloned()).collect();
+                for (offset, mut row) in copied.into_iter().enumerate() {
+                    let index = usize::from(op.dst_row) + offset;
+                    if let Some(target) = self.rows.get_mut(index) {
+                        row.row = index as u16;
+                        *target = row;
+                        self.row_generations[index] = generation;
+                    }
+                }
+            } else {
+                for row in op.rows {
+                    let index = usize::from(row.row);
+                    if let Some(target) = self.rows.get_mut(index) {
+                        *target = row;
+                        self.row_generations[index] = generation;
+                    }
+                }
+            }
+        }
+        self.latest = Some(bundle);
+    }
+
+    fn since(&self, generation: u64) -> Option<RenderBundle> {
+        use crate::provider::{TerminalRenderUpdateOp, TerminalRenderUpdateOpKind as Kind};
+        let mut bundle = self.latest.clone()?;
+        let update = &mut bundle.packet.update;
+        if generation < self.reset_generation {
+            update.dirty = DirtyState::Full;
+            update.ops.push(TerminalRenderUpdateOp {
+                kind: Kind::FullVisibleReplace,
+                row_count: update.rows,
+                col_count: update.cols,
+                rows: self.rows.clone(),
+                ..Default::default()
+            });
+        } else {
+            update.ops = self
+                .rows
+                .iter()
+                .zip(&self.row_generations)
+                .filter(|(_, changed)| **changed > generation)
+                .map(|(row, _)| TerminalRenderUpdateOp {
+                    kind: Kind::RowReplace,
+                    first_row: row.row,
+                    row_count: 1,
+                    col_count: update.cols,
+                    rows: vec![row.clone()],
+                    ..Default::default()
+                })
+                .collect();
+            update.dirty = if update.ops.is_empty() { DirtyState::Clean } else { DirtyState::Partial };
+        }
+        Some(bundle)
     }
 
     fn latest_generation(&self) -> Option<u64> {
@@ -4119,7 +4210,7 @@ fn push_due_packet_renders(
     }
 
     if actor.observation().dirty() != DirtyState::Clean {
-        let result = actor.packet_render(has_packet_channel_lagging_cached_generation(session_id, packet_clients, render_cache));
+        let result = actor.packet_render(false);
         match result {
             Ok(update) => render_cache.store(update),
             Err(error) => {
@@ -4142,9 +4233,6 @@ fn push_due_packet_renders(
     }
 
     let Some(latest_generation) = render_cache.latest_generation() else {
-        return Ok(());
-    };
-    let Some(update) = render_cache.latest().cloned() else {
         return Ok(());
     };
 
@@ -4173,9 +4261,9 @@ fn push_due_packet_renders(
         let result = if session.history {
             captures += 1;
             render_cache.history_cursor = key.view_id();
-            actor.request_result(|reply| crate::host::actor::SessionCommand::CaptureAttachmentView { id: key.view_id(), reply }).and_then(
+            actor.request_result(|reply| crate::host::actor::SessionCommand::CaptureAttachmentView { id: key.view_id(), reply }).map(
                 |capture| match capture {
-                    Some(frame) => Ok(RenderBundle {
+                    Some(frame) => RenderBundle {
                         images: frame.images.into_iter().map(crate::image_backing::RetainedImage::from_owned).collect(),
                         packet: RenderPacket {
                             update: frame.update,
@@ -4185,17 +4273,18 @@ fn push_due_packet_renders(
                                 notice: frame.discarded.then(|| "Earlier history was discarded".into()),
                             },
                         },
-                    }),
-                    None => actor.packet_render(true).map(|mut packet| {
+                    },
+                    None => {
+                        let mut packet = render_cache.since(0).expect("cache generation checked above");
                         packet.packet.view.notice = Some("History was cleared; returned to live".into());
                         packet
-                    }),
+                    }
                 },
             )
         } else if session.view_changed {
-            actor.packet_render(true)
+            Ok(render_cache.since(0).expect("cache generation checked above"))
         } else {
-            Ok(update.clone())
+            Ok(render_cache.since(session.last_source_generation).expect("cache generation checked above"))
         };
         let next_generation = session.last_sent_generation.saturating_add(1);
         let result = result.and_then(|mut packet| {
@@ -4234,19 +4323,6 @@ fn push_due_packet_renders(
         }
     }
     Ok(())
-}
-
-fn has_packet_channel_lagging_cached_generation(
-    session_id: &str,
-    packet_clients: &[PacketClient],
-    render_cache: &PacketRenderCache,
-) -> bool {
-    let Some(latest_generation) = render_cache.latest_generation() else {
-        return false;
-    };
-    packet_clients.iter().flat_map(|client| client.channels.values()).any(|session| {
-        session.session_id == session_id && !session.history && !session.view_changed && session.last_source_generation < latest_generation
-    })
 }
 
 fn route_packet_input_event(actor: &SessionActor, source: u128, event: TerminalInputEvent) -> Result<(), String> {
@@ -4625,6 +4701,80 @@ mod tests {
         vt::{self, VtEngine},
     };
 
+    fn cached_row(row: u16, text: &str) -> TerminalRenderRow {
+        TerminalRenderRow {
+            row,
+            col_count: 1,
+            cells: vec![crate::provider::TerminalRenderCell { graphemes: text.chars().map(u32::from).collect(), ..Default::default() }],
+            ..Default::default()
+        }
+    }
+
+    fn cached_update(
+        generation: u64,
+        kind: TerminalRenderUpdateOpKind,
+        rows: Vec<TerminalRenderRow>,
+    ) -> crate::image_delivery::RenderBundle {
+        crate::image_delivery::RenderBundle::live(
+            TerminalRenderUpdate {
+                render_generation: generation,
+                cols: 1,
+                rows: 3,
+                ops: vec![TerminalRenderUpdateOp { kind, row_count: rows.len() as u16, col_count: 1, rows, ..Default::default() }],
+                ..Default::default()
+            },
+            vec![],
+        )
+    }
+
+    #[test]
+    fn packet_cache_catches_up_each_client_without_cells_for_image_only_changes() {
+        use TerminalRenderUpdateOpKind::{FullVisibleReplace, RowReplace};
+        let mut cache = super::PacketRenderCache::default();
+        cache.store(cached_update(1, FullVisibleReplace, vec![cached_row(0, "a"), cached_row(1, "b"), cached_row(2, "c")]));
+        cache.store(cached_update(2, RowReplace, vec![cached_row(0, "A")]));
+        cache.store(cached_update(3, RowReplace, vec![cached_row(2, "C")]));
+        let mut image_only = cached_update(4, RowReplace, vec![]);
+        image_only.packet.update.image_resources.push(crate::provider::TerminalImageResource {
+            image_id: 42,
+            generation: 4,
+            ..Default::default()
+        });
+        cache.store(image_only);
+        let slow = cache.since(1).unwrap().packet.update;
+        assert_eq!(slow.ops.len(), 2);
+        assert_eq!(slow.ops[0].rows[0], cached_row(0, "A"));
+        assert_eq!(slow.ops[1].rows[0], cached_row(2, "C"));
+        assert_eq!(cache.since(2).unwrap().packet.update.ops.len(), 1);
+        let current = cache.since(3).unwrap().packet.update;
+        assert!(current.ops.is_empty());
+        assert_eq!(current.image_resources[0].image_id, 42);
+        let initial = cache.since(0).unwrap().packet.update;
+        assert_eq!(initial.ops[0].kind, FullVisibleReplace);
+        assert_eq!(initial.ops[0].rows, vec![cached_row(0, "A"), cached_row(1, "b"), cached_row(2, "C")]);
+    }
+
+    #[test]
+    fn packet_cache_materializes_overlapping_scrolls_and_resets_on_screen_change() {
+        use TerminalRenderUpdateOpKind::{FullVisibleReplace, ScrollCopy};
+        let mut cache = super::PacketRenderCache::default();
+        cache.store(cached_update(1, FullVisibleReplace, vec![cached_row(0, "a"), cached_row(1, "b"), cached_row(2, "c")]));
+        let mut scroll = cached_update(2, ScrollCopy, vec![]);
+        scroll.packet.update.ops[0].src_row = 0;
+        scroll.packet.update.ops[0].dst_row = 1;
+        scroll.packet.update.ops[0].row_count = 2;
+        cache.store(scroll);
+        let caught_up = cache.since(1).unwrap().packet.update;
+        assert_eq!(caught_up.ops[0].rows[0], cached_row(1, "a"));
+        assert_eq!(caught_up.ops[1].rows[0], cached_row(2, "b"));
+        let mut other_screen = cached_update(3, FullVisibleReplace, vec![cached_row(0, "x"), cached_row(1, "y"), cached_row(2, "z")]);
+        other_screen.packet.update.terminal_modes.active_alternate_screen = true;
+        cache.store(other_screen);
+        let caught_up = cache.since(2).unwrap().packet.update;
+        assert_eq!(caught_up.ops[0].kind, FullVisibleReplace);
+        assert_eq!(caught_up.ops[0].rows[0], cached_row(0, "x"));
+    }
+
     #[cfg(feature = "ghostty-vt")]
     #[test]
     fn packet_katzensteg_background_image_keeps_default_cells_transparent() {
@@ -4790,7 +4940,8 @@ mod tests {
                 }
             }
             output.clear();
-            renderer.repaint(&mut output).unwrap();
+            renderer.refresh_images(&mut output).unwrap();
+            assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2K"), "image acknowledgement must not erase/repaint text rows");
             host.feed(&output).unwrap();
             let displayed = host.render_update(DirtyState::Full).unwrap();
             assert_eq!(displayed.image_placements.len(), 1);

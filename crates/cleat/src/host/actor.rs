@@ -1129,15 +1129,22 @@ fn session_actor_handle_command(
             sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
             let result = (|| {
                 let mut update = runtime.render_update(if full { DirtyState::Full } else { state.observation.dirty() })?;
-                state.observation.annotate_render_update(&mut update);
                 if full {
+                    update.render_generation = state.observation.render_generation;
                     update.dirty = DirtyState::Full;
+                } else {
+                    state.observation.annotate_render_update(&mut update);
                 }
                 let images = state.images.capture(&update.image_resources, |id, generation, callback| {
                     runtime.with_image_resource_data(id, generation, callback)
                 })?;
                 Ok(crate::image_delivery::RenderBundle::live(update, images))
             })();
+            if let Ok(bundle) = &result {
+                // The daemon cache owns this captured generation, independently
+                // of when each attachment acknowledges its delivered view.
+                state.observation.mark_observed(bundle.packet.update.render_generation);
+            }
             let _ = reply.send(result);
         }
         SessionCommand::FullSnapshot { reply } => {

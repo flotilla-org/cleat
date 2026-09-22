@@ -108,6 +108,21 @@ impl SessionService {
         self.layout.root()
     }
 
+    /// Query only the running daemon, without starting one or negotiating packets.
+    pub fn daemon_build_info(&self) -> Result<Option<crate::build_info::BuildInfo>, String> {
+        let path = self.layout.socket_path();
+        let mut stream = try_connect_session_stream(&path).map_err(|err| format!("connect {}: {err}", path.display()))?;
+        set_stream_read_timeout(&stream, Some(Duration::from_secs(2)))?;
+        http_uds::write_request(&mut stream, Method::GET, "/", &[]).map_err(|err| format!("write HTTP request: {err}"))?;
+        let response = http_uds::read_response(&mut stream).map_err(|err| format!("read HTTP response: {err}"))?;
+        if response.status != StatusCode::OK {
+            return Err(http_error_message(response));
+        }
+        let status: crate::build_info::DaemonBuildStatus =
+            serde_json::from_slice(&response.body).map_err(|err| format!("parse daemon build status: {err}"))?;
+        Ok(status.build)
+    }
+
     pub fn discover_daemons(&self) -> Vec<DaemonCoordinates> {
         let mut roots = discoverable_runtime_roots();
         roots.push(self.layout.root().to_path_buf());

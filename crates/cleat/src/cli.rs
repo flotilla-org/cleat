@@ -14,7 +14,7 @@ use crate::{
 #[derive(Debug, Parser)]
 #[command(
     name = "cleat",
-    version,
+    version = crate::build_info::version(),
     about = "Session daemon with a structured control plane for agents and terminal persistence",
     after_help = "Typical agent workflow:\n\
                   \x20 cleat launch --record my-session --cmd bash\n\
@@ -225,6 +225,13 @@ pub enum Command {
         all: bool,
         #[arg(long = "selector", value_name = "TAG", allow_hyphen_values = true, help = "Require an exact opaque tag match; repeatable")]
         selectors: Vec<String>,
+    },
+    /// Show client build information and optionally query the running daemon
+    Version {
+        #[arg(long, help = "Query the selected daemon without starting it")]
+        daemon: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
     /// List discoverable daemons (best effort; private state roots may not be found)
     Daemons {
@@ -705,6 +712,32 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
             } else {
                 ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
+        }
+        Command::Version { daemon, json } => {
+            let client = crate::build_info::BuildInfo::current();
+            let daemon_build = if daemon {
+                match service.daemon_build_info() {
+                    Ok(build) => build,
+                    Err(err) => return ExecResult::Err(err),
+                }
+            } else {
+                None
+            };
+            let output = if json {
+                let mut report = serde_json::json!({ "client": client });
+                if daemon {
+                    report["daemon"] = serde_json::json!(daemon_build);
+                }
+                report.to_string()
+            } else if daemon {
+                format!(
+                    "client: {client}\ndaemon: {}",
+                    daemon_build.map(|build| build.to_string()).unwrap_or_else(|| "unknown (daemon does not report build metadata)".into())
+                )
+            } else {
+                client.to_string()
+            };
+            ExecResult::Ok(Some(output))
         }
         Command::Daemons { json } => {
             let daemons = service.discover_daemons();

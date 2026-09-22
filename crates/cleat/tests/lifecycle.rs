@@ -545,9 +545,15 @@ fn launch_owns_term_when_daemon_environment_is_scrubbed_and_honors_override() {
         || matches!(std::fs::read_to_string(&default_output), Ok(value) if matches!(value.as_str(), "xterm-256color" | "xterm-ghostty")),
     );
     let selected = std::fs::read_to_string(&default_output).unwrap();
-    let colors = std::process::Command::new("tput").args(["-T", &selected, "colors"]).output().unwrap();
-    assert!(colors.status.success(), "launched TERM resolves for terminfo consumers");
-    assert_eq!(String::from_utf8_lossy(&colors.stdout).trim(), "256");
+    match std::process::Command::new("tput").args(["-T", &selected, "colors"]).output() {
+        Ok(colors) => {
+            assert!(colors.status.success(), "launched TERM resolves for terminfo consumers");
+            assert_eq!(String::from_utf8_lossy(&colors.stdout).trim(), "256");
+        }
+        // Minimal Unix environments need not install this optional consumer.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!("run tput: {err}"),
+    }
 
     let override_output = temp.path().join("override-term");
     let override_command = format!("printf %s \"$TERM\" > {}; sleep 30", override_output.display());

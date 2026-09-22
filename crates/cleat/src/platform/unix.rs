@@ -399,7 +399,7 @@ impl ChildExecSpec {
             argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
             argv.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
         }
-        let envp = child_envp_from(env::vars_os(), session.vt_engine, &session.environment, coordinates)?;
+        let envp = child_envp_from(env::vars_os(), session.vt_engine, &session.environment, coordinates, session.cwd.as_deref())?;
         let cwd = session.cwd.as_ref().map(|cwd| cstring_from_os(cwd.as_os_str(), "cwd contains interior nul")).transpose()?;
         let argv_ptrs = null_terminated_ptrs(&argv);
         let envp_ptrs = null_terminated_ptrs(&envp);
@@ -449,7 +449,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 fn filtered_envp_from(env: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Vec<CString>, String> {
-    child_envp_from(env, crate::vt::VtEngineKind::Passthrough, &[], None)
+    child_envp_from(env, crate::vt::VtEngineKind::Passthrough, &[], None, None)
 }
 
 fn child_envp_from(
@@ -457,11 +457,14 @@ fn child_envp_from(
     vt_engine: crate::vt::VtEngineKind,
     overrides: &[(String, String)],
     coordinates: Option<&AmbientSessionCoordinates>,
+    cwd: Option<&std::path::Path>,
 ) -> Result<Vec<CString>, String> {
+    let env: Vec<_> = env.into_iter().collect();
+    let identity = crate::terminal_identity::defaults(vt_engine, &env, overrides, cwd);
     let mut envp = Vec::new();
     for (key, value) in env {
         if STRIP_ENV_VARS.iter().any(|strip| key == OsStr::new(strip))
-            || key == OsStr::new("TERM")
+            || crate::terminal_identity::is_identity(&key)
             || overrides.iter().any(|(name, _)| key == OsStr::new(name))
             || coordinates.is_some() && AMBIENT_COORDINATE_ENV_NAMES.iter().any(|ambient| key == OsStr::new(ambient))
         {
@@ -473,9 +476,10 @@ fn child_envp_from(
         entry.extend_from_slice(value.as_bytes());
         envp.push(CString::new(entry).map_err(|_| "environment contains interior nul".to_string())?);
     }
-    if !overrides.iter().any(|(name, _)| name == "TERM") {
+    for (key, value) in identity {
         envp.push(
-            CString::new(format!("TERM={}", vt_engine.terminal_name())).map_err(|_| "terminal name contains interior nul".to_string())?,
+            CString::new(format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
+                .map_err(|_| "terminal identity contains interior nul".to_string())?,
         );
     }
     for (index, (name, value)) in overrides.iter().enumerate() {
@@ -674,11 +678,33 @@ mod tests {
 
         assert!(entries.contains(&"PATH=/bin"));
         assert!(entries.contains(&"CLEAT_KEEP=1"));
-        assert!(entries.contains(&"TERM=xterm-256color"));
+        assert!(entries.contains(&"TERM=dumb"));
         assert!(!entries.contains(&"TERM=vt100"));
         assert!(!entries.iter().any(|entry| entry.starts_with("SSH_TTY=")));
         assert!(!entries.iter().any(|entry| entry.starts_with("SSH_CONNECTION=")));
         assert!(!entries.iter().any(|entry| entry.starts_with("SSH_CLIENT=")));
+    }
+
+    #[test]
+    fn ghostty_child_environment_replaces_outer_identity_and_honors_individual_overrides() {
+        let envp = super::child_envp_from(
+            [
+                (OsString::from("TERM"), OsString::from("xterm-kitty")),
+                (OsString::from("TERM_PROGRAM"), OsString::from("kitty")),
+                (OsString::from("TERM_PROGRAM_VERSION"), OsString::from("outer-version")),
+                (OsString::from("COLORTERM"), OsString::from("outer-color")),
+            ],
+            VtEngineKind::Ghostty,
+            &[("TERM".into(), "screen-256color".into())],
+            None,
+            None,
+        )
+        .unwrap();
+        let entries: Vec<_> = envp.iter().map(|e| e.to_str().unwrap()).collect();
+        assert!(entries.contains(&"TERM=screen-256color"));
+        assert!(entries.contains(&"TERM_PROGRAM=ghostty"));
+        assert!(entries.contains(&"COLORTERM=truecolor"));
+        assert_eq!(entries.len(), 3, "do not retain the outer program version");
     }
 
     #[test]
@@ -687,6 +713,7 @@ mod tests {
             [(OsString::from("TERM"), OsString::from("vt100"))],
             VtEngineKind::Passthrough,
             &[("TERM".to_string(), "screen-256color".to_string())],
+            None,
             None,
         )
         .expect("child environment");

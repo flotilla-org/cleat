@@ -335,16 +335,17 @@ fn spawn_with_conpty(
 }
 
 fn child_environment_block(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Vec<u16>, String> {
-    let mut variables: Vec<(OsString, OsString)> = env::vars_os()
+    let inherited: Vec<_> = env::vars_os().collect();
+    let identity = crate::terminal_identity::defaults(session.vt_engine, &inherited, &session.environment, session.cwd.as_deref());
+    let mut variables: Vec<(OsString, OsString)> = inherited
+        .into_iter()
         .filter(|(key, _)| {
-            !key.eq_ignore_ascii_case(OsStr::new("TERM"))
+            !crate::terminal_identity::is_identity(key)
                 && !session.environment.iter().any(|(name, _)| key.eq_ignore_ascii_case(OsStr::new(name)))
                 && !coordinates.is_some_and(|_| AMBIENT_COORDINATE_ENV_NAMES.iter().any(|name| key.eq_ignore_ascii_case(OsStr::new(name))))
         })
         .collect();
-    if !session.environment.iter().any(|(name, _)| name.eq_ignore_ascii_case("TERM")) {
-        variables.push((OsString::from("TERM"), OsString::from(session.vt_engine.terminal_name())));
-    }
+    variables.extend(identity);
     for (index, (name, value)) in session.environment.iter().enumerate() {
         if name.is_empty() || name.contains('=') {
             return Err("environment name must be non-empty and contain no '='".to_string());

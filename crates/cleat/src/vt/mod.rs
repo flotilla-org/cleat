@@ -255,12 +255,13 @@ impl VtEngineKind {
         }
     }
 
-    /// The portable terminfo entry matching Cleat's VT capability baseline.
+    /// Portable fallback identity. Session launch prefers the Ghostty entry
+    /// when the host can resolve it; see the terminal identity policy.
     pub fn terminal_name(self) -> &'static str {
-        // Cleat embeds the Ghostty VT engine, rather than a Ghostty terminal
-        // application with its own terminfo entry. Its portable contract is
-        // xterm's 256-colour capability set.
-        "xterm-256color"
+        match self {
+            Self::Ghostty => "xterm-256color",
+            Self::Passthrough => "dumb",
+        }
     }
 
     pub fn ensure_available(self) -> Result<(), String> {

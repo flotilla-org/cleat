@@ -143,36 +143,20 @@ This subscription contract starts with packet protocol v4. Version 3 used raw PT
 
 ### Queries and capabilities
 
-When the child emits a capability query, the reply source depends on attach state:
+For Ghostty packet sessions, the session's VT engine answers application queries
+whether or not a viewer is attached. CLI and native viewers render that state;
+the CLI negotiates keyboard, mouse and image delivery with its outer terminal
+separately. See [structured input](docs/structured-keyboard.md).
 
-- **Attached** — the host terminal replies. Whatever your real terminal actually supports is what the child sees. Behavior matches running the child outside cleat.
-- **Detached** — the VT engine (libghostty) synthesizes replies.
-
-Currently answered by the VT engine in detached mode:
-
-| Query | Reply |
-|---|---|
-| DA1 (`CSI c`) | `\x1b[?62;22c` (conformance level 62 = VT220, feature 22 = ANSI color) |
-| DA2 (`CSI > c`) | `\x1b[>1;10;0c` (device type 1 = VT220, firmware 10, cartridge 0) |
-| DA3 (`CSI = c`) | DECRPTUI response with unit ID 0 |
-| DSR, including Cursor Position Report (`CSI 6 n`) | computed from VT state (e.g. `\x1b[row;colR`) |
-| DECRQM (mode reports) | computed from VT mode state |
-
-Currently dropped (no reply sent, even in detached mode):
-
-- ENQ (`0x05`)
-- XTVERSION (`CSI > q`)
-- XTWINOPS size queries (`CSI 14/16/18 t`)
-- Color-scheme query (`CSI ? 996 n`)
-- Kitty keyboard protocol queries (`CSI ? u`)
-- Kitty graphics protocol queries (`APC G ... q=... ST`)
-- XTGETTCAP (`DCS + q ... ST`)
-
-The first four have structurally identical fixes to the DA/DSR wiring and will likely land as a follow-up. The kitty-protocol and XTGETTCAP entries need upstream libghostty work or a cleat-side sniffer — tracked in the issue list.
+Child terminal identity also belongs to the engine. Ghostty sessions prefer
+`TERM=xterm-ghostty` when the session host can resolve its terminfo entry,
+otherwise `xterm-256color`. They set `TERM_PROGRAM=ghostty` and
+`COLORTERM=truecolor`; explicit session environment overrides win. The
+passthrough test engine uses `TERM=dumb`. See [terminal identity](docs/terminal-identity.md)
+for lookup, platform and compatibility details.
 
 ### Common surprises
 
-- **`capture` shows what the VT engine parsed** from the output stream — not necessarily what your real terminal would display. Usually identical, but diverges for kitty graphics: the VT engine doesn't surface image content today, while an attached host terminal would render the images.
-- **Attached and detached sessions may behave differently for the same child program** if the child branches on capability-query responses. A TUI that probes for kitty graphics via `APC G ... q=... ST` sees support when attached to kitty and no support when detached (the query is currently dropped). Reproducible behavior for protocol-sensitive stages requires picking the right mode. This asymmetry is a known design question, not a target — see [#58](https://github.com/flotilla-org/cleat/issues/58) for the direction (VT engine always authoritative, host terminal as a derived view).
+- **Text `capture` reports the VT engine's screen text.** Graphics resources and placements are delivered separately to packet/native viewers; text capture is not an image export.
 - **Recording is raw PTY output** with escape sequences intact. `transcript` emits them verbatim; use `capture` to get human-readable text from the current screen state.
 - **Non-Ghostty builds return errors** for `capture` and other VT-dependent operations. The `passthrough` engine is a test seam, not a real VT. A functional binary requires `--features ghostty-vt`.

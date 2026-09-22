@@ -540,7 +540,20 @@ fn launch_owns_term_when_daemon_environment_is_scrubbed_and_honors_override() {
     let default_launch = Cli::try_parse_from(["cleat", "launch", "default-term", "--no-record", "--cmd", &default_command])
         .expect("parse default TERM launch");
     cli::execute(default_launch, &service).expect("launch with scrubbed TERM");
-    wait_until("default TERM output", || matches!(std::fs::read_to_string(&default_output), Ok(value) if value == "xterm-256color"));
+    wait_until(
+        "default TERM output",
+        || matches!(std::fs::read_to_string(&default_output), Ok(value) if matches!(value.as_str(), "xterm-256color" | "xterm-ghostty")),
+    );
+    let selected = std::fs::read_to_string(&default_output).unwrap();
+    match std::process::Command::new("tput").args(["-T", &selected, "colors"]).output() {
+        Ok(colors) => {
+            assert!(colors.status.success(), "launched TERM resolves for terminfo consumers");
+            assert_eq!(String::from_utf8_lossy(&colors.stdout).trim(), "256");
+        }
+        // Minimal Unix environments need not install this optional consumer.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!("run tput: {err}"),
+    }
 
     let override_output = temp.path().join("override-term");
     let override_command = format!("printf %s \"$TERM\" > {}; sleep 30", override_output.display());
@@ -2421,6 +2434,10 @@ fn packet_render_ack_enforces_one_in_flight_and_coalesces_slow_clients() {
     packet_ack(&mut stream, 1, first.render_generation);
     let coalesced = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
     assert!(coalesced.render_generation > first.render_generation);
+    assert!(
+        coalesced.ops.iter().all(|op| op.kind != cleat::provider::TerminalRenderUpdateOpKind::FullVisibleReplace),
+        "catching up a slow client must not force full VT extraction"
+    );
     packet_ack(&mut stream, 1, coalesced.render_generation);
     expect_no_render(&mut stream, &mut buffer, Duration::from_millis(120));
 }

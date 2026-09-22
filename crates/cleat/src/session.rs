@@ -71,6 +71,7 @@ enum ForegroundTransport {
 
 #[derive(Debug)]
 struct PacketForegroundAttach {
+    session_name: String,
     stream: Arc<Mutex<SessionStream>>,
     channel: u32,
     initial_update: TerminalRenderUpdate,
@@ -208,6 +209,8 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
 }
 
 struct AttachChrome {
+    session_name: String,
+    nested_in: Option<String>,
     renderer: PacketTerminalRenderer,
     panning: bool,
     visible: bool,
@@ -292,8 +295,10 @@ impl AttachChrome {
                 crate::provider::ViewStatus::Unavailable => "unavailable",
             };
             let size = self.role.fixed_size.as_ref().map(|size| format!(" | fixed {}x{}", size.cols, size.rows)).unwrap_or_default();
+            let nesting = self.nested_in.as_ref().map(|source| format!("nested in {source} | ")).unwrap_or_default();
             format!(
-                "{}{}cleat {role} | {drivers} drivers, {watchers} watchers | {view}{exclusive}{size}",
+                "cleat {} | {nesting}{}{}{role} | {drivers} drivers, {watchers} watchers | {view}{exclusive}{size}",
+                self.session_name,
                 self.renderer.geometry.description(),
                 if self.panning { "pan (Esc exits) | " } else { "" }
             )
@@ -337,10 +342,14 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let controller = Arc::new(AtomicBool::new(packet.initial_role.role == ChannelRole::Controller));
     let mut renderer = PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows);
     renderer.keyboard = keyboard.clone();
+    let nested_in =
+        crate::runtime::ambient_session_coordinates()?.map(|source| format!("{}/{}", source.daemon_name(), source.session_id()));
     let chrome = Arc::new(Mutex::new(AttachChrome {
+        session_name: packet.session_name,
         renderer,
         panning: false,
-        visible: packet.initial_role.participants.len() > 1,
+        visible: nested_in.is_some() || packet.initial_role.participants.len() > 1,
+        nested_in,
         hidden: false,
         role: packet.initial_role,
         view: Default::default(),
@@ -537,7 +546,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     let mut stdout = std::io::stdout().lock();
                     let mut chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
                     chrome.renderer.images.reply(&mut stdout, &bytes)?;
-                    chrome.paint(&mut stdout, None)?;
+                    chrome.renderer.refresh_images(&mut stdout)?;
                     stdout.flush().map_err(|e| e.to_string())?;
                 }
                 Action::KeyboardFlags(_) => {
@@ -732,6 +741,15 @@ impl PacketTerminalRenderer {
     fn repaint(&mut self, writer: &mut impl Write) -> Result<(), String> {
         if let Some(update) = self.last_update.clone() {
             self.needs_full_repaint = true;
+            self.apply_and_render(writer, &update)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_images(&mut self, writer: &mut impl Write) -> Result<(), String> {
+        // last_update has metadata but no cell operations. Preserve the cursor
+        // and synchronize the placement swap without invalidating cached rows.
+        if let Some(update) = self.last_update.clone() {
             self.apply_and_render(writer, &update)?;
         }
         Ok(())
@@ -972,8 +990,13 @@ fn render_packet_cell(writer: &mut impl Write, cell: &crate::provider::TerminalR
     }
     let fg = cell.style.resolved_fg;
     let bg = cell.style.resolved_bg;
-    write!(writer, "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m", fg.r, fg.g, fg.b, bg.r, bg.g, bg.b)
-        .map_err(|err| format!("write packet cell colours: {err}"))?;
+    write!(writer, "\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b).map_err(|err| format!("write packet cell foreground: {err}"))?;
+    // Default backgrounds must stay default: Kitty images with z < -(1 << 30)
+    // are drawn behind explicit cell backgrounds. Background-only cells carry
+    // their colour in the content (palette = 2, RGB = 3), rather than the style.
+    if cell.style.bg_color.tag != crate::provider::TerminalStyleColorTag::None || matches!(cell.style.content_tag, 2 | 3) {
+        write!(writer, "\x1b[48;2;{};{};{}m", bg.r, bg.g, bg.b).map_err(|err| format!("write packet cell background: {err}"))?;
+    }
     if cell.graphemes.is_empty() || cell.graphemes.contains(&0x10eeee) {
         writer.write_all(b" ").map_err(|err| format!("write packet blank cell: {err}"))?;
     } else {
@@ -1293,6 +1316,7 @@ pub fn attach_packet_foreground(
     }
     Ok(ForegroundAttach {
         transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
+            session_name: id.to_owned(),
             stream: Arc::new(Mutex::new(stream)),
             channel: FOREGROUND_CHANNEL,
             initial_update: initial_update.expect("render checked above"),
@@ -3439,7 +3463,6 @@ struct PacketSessionChannel {
     in_flight_generation: Option<u64>,
     last_sent_generation: u64,
     last_source_generation: u64,
-    in_flight_source_generation: u64,
     history: bool,
     view_changed: bool,
     view_state: crate::provider::ViewState,
@@ -3453,11 +3476,93 @@ struct PacketSessionChannel {
 struct PacketRenderCache {
     latest: Option<RenderBundle>,
     history_cursor: u128,
+    rows: Vec<crate::provider::TerminalRenderRow>,
+    row_generations: Vec<u64>,
+    reset_generation: u64,
 }
 
 impl PacketRenderCache {
-    fn store(&mut self, update: RenderBundle) {
-        self.latest = Some(update);
+    fn store(&mut self, mut bundle: RenderBundle) {
+        use crate::provider::TerminalRenderUpdateOpKind as Kind;
+        let update = &mut bundle.packet.update;
+        let generation = update.render_generation;
+        if self.latest.as_ref().is_none_or(|previous| {
+            let previous = &previous.packet.update;
+            previous.cols != update.cols
+                || previous.rows != update.rows
+                || previous.terminal_modes.active_alternate_screen != update.terminal_modes.active_alternate_screen
+        }) {
+            self.rows = (0..update.rows)
+                .map(|row| crate::provider::TerminalRenderRow {
+                    row,
+                    col_count: update.cols,
+                    cells: vec![Default::default(); update.cols as usize],
+                    ..Default::default()
+                })
+                .collect();
+            self.row_generations = vec![generation; update.rows as usize];
+            self.reset_generation = generation;
+        }
+        for op in std::mem::take(&mut update.ops) {
+            if op.kind == Kind::FullVisibleReplace {
+                self.reset_generation = generation;
+            }
+            if op.kind == Kind::ScrollCopy {
+                // Snapshot before copying so overlapping scrolls are lossless.
+                let copied: Vec<_> =
+                    (0..op.row_count).filter_map(|offset| self.rows.get(usize::from(op.src_row + offset)).cloned()).collect();
+                for (offset, mut row) in copied.into_iter().enumerate() {
+                    let index = usize::from(op.dst_row) + offset;
+                    if let Some(target) = self.rows.get_mut(index) {
+                        row.row = index as u16;
+                        *target = row;
+                        self.row_generations[index] = generation;
+                    }
+                }
+            } else {
+                for row in op.rows {
+                    let index = usize::from(row.row);
+                    if let Some(target) = self.rows.get_mut(index) {
+                        *target = row;
+                        self.row_generations[index] = generation;
+                    }
+                }
+            }
+        }
+        self.latest = Some(bundle);
+    }
+
+    fn since(&self, generation: u64) -> Option<RenderBundle> {
+        use crate::provider::{TerminalRenderUpdateOp, TerminalRenderUpdateOpKind as Kind};
+        let mut bundle = self.latest.clone()?;
+        let update = &mut bundle.packet.update;
+        if generation < self.reset_generation {
+            update.dirty = DirtyState::Full;
+            update.ops.push(TerminalRenderUpdateOp {
+                kind: Kind::FullVisibleReplace,
+                row_count: update.rows,
+                col_count: update.cols,
+                rows: self.rows.clone(),
+                ..Default::default()
+            });
+        } else {
+            update.ops = self
+                .rows
+                .iter()
+                .zip(&self.row_generations)
+                .filter(|(_, changed)| **changed > generation)
+                .map(|(row, _)| TerminalRenderUpdateOp {
+                    kind: Kind::RowReplace,
+                    first_row: row.row,
+                    row_count: 1,
+                    col_count: update.cols,
+                    rows: vec![row.clone()],
+                    ..Default::default()
+                })
+                .collect();
+            update.dirty = if update.ops.is_empty() { DirtyState::Clean } else { DirtyState::Partial };
+        }
+        Some(bundle)
     }
 
     fn latest_generation(&self) -> Option<u64> {
@@ -3791,13 +3896,11 @@ fn handle_packet_frame(
         (channel, MSG_SESSION_ACK) if channel != CHANNEL_CONTROL => {
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
             let client = &mut packet_clients[index];
-            let session_id = client.channels.get(&channel).map(|session| session.session_id.clone());
             if let Some(session_channel) = client.channels.get_mut(&channel) {
                 if session_channel.in_flight_generation == Some(ack.generation) {
                     session_channel.in_flight_generation = None;
-                    if let Some(hosted) = session_id.and_then(|id| sessions.get(&id)) {
-                        hosted.actor.mark_observed(session_channel.in_flight_source_generation);
-                    }
+                    // ACKs release channel backpressure only. Packet capture
+                    // already consumed actor damage into the daemon cache.
                 }
             }
         }
@@ -4073,7 +4176,6 @@ fn open_packet_channel(
         in_flight_generation: Some(generation),
         last_sent_generation: generation,
         last_source_generation: generation,
-        in_flight_source_generation: generation,
         history: false,
         view_changed: false,
         view_state: Default::default(),
@@ -4119,7 +4221,7 @@ fn push_due_packet_renders(
     }
 
     if actor.observation().dirty() != DirtyState::Clean {
-        let result = actor.packet_render(has_packet_channel_lagging_cached_generation(session_id, packet_clients, render_cache));
+        let result = actor.packet_render(false);
         match result {
             Ok(update) => render_cache.store(update),
             Err(error) => {
@@ -4142,9 +4244,6 @@ fn push_due_packet_renders(
     }
 
     let Some(latest_generation) = render_cache.latest_generation() else {
-        return Ok(());
-    };
-    let Some(update) = render_cache.latest().cloned() else {
         return Ok(());
     };
 
@@ -4173,9 +4272,9 @@ fn push_due_packet_renders(
         let result = if session.history {
             captures += 1;
             render_cache.history_cursor = key.view_id();
-            actor.request_result(|reply| crate::host::actor::SessionCommand::CaptureAttachmentView { id: key.view_id(), reply }).and_then(
+            actor.request_result(|reply| crate::host::actor::SessionCommand::CaptureAttachmentView { id: key.view_id(), reply }).map(
                 |capture| match capture {
-                    Some(frame) => Ok(RenderBundle {
+                    Some(frame) => RenderBundle {
                         images: frame.images.into_iter().map(crate::image_backing::RetainedImage::from_owned).collect(),
                         packet: RenderPacket {
                             update: frame.update,
@@ -4185,17 +4284,18 @@ fn push_due_packet_renders(
                                 notice: frame.discarded.then(|| "Earlier history was discarded".into()),
                             },
                         },
-                    }),
-                    None => actor.packet_render(true).map(|mut packet| {
+                    },
+                    None => {
+                        let mut packet = render_cache.since(0).expect("cache generation checked above");
                         packet.packet.view.notice = Some("History was cleared; returned to live".into());
                         packet
-                    }),
+                    }
                 },
             )
         } else if session.view_changed {
-            actor.packet_render(true)
+            Ok(render_cache.since(0).expect("cache generation checked above"))
         } else {
-            Ok(update.clone())
+            Ok(render_cache.since(session.last_source_generation).expect("cache generation checked above"))
         };
         let next_generation = session.last_sent_generation.saturating_add(1);
         let result = result.and_then(|mut packet| {
@@ -4214,7 +4314,6 @@ fn push_due_packet_renders(
                 session.view_state = view;
                 session.view_changed = false;
                 session.in_flight_generation = Some(next_generation);
-                session.in_flight_source_generation = latest_generation;
                 session.last_sent_generation = next_generation;
                 session.last_source_generation = latest_generation;
                 session.next_capture = now + Duration::from_millis(34);
@@ -4234,19 +4333,6 @@ fn push_due_packet_renders(
         }
     }
     Ok(())
-}
-
-fn has_packet_channel_lagging_cached_generation(
-    session_id: &str,
-    packet_clients: &[PacketClient],
-    render_cache: &PacketRenderCache,
-) -> bool {
-    let Some(latest_generation) = render_cache.latest_generation() else {
-        return false;
-    };
-    packet_clients.iter().flat_map(|client| client.channels.values()).any(|session| {
-        session.session_id == session_id && !session.history && !session.view_changed && session.last_source_generation < latest_generation
-    })
 }
 
 fn route_packet_input_event(actor: &SessionActor, source: u128, event: TerminalInputEvent) -> Result<(), String> {
@@ -4625,6 +4711,136 @@ mod tests {
         vt::{self, VtEngine},
     };
 
+    fn cached_row(row: u16, text: &str) -> TerminalRenderRow {
+        TerminalRenderRow {
+            row,
+            col_count: 1,
+            cells: vec![crate::provider::TerminalRenderCell { graphemes: text.chars().map(u32::from).collect(), ..Default::default() }],
+            ..Default::default()
+        }
+    }
+
+    fn cached_update(
+        generation: u64,
+        kind: TerminalRenderUpdateOpKind,
+        rows: Vec<TerminalRenderRow>,
+    ) -> crate::image_delivery::RenderBundle {
+        crate::image_delivery::RenderBundle::live(
+            TerminalRenderUpdate {
+                render_generation: generation,
+                cols: 1,
+                rows: 3,
+                ops: vec![TerminalRenderUpdateOp { kind, row_count: rows.len() as u16, col_count: 1, rows, ..Default::default() }],
+                ..Default::default()
+            },
+            vec![],
+        )
+    }
+
+    #[test]
+    fn packet_cache_catches_up_each_client_without_cells_for_image_only_changes() {
+        use TerminalRenderUpdateOpKind::{FullVisibleReplace, RowReplace};
+        let mut cache = super::PacketRenderCache::default();
+        cache.store(cached_update(1, FullVisibleReplace, vec![cached_row(0, "a"), cached_row(1, "b"), cached_row(2, "c")]));
+        cache.store(cached_update(2, RowReplace, vec![cached_row(0, "A")]));
+        cache.store(cached_update(3, RowReplace, vec![cached_row(2, "C")]));
+        let mut image_only = cached_update(4, RowReplace, vec![]);
+        image_only.packet.update.image_resources.push(crate::provider::TerminalImageResource {
+            image_id: 42,
+            generation: 4,
+            ..Default::default()
+        });
+        cache.store(image_only);
+        let slow = cache.since(1).unwrap().packet.update;
+        assert_eq!(slow.ops.len(), 2);
+        assert_eq!(slow.ops[0].rows[0], cached_row(0, "A"));
+        assert_eq!(slow.ops[1].rows[0], cached_row(2, "C"));
+        assert_eq!(cache.since(2).unwrap().packet.update.ops.len(), 1);
+        let current = cache.since(3).unwrap().packet.update;
+        assert!(current.ops.is_empty());
+        assert_eq!(current.image_resources[0].image_id, 42);
+        let initial = cache.since(0).unwrap().packet.update;
+        assert_eq!(initial.ops[0].kind, FullVisibleReplace);
+        assert_eq!(initial.ops[0].rows, vec![cached_row(0, "A"), cached_row(1, "b"), cached_row(2, "C")]);
+    }
+
+    #[test]
+    fn packet_cache_materializes_overlapping_scrolls_and_resets_on_screen_change() {
+        use TerminalRenderUpdateOpKind::{FullVisibleReplace, ScrollCopy};
+        let mut cache = super::PacketRenderCache::default();
+        cache.store(cached_update(1, FullVisibleReplace, vec![cached_row(0, "a"), cached_row(1, "b"), cached_row(2, "c")]));
+        let mut scroll = cached_update(2, ScrollCopy, vec![]);
+        scroll.packet.update.ops[0].src_row = 0;
+        scroll.packet.update.ops[0].dst_row = 1;
+        scroll.packet.update.ops[0].row_count = 2;
+        cache.store(scroll);
+        let caught_up = cache.since(1).unwrap().packet.update;
+        assert_eq!(caught_up.ops[0].rows[0], cached_row(1, "a"));
+        assert_eq!(caught_up.ops[1].rows[0], cached_row(2, "b"));
+        let mut other_screen = cached_update(3, FullVisibleReplace, vec![cached_row(0, "x"), cached_row(1, "y"), cached_row(2, "z")]);
+        other_screen.packet.update.terminal_modes.active_alternate_screen = true;
+        cache.store(other_screen);
+        let caught_up = cache.since(2).unwrap().packet.update;
+        assert_eq!(caught_up.ops[0].kind, FullVisibleReplace);
+        assert_eq!(caught_up.ops[0].rows[0], cached_row(0, "x"));
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_katzensteg_background_image_keeps_default_cells_transparent() {
+        use crate::{
+            image_delivery::CaptureImages,
+            provider::{DirtyState, TerminalStyleColorTag},
+            vt::ghostty::GhosttyVtEngine,
+        };
+        let mut source = GhosttyVtEngine::new(4, 2);
+        source.set_cell_size(10, 20).unwrap();
+        // Katzensteg places frames below non-default cell backgrounds.
+        source.feed(b"\x1b_Ga=T,C=1,i=7,p=1,f=32,s=1,v=1,c=4,r=2,z=-1610612636;ESIz/w==\x1b\\\x1b[H \x1b[48;2;0;0;0m \x1b[44m \x1b[0m\x1b[2;1H\x1b[48;2;1;2;3m\x1b[K\x1b[0m").unwrap();
+        let update = source.render_update(DirtyState::Full).unwrap();
+        assert_eq!(update.ops[0].rows[0].cells[0].style.bg_color.tag, TerminalStyleColorTag::None);
+        let images = CaptureImages::default()
+            .capture(&update.image_resources, |id, generation, copy| source.with_image_resource_data(id, generation, copy))
+            .unwrap();
+        let mut renderer = PacketTerminalRenderer::new(4, 2);
+        renderer.images.set_assets(images);
+        let mut host = GhosttyVtEngine::new(4, 2);
+        host.set_cell_size(10, 20).unwrap();
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &update).unwrap();
+        host.feed(&output).unwrap();
+        let mut decoder = crate::attach_input::InputDecoder::new(0x1d);
+        for action in decoder.feed(&host.drain_replies()) {
+            if let crate::attach_input::Action::GraphicsReply(reply) = action {
+                renderer.images.reply(&mut Vec::new(), &reply).unwrap();
+            }
+        }
+        output.clear();
+        renderer.repaint(&mut output).unwrap();
+        host.feed(&output).unwrap();
+        let displayed = host.render_update(DirtyState::Full).unwrap();
+        assert_eq!(displayed.image_placements.len(), 1);
+        assert_eq!(displayed.image_placements[0].z, -1610612636);
+        assert_eq!(
+            displayed.ops[0].rows[0].cells[0].style.bg_color.tag,
+            TerminalStyleColorTag::None,
+            "an explicit background hides Katzensteg's below-background image"
+        );
+        assert_eq!(
+            displayed.ops[0].rows[0].cells[1].style.bg_color.tag,
+            TerminalStyleColorTag::Rgb,
+            "the application's explicit background must still occlude the image"
+        );
+        assert_eq!(displayed.ops[0].rows[0].cells[2].style.resolved_bg, update.ops[0].rows[0].cells[2].style.resolved_bg);
+        for cell in &displayed.ops[0].rows[1].cells {
+            assert_eq!(
+                cell.style.resolved_bg,
+                crate::provider::TerminalRgb { r: 1, g: 2, b: 3 },
+                "erased coloured cells must retain their background"
+            );
+        }
+    }
+
     #[cfg(feature = "ghostty-vt")]
     #[test]
     fn packet_images_round_trip_file_upload_replacement_and_pan_through_terminal_engine() {
@@ -4694,6 +4910,53 @@ mod tests {
         renderer.apply_and_render(&mut output, &update).unwrap();
         host.feed(&output).unwrap();
         assert!(host.render_update(crate::provider::DirtyState::Full).unwrap().image_placements.is_empty());
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_image_replacement_keeps_previous_frame_until_upload_reply() {
+        use crate::{image_delivery::CaptureImages, provider::DirtyState, vt::ghostty::GhosttyVtEngine};
+        let mut source = GhosttyVtEngine::new(4, 2);
+        let mut host = GhosttyVtEngine::new(4, 2);
+        source.set_cell_size(10, 20).unwrap();
+        host.set_cell_size(10, 20).unwrap();
+        let mut capture = CaptureImages::default();
+        let mut renderer = PacketTerminalRenderer::new(4, 2);
+        for (frame, id) in [7, 7, 8].into_iter().enumerate() {
+            // Katzensteg transmits a fresh image, places it, then deletes the old one.
+            source.feed(format!("\x1b[H\x1b_Ga=T,C=1,i={id},p=1,f=32,s=1,v=1,c=4,r=2,z=-1610612636;ESIz/w==\x1b\\").as_bytes()).unwrap();
+            if id == 8 {
+                source.feed(b"\x1b_Ga=d,d=I,i=7;\x1b\\").unwrap();
+            }
+            let update = source.render_update(DirtyState::Full).unwrap();
+            let assets = capture
+                .capture(&update.image_resources, |id, generation, copy| source.with_image_resource_data(id, generation, copy))
+                .unwrap();
+            renderer.images.set_assets(assets);
+            let mut output = Vec::new();
+            renderer.apply_and_render(&mut output, &update).unwrap();
+            host.feed(&output).unwrap();
+            if frame > 0 {
+                assert_eq!(
+                    host.render_update(DirtyState::Full).unwrap().image_placements.len(),
+                    1,
+                    "replacement upload must not expose a blank frame before its acknowledgement"
+                );
+            }
+            let mut decoder = crate::attach_input::InputDecoder::new(0x1d);
+            for action in decoder.feed(&host.drain_replies()) {
+                if let crate::attach_input::Action::GraphicsReply(reply) = action {
+                    renderer.images.reply(&mut Vec::new(), &reply).unwrap();
+                }
+            }
+            output.clear();
+            renderer.refresh_images(&mut output).unwrap();
+            assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2K"), "image acknowledgement must not erase/repaint text rows");
+            host.feed(&output).unwrap();
+            let displayed = host.render_update(DirtyState::Full).unwrap();
+            assert_eq!(displayed.image_placements.len(), 1);
+            assert_eq!(displayed.image_resources.len(), 1, "retired frame must be released after replacement");
+        }
     }
 
     #[cfg(feature = "ghostty-vt")]
@@ -4856,6 +5119,8 @@ mod tests {
             provider::{TerminalModifiers, TerminalMouseButtons, TerminalMouseEvent, TerminalMouseEventKind},
         };
         let mut chrome = super::AttachChrome {
+            session_name: "whatever3".to_owned(),
+            nested_in: None,
             renderer: PacketTerminalRenderer::new(120, 40),
             panning: false,
             visible: false,

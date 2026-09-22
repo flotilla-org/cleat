@@ -33,3 +33,5 @@ pub mod vt;
 mod mouse;
 
 mod attach_mouse;
+
+mod terminal_identity;

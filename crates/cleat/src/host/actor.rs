@@ -767,10 +767,6 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::PacketRender { full, reply })
     }
 
-    pub(crate) fn mark_observed(&self, generation: u64) -> bool {
-        self.request(|reply| SessionCommand::MarkObserved { generation, reply }, false)
-    }
-
     pub(crate) fn capture_text(&self) -> Result<String, String> {
         self.request_result(|reply| SessionCommand::CaptureText { reply })
     }

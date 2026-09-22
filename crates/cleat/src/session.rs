@@ -3453,7 +3453,6 @@ struct PacketSessionChannel {
     in_flight_generation: Option<u64>,
     last_sent_generation: u64,
     last_source_generation: u64,
-    in_flight_source_generation: u64,
     history: bool,
     view_changed: bool,
     view_state: crate::provider::ViewState,
@@ -3887,13 +3886,11 @@ fn handle_packet_frame(
         (channel, MSG_SESSION_ACK) if channel != CHANNEL_CONTROL => {
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
             let client = &mut packet_clients[index];
-            let session_id = client.channels.get(&channel).map(|session| session.session_id.clone());
             if let Some(session_channel) = client.channels.get_mut(&channel) {
                 if session_channel.in_flight_generation == Some(ack.generation) {
                     session_channel.in_flight_generation = None;
-                    if let Some(hosted) = session_id.and_then(|id| sessions.get(&id)) {
-                        hosted.actor.mark_observed(session_channel.in_flight_source_generation);
-                    }
+                    // ACKs release channel backpressure only. Packet capture
+                    // already consumed actor damage into the daemon cache.
                 }
             }
         }
@@ -4169,7 +4166,6 @@ fn open_packet_channel(
         in_flight_generation: Some(generation),
         last_sent_generation: generation,
         last_source_generation: generation,
-        in_flight_source_generation: generation,
         history: false,
         view_changed: false,
         view_state: Default::default(),
@@ -4308,7 +4304,6 @@ fn push_due_packet_renders(
                 session.view_state = view;
                 session.view_changed = false;
                 session.in_flight_generation = Some(next_generation);
-                session.in_flight_source_generation = latest_generation;
                 session.last_sent_generation = next_generation;
                 session.last_source_generation = latest_generation;
                 session.next_capture = now + Duration::from_millis(34);

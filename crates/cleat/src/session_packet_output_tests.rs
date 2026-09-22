@@ -35,7 +35,6 @@ fn channel(id: u32, image: Image) -> PacketSessionChannel {
         in_flight_generation: Some(1),
         last_sent_generation: 1,
         last_source_generation: 1,
-        in_flight_source_generation: 1,
         history: false,
         view_changed: false,
         view_state: Default::default(),

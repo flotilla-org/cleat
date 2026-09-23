@@ -14,3 +14,10 @@ cargo test --workspace --locked
 
 - `ghostty-vt` is a **default feature**: a plain `cargo build` produces a functional binary, and fails with an actionable message if the prepared Ghostty install is missing (run the prepare script above).
 - The VT-less placeholder variant (testing only) is an explicit opt-out: `cargo build -p cleat --locked --no-default-features`. CI's `no-vt` job keeps it building.
+
+## Roadmap and issue triage
+
+Read [ROADMAP.md](ROADMAP.md) before choosing work. It records the ordered queue,
+accepted decisions and the [tracker label conventions](ROADMAP.md#tracker-conventions).
+Issue priority and readiness are independent. Update the roadmap and issue status
+when decisions change; use native blocked-by relationships for actual dependencies.

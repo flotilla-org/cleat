@@ -2,6 +2,8 @@
 
 Session daemon with a structured control plane for agents and terminal persistence.
 
+See [ROADMAP.md](ROADMAP.md) for the current priorities, decisions and issue links.
+
 ## Status
 
 **Ghostty is currently the only functional VT engine.**
@@ -14,7 +16,7 @@ A future Rust VT engine may be added later. Until then, treat Ghostty as the onl
 
 ## Development
 
-Default development builds still compile without Ghostty so contributors can work in the repo, but those binaries are intentionally incomplete for real use.
+Development builds use Ghostty by default. The explicit `--no-default-features` build is available for work on the Rust-only placeholder path.
 
 ```bash
 ./tools/prepare-ghostty-vt.sh   # once per checkout (fetches + builds the pinned Ghostty VT)

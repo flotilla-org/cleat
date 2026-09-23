@@ -1,10 +1,12 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    emit_build_info();
 
     if env::var_os("CARGO_FEATURE_GHOSTTY_VT").is_none() {
         println!("cargo:rustc-env=CLEAT_FUNCTIONAL_VT_AVAILABLE=0");
@@ -40,6 +42,43 @@ fn main() {
     }
     if install.link_mode == LinkMode::Dynamic && cfg!(any(target_os = "linux", target_os = "macos")) {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", install.lib_dir.display());
+    }
+}
+
+// Watch both repository state and tracked files so incremental builds refresh
+// the identity after commits, checkouts and edits, including in Git worktrees.
+fn emit_build_info() {
+    let root = repo_root().expect("repository layout");
+    let git = |args: &[&str]| -> Option<String> {
+        let output = Command::new("git").current_dir(&root).args(args).output().ok()?;
+        output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim_end().to_owned())
+    };
+    let sha = git(&["rev-parse", "--verify", "HEAD"]);
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).map(|status| !status.is_empty());
+    // Reftable stores ref updates in its table directory instead of loose refs.
+    for name in ["HEAD", "index", "packed-refs", "reftable"].into_iter().map(str::to_owned).chain(git(&["symbolic-ref", "-q", "HEAD"])) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+            let mut path = root.join(path);
+            // A packed branch has no loose ref yet. Watch its nearest existing
+            // directory so a ref-only update that creates it invalidates Cargo,
+            // including when git --git-path points into a worktree's common dir.
+            if name.starts_with("refs/") {
+                while !path.exists() && path.pop() {}
+            }
+            if path.exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
+    if let Some(files) = git(&["ls-files", "-z"]) {
+        for file in files.split('\0').filter(|file| !file.is_empty() && !file.contains(['\n', '\r'])) {
+            println!("cargo:rerun-if-changed={}", root.join(file).display());
+        }
+    }
+    println!("cargo:rustc-env=CLEAT_GIT_SHA={}", sha.as_deref().unwrap_or("unknown"));
+    println!("cargo:rustc-env=CLEAT_GIT_DIRTY={}", dirty.map(|value| value.to_string()).unwrap_or_else(|| "unknown".into()));
+    for name in ["PROFILE", "OPT_LEVEL", "TARGET"] {
+        println!("cargo:rustc-env=CLEAT_BUILD_{name}={}", env::var(name).unwrap_or_else(|_| "unknown".into()));
     }
 }
 

@@ -2,6 +2,8 @@
 
 Session daemon with a structured control plane for agents and terminal persistence.
 
+See [ROADMAP.md](ROADMAP.md) for the current priorities, decisions and issue links.
+
 ## Status
 
 **Ghostty is currently the only functional VT engine.**
@@ -14,7 +16,7 @@ A future Rust VT engine may be added later. Until then, treat Ghostty as the onl
 
 ## Development
 
-Default development builds still compile without Ghostty so contributors can work in the repo, but those binaries are intentionally incomplete for real use.
+Development builds use Ghostty by default. The explicit `--no-default-features` build is available for work on the Rust-only placeholder path.
 
 ```bash
 ./tools/prepare-ghostty-vt.sh   # once per checkout (fetches + builds the pinned Ghostty VT)
@@ -59,6 +61,8 @@ find .tools/ghostty-install -maxdepth 3 | sort
 ## Session Model
 
 **Named daemons host sets of sessions.** A daemon is the process boundary for one named session set. The default daemon is named `default`; pass `--server NAME` to address a different daemon. Without `--server`, commands target the ambient daemon named by `$CLEAT_DAEMON` when running inside a session, and `default` otherwise. An explicit `--server` always wins. A session address is therefore `(daemon, id)`, with an unqualified ID meaning "this ID in the selected daemon."
+
+**Build identity.** `cleat --version` includes the Git revision, tracked-file dirty status, build profile, optimization level, target, packet protocol version, and VT engine. `cleat version --daemon` also reports the selected running daemon's build without starting or restarting it; add `--json` for structured metadata. Older daemons report an unknown build. Builds made without Git metadata report an unknown revision and dirty status. The daemon exposes the same metadata in the `build` field of `GET /` and `GET /healthz` on its control socket.
 
 **Session IDs.** You choose the ID (`cleat launch my-session`) or let cleat generate one (`session-<uuid>`). IDs are directory names under their daemon's `sessions/` directory, so use filesystem-safe characters. Launching with an ID that already has a live session in the selected daemon reuses that session; it does not create a duplicate.
 

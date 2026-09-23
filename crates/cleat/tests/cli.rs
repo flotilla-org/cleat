@@ -69,6 +69,7 @@ fn help_lists_expected_subcommands() {
         "packets",
         "launch",
         "list",
+        "version",
         "daemons",
         "tag",
         "capture",
@@ -1101,4 +1102,27 @@ fn http_request_complete_for_cli_test(bytes: &[u8]) -> bool {
         })
         .unwrap_or(0);
     bytes.len() >= header_end + 4 + content_length
+}
+
+#[test]
+fn version_flag_reports_build_and_protocol() {
+    let err = Cli::try_parse_from(["cleat", "--version"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert!(err.to_string().contains(cleat::build_info::version()));
+}
+
+#[test]
+fn version_json_reports_client_without_starting_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli = Cli::try_parse_from(["cleat", "--server", "version-test", "version", "--json"]).unwrap();
+    let output = execute(cli, &service).expect("version").unwrap();
+    let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(report["client"], serde_json::to_value(cleat::build_info::BuildInfo::current()).unwrap());
+    assert!(report.get("daemon").is_none());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+
+    let cli = Cli::try_parse_from(["cleat", "--server", "version-test", "version", "--daemon"]).unwrap();
+    assert!(execute(cli, &service).expect_err("absent daemon").contains("connect"));
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
 }

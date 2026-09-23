@@ -1,5 +1,26 @@
 # A recording is a multi-track state timeline; image pixels come from the engine
 
+## Sequencing amendment — 2026-09-23
+
+The multi-track/engine-owned capture direction below still applies. The original
+ladder is no longer an instruction to implement raw image storage first and
+consider video later. Resolve [#230](https://github.com/flotilla-org/cleat/issues/230)
+with Jackstay export and continuity before implementing durable image recording
+[#73](https://github.com/flotilla-org/cleat/issues/73). Daemon upgrades
+[#191](https://github.com/flotilla-org/cleat/issues/191) precede that implementation.
+The continuity design must reconcile the earlier MKV/sidecar direction below with
+the actual export contract; this amendment does not choose a new container.
+
+Storage budgets [#227](https://github.com/flotilla-org/cleat/issues/227) and safe
+recording lifecycle operations [#228](https://github.com/flotilla-org/cleat/issues/228)
+are nearer-term independent work. The self-attachment incident produced enormous
+text/control logs without image payloads, so limits cannot wait for image encoding.
+A snapshot of the latest screen does not alone prove that older temporal history,
+scrollback, placements or in-flight seeks are disposable. Compaction needs an
+explicit reachability and retention contract. See [the roadmap](../../ROADMAP.md).
+
+## Original rationale
+
 [ADR 0001](0001-session-hosting-and-recreation.md) made recreation-from-recording
 the persistence floor. [ADR 0002](0002-recording-on-by-default.md) made recording
 on by default and decoupled the on-disk format from a permanent asciinema-export

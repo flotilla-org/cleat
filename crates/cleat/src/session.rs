@@ -2844,6 +2844,7 @@ fn handle_http_request(
             StatusCode::OK,
             &serde_json::json!({
                 "service": "cleat-session",
+                "build": crate::build_info::BuildInfo::current(),
                 "session": daemon_id,
                 "ok": true,
             }),

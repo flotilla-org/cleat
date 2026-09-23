@@ -1497,6 +1497,12 @@ fn session_daemon_accepts_http_control_requests_on_session_socket() {
     assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
     assert!(http_body(&health).contains("\"service\":\"cleat-session\""));
 
+    let root = http_session_request(temp.path(), "alpha", "GET / HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    let root_json: serde_json::Value = serde_json::from_str(http_body(&root)).expect("root json");
+    let daemon_build = service.daemon_build_info().expect("daemon build").expect("build metadata");
+    assert_eq!(root_json["build"], serde_json::to_value(&daemon_build).unwrap());
+    assert_eq!(daemon_build, cleat::build_info::BuildInfo::current());
+
     let inspect = http_session_request(temp.path(), "alpha", "GET /sessions/alpha HTTP/1.1\r\nHost: cleat\r\n\r\n");
     assert!(inspect.starts_with("HTTP/1.1 200 OK\r\n"), "{inspect}");
     let inspect_json: serde_json::Value = serde_json::from_str(http_body(&inspect)).expect("inspect json");

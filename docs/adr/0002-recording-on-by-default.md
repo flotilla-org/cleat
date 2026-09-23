@@ -78,3 +78,14 @@ caveat in the consequences.
   file itself monotonic (carry the prior activation's last timestamp as the new
   base offset) is deferred follow-up work, naturally subsumed by front-truncation
   and the custom codec.
+
+
+## Follow-up priorities — 2026-09-23
+
+Recording remains on by default. Explicit budgets and retention policies are now
+tracked in [#227](https://github.com/flotilla-org/cleat/issues/227); safe pause,
+resume and discard operations are [#228](https://github.com/flotilla-org/cleat/issues/228).
+These can ship before semantic compaction or durable image/video storage. Recovery
+history and deliberately retained archives may need different policies; the limits
+and defaults are not decided by this ADR. [ROADMAP.md](../../ROADMAP.md) records the
+current order and the Jackstay continuity design gate.

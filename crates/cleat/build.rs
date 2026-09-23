@@ -57,9 +57,13 @@ fn emit_build_info() {
     let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).map(|status| !status.is_empty());
     for name in ["HEAD", "index", "packed-refs"].into_iter().map(str::to_owned).chain(git(&["symbolic-ref", "-q", "HEAD"])) {
         if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
-            let path = root.join(path);
-            // A packed branch has no loose ref; packing an existing loose ref
-            // removes its watched file and causes us to discover packed-refs.
+            let mut path = root.join(path);
+            // A packed branch has no loose ref yet. Watch its nearest existing
+            // directory so a ref-only update that creates it invalidates Cargo,
+            // including when git --git-path points into a worktree's common dir.
+            if name.starts_with("refs/") {
+                while !path.exists() && path.pop() {}
+            }
             if path.exists() {
                 println!("cargo:rerun-if-changed={}", path.display());
             }

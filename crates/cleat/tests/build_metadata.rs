@@ -18,7 +18,7 @@ fn run(dir: &Path, program: &str, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("UTF-8 output").trim().to_owned()
 }
 
-fn check_packed_ref_transition(root: &Path) {
+fn check_ref_update(root: &Path) {
     let crate_dir = root.join("crates/cleat");
     let old_head = run(root, "git", &["rev-parse", "HEAD"]);
     // A first build's git status can refresh index stat metadata. Warm Cargo's
@@ -30,15 +30,10 @@ fn check_packed_ref_transition(root: &Path) {
     let next_head = run(root, "git", &["commit-tree", &tree, "-p", "HEAD", "-m", "ref-only change"]);
     run(root, "git", &["update-ref", "HEAD", &next_head]);
     assert_ne!(old_head, next_head);
-    assert_eq!(
-        run(&crate_dir, "cargo", &["run", "--quiet", "--offline"]),
-        next_head,
-        "build identity must follow a packed ref becoming loose"
-    );
+    assert_eq!(run(&crate_dir, "cargo", &["run", "--quiet", "--offline"]), next_head, "build identity must follow a ref-only update");
 }
 
-#[test]
-fn cached_build_follows_packed_refs_becoming_loose_in_checkout_and_worktree() {
+fn check_ref_backend(use_reftable: bool) {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("repo");
     let crate_dir = root.join("crates/cleat");
@@ -48,7 +43,11 @@ fn cached_build_follows_packed_refs_becoming_loose_in_checkout_and_worktree() {
     fs::write(crate_dir.join("src/main.rs"), "fn main() { println!(\"{}\", env!(\"CLEAT_GIT_SHA\")); }\n").unwrap();
     fs::write(crate_dir.join("build.rs"), include_str!("../build.rs")).unwrap();
     fs::write(root.join(".gitignore"), "target/\n").unwrap();
-    run(&root, "git", &["init", "--quiet", "--initial-branch=main"]);
+    let mut init_args = vec!["init", "--quiet", "--initial-branch=main"];
+    if use_reftable {
+        init_args.push("--ref-format=reftable");
+    }
+    run(&root, "git", &init_args);
     run(&root, "git", &["config", "user.name", "Build identity test"]);
     run(&root, "git", &["config", "user.email", "build-test@example.invalid"]);
     run(&root, "git", &["config", "commit.gpgsign", "false"]);
@@ -59,10 +58,26 @@ fn cached_build_follows_packed_refs_becoming_loose_in_checkout_and_worktree() {
     run(&root, "git", &["add", "."]);
     run(&root, "git", &["commit", "--quiet", "-m", "fixture"]);
     run(&root, "git", &["pack-refs", "--all", "--prune"]);
-    check_packed_ref_transition(&root);
+    check_ref_update(&root);
 
     let worktree = temp.path().join("worktree");
     run(&root, "git", &["worktree", "add", "--quiet", "-b", "nested/branch", worktree.to_str().unwrap()]);
     run(&root, "git", &["pack-refs", "--all", "--prune"]);
-    check_packed_ref_transition(&worktree);
+    check_ref_update(&worktree);
+}
+
+#[test]
+fn cached_build_follows_packed_refs_becoming_loose_in_checkout_and_worktree() {
+    check_ref_backend(false);
+}
+
+#[test]
+fn cached_build_follows_reftable_updates_in_checkout_and_worktree() {
+    let help = Command::new("git").args(["init", "-h"]).output().expect("git init help");
+    let help = format!("{}{}", String::from_utf8_lossy(&help.stdout), String::from_utf8_lossy(&help.stderr));
+    if !help.contains("--ref-format") {
+        eprintln!("skipping reftable fixture: installed Git predates selectable ref formats");
+        return;
+    }
+    check_ref_backend(true);
 }

@@ -55,7 +55,8 @@ fn emit_build_info() {
     };
     let sha = git(&["rev-parse", "--verify", "HEAD"]);
     let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).map(|status| !status.is_empty());
-    for name in ["HEAD", "index", "packed-refs"].into_iter().map(str::to_owned).chain(git(&["symbolic-ref", "-q", "HEAD"])) {
+    // Reftable stores ref updates in its table directory instead of loose refs.
+    for name in ["HEAD", "index", "packed-refs", "reftable"].into_iter().map(str::to_owned).chain(git(&["symbolic-ref", "-q", "HEAD"])) {
         if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
             let mut path = root.join(path);
             // A packed branch has no loose ref yet. Watch its nearest existing

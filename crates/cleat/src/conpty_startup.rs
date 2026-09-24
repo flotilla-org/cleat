@@ -10,7 +10,7 @@
 //! on them.
 
 /// The DA1 query ConPTY sends; also fed to the engine to obtain its answer.
-pub(crate) const DA1_QUERY: &[u8] = b"\x1b[c";
+pub(crate) use crate::da::DA1_QUERY;
 const WINDOW_VISIBILITY: [&[u8]; 2] = [b"\x1b[1t", b"\x1b[2t"];
 
 #[derive(Debug, Default)]

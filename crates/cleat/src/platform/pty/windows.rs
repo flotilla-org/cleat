@@ -55,13 +55,20 @@ impl PtyChild {
             eprintln!("cleat: session {} ConPTY: {}; Kitty graphics and sixel will not pass through", session.id, conpty_info.summary());
         }
         let pipes = Pipes::new()?;
-        let conpty = api.create(session.initial_size.cols, session.initial_size.rows, pipes.input_read, pipes.output_write)?;
+        let conpty = match api.create(session.initial_size.cols, session.initial_size.rows, pipes.input_read, pipes.output_write) {
+            Ok(conpty) => conpty,
+            Err(err) => {
+                pipes.close_all();
+                return Err(err);
+            }
+        };
         let process = match spawn_with_conpty(&windows_shell_command(session), conpty, session, coordinates) {
             Ok(process) => process,
             Err(err) => {
                 unsafe {
                     api.close(conpty);
                 }
+                pipes.close_all();
                 return Err(err);
             }
         };
@@ -265,6 +272,16 @@ impl Pipes {
         }
 
         Ok(Self { input_read, input_write, output_read, output_write })
+    }
+
+    /// Release every pipe end when session startup fails before the child owns them.
+    fn close_all(self) {
+        unsafe {
+            CloseHandle(self.input_read);
+            CloseHandle(self.input_write);
+            CloseHandle(self.output_read);
+            CloseHandle(self.output_write);
+        }
     }
 }
 

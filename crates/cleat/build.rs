@@ -7,6 +7,7 @@ use std::{
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     emit_build_info();
+    stage_bundled_conpty();
 
     if env::var_os("CARGO_FEATURE_GHOSTTY_VT").is_none() {
         println!("cargo:rustc-env=CLEAT_FUNCTIONAL_VT_AVAILABLE=0");
@@ -80,6 +81,101 @@ fn emit_build_info() {
     for name in ["PROFILE", "OPT_LEVEL", "TARGET"] {
         println!("cargo:rustc-env=CLEAT_BUILD_{name}={}", env::var(name).unwrap_or_else(|_| "unknown".into()));
     }
+}
+
+/// Stage the pinned bundled ConPTY (`conpty.dll`, `OpenConsole.exe` and its
+/// licence) beside the Windows executables this build produces (ADR 0006).
+/// Without a prepared package the build still succeeds: sessions fall back to
+/// the inbox ConPTY and report the degradation.
+fn stage_bundled_conpty() {
+    let root = repo_root().expect("repository layout");
+    let pin_path = root.join("tools").join("conpty.toml");
+    println!("cargo:rerun-if-changed={}", pin_path.display());
+    let version = conpty_pin_version(&pin_path).unwrap_or_else(|err| panic!("{err}"));
+    println!("cargo:rustc-env=CLEAT_CONPTY_VERSION={version}");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let Some((runtime, host)) = conpty_arch_dirs(&arch) else {
+        println!("cargo:warning=no bundled ConPTY for target architecture {arch}; Windows sessions will use the inbox ConPTY");
+        return;
+    };
+    let package = root.join(".tools").join("conpty").join(&version);
+    let mut watched = package.clone();
+    while !watched.exists() && watched.pop() {}
+    println!("cargo:rerun-if-changed={}", watched.display());
+    let licence = root.join("tools").join("conpty-LICENSE.txt");
+    println!("cargo:rerun-if-changed={}", licence.display());
+    let files = [
+        (package.join("runtimes").join(runtime).join("native").join("conpty.dll"), "conpty.dll"),
+        (package.join("build").join("native").join("runtimes").join(host).join("OpenConsole.exe"), "OpenConsole.exe"),
+        (licence, "conpty-LICENSE.txt"),
+    ];
+
+    let profile = profile_dir_from_out_dir().unwrap_or_else(|err| panic!("{err}"));
+    // Test and example executables run from deps/ and examples/, and load
+    // conpty.dll only from their own directory.
+    let destinations = [profile.clone(), profile.join("deps"), profile.join("examples")];
+    let missing: Vec<String> =
+        files.iter().filter(|(source, _)| !source.is_file()).map(|(source, _)| source.display().to_string()).collect();
+    if !missing.is_empty() {
+        println!(
+            "cargo:warning=bundled ConPTY {version} is not prepared (missing {}); Windows sessions will fall back to the inbox ConPTY, which drops Kitty graphics and sixel. Run tools/prepare-conpty.ps1",
+            missing.join(", ")
+        );
+        // Never leave another version's bundle to be used as if it were the pin.
+        for destination in &destinations {
+            for (_, name) in &files {
+                let _ = std::fs::remove_file(destination.join(name));
+            }
+        }
+        return;
+    }
+    for destination in &destinations {
+        std::fs::create_dir_all(destination).unwrap_or_else(|err| panic!("create {}: {err}", destination.display()));
+        for (source, name) in &files {
+            copy_if_changed(source, &destination.join(name)).unwrap_or_else(|err| panic!("{err}"));
+        }
+    }
+}
+
+fn conpty_pin_version(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let mut section = "";
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+            section = name.trim();
+        } else if section == "conpty" {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == "version" {
+                    return Ok(value.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    Err(format!("missing [conpty].version in {}", path.display()))
+}
+
+fn conpty_arch_dirs(arch: &str) -> Option<(&'static str, &'static str)> {
+    match arch {
+        "x86_64" => Some(("win-x64", "x64")),
+        "aarch64" => Some(("win-arm64", "arm64")),
+        "x86" => Some(("win-x86", "x86")),
+        _ => None,
+    }
+}
+
+// Skipping identical files lets a build succeed while a daemon started from
+// this target directory still has conpty.dll and OpenConsole.exe open.
+fn copy_if_changed(source: &Path, target: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(source).map_err(|err| format!("read {}: {err}", source.display()))?;
+    if std::fs::read(target).is_ok_and(|existing| existing == bytes) {
+        return Ok(());
+    }
+    std::fs::write(target, &bytes).map_err(|err| format!("copy {} to {}: {err}", source.display(), target.display()))
 }
 
 struct GhosttyInstall {

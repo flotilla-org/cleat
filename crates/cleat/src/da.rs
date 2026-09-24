@@ -3,7 +3,7 @@ pub const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c";
 /// Synthetic Secondary Device Attributes (DA2) reply for detached sessions.
 pub const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c";
 
-const DA1_QUERY: &[u8] = b"\x1b[c";
+pub(crate) const DA1_QUERY: &[u8] = b"\x1b[c";
 const DA1_QUERY_EXPLICIT: &[u8] = b"\x1b[0c";
 const DA2_QUERY: &[u8] = b"\x1b[>c";
 const DA2_QUERY_EXPLICIT: &[u8] = b"\x1b[>0c";

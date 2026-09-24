@@ -6,6 +6,7 @@ mod attachment_view;
 pub mod build_info;
 pub mod cast_reader;
 pub mod cli;
+mod conpty_startup;
 pub mod da;
 pub mod duration_parser;
 mod host;

@@ -4,6 +4,7 @@
 
 ```bash
 ./tools/prepare-ghostty-vt.sh   # once per checkout; fetches + builds the pinned Ghostty VT
+# Windows: tools\prepare-ghostty-vt.ps1 (also fetches the pinned bundled ConPTY, ADR 0006)
 cargo build --locked
 cargo +nightly-2026-03-12 fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings

@@ -22,6 +22,12 @@ If you say a change matches CI locally, it should have been checked against thes
 - `cleat` treats Ghostty as a prefix dependency: headers at `.tools/ghostty-install/include/ghostty/vt.h` and libraries under `.tools/ghostty-install/lib`. Static linking is preferred on Unix when `libghostty-vt.a` is available; shared library linkage remains a fallback. Windows links via `ghostty-vt.lib` and copies `ghostty-vt.dll` next to the built executable.
 - Verify the helper with `./tools/prepare-ghostty-vt.sh` on Unix or `powershell -NoProfile -ExecutionPolicy Bypass -File tools\prepare-ghostty-vt.ps1` on Windows, then `cargo build -p cleat --locked --features ghostty-vt` and `cargo test -p cleat --locked --features ghostty-vt`.
 
+## Bundled ConPTY (Windows)
+
+- Windows sessions load `conpty.dll` + `OpenConsole.exe` from beside the executable and fall back, reported, to the inbox ConPTY ([ADR 0006](docs/adr/0006-bundled-conpty-on-windows.md)). The package is pinned (version + SHA-256) only in [`tools/conpty.toml`](tools/conpty.toml).
+- `powershell -NoProfile -ExecutionPolicy Bypass -File tools\prepare-conpty.ps1` fetches and verifies it into `.tools/conpty/<version>`; `prepare-ghostty-vt.ps1` runs it too. `build.rs` stages the files beside `target/<profile>`, `deps` and `examples` executables.
+- After a version bump, run `cargo test -p cleat --locked --lib conpty` with the bundle (passes) and with `CLEAT_CONPTY=inbox` (the pass-through regression must fail).
+
 ## Repo Scope
 
 This repository is the standalone home for `cleat`, the session daemon and control-plane CLI extracted from Flotilla.

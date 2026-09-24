@@ -232,6 +232,7 @@ impl SessionService {
             stable_since: None,
             last_output_at: None,
             controller: None,
+            conpty: None,
             error: None,
         }
     }
@@ -355,6 +356,7 @@ impl SessionService {
                         stable_since: result.stable_since,
                         last_output_at: result.last_output_at,
                         controller: controller_identity(&result.attachments),
+                        conpty: result.session.conpty,
                         error: None,
                     };
                     if session_matches_selectors(&info, selectors) {
@@ -592,6 +594,7 @@ impl SessionService {
                     stable_since: None,
                     last_output_at: None,
                     controller: None,
+                    conpty: None,
                     error: None,
                 }
             }
@@ -953,6 +956,7 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
             stable_since: None,
             last_output_at: None,
             controller: None,
+            conpty: None,
             error: Some(err.clone()),
         });
     }
@@ -1030,6 +1034,7 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         stable_since: result.stable_since,
         last_output_at: result.last_output_at,
         controller: controller_identity(&result.attachments),
+        conpty: result.session.conpty,
         error: None,
     }
 }

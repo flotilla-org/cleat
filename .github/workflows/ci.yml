@@ -102,6 +102,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Compile the application and exercise named-pipe/provider behavior
       # without making this portability gate depend on a Ghostty build.
+      # The bundled ConPTY is staged so the graphics pass-through regression
+      # runs against it (ADR 0006).
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/prepare-conpty.ps1
       - run: cargo build -p cleat --locked --no-default-features
       - run: cargo test -p cleat --locked --no-default-features --lib
       - run: cargo test -p cleat --locked --no-default-features --test windows_daemon_launch

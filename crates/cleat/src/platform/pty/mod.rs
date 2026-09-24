@@ -1,4 +1,6 @@
 #[cfg(windows)]
+mod conpty;
+#[cfg(windows)]
 mod windows;
 
 #[cfg(all(not(unix), not(windows)))]

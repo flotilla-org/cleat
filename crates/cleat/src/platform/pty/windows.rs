@@ -15,7 +15,7 @@ use windows_sys::Win32::{
     Security::SECURITY_ATTRIBUTES,
     Storage::FileSystem::{ReadFile, WriteFile},
     System::{
-        Console::{ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent, ResizePseudoConsole, COORD, CTRL_C_EVENT, HPCON},
+        Console::{GenerateConsoleCtrlEvent, CTRL_C_EVENT, HPCON},
         Pipes::CreatePipe,
         Threading::{
             CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, InitializeProcThreadAttributeList, TerminateProcess,
@@ -26,9 +26,10 @@ use windows_sys::Win32::{
     },
 };
 
+use super::conpty::{self, ConptyApi, ConptyPreference};
 use crate::{
     platform::ipc::{handle_has_available_bytes, SessionListener, SessionStream},
-    protocol::SignalTarget,
+    protocol::{ConptyInfo, ConptyKind, SignalTarget},
     runtime::{AmbientSessionCoordinates, SessionMetadata, AMBIENT_COORDINATE_ENV_NAMES},
 };
 
@@ -37,6 +38,8 @@ const POSIX_SIGKILL: i32 = 9;
 const POSIX_SIGTERM: i32 = 15;
 
 pub struct PtyChild {
+    api: ConptyApi,
+    conpty_info: ConptyInfo,
     conpty: HPCON,
     process: HANDLE,
     thread: HANDLE,
@@ -47,15 +50,29 @@ pub struct PtyChild {
 
 impl PtyChild {
     pub fn spawn_with_ambient(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Self, String> {
+        let (api, conpty_info) = conpty::select(ConptyPreference::from_env());
+        if !conpty_info.graphics_passthrough {
+            eprintln!("cleat: session {} ConPTY: {}; Kitty graphics and sixel will not pass through", session.id, conpty_info.summary());
+        }
         let pipes = Pipes::new()?;
-        let conpty = create_pseudo_console(session.initial_size.cols, session.initial_size.rows, pipes.input_read, pipes.output_write)?;
-        let process = spawn_with_conpty(&windows_shell_command(session), conpty, session, coordinates)?;
+        let conpty = api.create(session.initial_size.cols, session.initial_size.rows, pipes.input_read, pipes.output_write)?;
+        let process = match spawn_with_conpty(&windows_shell_command(session), conpty, session, coordinates) {
+            Ok(process) => process,
+            Err(err) => {
+                unsafe {
+                    api.close(conpty);
+                }
+                return Err(err);
+            }
+        };
         unsafe {
             CloseHandle(pipes.input_read);
             CloseHandle(pipes.output_write);
         }
 
         Ok(Self {
+            api,
+            conpty_info,
             conpty,
             process: process.hProcess,
             thread: process.hThread,
@@ -63,6 +80,18 @@ impl PtyChild {
             input_write: pipes.input_write,
             output_read: pipes.output_read,
         })
+    }
+
+    /// The ConPTY chosen when this session's program started.
+    pub fn conpty(&self) -> Option<&ConptyInfo> {
+        Some(&self.conpty_info)
+    }
+
+    /// The bundled ConPTY greets its host with `CSI 1 t` and a DA1 query and
+    /// holds the program's console connection until the DA1 reply arrives
+    /// (up to 3 s). The inbox ConPTY sends neither.
+    pub fn sends_startup_queries(&self) -> bool {
+        self.conpty_info.kind == ConptyKind::Bundled
     }
 
     pub fn master_fd(&self) -> i32 {
@@ -96,12 +125,7 @@ impl PtyChild {
     // ConPTY sizing is character-cell only; the pixel dimensions (used for the
     // unix PTY winsize) have no ConPTY equivalent and are ignored here.
     pub fn resize(&self, cols: u16, rows: u16, _width_px: u32, _height_px: u32) -> Result<(), String> {
-        let result = unsafe { ResizePseudoConsole(self.conpty, COORD { X: cols as i16, Y: rows as i16 }) };
-        if result < 0 {
-            Err(format!("ResizePseudoConsole failed with HRESULT 0x{result:08x}"))
-        } else {
-            Ok(())
-        }
+        self.api.resize(self.conpty, cols, rows)
     }
 
     pub fn exited(&self) -> Result<Option<WindowsExitStatus>, String> {
@@ -170,7 +194,7 @@ impl Drop for PtyChild {
             CloseHandle(self.output_read);
             CloseHandle(self.thread);
             CloseHandle(self.process);
-            ClosePseudoConsole(self.conpty);
+            self.api.close(self.conpty);
         }
     }
 }
@@ -241,17 +265,6 @@ impl Pipes {
         }
 
         Ok(Self { input_read, input_write, output_read, output_write })
-    }
-}
-
-fn create_pseudo_console(cols: u16, rows: u16, input: HANDLE, output: HANDLE) -> Result<HPCON, String> {
-    let mut conpty = 0;
-    let result = unsafe { CreatePseudoConsole(COORD { X: cols as i16, Y: rows as i16 }, input, output, 0, &mut conpty) };
-
-    if result < 0 {
-        Err(format!("CreatePseudoConsole failed with HRESULT 0x{result:08x}"))
-    } else {
-        Ok(conpty)
     }
 }
 

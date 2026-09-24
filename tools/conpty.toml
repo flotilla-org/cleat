@@ -1,0 +1,15 @@
+# Bundled ConPTY for Windows sessions (ADR 0006, flotilla-org/cleat#233).
+# Microsoft's Microsoft.Windows.Console.ConPTY NuGet package (MIT, built from
+# microsoft/terminal): conpty.dll + OpenConsole.exe pass Kitty graphics APC
+# and sixel DCS through, which the inbox ConPTY drops.
+#
+# This is the one place the package is pinned. tools/prepare-conpty.ps1
+# fetches it from nuget.org and verifies the SHA-256; build.rs stages it beside
+# the Windows executables with tools/conpty-LICENSE.txt. Updates are deliberate
+# version bumps: change both values, re-run the prepare script, and re-run the
+# pass-through regression (`cargo test -p cleat --locked --lib conpty`) with
+# the bundle and with CLEAT_CONPTY=inbox (which must fail).
+[conpty]
+package = "Microsoft.Windows.Console.ConPTY"
+version = "1.24.260710001"
+sha256 = "175640566a3b59c4b132070ee96c2c77e5ab7edd2e92732a5eb3610bbf63d90e"

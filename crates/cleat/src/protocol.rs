@@ -30,8 +30,63 @@ pub struct SessionInfo {
     pub last_output_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller: Option<AttachmentIdentity>,
+    /// The Windows pseudoconsole this session's program runs under; absent on
+    /// other platforms and from daemons that predate the report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conpty: Option<ConptyInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Which ConPTY implementation hosts a Windows session, chosen when the
+/// session's program starts (ADR 0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConptyKind {
+    /// `conpty.dll` + `OpenConsole.exe` shipped beside the executable.
+    Bundled,
+    /// The operating system's kernel32 ConPTY.
+    Inbox,
+}
+
+impl ConptyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::Inbox => "inbox",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConptyInfo {
+    pub kind: ConptyKind,
+    /// Whether Kitty graphics (APC) and sixel (DCS) reach the VT engine. The
+    /// inbox ConPTY drops them, so a session on it is degraded.
+    pub graphics_passthrough: bool,
+    /// Pinned package version the build staged, for a bundled session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The `conpty.dll` that was loaded, for a bundled session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// Why the bundled ConPTY was not used, for an inbox session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+impl ConptyInfo {
+    /// One-line human summary; never hides a degraded session.
+    pub fn summary(&self) -> String {
+        match (self.kind, &self.fallback_reason) {
+            (ConptyKind::Bundled, _) => match &self.version {
+                Some(version) => format!("bundled {version}"),
+                None => "bundled".to_string(),
+            },
+            (ConptyKind::Inbox, Some(reason)) => format!("inbox, graphics pass-through degraded ({reason})"),
+            (ConptyKind::Inbox, None) => "inbox, graphics pass-through degraded".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +126,8 @@ pub struct SessionInspect {
     pub cmd: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conpty: Option<ConptyInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

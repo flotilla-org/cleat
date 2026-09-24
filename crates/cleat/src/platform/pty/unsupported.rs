@@ -9,6 +9,14 @@ impl PtyChild {
     pub fn spawn_with_ambient(_session: &SessionMetadata, _coordinates: Option<&AmbientSessionCoordinates>) -> Result<Self, String> {
         Err("PTY sessions are only supported on Unix".to_string())
     }
+
+    pub fn conpty(&self) -> Option<&crate::protocol::ConptyInfo> {
+        None
+    }
+
+    pub fn sends_startup_queries(&self) -> bool {
+        false
+    }
 }
 
 pub struct PollResult {

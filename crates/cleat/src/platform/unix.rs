@@ -74,6 +74,16 @@ impl PtyChild {
         }
     }
 
+    /// Unix PTYs have no ConPTY.
+    pub fn conpty(&self) -> Option<&crate::protocol::ConptyInfo> {
+        None
+    }
+
+    /// Unix PTYs send no host-directed startup queries.
+    pub fn sends_startup_queries(&self) -> bool {
+        false
+    }
+
     pub fn master_fd(&self) -> RawFd {
         self.master_fd.as_raw_fd()
     }

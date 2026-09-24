@@ -54,6 +54,8 @@ The helpers read pinned inputs from [`tools/ghostty-toolchain.toml`](tools/ghost
 
 The `ghostty-vt` build path defaults to the repo-local prefix at `.tools/ghostty-install`. You can still override it with `CLEAT_GHOSTTY_PREFIX`. Cleat prefers the static Ghostty VT library on Unix when present (`libghostty-vt.a`) and falls back to the shared library otherwise. On Windows, cleat links against `ghostty-vt.lib` and copies `ghostty-vt.dll` next to the built executable.
 
+On Windows, sessions run under the bundled ConPTY ([ADR 0006](docs/adr/0006-bundled-conpty-on-windows.md)) so Kitty graphics and sixel reach the VT engine; the inbox ConPTY drops them. `prepare-ghostty-vt.ps1` also runs `tools\prepare-conpty.ps1`, which fetches the package pinned in [`tools/conpty.toml`](tools/conpty.toml) from nuget.org and verifies its SHA-256. The build copies `conpty.dll`, `OpenConsole.exe` and `conpty-LICENSE.txt` next to the built executables. Without them, sessions fall back to the inbox ConPTY and `cleat list`/`inspect` report the degradation. Set `CLEAT_CONPTY=inbox` in the daemon's environment to force the fallback.
+
 ```bash
 find .tools/ghostty-install -maxdepth 3 | sort
 ```

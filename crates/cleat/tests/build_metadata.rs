@@ -42,6 +42,9 @@ fn check_ref_backend(use_reftable: bool) {
         .unwrap();
     fs::write(crate_dir.join("src/main.rs"), "fn main() { println!(\"{}\", env!(\"CLEAT_GIT_SHA\")); }\n").unwrap();
     fs::write(crate_dir.join("build.rs"), include_str!("../build.rs")).unwrap();
+    // build.rs reads the bundled ConPTY pin (ADR 0006).
+    fs::create_dir_all(root.join("tools")).unwrap();
+    fs::write(root.join("tools/conpty.toml"), include_str!("../../../tools/conpty.toml")).unwrap();
     fs::write(root.join(".gitignore"), "target/\n").unwrap();
     let mut init_args = vec!["init", "--quiet", "--initial-branch=main"];
     if use_reftable {

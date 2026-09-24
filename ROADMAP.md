@@ -105,8 +105,10 @@ The queue above is the current focus, not a replacement for the rest of the
 backlog. Windows work continues separately through
 [PR #76](https://github.com/flotilla-org/cleat/pull/76),
 [#205](https://github.com/flotilla-org/cleat/issues/205),
-[#223](https://github.com/flotilla-org/cleat/issues/223) and
-[#169](https://github.com/flotilla-org/cleat/issues/169).
+[#223](https://github.com/flotilla-org/cleat/issues/223),
+[#169](https://github.com/flotilla-org/cleat/issues/169) and
+[#234](https://github.com/flotilla-org/cleat/issues/234) (bundled ConPTY for graphics
+pass-through, decided in [ADR 0006](docs/adr/0006-bundled-conpty-on-windows.md)).
 Existing-only attach responsiveness is [#224](https://github.com/flotilla-org/cleat/issues/224);
 remote/socket-only operation remains [#122](https://github.com/flotilla-org/cleat/issues/122),
 [#125](https://github.com/flotilla-org/cleat/issues/125),

@@ -395,11 +395,20 @@ impl<S: Read + Write> PacketClient<S> {
         }
     }
 
+    /// Read the channel's next render. This simple client never acquires image
+    /// files: it declines each offer so the daemon sends the bytes instead,
+    /// since the render that references an image waits for the offer's reply.
     pub fn read_render(&mut self, channel: u32) -> std::io::Result<RenderPacket> {
         loop {
             let frame = self.read_frame()?;
             if frame.channel == channel && frame.msg_type == MSG_SESSION_RENDER {
                 return frame.decode();
+            }
+            if frame.channel == channel && frame.msg_type == MSG_SESSION_IMAGE_FILE {
+                let offer = frame.decode::<ImageFile>()?;
+                let declined = ImageFileResult { image_id: offer.image_id, generation: offer.generation, acquired: false };
+                self.write(channel, MSG_SESSION_IMAGE_FILE_RESULT, &declined)?;
+                continue;
             }
             if frame.channel == CHANNEL_CONTROL && frame.msg_type == MSG_CONTROL_ERROR {
                 let error = frame.decode::<ControlError>()?;
@@ -539,6 +548,42 @@ mod tests {
         let err = client.read_render(7).expect_err("control error should surface");
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "bad channel");
+    }
+
+    #[test]
+    fn packet_client_read_render_declines_image_file_offers() {
+        struct Duplex {
+            input: std::io::Cursor<Vec<u8>>,
+            output: Vec<u8>,
+        }
+        impl Read for Duplex {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.input.read(buf)
+            }
+        }
+        impl Write for Duplex {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.output.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut input = Vec::new();
+        let offer = ImageFile { image_id: 3, generation: 9, len: 64, path: "image".to_string() };
+        PacketFrame::new(7, MSG_SESSION_IMAGE_FILE, &offer).expect("encode offer").write(&mut input).expect("write offer");
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_ERROR, &ControlError { channel: 7, message: "end".to_string() })
+            .expect("encode error")
+            .write(&mut input)
+            .expect("write error");
+        let mut client = PacketClient::new(Duplex { input: std::io::Cursor::new(input), output: Vec::new() });
+
+        client.read_render(7).expect_err("stream ends with a control error");
+        let reply = PacketFrame::read(&mut client.stream.output.as_slice()).expect("declined offer reply");
+        assert_eq!((reply.channel, reply.msg_type), (7, MSG_SESSION_IMAGE_FILE_RESULT));
+        let result = reply.decode::<ImageFileResult>().expect("decode reply");
+        assert_eq!((result.image_id, result.generation, result.acquired), (3, 9, false));
     }
 
     #[test]

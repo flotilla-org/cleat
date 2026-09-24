@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::{
+    conpty_startup::{ConptyStartup, StartupStep},
     da::DeviceAttributeTracker,
     platform::pty::{exit_code_from_wait_status, PtyChild},
     protocol::{InspectResult, SignalTarget},
@@ -38,6 +39,8 @@ pub(crate) struct SessionRuntime {
     pty_child: PtyChild,
     vt_engine: Box<dyn VtEngine>,
     detached_da: Option<DeviceAttributeTracker>,
+    /// The bundled ConPTY's startup handshake, until it has been answered.
+    conpty_startup: Option<ConptyStartup>,
     recorder: Option<SessionRecorder>,
     markers: HashMap<String, u64>,
     held_keys: crate::keyboard::HeldKeys,
@@ -98,6 +101,7 @@ impl SessionRuntime {
 
         let pty_child = PtyChild::spawn_with_ambient(session, coordinates)?;
         pty_child.set_nonblocking()?;
+        let conpty_startup = pty_child.sends_startup_queries().then(ConptyStartup::new);
         let detached_da = match session.vt_engine {
             // The DA tracker is the only DA source for the passthrough engine.
             // The ghostty engine answers DA itself via its DeviceAttributes callback,
@@ -127,6 +131,7 @@ impl SessionRuntime {
             session: session.clone(),
             session_dir,
             pty_child,
+            conpty_startup,
             vt_engine,
             detached_da,
             recorder,
@@ -424,6 +429,7 @@ impl SessionRuntime {
                 cwd: self.session.cwd.clone(),
                 cmd: self.session.cmd.clone(),
                 tags: self.session.tags.clone(),
+                conpty: self.pty_child.conpty().cloned(),
             },
             terminal: crate::protocol::TerminalInspect { rows, cols },
             process: crate::protocol::ProcessInspect {
@@ -551,7 +557,25 @@ impl SessionRuntime {
                 Ok(0) => break,
                 Ok(n) => {
                     budget = budget.saturating_sub(n);
-                    let bytes = &buf[..n];
+                    let startup_rest;
+                    let bytes = match self.conpty_startup.as_mut().map(|startup| startup.push(&buf[..n])) {
+                        None => &buf[..n],
+                        Some(StartupStep::Pending) => continue,
+                        Some(StartupStep::Answered { rest }) => {
+                            self.conpty_startup = None;
+                            self.answer_conpty_startup_query()?;
+                            startup_rest = rest;
+                            &startup_rest[..]
+                        }
+                        Some(StartupStep::Absent { bytes }) => {
+                            self.conpty_startup = None;
+                            startup_rest = bytes;
+                            &startup_rest[..]
+                        }
+                    };
+                    if bytes.is_empty() {
+                        continue;
+                    }
                     self.last_pty_output_at = Some(Instant::now());
                     self.vt_engine.feed(bytes)?;
                     self.record_output(bytes);
@@ -599,6 +623,17 @@ impl SessionRuntime {
                 eprintln!("screen activity render flush error: {err}");
             }
         }
+    }
+
+    /// Answer ConPTY's startup DA1 query as the VT engine answers a program's,
+    /// independent of attached clients so the program never waits on one.
+    /// An engine without a DA1 answer (the no-VT build) gets the fixed reply
+    /// the detached tracker gives programs.
+    fn answer_conpty_startup_query(&mut self) -> Result<(), String> {
+        self.vt_engine.feed(crate::conpty_startup::DA1_QUERY)?;
+        let reply = self.vt_engine.drain_replies();
+        let reply = if reply.is_empty() { crate::da::DA1_RESPONSE.to_vec() } else { reply };
+        self.pty_child.write_all(&reply)
     }
 
     fn write_detached_replies(&mut self, pty_output: &[u8], engine_reply: &[u8]) -> Result<(), String> {
@@ -855,5 +890,159 @@ mod tests {
         // The stale answer belongs to the dead program: it must not be pending
         // where the first detached pump would write it to the new child's stdin.
         assert!(rt.vt_engine.drain_replies().is_empty(), "stale replies must be discarded during spawn");
+    }
+
+    /// The child half of the ConPTY pass-through regression below. It is an
+    /// ordinary no-op test unless that regression launches it inside a session.
+    #[cfg(windows)]
+    const CONPTY_EMITTER_ENV: &str = "CLEAT_TEST_CONPTY_GRAPHICS_EMITTER";
+    #[cfg(windows)]
+    const KITTY_APC: &[u8] = b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\";
+    #[cfg(windows)]
+    const SIXEL_DCS: &[u8] = b"\x1bPq#0;2;100;0;0#0~~~~\x1b\\";
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_graphics_emitter() {
+        use windows_sys::Win32::{
+            Storage::FileSystem::WriteFile,
+            System::Console::{
+                GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                STD_OUTPUT_HANDLE,
+            },
+        };
+
+        if std::env::var_os(CONPTY_EMITTER_ENV).is_none() {
+            return;
+        }
+        let payload = [b"<BEGIN>".as_slice(), KITTY_APC, b"<AFTER-APC>", SIXEL_DCS, b"<AFTER-SIXEL><END>\r\n"].concat();
+        // SAFETY: plain console calls on this process's own output handle.
+        unsafe {
+            let output = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode = 0;
+            GetConsoleMode(output, &mut mode);
+            SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
+            let mut written = 0;
+            assert_ne!(WriteFile(output, payload.as_ptr(), payload.len() as u32, &mut written, std::ptr::null_mut()), 0);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    /// Records every byte a session feeds its VT engine. It never answers
+    /// queries, so ConPTY's startup DA1 gets the no-VT fixed reply.
+    #[cfg(windows)]
+    struct FeedSpy {
+        fed: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    #[cfg(windows)]
+    impl VtEngine for FeedSpy {
+        fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.fed.lock().expect("spy lock").extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn resize(&mut self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn supports_replay(&self) -> bool {
+            false
+        }
+
+        fn replay_payload(&self, _capabilities: &vt::ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+
+        fn screen_text(&self) -> Result<String, String> {
+            Err("feed spy has no screen".into())
+        }
+
+        fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
+            Err("feed spy has no screen".into())
+        }
+
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+    }
+
+    /// Spawn `cmd` in a detached session and pump its output into a feed spy
+    /// until `marker` arrives. Returns every fed byte and the time it took.
+    #[cfg(windows)]
+    fn run_detached_until(cmd: String, environment: Vec<(String, String)>, marker: &[u8]) -> (Vec<u8>, Duration, SessionRuntime) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = SessionMetadata {
+            id: "conpty-regression".to_string(),
+            vt_engine: VtEngineKind::Passthrough,
+            cwd: None,
+            cmd: Some(cmd),
+            tags: Vec::new(),
+            environment,
+            record: false,
+            initial_size: crate::runtime::TerminalSize::default(),
+            colors: crate::vt::TerminalColors::default(),
+        };
+        let fed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = Instant::now();
+        let mut rt =
+            SessionRuntime::spawn(temp.path().to_path_buf(), &session, Box::new(FeedSpy { fed: fed.clone() })).expect("spawn session");
+        let deadline = started + Duration::from_secs(30);
+        loop {
+            // No client is attached: queries are never forwarded.
+            rt.read_available_output(false).expect("read pty output");
+            let bytes = fed.lock().expect("spy lock").clone();
+            if bytes.windows(marker.len()).any(|window| window == marker) {
+                return (bytes, started.elapsed(), rt);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {:?}; fed {:?}",
+                String::from_utf8_lossy(marker),
+                String::from_utf8_lossy(&bytes)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|window| window == needle)
+    }
+
+    /// The inbox ConPTY drops Kitty graphics APC and sixel DCS; the bundle
+    /// passes them through (ADR 0006). Run with CLEAT_CONPTY=inbox to watch
+    /// this fail against the inbox ConPTY.
+    #[cfg(windows)]
+    #[test]
+    fn conpty_passes_kitty_apc_and_sixel_dcs_to_the_vt_engine() {
+        let exe = std::env::current_exe().expect("test executable");
+        let test_path = module_path!().split_once("::").map(|(_, path)| path).expect("crate-relative module path");
+        let cmd = format!("{} --exact {test_path}::conpty_graphics_emitter --nocapture --test-threads=1", exe.display());
+        let (fed, _, rt) = run_detached_until(cmd, vec![(CONPTY_EMITTER_ENV.to_string(), "1".to_string())], b"<END>");
+
+        let conpty = rt.pty_child().conpty().expect("Windows sessions report their ConPTY").clone();
+        let text = String::from_utf8_lossy(&fed);
+        assert!(
+            contains(&fed, KITTY_APC) && contains(&fed, SIXEL_DCS),
+            "Kitty APC and sixel DCS must reach the VT engine verbatim under the {} ConPTY; fed {text:?}",
+            conpty.summary()
+        );
+        assert!(
+            contains(&fed, &[b"<BEGIN>".as_slice(), KITTY_APC, b"<AFTER-APC>", SIXEL_DCS, b"<AFTER-SIXEL>"].concat()),
+            "order preserved: {text:?}"
+        );
+        // The startup handshake is ConPTY's question to Cleat, not program output.
+        assert!(!contains(&fed, b"\x1b[1t\x1b[c"), "startup queries must not reach the engine: {text:?}");
+    }
+
+    /// Without an answer to its startup DA1 query the bundled ConPTY holds the
+    /// program for 3 s. Cleat answers it even with no client attached.
+    #[cfg(windows)]
+    #[test]
+    fn detached_conpty_session_starts_without_startup_query_delay() {
+        let (_, elapsed, rt) = run_detached_until("echo cleat-startup-ready".to_string(), Vec::new(), b"cleat-startup-ready");
+        let conpty = rt.pty_child().conpty().expect("Windows sessions report their ConPTY").summary();
+        assert!(elapsed < Duration::from_millis(2000), "detached {conpty} session took {elapsed:?} to produce output");
     }
 }

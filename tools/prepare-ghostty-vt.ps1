@@ -92,3 +92,6 @@ $importLib = Join-Path $InstallDir 'lib\ghostty-vt.lib'
 if (!(Test-Path $staticLib) -and !((Test-Path $importLib) -and ((Test-Path $sharedLib) -or (Test-Path $sharedLibAlt)))) {
     throw "Missing Ghostty VT library; expected $staticLib or $importLib plus ghostty-vt.dll"
 }
+
+# Windows builds also stage the pinned bundled ConPTY (ADR 0006).
+& (Join-Path $RepoRoot 'tools\prepare-conpty.ps1') -RepoRoot $RepoRoot | Out-Null

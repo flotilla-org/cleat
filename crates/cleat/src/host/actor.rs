@@ -941,6 +941,22 @@ fn mark_partial_unknown_and_wake(observation: &mut ObservationState, wake: &Wake
     }
 }
 
+/// Record that the host observed `generation`, re-arming the wake if the
+/// session is still dirty afterwards.
+///
+/// Wakes are edge-triggered on the clean-to-dirty transition. Output that
+/// arrives between a host's render and its (asynchronous) observation of that
+/// render advances the generation while the session is already dirty, so it
+/// fires no wake of its own; a stale observation then leaves the session dirty
+/// with no wake pending. Waking again here gives the host the edge it missed.
+fn mark_observed_and_wake(observation: &mut ObservationState, generation: u64, wake: &WakeCallback) -> bool {
+    let marked = observation.mark_observed(generation);
+    if marked && observation.dirty() != DirtyState::Clean {
+        wake();
+    }
+    marked
+}
+
 fn sync_terminal_modes_and_wake(runtime: &SessionRuntime, observation: &mut ObservationState, wake: &WakeCallback) {
     if let Ok(terminal_modes) = runtime.terminal_mode_state() {
         if observation.sync_terminal_modes(terminal_modes) {
@@ -1245,7 +1261,7 @@ fn session_actor_handle_command(
             let _ = reply.send(Ok(runtime.should_keep_session_dir()));
         }
         SessionCommand::MarkObserved { generation, reply } => {
-            let _ = reply.send(state.observation.mark_observed(generation));
+            let _ = reply.send(mark_observed_and_wake(&mut state.observation, generation, wake));
         }
         SessionCommand::ScrollbackExtent { reply } => {
             let extent = runtime.scrollback_extent().unwrap_or_else(|_| TerminalScrollbackExtent {
@@ -1624,5 +1640,65 @@ mod idle_tests {
         drop(actor);
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(after, before, "exited actor continued polling while idle");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    fn counting_wake() -> (WakeCallback, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        let wake: WakeCallback = Arc::new(move || {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+        (wake, count)
+    }
+
+    #[test]
+    fn stale_mark_observed_rewakes_when_output_arrived_after_render() {
+        let (wake, wakes) = counting_wake();
+        let mut observation = ObservationState::new(24);
+        let initial = observation.render_generation;
+        assert!(mark_observed_and_wake(&mut observation, initial, &wake));
+        assert_eq!(observation.dirty(), DirtyState::Clean);
+        assert_eq!(wakes.load(AtomicOrdering::SeqCst), 0, "observing the latest render needs no wake");
+
+        // Output makes the session dirty: the clean-to-dirty edge wakes the host.
+        mark_partial_unknown_and_wake(&mut observation, &wake);
+        assert_eq!(wakes.load(AtomicOrdering::SeqCst), 1);
+
+        // The host renders this generation...
+        let mut update = TerminalRenderUpdate::default();
+        observation.annotate_render_update(&mut update);
+        let rendered = update.render_generation;
+
+        // ...more output lands before its mark_observed. Already dirty, so no edge.
+        mark_partial_unknown_and_wake(&mut observation, &wake);
+        assert_eq!(wakes.load(AtomicOrdering::SeqCst), 1);
+
+        // The stale observation leaves the session dirty and must wake again,
+        // or the host never renders the newer output.
+        assert!(mark_observed_and_wake(&mut observation, rendered, &wake));
+        assert_eq!(observation.dirty(), DirtyState::Partial);
+        assert_eq!(wakes.load(AtomicOrdering::SeqCst), 2, "stale observation must re-arm the wake");
+
+        // Observing the newer render cleans the session without a spurious wake.
+        let latest = observation.render_generation;
+        assert!(mark_observed_and_wake(&mut observation, latest, &wake));
+        assert_eq!(observation.dirty(), DirtyState::Clean);
+        assert_eq!(wakes.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rejected_mark_observed_does_not_wake() {
+        let (wake, wakes) = counting_wake();
+        let mut observation = ObservationState::new(24);
+        let future = observation.render_generation + 1;
+        assert!(!mark_observed_and_wake(&mut observation, future, &wake));
+        assert_eq!(wakes.load(AtomicOrdering::SeqCst), 0);
     }
 }

@@ -1182,6 +1182,10 @@ fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
     if let Some(controller) = &session.controller {
         fields.push(format!("controller={} ({})", controller.name, controller.kind.as_str()));
     }
+    // A degraded ConPTY is never silent, even in the compact listing.
+    if let Some(conpty) = session.conpty.as_ref().filter(|conpty| !conpty.graphics_passthrough) {
+        fields.push(format!("conpty={} (graphics degraded)", conpty.kind.as_str()));
+    }
     fields.join("\t")
 }
 
@@ -1390,6 +1394,9 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
     table.add_row(vec!["state", &result.session.state]);
     table.add_row(vec!["vt_engine", &format!("{} ({})", result.session.vt_engine, result.session.vt_engine_status)]);
     table.add_row(vec!["functional_vt", if result.session.functional_vt_available { "yes" } else { "no" }]);
+    if let Some(conpty) = &result.session.conpty {
+        table.add_row(vec!["conpty", &conpty.summary()]);
+    }
     if !result.session.tags.is_empty() {
         table.add_row(vec!["tags", &result.session.tags.join(", ")]);
     }

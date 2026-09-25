@@ -11,7 +11,8 @@ use super::{
         GhosttyStyleColor, GhosttyStyleColorTag, GhosttyTerminalScreen, GhosttyTerminalScrollViewport, MouseEncodeEvent, MouseEncoder,
         RenderStateHandle, RowCellsHandle, RowIteratorHandle, TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_BRACKETED_PASTE,
         GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_MOUSE_ANY, GHOSTTY_MODE_MOUSE_BUTTON, GHOSTTY_MODE_MOUSE_NORMAL, GHOSTTY_MODE_MOUSE_X10,
-        GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
+        GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODE_SYNCHRONIZED_OUTPUT, GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL,
+        GHOSTTY_MODS_SHIFT,
     },
     CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, MouseAction, MouseButton, MouseModifiers,
     MouseReportFormat, MouseTrackingMode, ResolvedCell, Rgb, ScreenGrid, TerminalColors, TerminalModeState, VtEngine,
@@ -736,6 +737,14 @@ impl VtEngine for GhosttyVtEngine {
         (self.cols, self.rows)
     }
 
+    fn synchronized_output_active(&self) -> Result<bool, String> {
+        self.terminal.mode_enabled(GHOSTTY_MODE_SYNCHRONIZED_OUTPUT)
+    }
+
+    fn end_synchronized_output(&mut self) -> Result<(), String> {
+        self.terminal.set_mode(GHOSTTY_MODE_SYNCHRONIZED_OUTPUT, false)
+    }
+
     fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
         let mouse_tracking_mode = if self.terminal.mode_enabled(GHOSTTY_MODE_MOUSE_ANY)? {
             MouseTrackingMode::Any
@@ -1284,6 +1293,18 @@ mod history_tests {
     }
     fn text(frame: &HistoryFrame) -> String {
         frame.grid.cells.iter().flat_map(|cell| cell.graphemes.iter().copied()).filter_map(char::from_u32).collect()
+    }
+
+    #[test]
+    fn cursor_sync_investigation_control_cases() {
+        let mut engine = GhosttyVtEngine::new(20, 3);
+        engine.feed(b"ready\x1b[?25h").unwrap();
+        assert!(engine.render_update(DirtyState::Full).unwrap().cursor.visible);
+        engine.feed(b"\x1b[?2026h\x1b[?25lx\x1b[?25h\x1b[?2026l").unwrap();
+        assert!(engine.render_update(DirtyState::Partial).unwrap().cursor.visible);
+        // Intentional hiding outside a synchronized batch must remain observable.
+        engine.feed(b"\x1b[?25l").unwrap();
+        assert!(!engine.render_update(DirtyState::Partial).unwrap().cursor.visible);
     }
 
     #[test]

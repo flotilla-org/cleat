@@ -2620,6 +2620,71 @@ fn packet_concurrent_channels_each_progress_past_initial_generation() {
 }
 
 #[cfg(feature = "ghostty-vt")]
+fn render_text(update: &TerminalRenderUpdate) -> String {
+    update
+        .ops
+        .iter()
+        .flat_map(|op| &op.rows)
+        .flat_map(|row| &row.cells)
+        .flat_map(|cell| cell.graphemes.iter().copied())
+        .filter_map(char::from_u32)
+        .collect()
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_channel_opened_mid_synchronized_batch_starts_from_last_completed_frame() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some(
+                r"printf 'ready\033[?25h'; sleep 0.5; printf '\033[?2026h\033[?25lMID'; sleep 0.6; printf '\033[?25h\033[?2026l'; exec cat"
+                    .into(),
+            ),
+            false,
+        )
+        .expect("create alpha");
+    wait_until("initial output", || service.capture("alpha").unwrap().contains("ready"));
+
+    // The first attachment publishes a completed frame into the daemon cache.
+    let mut first = http_packet_stream(temp.path(), "alpha");
+    let mut first_buffer = Vec::new();
+    let _hello = PacketFrame::read(&mut first).expect("read first hello");
+    let _directory = PacketFrame::read(&mut first).expect("read first directory");
+    packet_open_channel(&mut first, 1, "alpha");
+    let initial = read_packet_render(&mut first, &mut first_buffer, 1, Duration::from_secs(2));
+    assert!(render_text(&initial).contains("ready"));
+    packet_ack(&mut first, 1, initial.render_generation);
+
+    // Mid-batch, a new attachment starts from that frame, not the batch.
+    wait_until("mid-batch output parsed", || service.capture("alpha").unwrap().contains("MID"));
+    let mut second = http_packet_stream(temp.path(), "alpha");
+    let mut second_buffer = Vec::new();
+    let _hello = PacketFrame::read(&mut second).expect("read second hello");
+    let _directory = PacketFrame::read(&mut second).expect("read second directory");
+    packet_open_channel(&mut second, 1, "alpha");
+    let joined = read_packet_render(&mut second, &mut second_buffer, 1, Duration::from_secs(2));
+    assert_eq!(joined.render_generation, initial.render_generation, "joined on a mid-batch render");
+    assert!(joined.cursor.visible, "joined with the batch's hidden cursor");
+    assert!(!render_text(&joined).contains("MID"), "joined with mid-batch cells");
+    assert!(render_text(&joined).contains("ready"));
+    packet_ack(&mut second, 1, joined.render_generation);
+
+    // Both attachments receive the completed frame once the batch ends.
+    for (stream, buffer) in [(&mut first, &mut first_buffer), (&mut second, &mut second_buffer)] {
+        let completed = read_packet_render(stream, buffer, 1, Duration::from_secs(5));
+        assert!(render_text(&completed).contains("MID"), "completed frame: {:?}", render_text(&completed));
+        assert!(completed.cursor.visible);
+        assert!(completed.render_generation > initial.render_generation);
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
 #[test]
 fn packet_lagging_channel_receives_cached_generation_after_session_goes_clean() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());

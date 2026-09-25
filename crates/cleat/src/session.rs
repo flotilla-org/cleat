@@ -4151,8 +4151,18 @@ fn open_packet_channel(
     // Probe render state before granting a role: a session whose VT engine
     // cannot serve it (e.g. the passthrough placeholder) must fail this one
     // channel, not demote the current controller or tear down the daemon.
-    let update = match hosted.actor.packet_render(true) {
-        Ok(update) => update,
+    // Mid synchronized-output batch the actor withholds a fresh render; the
+    // new attachment starts from the last completed presentation instead.
+    let rendered = hosted.actor.packet_render(true).and_then(|update| match update {
+        Some(update) => Ok((update, true)),
+        None => hosted
+            .packet_render_cache
+            .since(0)
+            .map(|update| (update, false))
+            .ok_or_else(|| "no completed presentation to retain".to_string()),
+    });
+    let (update, fresh) = match rendered {
+        Ok(rendered) => rendered,
         Err(err) => {
             packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
                 channel: open.channel,
@@ -4168,7 +4178,9 @@ fn open_packet_channel(
     let generation = update.packet.update.render_generation;
     let controller =
         if granted == ChannelRole::Controller { Some(open.identity.clone()) } else { controller_identity(hosted, packet_clients) };
-    hosted.packet_render_cache.store(update.clone());
+    if fresh {
+        hosted.packet_render_cache.store(update.clone());
+    }
     packet_clients[index].channels.insert(open.channel, PacketSessionChannel {
         session_id: session_id.clone(),
         role: granted,
@@ -4225,7 +4237,8 @@ fn push_due_packet_renders(
     if actor.observation().dirty() != DirtyState::Clean {
         let result = actor.packet_render(false);
         match result {
-            Ok(update) => render_cache.store(update),
+            Ok(Some(update)) => render_cache.store(update),
+            Ok(None) => {}
             Err(error) => {
                 for client in packet_clients.iter_mut() {
                     let channels: Vec<_> = client.channels.iter().filter(|(_, c)| c.session_id == session_id).map(|(id, _)| *id).collect();
@@ -5026,6 +5039,47 @@ mod tests {
             assert_eq!(host.screen_grid().unwrap().cells[..8], expected, "unchanged row flashed at output byte {offset}");
         }
         assert_eq!(host.screen_grid().unwrap().cells[8].graphemes, vec!['+' as u32]);
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_repaint_keeps_outer_cursor_visible_across_transport_chunks() {
+        use crate::{
+            host::presentation::{publish_from_engine, PresentationGate},
+            provider::DirtyState,
+            vt::ghostty::GhosttyVtEngine,
+        };
+        // The outer session (e.g. Wheelhouse running `ssh … cleat attach`)
+        // publishes through the same gate as any hosted session.
+        let mut source = GhosttyVtEngine::new(20, 3);
+        let mut host = GhosttyVtEngine::new(20, 3);
+        let mut gate = PresentationGate::default();
+        let mut renderer = PacketTerminalRenderer::new(20, 3);
+        source.feed(b"prompt> \x1b[?25h").unwrap();
+        let mut bytes = Vec::new();
+        renderer.apply_and_render(&mut bytes, &source.render_update(DirtyState::Full).unwrap()).unwrap();
+        host.feed(&bytes).unwrap();
+        assert!(publish_from_engine(&mut gate, &mut host, DirtyState::Full).cursor.visible);
+        // The source only echoes a character: it never requests cursor hiding.
+        source.feed(b"a").unwrap();
+        let update = source.render_update(DirtyState::Partial).unwrap();
+        assert!(update.cursor.visible);
+        bytes.clear();
+        renderer.apply_and_render(&mut bytes, &update).unwrap();
+        // Any transport may split the repaint; split right after the hide.
+        let split = b"\x1b[?2026h\x1b[?25l".len();
+        assert_eq!(&bytes[..split], b"\x1b[?2026h\x1b[?25l");
+        host.feed(&bytes[..split]).unwrap();
+        let intermediate = publish_from_engine(&mut gate, &mut host, DirtyState::Partial);
+        host.feed(&bytes[split..]).unwrap();
+        let completed = publish_from_engine(&mut gate, &mut host, DirtyState::Partial);
+        eprintln!(
+            "source visible={}, outer mid-batch={}, outer completed={}",
+            update.cursor.visible, intermediate.cursor.visible, completed.cursor.visible
+        );
+        assert!(completed.cursor.visible);
+        assert!(intermediate.cursor.visible, "attach repaint exposed a hidden cursor although source cursor stayed visible");
+        assert!(host.screen_text().unwrap().contains("prompt> a"));
     }
 
     #[test]

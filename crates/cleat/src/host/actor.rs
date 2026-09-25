@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+use nix::poll::PollTimeout;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 #[cfg(target_os = "linux")]
@@ -24,6 +26,7 @@ use nix::{
     fcntl::{fcntl, FcntlArg, OFlag},
 };
 
+use super::presentation::{GateTransition, PresentationGate};
 use crate::{
     platform::pty::PtyChild,
     protocol::{InspectResult, SignalTarget},
@@ -92,6 +95,8 @@ pub(crate) struct ObservationState {
     dirty: DirtyState,
     dirty_rows: Vec<u16>,
     terminal_modes: Option<vt::TerminalModeState>,
+    /// Publication is held for an open synchronized-output batch.
+    held: bool,
     mirror: Option<Arc<ObservationMirror>>,
 }
 
@@ -107,18 +112,41 @@ impl ObservationState {
             dirty: DirtyState::Clean,
             dirty_rows: Vec::new(),
             terminal_modes: None,
+            held: false,
             mirror,
         };
         state.mark_full(rows);
         state
     }
 
+    /// Published dirty state: clean while publication is held, so pollers
+    /// and wakes wait for the completed presentation.
     pub(crate) fn dirty(&self) -> DirtyState {
+        if self.held {
+            DirtyState::Clean
+        } else {
+            self.pending_dirty()
+        }
+    }
+
+    /// Damage not yet observed, whether or not publication is held.
+    pub(crate) fn pending_dirty(&self) -> DirtyState {
         if self.render_generation > self.observed_generation {
             self.dirty
         } else {
             DirtyState::Clean
         }
+    }
+
+    /// Hold or release publication. Damage accumulates while held; returns
+    /// true when releasing exposes it, so the caller wakes the host.
+    pub(crate) fn set_held(&mut self, held: bool) -> bool {
+        if self.held == held {
+            return false;
+        }
+        self.held = held;
+        self.publish_mirror();
+        !held && self.dirty() != DirtyState::Clean
     }
 
     pub(crate) fn mark_full(&mut self, _rows: u16) -> bool {
@@ -127,7 +155,7 @@ impl ObservationState {
         self.dirty = DirtyState::Full;
         self.dirty_rows.clear();
         self.publish_mirror();
-        was_clean
+        was_clean && !self.held
     }
 
     pub(crate) fn mark_partial_rows(&mut self, rows: impl IntoIterator<Item = u16>) -> bool {
@@ -143,7 +171,7 @@ impl ObservationState {
             self.dirty_rows.sort_unstable();
         }
         self.publish_mirror();
-        was_clean
+        was_clean && !self.held
     }
 
     pub(crate) fn mark_partial_unknown(&mut self) -> bool {
@@ -154,7 +182,7 @@ impl ObservationState {
             self.dirty_rows.clear();
         }
         self.publish_mirror();
-        was_clean
+        was_clean && !self.held
     }
 
     /// Publish the child's exit code to the mirror (once), waking observers
@@ -192,7 +220,7 @@ impl ObservationState {
 
     pub(crate) fn annotate_snapshot(&self, snapshot: &mut TerminalSnapshot) {
         snapshot.render_generation = self.render_generation;
-        snapshot.dirty = self.dirty();
+        snapshot.dirty = self.pending_dirty();
         snapshot.dirty_rows = if snapshot.dirty == DirtyState::Partial {
             if self.dirty_rows.is_empty() {
                 snapshot.dirty_rows.clone()
@@ -206,7 +234,7 @@ impl ObservationState {
 
     pub(crate) fn annotate_render_update(&self, update: &mut TerminalRenderUpdate) {
         update.render_generation = self.render_generation;
-        let dirty = self.dirty();
+        let dirty = self.pending_dirty();
         if dirty == DirtyState::Clean {
             update.dirty = DirtyState::Clean;
             update.ops.clear();
@@ -217,7 +245,8 @@ impl ObservationState {
 
     fn publish_mirror(&self) {
         if let Some(mirror) = &self.mirror {
-            mirror.store(self.render_generation, self.observed_generation, self.dirty);
+            let dirty = if self.held { DirtyState::Clean } else { self.dirty };
+            mirror.store(self.render_generation, self.observed_generation, dirty);
         }
     }
 }
@@ -337,7 +366,7 @@ pub(crate) enum SessionCommand {
     ScrollViewport { command: ViewportCommand, reply: mpsc::Sender<Result<ViewportCommandOutcome, String>> },
     Snapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     RenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
-    PacketRender { full: bool, reply: mpsc::Sender<Result<crate::image_delivery::RenderBundle, String>> },
+    PacketRender { full: bool, reply: mpsc::Sender<Result<Option<crate::image_delivery::RenderBundle>, String>> },
     FullSnapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
     ImageResourceData { image_id: u32, generation: u64, callback: ImageResourceDataCallback, reply: mpsc::Sender<Result<bool, String>> },
     Inspect { has_controller: bool, watcher_count: usize, reply: mpsc::Sender<Result<InspectResult, String>> },
@@ -506,23 +535,34 @@ struct ActorReadiness {
 }
 
 #[cfg(unix)]
-fn wait_actor_ready(pty_child: &PtyChild, command_fd: RawFd) -> Result<ActorReadiness, String> {
+/// Wait for PTY output or a command, or until `timeout` (the presentation
+/// recovery deadline) elapses with neither.
+fn wait_actor_ready(pty_child: &PtyChild, command_fd: RawFd, timeout: Option<Duration>) -> Result<ActorReadiness, String> {
     #[cfg(target_os = "macos")]
     {
-        wait_actor_ready_kqueue(pty_child.master_fd(), command_fd)
+        wait_actor_ready_kqueue(pty_child.master_fd(), command_fd, timeout)
     }
     #[cfg(target_os = "linux")]
     {
-        wait_actor_ready_epoll(pty_child.master_fd(), command_fd)
+        wait_actor_ready_epoll(pty_child.master_fd(), command_fd, timeout)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        wait_actor_ready_poll(pty_child.master_fd(), command_fd)
+        wait_actor_ready_poll(pty_child.master_fd(), command_fd, timeout)
     }
 }
 
+/// Round up so a wait never returns just short of the deadline it serves.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn poll_timeout(timeout: Option<Duration>) -> PollTimeout {
+    timeout.map_or(PollTimeout::NONE, |timeout| {
+        let millis = timeout.as_nanos().div_ceil(1_000_000);
+        PollTimeout::try_from(millis).unwrap_or(PollTimeout::MAX)
+    })
+}
+
 #[cfg(target_os = "macos")]
-fn wait_actor_ready_kqueue(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadiness, String> {
+fn wait_actor_ready_kqueue(pty_fd: RawFd, command_fd: RawFd, timeout: Option<Duration>) -> Result<ActorReadiness, String> {
     const TOKEN_PTY: isize = 1;
     const TOKEN_COMMAND: isize = 2;
 
@@ -533,9 +573,13 @@ fn wait_actor_ready_kqueue(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorRead
     ];
     let mut events = [KEvent::new(0, EventFilter::EVFILT_READ, EvFlags::empty(), FilterFlag::empty(), 0, 0); 2];
     let event_count = loop {
-        match kqueue.kevent(&changes, &mut events, None) {
+        let timeout = timeout
+            .map(|timeout| libc::timespec { tv_sec: timeout.as_secs() as libc::time_t, tv_nsec: timeout.subsec_nanos() as libc::c_long });
+        match kqueue.kevent(&changes, &mut events, timeout) {
             Ok(event_count) => break event_count,
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) if timeout.is_none() => continue,
+            // Let the caller recompute the remaining time to its deadline.
+            Err(Errno::EINTR) => return Ok(ActorReadiness::default()),
             Err(err) => return Err(format!("kqueue actor fds: {err}")),
         }
     };
@@ -558,7 +602,7 @@ fn wait_actor_ready_kqueue(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorRead
 }
 
 #[cfg(target_os = "linux")]
-fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadiness, String> {
+fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd, timeout: Option<Duration>) -> Result<ActorReadiness, String> {
     const TOKEN_PTY: u64 = 1;
     const TOKEN_COMMAND: u64 = 2;
 
@@ -573,9 +617,11 @@ fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadi
 
     let mut events = [EpollEvent::empty(); 2];
     let event_count = loop {
-        match epoll.wait(&mut events, nix::poll::PollTimeout::NONE) {
+        match epoll.wait(&mut events, poll_timeout(timeout)) {
             Ok(event_count) => break event_count,
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) if timeout.is_none() => continue,
+            // Let the caller recompute the remaining time to its deadline.
+            Err(Errno::EINTR) => return Ok(ActorReadiness::default()),
             Err(err) => return Err(format!("epoll actor fds: {err}")),
         }
     };
@@ -594,7 +640,7 @@ fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadi
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn wait_actor_ready_poll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadiness, String> {
+fn wait_actor_ready_poll(pty_fd: RawFd, command_fd: RawFd, timeout: Option<Duration>) -> Result<ActorReadiness, String> {
     let mut fds = [
         PollFd::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(pty_fd) }, PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR),
         PollFd::new(
@@ -603,9 +649,11 @@ fn wait_actor_ready_poll(pty_fd: RawFd, command_fd: RawFd) -> Result<ActorReadin
         ),
     ];
     loop {
-        match poll(&mut fds, PollTimeout::NONE) {
+        match poll(&mut fds, poll_timeout(timeout)) {
             Ok(_) => break,
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) if timeout.is_none() => continue,
+            // Let the caller recompute the remaining time to its deadline.
+            Err(Errno::EINTR) => return Ok(ActorReadiness::default()),
             Err(err) => return Err(format!("poll actor fds: {err}")),
         }
     }
@@ -763,7 +811,9 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::FullSnapshot { reply })
     }
 
-    pub(crate) fn packet_render(&self, full: bool) -> Result<crate::image_delivery::RenderBundle, String> {
+    /// Render for the packet cache; `None` while a synchronized-output batch
+    /// withholds publication (the cache already holds the retained frame).
+    pub(crate) fn packet_render(&self, full: bool) -> Result<Option<crate::image_delivery::RenderBundle>, String> {
         self.request_result(|reply| SessionCommand::PacketRender { full, reply })
     }
 
@@ -890,6 +940,7 @@ struct PumpResult {
 struct SessionActorLoopState {
     images: crate::image_delivery::CaptureImages,
     observation: ObservationState,
+    presentation: PresentationGate,
     exited: bool,
     exit_code: Option<i32>,
     queries_forwarded_to_client: bool,
@@ -977,6 +1028,7 @@ fn session_actor_loop(
     let mut state = SessionActorLoopState {
         images: Default::default(),
         observation: ObservationState::new_with_mirror(rows, Some(mirror)),
+        presentation: PresentationGate::default(),
         exited: false,
         exit_code: None,
         queries_forwarded_to_client: false,
@@ -1000,7 +1052,8 @@ fn session_actor_loop(
         }
         #[cfg(unix)]
         {
-            let readiness = match wait_actor_ready(runtime.pty_child(), command_wake.raw_fd()) {
+            let timeout = state.presentation.deadline().map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let readiness = match wait_actor_ready(runtime.pty_child(), command_wake.raw_fd(), timeout) {
                 Ok(readiness) => readiness,
                 Err(_) => {
                     let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
@@ -1015,6 +1068,8 @@ fn session_actor_loop(
             }
             if readiness.pty_readable {
                 session_actor_pump(&mut runtime, &mut state, &wake);
+            } else if state.presentation.expired(Instant::now()) {
+                reconcile_presentation(&mut runtime, &mut state, &wake);
             }
         }
         #[cfg(not(unix))]
@@ -1135,7 +1190,7 @@ fn session_actor_handle_command(
         }
         SessionCommand::Snapshot { reply } => {
             sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
-            let result = runtime.snapshot(state.observation.dirty()).map(|mut snapshot| {
+            let result = runtime.snapshot(state.observation.pending_dirty()).map(|mut snapshot| {
                 state.observation.annotate_snapshot(&mut snapshot);
                 snapshot
             });
@@ -1143,9 +1198,12 @@ fn session_actor_handle_command(
         }
         SessionCommand::RenderUpdate { reply } => {
             sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
-            let result = runtime.render_update(state.observation.dirty()).map(|mut update| {
-                state.observation.annotate_render_update(&mut update);
-                update
+            let observation = &state.observation;
+            let result = state.presentation.present(|| {
+                runtime.render_update(observation.pending_dirty()).map(|mut update| {
+                    observation.annotate_render_update(&mut update);
+                    update
+                })
             });
             let _ = reply.send(result);
         }
@@ -1155,7 +1213,11 @@ fn session_actor_handle_command(
             }
             sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
             let result = (|| {
-                let mut update = runtime.render_update(if full { DirtyState::Full } else { state.observation.dirty() })?;
+                // The host already holds the retained presentation; send nothing.
+                if state.presentation.withholding() {
+                    return Ok(None);
+                }
+                let mut update = runtime.render_update(if full { DirtyState::Full } else { state.observation.pending_dirty() })?;
                 if full {
                     update.render_generation = state.observation.render_generation;
                     update.dirty = DirtyState::Full;
@@ -1165,9 +1227,10 @@ fn session_actor_handle_command(
                 let images = state.images.capture(&update.image_resources, |id, generation, callback| {
                     runtime.with_image_resource_data(id, generation, callback)
                 })?;
-                Ok(crate::image_delivery::RenderBundle::live(update, images))
+                state.presentation.retain(&update);
+                Ok(Some(crate::image_delivery::RenderBundle::live(update, images)))
             })();
-            if let Ok(bundle) = &result {
+            if let Ok(Some(bundle)) = &result {
                 // The daemon cache owns this captured generation, independently
                 // of when each attachment acknowledges its delivered view.
                 state.observation.mark_observed(bundle.packet.update.render_generation);
@@ -1215,7 +1278,8 @@ fn session_actor_handle_command(
             let _ = reply.send(Ok(runtime.last_pty_output_at()));
         }
         SessionCommand::FlushScreenActivity => {
-            runtime.flush_screen_activity();
+            // A held batch's damage belongs to the frame published after it.
+            runtime.flush_screen_activity(!state.presentation.is_held());
         }
         SessionCommand::FlushRecording { reply } => {
             runtime.flush_recording();
@@ -1337,6 +1401,8 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
             if !result.chunks.is_empty() || state.exited {
                 runtime.flush_recording();
             }
+            // Before marking damage, so output that opens a batch never wakes.
+            reconcile_presentation(runtime, state, wake);
             match result.outcome {
                 PumpOutcome::Clean => {}
                 PumpOutcome::PartialUnknown => mark_partial_unknown_and_wake(&mut state.observation, wake),
@@ -1347,6 +1413,7 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
             }
         }
         Err(_) => {
+            reconcile_presentation(runtime, state, wake);
             let rows = runtime.inspect(false, 0).terminal.rows;
             mark_full_and_wake(&mut state.observation, rows, wake);
         }
@@ -1357,6 +1424,29 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
         }
     }
     sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
+}
+
+/// Follow the engine's synchronized-output mode at the publication boundary.
+/// A batch still open past its deadline, or when the child has exited and can
+/// never finish it, is ended in the engine as Ghostty's own timer does.
+fn reconcile_presentation(runtime: &mut SessionRuntime, state: &mut SessionActorLoopState, wake: &WakeCallback) {
+    let now = Instant::now();
+    let mut synchronized = runtime.synchronized_output_active().unwrap_or(false);
+    if synchronized && (state.exited || state.presentation.expired(now)) {
+        let _ = runtime.end_synchronized_output();
+        synchronized = false;
+    }
+    match state.presentation.reconcile(synchronized, now) {
+        GateTransition::Unchanged => {}
+        GateTransition::Held => {
+            state.observation.set_held(true);
+        }
+        GateTransition::Released => {
+            if state.observation.set_held(false) {
+                wake();
+            }
+        }
+    }
 }
 
 fn publish_raw_output(taps: &mut Vec<SyncSender<RawOutputChunk>>, last_sequence: &mut u64, chunks: &[Arc<[u8]>]) {
@@ -1644,6 +1734,166 @@ mod idle_tests {
         drop(actor);
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(after, before, "exited actor continued polling while idle");
+    }
+}
+
+/// End-to-end synchronized-output publication through a real PTY child.
+#[cfg(all(test, unix, feature = "ghostty-vt"))]
+mod synchronized_output_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    fn spawn(id: &str, command: &str) -> (tempfile::TempDir, SessionActor, Arc<AtomicUsize>) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        let (id, command) = (id.to_string(), command.to_string());
+        let actor = SessionActor::spawn(
+            3,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            move || {
+                let session = crate::runtime::SessionMetadata {
+                    id,
+                    vt_engine: vt::VtEngineKind::Ghostty,
+                    cwd: None,
+                    cmd: Some(command),
+                    tags: vec![],
+                    environment: vec![],
+                    record: false,
+                    initial_size: Default::default(),
+                    colors: Default::default(),
+                };
+                SessionRuntime::spawn(dir, &session, vt::make_default_vt_engine(20, 3))
+            },
+        )
+        .unwrap();
+        (temp, actor, wakes)
+    }
+
+    fn wait_until(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn render(actor: &SessionActor) -> TerminalRenderUpdate {
+        actor.request_result(|reply| SessionCommand::RenderUpdate { reply }).unwrap()
+    }
+
+    fn observe(actor: &SessionActor, update: &TerminalRenderUpdate) {
+        let generation = update.render_generation;
+        assert!(actor.request(|reply| SessionCommand::MarkObserved { generation, reply }, false));
+    }
+
+    fn text(update: &TerminalRenderUpdate) -> String {
+        update
+            .ops
+            .iter()
+            .flat_map(|op| &op.rows)
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| cell.graphemes.iter().copied())
+            .filter_map(char::from_u32)
+            .collect()
+    }
+
+    /// Render and observe until `ready` holds, as a polling host does.
+    fn present_until(actor: &SessionActor, what: &str, ready: impl Fn(&TerminalRenderUpdate) -> bool) -> TerminalRenderUpdate {
+        let mut seen = None;
+        wait_until(what, Duration::from_secs(10), || {
+            if actor.observation().dirty() == DirtyState::Clean && seen.is_some() {
+                return false;
+            }
+            let update = render(actor);
+            observe(actor, &update);
+            let done = ready(&update);
+            seen = Some(update);
+            done
+        });
+        seen.unwrap()
+    }
+
+    #[test]
+    fn batch_split_across_reads_publishes_only_completed_frames() {
+        let (_temp, actor, wakes) = spawn(
+            "sync-split",
+            r"printf 'prompt> \033[?25h'; sleep 0.3; printf '\033[?2026h\033[?25lMID'; sleep 0.8; printf '\033[?25h\033[?2026l'; sleep 10",
+        );
+        let first = present_until(&actor, "initial prompt", |update| text(update).contains("prompt>") && update.cursor.visible);
+        wait_until("mid-batch output parsed", Duration::from_secs(10), || actor.capture_text().unwrap().contains("MID"));
+        let wakes_mid_batch = wakes.load(Ordering::SeqCst);
+
+        // Parsed but not published: pollers see nothing new, and a render
+        // serves the retained frame without acknowledging pending damage.
+        assert_eq!(actor.observation().dirty(), DirtyState::Clean);
+        let held = render(&actor);
+        assert!(held.cursor.visible, "published the batch's hidden cursor");
+        assert!(held.ops.is_empty());
+        assert_eq!(held.render_generation, first.render_generation, "a withheld frame is not a new presentation");
+        observe(&actor, &held);
+        assert!(actor.packet_render(false).unwrap().is_none(), "packet path published mid-batch");
+        assert_eq!(actor.observation().dirty(), DirtyState::Clean);
+        assert_eq!(wakes.load(Ordering::SeqCst), wakes_mid_batch, "woke the host for a withheld frame");
+
+        // The batch ends: one wake, and the completed frame carries the
+        // damage withheld earlier.
+        wait_until("wake at batch end", Duration::from_secs(10), || actor.observation().dirty() != DirtyState::Clean);
+        assert!(wakes.load(Ordering::SeqCst) > wakes_mid_batch);
+        let completed = render(&actor);
+        assert!(completed.cursor.visible);
+        assert!(text(&completed).contains("MID"), "completed frame lost mid-batch damage: {:?}", text(&completed));
+        assert!(completed.render_generation > held.render_generation);
+        observe(&actor, &completed);
+    }
+
+    #[test]
+    fn packet_render_withholds_mid_batch_and_resumes_after() {
+        let (_temp, actor, _wakes) =
+            spawn("sync-packet", r"printf 'ready'; sleep 0.3; printf '\033[?2026h\033[?25lMID'; sleep 0.8; printf '\033[?2026l'; sleep 10");
+        wait_until("initial output", Duration::from_secs(10), || actor.capture_text().unwrap().contains("ready"));
+        let initial = actor.packet_render(true).unwrap().expect("first frame is rendered");
+        wait_until("mid-batch output parsed", Duration::from_secs(10), || actor.capture_text().unwrap().contains("MID"));
+        assert!(actor.packet_render(false).unwrap().is_none());
+        assert!(actor.packet_render(true).unwrap().is_none(), "full render must use the host's retained frame");
+        wait_until("batch end", Duration::from_secs(10), || actor.observation().dirty() != DirtyState::Clean);
+        let completed = actor.packet_render(false).unwrap().expect("completed frame is published");
+        assert!(completed.packet.update.render_generation > initial.packet.update.render_generation);
+        assert!(!completed.packet.update.cursor.visible, "the program left its cursor hidden");
+    }
+
+    #[test]
+    fn abandoned_batch_is_published_at_the_deadline_without_further_output() {
+        let (_temp, actor, wakes) =
+            spawn("sync-abandoned", r"printf 'ready\033[?25h'; sleep 0.3; printf '\033[?2026h\033[?25lstuck'; sleep 10");
+        present_until(&actor, "initial frame", |update| text(update).contains("ready"));
+        wait_until("batch output parsed", Duration::from_secs(10), || actor.capture_text().unwrap().contains("stuck"));
+        let parsed_at = Instant::now();
+        let wakes_before = wakes.load(Ordering::SeqCst);
+        assert_eq!(actor.observation().dirty(), DirtyState::Clean);
+
+        wait_until("deadline wake", Duration::from_secs(5), || wakes.load(Ordering::SeqCst) > wakes_before);
+        let waited = parsed_at.elapsed();
+        assert!(waited >= Duration::from_millis(900), "released before the deadline: {waited:?}");
+        assert_ne!(actor.observation().dirty(), DirtyState::Clean);
+        let update = render(&actor);
+        assert!(text(&update).contains("stuck"));
+        assert!(!update.cursor.visible, "the abandoned batch's own state is shown");
+    }
+
+    #[test]
+    fn exit_mid_batch_publishes_final_state() {
+        let (_temp, actor, _wakes) = spawn("sync-exit", r"printf 'ready'; sleep 0.3; printf '\033[?2026h\033[?25lgone'; sleep 0.2; exit 0");
+        present_until(&actor, "initial frame", |update| text(update).contains("ready"));
+        wait_until("exit", Duration::from_secs(10), || actor.observation().exit_code().is_some());
+        let started = Instant::now();
+        let update = present_until(&actor, "final frame", |update| text(update).contains("gone"));
+        assert!(started.elapsed() < Duration::from_millis(900), "exit waited for the deadline");
+        assert!(!update.cursor.visible);
     }
 }
 

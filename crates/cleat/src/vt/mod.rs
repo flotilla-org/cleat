@@ -374,6 +374,17 @@ pub trait VtEngine {
     fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
         Ok(TerminalModeState::default())
     }
+    /// Whether the program is inside a synchronized-output batch (DEC mode
+    /// 2026). Parsing and query replies continue during a batch; presentation
+    /// publishing is deferred by the host, not by the engine.
+    fn synchronized_output_active(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+    /// Force the synchronized-output mode off, as a terminal does when a batch
+    /// is abandoned past its recovery deadline.
+    fn end_synchronized_output(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     fn set_attachment_view(&mut self, _id: u128, _command: ViewportCommand) -> Result<bool, String> {
         Err("independent history is unsupported by this VT engine".into())
     }

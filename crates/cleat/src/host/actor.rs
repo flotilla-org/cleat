@@ -984,39 +984,54 @@ fn session_actor_loop(
         last_raw_output_sequence: 0,
     };
     let _ = ready.send(Ok(runtime.screen_activity_tracker()));
-    #[cfg(unix)]
     loop {
-        let readiness = match wait_actor_ready(runtime.pty_child(), command_wake.raw_fd()) {
-            Ok(readiness) => readiness,
-            Err(_) => {
-                let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
-                break;
-            }
-        };
-        if readiness.command_readable {
+        // Exit has been reaped and final output drained. EOF remains readable
+        // forever, so monitoring the PTY here would turn an idle retained
+        // terminal into a busy loop. Keep its state available for commands,
+        // but do no background work until one arrives.
+        if state.exited {
+            let Ok(command) = rx.recv() else { break };
+            #[cfg(unix)]
             command_wake.drain();
-            if drain_session_commands(&rx, &mut runtime, &mut state, &wake) {
+            if session_actor_handle_command(command, &mut runtime, &mut state, &wake) {
                 break;
             }
+            continue;
         }
-        if readiness.pty_readable {
-            session_actor_pump(&mut runtime, &mut state, &wake);
-        }
-    }
-    #[cfg(not(unix))]
-    loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-            Ok(command) => {
-                if session_actor_handle_command(command, &mut runtime, &mut state, &wake) {
+        #[cfg(unix)]
+        {
+            let readiness = match wait_actor_ready(runtime.pty_child(), command_wake.raw_fd()) {
+                Ok(readiness) => readiness,
+                Err(_) => {
+                    let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
+                    break;
+                }
+            };
+            if readiness.command_readable {
+                command_wake.drain();
+                if drain_session_commands(&rx, &mut runtime, &mut state, &wake) {
                     break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            if readiness.pty_readable {
                 session_actor_pump(&mut runtime, &mut state, &wake);
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
-                break;
+        }
+        #[cfg(not(unix))]
+        {
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(command) => {
+                    if session_actor_handle_command(command, &mut runtime, &mut state, &wake) {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    session_actor_pump(&mut runtime, &mut state, &wake);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
+                    break;
+                }
             }
         }
     }
@@ -1530,6 +1545,106 @@ fn pixel_coordinate(value: f32) -> u32 {
 fn legacy_mouse_byte(value: u16) -> Option<u8> {
     let encoded = value.checked_add(32)?;
     u8::try_from(encoded).ok()
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod idle_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::vt::{ClientCapabilities, ScreenGrid, VtEngine};
+
+    struct ObservedEngine {
+        inner: Box<dyn VtEngine>,
+        polls: Arc<AtomicU64>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for ObservedEngine {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    impl VtEngine for ObservedEngine {
+        fn feed(&mut self, b: &[u8]) -> Result<(), String> {
+            self.inner.feed(b)
+        }
+        fn resize(&mut self, c: u16, r: u16) -> Result<(), String> {
+            self.inner.resize(c, r)
+        }
+        fn supports_replay(&self) -> bool {
+            self.inner.supports_replay()
+        }
+        fn replay_payload(&self, c: &ClientCapabilities) -> Result<Option<Vec<u8>>, String> {
+            self.inner.replay_payload(c)
+        }
+        fn screen_text(&self) -> Result<String, String> {
+            self.inner.screen_text()
+        }
+        fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
+            self.inner.screen_grid()
+        }
+        fn size(&self) -> (u16, u16) {
+            self.inner.size()
+        }
+        fn terminal_mode_state(&self) -> Result<vt::TerminalModeState, String> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.inner.terminal_mode_state()
+        }
+    }
+
+    #[test]
+    fn exited_session_is_idle_but_final_output_remains_queryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let polls = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let engine_polls = polls.clone();
+        let engine_dropped = dropped.clone();
+        #[cfg(unix)]
+        let command = "printf final-output; exit 7";
+        #[cfg(windows)]
+        let command = "echo final-output & exit /b 7";
+        let actor = SessionActor::spawn(24, Arc::new(|| {}), move || {
+            let session = crate::runtime::SessionMetadata {
+                id: "exited-idle".into(),
+                vt_engine: vt::default_vt_engine_kind(),
+                cwd: None,
+                cmd: Some(command.into()),
+                tags: vec![],
+                environment: vec![],
+                record: false,
+                initial_size: Default::default(),
+                colors: Default::default(),
+            };
+            SessionRuntime::spawn(
+                dir,
+                &session,
+                Box::new(ObservedEngine { inner: vt::make_default_vt_engine(80, 24), polls: engine_polls, dropped: engine_dropped }),
+            )
+        })
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while actor.observation().exit_code().is_none() {
+            assert!(Instant::now() < deadline, "child did not exit");
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(actor.observation().exit_code(), Some(7));
+        actor.inspect(false, 0).unwrap();
+        #[cfg(feature = "ghostty-vt")]
+        assert!(actor.capture_text().unwrap().contains("final-output"));
+        // Let the command's final pump complete, then observe an idle interval.
+        thread::sleep(std::time::Duration::from_millis(30));
+        let before = polls.load(Ordering::SeqCst);
+        thread::sleep(std::time::Duration::from_millis(100));
+        let after = polls.load(Ordering::SeqCst);
+        // Still serve commands after parking and release the engine on close.
+        actor.inspect(false, 0).unwrap();
+        #[cfg(feature = "ghostty-vt")]
+        assert!(actor.capture_text().unwrap().contains("final-output"));
+        drop(actor);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(after, before, "exited actor continued polling while idle");
+    }
 }
 
 #[cfg(test)]

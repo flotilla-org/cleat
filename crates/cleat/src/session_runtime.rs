@@ -36,6 +36,7 @@ const PTY_READ_BUDGET_PER_PUMP: usize = 2 * PTY_READ_BUFFER_SIZE;
 pub(crate) struct SessionRuntime {
     session: SessionMetadata,
     session_dir: PathBuf,
+    hosting_epoch: u64,
     pty_child: PtyChild,
     vt_engine: Box<dyn VtEngine>,
     detached_da: Option<DeviceAttributeTracker>,
@@ -87,6 +88,7 @@ impl SessionRuntime {
         // a recording from a prior activation, replay it into the fresh engine so
         // its history returns as scrollback above the freshly-invoked command.
         // Detection is by cast presence — a brand-new session has an empty dir.
+        crate::runtime::ensure_hosting_epoch(&session_dir)?;
         let cast_path = session_dir.join(crate::recording::CAST_FILE_NAME);
         let recreating = crate::recreate::session_is_recreatable(&session_dir);
         if recreating {
@@ -127,7 +129,9 @@ impl SessionRuntime {
             None
         };
 
+        let hosting_epoch = crate::runtime::hosting_epoch(&session_dir)?;
         let mut runtime = Self {
+            hosting_epoch,
             session: session.clone(),
             session_dir,
             pty_child,
@@ -430,6 +434,15 @@ impl SessionRuntime {
 
         let activity = self.screen_activity.json_snapshot(Instant::now());
         InspectResult {
+            generation: self
+                .session_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.rsplit_once('@'))
+                .and_then(|(_, n)| n.parse().ok()),
+            hosting_epoch: self.hosting_epoch,
             session: crate::protocol::SessionInspect {
                 id: self.session.id.clone(),
                 state: "running".to_string(),

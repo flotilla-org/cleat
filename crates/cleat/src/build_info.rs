@@ -67,6 +67,8 @@ pub fn version() -> &'static str {
 #[derive(Debug, Deserialize)]
 pub(crate) struct DaemonBuildStatus {
     #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
     pub build: Option<BuildInfo>,
 }
 

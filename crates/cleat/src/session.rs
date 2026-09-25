@@ -1895,7 +1895,8 @@ fn flush_watchers(watchers: &mut Vec<ActiveClient>) {
 
 #[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> {
-    let layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(daemon_name.to_string())?;
+    let layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(daemon_name.to_string())?.prepare_generation()?;
+    let daemon_name = layout.daemon_name();
     let socket_path = layout.socket_path();
     validate_session_socket_path(&socket_path)?;
     layout.ensure_daemon_dirs()?;
@@ -1916,6 +1917,12 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     set_listener_nonblocking(&listener, true)?;
     let daemon_pid = std::process::id().to_string();
     fs::write(layout.daemon_pid_path(), &daemon_pid).map_err(|err| format!("write daemon pid: {err}"))?;
+
+    fs::write(
+        layout.daemon_dir().join("build.json"),
+        serde_json::to_vec(&crate::build_info::BuildInfo::current()).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write daemon build identity: {e}"))?;
 
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
@@ -2089,7 +2096,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     }
 
     let _ = fs::remove_file(&socket_path);
-    let _ = fs::remove_file(layout.daemon_pid_path());
+    // Retain the registration so the next auto-start advances the generation.
     Ok(())
 }
 
@@ -2833,7 +2840,7 @@ impl PendingHttpHandshake {
 
 fn handle_http_request(
     _root: &Path,
-    daemon_id: &str,
+    _daemon_id: &str,
     stream: &mut SessionStream,
     request: http_uds::HttpRequest,
     state: &mut HttpRequestState<'_>,
@@ -2845,8 +2852,9 @@ fn handle_http_request(
             StatusCode::OK,
             &serde_json::json!({
                 "service": "cleat-session",
+                "generation": state.layout.generation(),
                 "build": crate::build_info::BuildInfo::current(),
-                "session": daemon_id,
+                "session": state.layout.logical_name(),
                 "ok": true,
             }),
         )
@@ -4676,6 +4684,15 @@ fn wait_for_socket(path: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String> {
+    if layout.daemon_name().contains('@') && !is_session_daemon_alive(layout.root(), layout.daemon_name()) {
+        return Err(format!(
+            "daemon generation {} is dead; recreate the session through --server {}",
+            layout.daemon_name(),
+            layout.logical_name()
+        ));
+    }
+    let prepared = layout.prepare_generation()?;
+    let layout = &prepared;
     validate_session_socket_path(&layout.socket_path())?;
     if try_connect_session_stream(&layout.socket_path()).is_ok() && is_session_daemon_alive(layout.root(), layout.daemon_name()) {
         return Ok(());

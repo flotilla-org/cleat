@@ -15,7 +15,7 @@ use crate::{
         ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
     protocol::{AttachmentIdentity, SessionInfo, SessionStatus},
-    runtime::{discoverable_runtime_roots, validate_runtime_name, DaemonCoordinates, RuntimeLayout, TerminalSize},
+    runtime::{discoverable_runtime_roots, validate_daemon_name, validate_runtime_name, DaemonCoordinates, RuntimeLayout, TerminalSize},
     session::{
         attach_foreground, attach_packet_foreground, ensure_session_started, run_session_daemon, start_session_in_running_daemon,
         watch_foreground, ForegroundAttach, SessionStartOptions,
@@ -81,6 +81,10 @@ pub struct AttachOptions {
 
 impl DaemonInstance {
     pub fn name(&self) -> &str {
+        self.name.split('@').next().unwrap_or(&self.name)
+    }
+
+    pub fn address(&self) -> &str {
         &self.name
     }
 }
@@ -104,12 +108,79 @@ impl SessionService {
         Ok(Self::new(self.layout.clone().with_daemon(daemon_name)?))
     }
 
+    /// Resolve an id through the logical alias. Prefer live claims; retain dead
+    /// recordings as recreatable husks when no live generation claims the id.
+    pub fn for_session(&self, id: &str) -> Result<Self, String> {
+        if self.layout.daemon_name().contains('@') {
+            return Ok(self.clone());
+        }
+        let names: Vec<_> = self
+            .layout
+            .generation_names()?
+            .into_iter()
+            .filter(|name| self.with_daemon(name.clone()).is_ok_and(|candidate| candidate.session_dir(id).is_dir()))
+            .collect();
+        // A single candidate needs no connection probe (and existing-only attach
+        // must leave its first HTTP response untouched).
+        if names.len() <= 1 {
+            return names.first().map_or_else(|| Ok(self.clone()), |name| self.with_daemon(name.clone()));
+        }
+        let mut live = Vec::new();
+        let mut husks = Vec::new();
+        for name in names {
+            let candidate = self.with_daemon(name.clone())?;
+            if daemon_control_is_unavailable(&candidate.layout) {
+                husks.push(name);
+                continue;
+            }
+            let directory: http_uds::SessionListResponse = candidate.http_json_daemon(Method::GET, "/sessions", &())?;
+            if directory.sessions.iter().any(|session| session.session.id == id) {
+                live.push(name);
+            } else {
+                husks.push(name);
+            }
+        }
+        let candidates = if live.is_empty() { husks } else { live };
+        match candidates.as_slice() {
+            [] => Ok(self.clone()),
+            [name] => self.with_daemon(name.clone()),
+            _ => Err(format!(
+                "session {id} exists in multiple daemons ({}); use --server to select the target daemon instead",
+                candidates.join(", ")
+            )),
+        }
+    }
+
+    /// Recreate a dead generation's retained session on the current generation.
+    /// Live sessions still resolve to their existing host; explicit addresses
+    /// remain pinned and cannot silently change generations.
+    pub fn for_recreation(&self, id: &str) -> Result<Self, String> {
+        let source = self.for_session(id)?;
+        if self.layout.daemon_name().contains('@') || !source.session_dir(id).is_dir() || !daemon_control_is_unavailable(&source.layout) {
+            return Ok(source);
+        }
+        let target = Self::new(self.layout.prepare_generation()?);
+        let source_dir = source.session_dir(id);
+        let target_dir = target.session_dir(id);
+        if source_dir != target_dir && source_dir.exists() {
+            if target_dir.exists() {
+                return Err(format!("session {id} exists in multiple daemons; use --server to select the target daemon instead"));
+            }
+            std::fs::rename(&source_dir, &target_dir).map_err(|e| format!("adopt retained session {id} for recreation: {e}"))?;
+        }
+        Ok(target)
+    }
+
     pub fn layout_root(&self) -> &std::path::Path {
         self.layout.root()
     }
 
     /// Query only the running daemon, without starting one or negotiating packets.
     pub fn daemon_build_info(&self) -> Result<Option<crate::build_info::BuildInfo>, String> {
+        Ok(self.daemon_build_status()?.build)
+    }
+
+    pub(crate) fn daemon_build_status(&self) -> Result<crate::build_info::DaemonBuildStatus, String> {
         let path = self.layout.socket_path();
         let mut stream = try_connect_session_stream(&path).map_err(|err| format!("connect {}: {err}", path.display()))?;
         set_stream_read_timeout(&stream, Some(Duration::from_secs(2)))?;
@@ -120,7 +191,7 @@ impl SessionService {
         }
         let status: crate::build_info::DaemonBuildStatus =
             serde_json::from_slice(&response.body).map_err(|err| format!("parse daemon build status: {err}"))?;
-        Ok(status.build)
+        Ok(status)
     }
 
     pub fn discover_daemons(&self) -> Vec<DaemonCoordinates> {
@@ -136,16 +207,28 @@ impl SessionService {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_dir() || !path.join("sessions").is_dir() {
+                if path.is_symlink() || !path.is_dir() || !path.join("sessions").is_dir() {
                     continue;
                 }
                 let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                     continue;
                 };
-                if validate_runtime_name(name).is_err() {
+                if validate_daemon_name(name).is_err() {
                     continue;
                 }
-                daemons.push(DaemonCoordinates { name: name.to_string(), runtime_root: root.clone() });
+                let layout = RuntimeLayout::new(root.clone()).with_daemon(name.to_string()).expect("validated daemon");
+                let service = Self::new(layout.clone());
+                let status = service.daemon_build_info();
+                daemons.push(DaemonCoordinates {
+                    name: name.to_string(),
+                    runtime_root: root.clone(),
+                    generation: layout.generation(),
+                    alive: status.is_ok(),
+                    drain_state: "serving".to_string(),
+                    build: status.ok().flatten().or_else(|| {
+                        std::fs::read(layout.daemon_dir().join("build.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    }),
+                });
             }
         }
         daemons.sort_by(|left, right| left.runtime_root.cmp(&right.runtime_root).then_with(|| left.name.cmp(&right.name)));
@@ -207,10 +290,14 @@ impl SessionService {
         cmd: Option<String>,
         options: SessionStartOptions,
     ) -> Result<SessionInfo, String> {
-        if self.layout.daemon_name() != daemon.name {
+        if self.layout.logical_name() != daemon.name() {
             return Err(format!("daemon instance {} does not match target {}", daemon.name, self.layout.daemon_name()));
         }
-        let session = start_session_in_running_daemon(&self.layout, daemon.pid, name, vt_engine, cwd, cmd, options)?;
+        let layout = self.layout.resolved()?;
+        if layout.daemon_name() != daemon.address() {
+            return Err("source daemon instance changed".into());
+        }
+        let session = start_session_in_running_daemon(&layout, daemon.pid, name, vt_engine, cwd, cmd, options)?;
         Ok(self.session_info_after_create(session))
     }
 
@@ -260,8 +347,11 @@ impl SessionService {
             if !daemon_service.session_dir(id).is_dir() {
                 continue;
             }
+            if daemon_control_is_unavailable(&daemon_service.layout) {
+                continue;
+            }
             let pid_before = daemon_service.registered_daemon_pid();
-            match daemon_service.inspect(id) {
+            match daemon_service.http_json::<_, crate::protocol::InspectResult>(id, Method::GET, &format!("/sessions/{id}"), &()) {
                 Ok(_) => match (pid_before, daemon_service.registered_daemon_pid()) {
                     (Ok(before), Ok(after)) if before == after => owners.push(DaemonInstance { name: daemon_name, pid: after }),
                     (Ok(_), Ok(_)) => candidate_errors.push(format!("{daemon_name}: daemon changed while resolving session")),
@@ -304,13 +394,7 @@ impl SessionService {
 
     fn daemon_names(&self, scope: ListScope) -> Result<Vec<String>, String> {
         match scope {
-            ListScope::Current => {
-                if self.layout.sessions_dir().is_dir() {
-                    Ok(vec![self.layout.daemon_name().to_string()])
-                } else {
-                    Ok(vec![])
-                }
-            }
+            ListScope::Current => self.layout.generation_names(),
             ListScope::All => {
                 let entries = std::fs::read_dir(self.layout.root())
                     .map_err(|err| format!("read runtime root {}: {err}", self.layout.root().display()))?;
@@ -318,10 +402,10 @@ impl SessionService {
                 for entry in entries {
                     let entry = entry.map_err(|err| format!("read runtime entry: {err}"))?;
                     let path = entry.path();
-                    if !path.is_dir() || !path.join("sessions").is_dir() {
+                    if path.is_symlink() || !path.is_dir() || !path.join("sessions").is_dir() {
                         continue;
                     }
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()).filter(|name| validate_daemon_name(name).is_ok()) {
                         names.push(name.to_string());
                     }
                 }
@@ -334,6 +418,11 @@ impl SessionService {
     fn list_one_daemon_with_selectors(&self, selectors: &[String]) -> Result<Vec<SessionInfo>, String> {
         if !self.layout.sessions_dir().is_dir() {
             return Ok(vec![]);
+        }
+        if self.layout.generation().is_some() && !is_session_daemon_alive(self.layout.root(), self.layout.daemon_name()) {
+            let mut sessions = sweep_dead_daemon_sessions(&self.layout, "daemon generation is dead; session is recreatable".into())?;
+            sessions.retain(|session| session_matches_selectors(session, selectors));
+            return Ok(sessions);
         }
         crate::session::ensure_daemon_started(&self.layout)?;
 
@@ -961,7 +1050,9 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
         });
     }
     remove_stale_daemon_file(layout.socket_path(), "socket")?;
-    remove_stale_daemon_file(layout.daemon_pid_path(), "pid")?;
+    if layout.generation().is_none() {
+        remove_stale_daemon_file(layout.daemon_pid_path(), "pid")?;
+    }
     Ok(sessions)
 }
 

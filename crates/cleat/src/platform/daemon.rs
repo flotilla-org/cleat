@@ -18,7 +18,10 @@ use crate::platform::process;
 const PID_NAME: &str = "daemon.pid";
 
 pub fn daemon_pid_path(root: &Path, daemon_name: &str) -> PathBuf {
-    root.join(daemon_name).join(PID_NAME)
+    crate::runtime::RuntimeLayout::new(root.to_path_buf())
+        .with_daemon(daemon_name.to_string())
+        .map(|layout| layout.daemon_dir().join(PID_NAME))
+        .unwrap_or_else(|_| root.join(daemon_name).join(PID_NAME))
 }
 
 pub fn spawn_daemon_process(root: &Path, daemon_name: &str) -> Result<(), String> {
@@ -77,7 +80,9 @@ fn is_expected_cleat_process(pid: i32) -> bool {
     let mut sys = System::new();
     let sysinfo_pid = Pid::from(pid as usize);
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sysinfo_pid]), true, ProcessRefreshKind::nothing());
-    sys.process(sysinfo_pid).map(|process| process.name().to_string_lossy().contains("cleat")).unwrap_or(false)
+    sys.process(sysinfo_pid)
+        .map(|process| process.name().to_string_lossy().contains("cleat") && process.status() != sysinfo::ProcessStatus::Zombie)
+        .unwrap_or(false)
 }
 
 pub fn resolve_cleat_executable() -> Result<PathBuf, String> {

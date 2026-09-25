@@ -768,8 +768,8 @@ fn daemons_lists_ambient_and_well_known_roots_best_effort() {
     assert_eq!(
         daemons,
         serde_json::json!([
-            {"name": "ambient-daemon", "runtime_root": ambient_root},
-            {"name": "well-known", "runtime_root": well_known_root},
+            {"name": "ambient-daemon", "runtime_root": ambient_root, "generation": null, "alive": false, "drain_state": "serving", "build": null},
+            {"name": "well-known", "runtime_root": well_known_root, "generation": null, "alive": false, "drain_state": "serving", "build": null},
         ])
     );
 }

@@ -97,6 +97,10 @@ pub enum SessionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResult {
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default = "default_hosting_epoch")]
+    pub hosting_epoch: u64,
     pub session: SessionInspect,
     pub terminal: TerminalInspect,
     pub process: ProcessInspect,
@@ -340,6 +344,10 @@ fn decode_size_frame(payload: Vec<u8>) -> std::io::Result<(u16, u16)> {
     let cols = u16::from_le_bytes([payload[0], payload[1]]);
     let rows = u16::from_le_bytes([payload[2], payload[3]]);
     Ok((cols, rows))
+}
+
+fn default_hosting_epoch() -> u64 {
+    1
 }
 
 #[cfg(test)]

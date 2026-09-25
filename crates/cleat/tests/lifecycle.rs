@@ -803,7 +803,7 @@ fn bare_list_targets_ambient_daemon_and_explicit_server_wins() {
 }
 
 #[test]
-fn read_verbs_auto_start_an_absent_daemon() {
+fn read_verbs_do_not_revive_dead_generations() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     for (verb, args) in [
         ("list", vec!["cleat", "list", "--json"]),
@@ -821,11 +821,18 @@ fn read_verbs_auto_start_an_absent_daemon() {
         let command = Cli::try_parse_from(args).unwrap_or_else(|err| panic!("parse {verb}: {err}"));
         let result = cli::execute(command, &service);
 
-        assert!(session_socket_path(temp.path(), "alpha").exists(), "{verb} should restart the daemon");
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        assert_eq!(layout.generation(), Some(1), "{verb} must retain the dead generation");
+        assert!(!cleat::platform::daemon::is_session_daemon_alive(temp.path(), DEFAULT_DAEMON_NAME));
+        assert!(layout.session_dir("alpha").join("session.cast").exists(), "retained recording remains recreatable");
         if verb == "list" {
-            result.expect("execute list");
+            let output = result.expect("execute list").expect("list output");
+            let sessions: Vec<SessionInfo> = serde_json::from_str(&output).expect("session list");
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, "alpha");
+            assert!(sessions[0].error.as_deref().unwrap().contains("recreatable"));
         } else {
-            assert_eq!(result.expect_err(&format!("execute {verb}")), "not found");
+            assert!(result.expect_err(&format!("execute {verb}")).contains("generation default@1 is dead"));
         }
         cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
     }

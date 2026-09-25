@@ -1,10 +1,11 @@
 use clap::CommandFactory;
+#[cfg(unix)]
+use cleat::session::session_socket_path;
 use cleat::{
     cli::{self, execute, resolve_daemon_target, AttachmentFlags, Cli, Command, ExecResult, RecordFlags},
     protocol::AttachmentKind,
     runtime::{RuntimeLayout, TerminalSize},
     server::SessionService,
-    session::session_socket_path,
     vt::{self, VtEngineKind},
 };
 

@@ -388,8 +388,7 @@ fn child_environment_block(session: &SessionMetadata, coordinates: Option<&Ambie
     if let Some(coordinates) = coordinates {
         variables.extend(coordinates.child_environment().map(|(name, value)| (OsString::from(name), value.to_os_string())));
     }
-    variables
-        .sort_by(|(left, _), (right, _)| left.to_string_lossy().to_ascii_lowercase().cmp(&right.to_string_lossy().to_ascii_lowercase()));
+    variables.sort_by_key(|(name, _)| name.to_string_lossy().to_ascii_lowercase());
 
     let mut block = Vec::new();
     for (key, value) in variables {
@@ -429,18 +428,18 @@ fn quote_windows_arg(arg: &str) -> String {
         match ch {
             '\\' => backslashes += 1,
             '"' => {
-                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
                 quoted.push('"');
                 backslashes = 0;
             }
             _ => {
-                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
                 quoted.push(ch);
                 backslashes = 0;
             }
         }
     }
-    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
     quoted.push('"');
     quoted
 }

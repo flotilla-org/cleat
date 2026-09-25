@@ -1,7 +1,9 @@
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::{
     io,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+};
+use std::{
     sync::{
         atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering as AtomicOrdering},
         mpsc,
@@ -27,8 +29,9 @@ use nix::{
 };
 
 use super::presentation::{GateTransition, PresentationGate};
+#[cfg(unix)]
+use crate::platform::pty::PtyChild;
 use crate::{
-    platform::pty::PtyChild,
     protocol::{InspectResult, SignalTarget},
     provider::{
         DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
@@ -1092,6 +1095,7 @@ fn session_actor_loop(
     }
 }
 
+#[cfg(unix)]
 fn drain_session_commands(
     rx: &mpsc::Receiver<SessionCommand>,
     runtime: &mut SessionRuntime,

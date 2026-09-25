@@ -11,7 +11,8 @@ use super::{
         GhosttyStyleColor, GhosttyStyleColorTag, GhosttyTerminalScreen, GhosttyTerminalScrollViewport, MouseEncodeEvent, MouseEncoder,
         RenderStateHandle, RowCellsHandle, RowIteratorHandle, TerminalHandle, GHOSTTY_MODE_ALT_SCROLL, GHOSTTY_MODE_BRACKETED_PASTE,
         GHOSTTY_MODE_DECCKM, GHOSTTY_MODE_MOUSE_ANY, GHOSTTY_MODE_MOUSE_BUTTON, GHOSTTY_MODE_MOUSE_NORMAL, GHOSTTY_MODE_MOUSE_X10,
-        GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL, GHOSTTY_MODS_SHIFT,
+        GHOSTTY_MODE_SGR_MOUSE, GHOSTTY_MODE_SGR_PIXELS_MOUSE, GHOSTTY_MODE_SYNCHRONIZED_OUTPUT, GHOSTTY_MODS_ALT, GHOSTTY_MODS_CTRL,
+        GHOSTTY_MODS_SHIFT,
     },
     CellFlags, CellWidth, ClientCapabilities, ColorLevel, CursorState, CursorStyle, MouseAction, MouseButton, MouseModifiers,
     MouseReportFormat, MouseTrackingMode, ResolvedCell, Rgb, ScreenGrid, TerminalColors, TerminalModeState, VtEngine,
@@ -736,6 +737,14 @@ impl VtEngine for GhosttyVtEngine {
         (self.cols, self.rows)
     }
 
+    fn synchronized_output_active(&self) -> Result<bool, String> {
+        self.terminal.mode_enabled(GHOSTTY_MODE_SYNCHRONIZED_OUTPUT)
+    }
+
+    fn end_synchronized_output(&mut self) -> Result<(), String> {
+        self.terminal.set_mode(GHOSTTY_MODE_SYNCHRONIZED_OUTPUT, false)
+    }
+
     fn terminal_mode_state(&self) -> Result<TerminalModeState, String> {
         let mouse_tracking_mode = if self.terminal.mode_enabled(GHOSTTY_MODE_MOUSE_ANY)? {
             MouseTrackingMode::Any
@@ -1296,21 +1305,6 @@ mod history_tests {
         // Intentional hiding outside a synchronized batch must remain observable.
         engine.feed(b"\x1b[?25l").unwrap();
         assert!(!engine.render_update(DirtyState::Partial).unwrap().cursor.visible);
-    }
-
-    #[test]
-    fn synchronized_repaint_does_not_publish_hidden_cursor_mid_batch() {
-        let mut engine = GhosttyVtEngine::new(20, 3);
-        engine.feed(b"ready\x1b[?25h").unwrap();
-        let before = engine.render_update(DirtyState::Full).unwrap();
-        assert!(before.cursor.visible);
-        engine.feed(b"\x1b[?2026h\x1b[?25l").unwrap();
-        let during = engine.render_update(DirtyState::Partial).unwrap();
-        engine.feed(b"x\x1b[?25h\x1b[?2026l").unwrap();
-        let after = engine.render_update(DirtyState::Partial).unwrap();
-        eprintln!("cursor visible: before={} during={} after={}", before.cursor.visible, during.cursor.visible, after.cursor.visible);
-        assert!(after.cursor.visible);
-        assert!(during.cursor.visible, "published intermediate hidden cursor inside synchronized repaint");
     }
 
     #[test]

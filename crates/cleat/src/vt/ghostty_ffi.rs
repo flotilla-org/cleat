@@ -138,6 +138,7 @@ pub const GHOSTTY_MODE_SGR_MOUSE: GhosttyMode = 1006;
 pub const GHOSTTY_MODE_ALT_SCROLL: GhosttyMode = 1007;
 pub const GHOSTTY_MODE_SGR_PIXELS_MOUSE: GhosttyMode = 1016;
 pub const GHOSTTY_MODE_BRACKETED_PASTE: GhosttyMode = 2004;
+pub const GHOSTTY_MODE_SYNCHRONIZED_OUTPUT: GhosttyMode = 2026;
 
 // Paste encoding (libghostty `ghostty/vt/paste.h`). Wraps paste data in
 // bracketed-paste markers when the program enabled mode 2004, strips unsafe
@@ -549,6 +550,7 @@ pub enum GhosttyTerminalOption {
     KittyImageMediumSharedMem = 18,
     ScrollbackMaxBytes = 27,
     ModeDefault = 33,
+    Mode = 34,
 }
 
 /// Callback fired synchronously from `ghostty_terminal_vt_write` when the
@@ -1677,6 +1679,14 @@ impl TerminalHandle {
             unsafe { ghostty_terminal_get(self.raw, GhosttyTerminalData::Mode, (&mut config as *mut GhosttyTerminalModeConfig).cast()) };
         check_result(result, "ghostty_terminal_get(Mode)")?;
         Ok(config.value)
+    }
+
+    /// Set a mode's current value without changing its reset default.
+    pub fn set_mode(&mut self, mode: GhosttyMode, value: bool) -> Result<(), String> {
+        let config = GhosttyTerminalModeConfig { mode, value };
+        let result =
+            unsafe { ghostty_terminal_set(self.raw, GhosttyTerminalOption::Mode, (&config as *const GhosttyTerminalModeConfig).cast()) };
+        check_result(result, "ghostty_terminal_set(Mode)")
     }
 
     pub fn scroll_viewport(&mut self, behavior: GhosttyTerminalScrollViewport) {

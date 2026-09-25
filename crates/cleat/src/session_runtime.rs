@@ -286,6 +286,14 @@ impl SessionRuntime {
         self.vt_engine.terminal_mode_state()
     }
 
+    pub(crate) fn synchronized_output_active(&self) -> Result<bool, String> {
+        self.vt_engine.synchronized_output_active()
+    }
+
+    pub(crate) fn end_synchronized_output(&mut self) -> Result<(), String> {
+        self.vt_engine.end_synchronized_output()
+    }
+
     pub(crate) fn encode_mouse(
         &mut self,
         action: vt::MouseAction,

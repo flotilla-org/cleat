@@ -5,6 +5,7 @@
 - CI parity (format): `cargo +nightly-2026-03-12 fmt --check`
 - CI parity (clippy): `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - CI parity (test): `cargo test --workspace --locked`
+- CI parity (Windows clippy): `cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings` and, after preparing Ghostty, `cargo clippy --workspace --all-targets --locked --features cleat/ghostty-vt -- -D warnings`. Linux Clippy never compiles `#[cfg(windows)]` code.
 - CI parity (Windows Ghostty VT): `powershell -NoProfile -ExecutionPolicy Bypass -File tools\prepare-ghostty-vt.ps1`, then `cargo build -p cleat --locked --features ghostty-vt` and `cargo test --workspace --locked --features cleat/ghostty-vt`
 
 If you say a change matches CI locally, it should have been checked against these exact commands.

@@ -100,11 +100,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       # Compile the application and exercise named-pipe/provider behavior
       # without making this portability gate depend on a Ghostty build.
       # The bundled ConPTY is staged so the graphics pass-through regression
       # runs against it (ADR 0006).
       - run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/prepare-conpty.ps1
+      # The Linux Clippy job never compiles #[cfg(windows)] code; lint it here.
+      - run: cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
       - run: cargo build -p cleat --locked --no-default-features
       - run: cargo test -p cleat --locked --no-default-features --lib
       - run: cargo test -p cleat --locked --no-default-features --test windows_daemon_launch
@@ -118,6 +122,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       # The prepared Ghostty install and bundled ConPTY depend only on the pins
       # and the scripts that realise them, so an exact-key hit skips Zig and the
       # Ghostty build entirely. A pin or script change misses and re-prepares.
@@ -145,6 +151,8 @@ jobs:
       - name: Prepare Ghostty VT (SIMD) and bundled ConPTY
         if: steps.ghostty-cache.outputs.cache-hit != 'true'
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/prepare-ghostty-vt.ps1
+      - name: Clippy with Ghostty VT
+        run: cargo clippy --workspace --all-targets --locked --features cleat/ghostty-vt -- -D warnings
       - name: Build functional binary and cleat.dll
         run: cargo build -p cleat --locked --features ghostty-vt
       # Loading the cdylib resolves its ghostty-vt.dll import and runs both

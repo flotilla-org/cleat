@@ -1868,7 +1868,15 @@ pub unsafe extern "C" fn cleat_session_mark_observed(session: *mut CleatSession,
         None => return false,
     };
     match &mut session.backend {
-        SessionBackend::Mock(mock) => mock.observation.mark_observed(generation),
+        SessionBackend::Mock(mock) => {
+            // Like the in-process actor: a stale observation that leaves the
+            // session dirty re-arms the edge-triggered wake.
+            let marked = mock.observation.mark_observed(generation);
+            if marked && mock.observation.dirty() != DirtyState::Clean {
+                notify_wake(&session.wake);
+            }
+            marked
+        }
         SessionBackend::InProcess(in_process) => {
             in_process.actor.request(|reply| SessionCommand::MarkObserved { generation, reply }, false)
         }
@@ -2892,6 +2900,7 @@ mod tests {
             assert_eq!(wake_count.load(Ordering::SeqCst), 1, "dirty-to-dirty input should coalesce wakeups");
             assert!(cleat_session_mark_observed(session, 2));
             assert_eq!(cleat_session_dirty(session), CleatDirtyState::Partial, "stale observation must not clear newer dirty state");
+            assert_eq!(wake_count.load(Ordering::SeqCst), 2, "stale observation must re-arm the wake");
 
             let mut later = CleatSnapshot::default();
             assert!(cleat_session_snapshot(session, &mut later));
@@ -2899,6 +2908,7 @@ mod tests {
             cleat_session_release_snapshot(session, &mut later);
             assert!(cleat_session_mark_observed(session, 3));
             assert_eq!(cleat_session_dirty(session), CleatDirtyState::Clean);
+            assert_eq!(wake_count.load(Ordering::SeqCst), 2, "observing the latest render must not wake");
             assert!(!cleat_session_mark_observed(session, 4), "future observations should be rejected");
 
             cleat_session_destroy(session);

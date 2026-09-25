@@ -156,7 +156,7 @@ fn cleanup_on_all_non_commit_paths() {
         (5, 1, serde_json::to_vec(&duplicate_role).unwrap()),
         (5, 1, serde_json::to_vec(&invalid_epoch).unwrap()),
         (4, 1, serde_json::to_vec(&manifest()).unwrap()),   // count mismatch
-        (100, 1, serde_json::to_vec(&manifest()).unwrap()), // ancillary truncation
+        (100, 1, serde_json::to_vec(&manifest()).unwrap()), // ancillary truncation (Linux), oversized rights (Darwin)
     ]
     .into_iter()
     .enumerate()
@@ -227,4 +227,27 @@ fn recording_append_and_child_status_descriptors_remain_usable() {
     assert_ne!(nix::fcntl::fcntl(&recording, nix::fcntl::FcntlArg::F_GETFL).unwrap() & libc::O_APPEND, 0);
     recording.write_all(b"transferred\n").unwrap();
     assert_eq!(std::fs::read_to_string(path).unwrap(), "transferred\n");
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn disconnected_peer_does_not_signal_embedded_host() {
+    if std::env::var_os("CLEAT_TRANSFER_SIGPIPE_TEST").is_none() {
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "disconnected_peer_does_not_signal_embedded_host", "--nocapture"])
+            .env("CLEAT_TRANSFER_SIGPIPE_TEST", "1")
+            .status()
+            .unwrap()
+            .success());
+        return;
+    }
+    // SAFETY: isolated subprocess; restore the C host's default disposition.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    let (mut sender, receiver) = pair();
+    drop(receiver);
+    let file = File::open("/dev/null").unwrap();
+    assert!(fd_transfer::send(&mut sender, &manifest(), &[file.as_fd(); 5]).is_err());
+    assert!(is_open(file.as_raw_fd()));
 }

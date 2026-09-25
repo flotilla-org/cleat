@@ -46,7 +46,10 @@ stream rather than infer successful adoption from a timeout.
 `send` borrows descriptors and waits for validation. It never closes originals,
 kills processes, or deletes state. `receive` owns every installed descriptor
 immediately, including those delivered in truncated ancillary data. All error
-paths and dropping `ReceivedTransfer` close those duplicates. `commit()` explicitly
+paths and dropping `ReceivedTransfer` close those duplicates. Darwin's receive
+buffer accommodates the kernel maximum of 512 rights because XNU installs all
+rights before truncating the control-data copy; iteration is also bounded by the
+actual returned buffer length, not just the header's declared length. `commit()` explicitly
 returns the owned descriptors to the caller; it has no wire effect. CLOEXEC is
 applied per received descriptor (atomically on Linux); O_NONBLOCK and O_APPEND
 are shared open-file-description flags and must not be toggled during receipt.

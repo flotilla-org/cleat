@@ -21,6 +21,13 @@ const TRANSFER_ACK: u8 = 1;
 const TRANSFER_NACK: u8 = 2;
 const MAX_TRANSFER_FDS: usize = 16;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+// Darwin installs all rights before copying the control data to userspace, and
+// retains the original cmsg_len on truncation. Reserve its kernel maximum (XNU
+// UIPC_MAX_CMSG_FD = 512) so even an oversized transfer can be fully closed.
+#[cfg(target_os = "macos")]
+const RECEIVE_CONTROL_WORDS: usize = 513;
+#[cfg(not(target_os = "macos"))]
+const RECEIVE_CONTROL_WORDS: usize = MAX_TRANSFER_FDS + 1;
 
 #[derive(Debug)]
 pub struct ReceivedTransfer {
@@ -57,7 +64,13 @@ pub fn send(stream: &mut UnixStream, manifest: &FdTransferManifest, fds: &[Borro
     let marker = [TRANSFER_MARKER];
     let iov = [IoSlice::new(&marker)];
     let raw_fds: Vec<_> = fds.iter().map(AsRawFd::as_raw_fd).collect();
-    let sent = sendmsg::<()>(stream.as_raw_fd(), &iov, &[ControlMessage::ScmRights(&raw_fds)], MsgFlags::empty(), None)
+    // Embedded callers may retain the default SIGPIPE disposition. A closed
+    // peer must return an error rather than terminate the hosting process.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let flags = MsgFlags::from_bits_retain(libc::MSG_NOSIGNAL);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let flags = MsgFlags::empty();
+    let sent = sendmsg::<()>(stream.as_raw_fd(), &iov, &[ControlMessage::ScmRights(&raw_fds)], flags, None)
         .map_err(|err| format!("send FD transfer descriptors: {err}"))?;
     if sent != marker.len() {
         return Err(format!("short FD transfer descriptor send: wrote {sent} of {} bytes", marker.len()));
@@ -113,7 +126,7 @@ pub fn receive(stream: &mut UnixStream) -> Result<ReceivedTransfer, String> {
 fn receive_descriptors(stream: &UnixStream) -> Result<(u8, Vec<OwnedFd>), String> {
     let mut marker = [0u8];
     // cmsghdr elements supply the alignment required by CMSG_FIRSTHDR.
-    let mut control: [libc::cmsghdr; MAX_TRANSFER_FDS + 1] = unsafe { std::mem::zeroed() };
+    let mut control: [libc::cmsghdr; RECEIVE_CONTROL_WORDS] = unsafe { std::mem::zeroed() };
     let mut iov = libc::iovec { iov_base: marker.as_mut_ptr().cast(), iov_len: 1 };
     // SAFETY: all pointers below reference live, suitably aligned buffers.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -136,12 +149,20 @@ fn receive_descriptors(stream: &UnixStream) -> Result<(u8, Vec<OwnedFd>), String
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&message);
         while !cmsg.is_null() {
+            let offset = cmsg.cast::<u8>().offset_from(control.as_ptr().cast::<u8>()) as usize;
+            // msg_controllen is usize on Linux, socklen_t (u32) on Darwin.
+            #[allow(clippy::unnecessary_cast)]
+            let available = (message.msg_controllen as usize).min(std::mem::size_of_val(&control)).saturating_sub(offset);
+            let declared = (*cmsg).cmsg_len as usize;
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let bytes = ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+                let bytes = declared.min(available).saturating_sub(libc::CMSG_LEN(0) as usize);
                 let data = libc::CMSG_DATA(cmsg).cast::<libc::c_int>();
                 for i in 0..bytes / std::mem::size_of::<libc::c_int>() {
                     fds.push(OwnedFd::from_raw_fd(data.add(i).read_unaligned()));
                 }
+            }
+            if declared > available || declared < libc::CMSG_LEN(0) as usize {
+                break;
             }
             cmsg = libc::CMSG_NXTHDR(&message, cmsg);
         }

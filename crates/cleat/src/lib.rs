@@ -37,3 +37,12 @@ mod mouse;
 mod attach_mouse;
 
 mod terminal_identity;
+
+#[cfg(unix)]
+pub mod child_observation;
+#[cfg(unix)]
+pub mod fd_transfer;
+#[cfg(unix)]
+pub mod hosting_epoch;
+#[cfg(unix)]
+pub mod transfer_manifest;

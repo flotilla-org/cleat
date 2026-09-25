@@ -311,7 +311,7 @@ impl OverlappedRead {
             WAIT_TIMEOUT => Ok(None),
             WAIT_OBJECT_0 => {
                 let mut transferred = 0;
-                let ok = unsafe { GetOverlappedResult(self.handle, &mut *self.overlapped, &mut transferred, 0) };
+                let ok = unsafe { GetOverlappedResult(self.handle, &*self.overlapped, &mut transferred, 0) };
                 self.pending = false;
                 if ok == 0 {
                     let err = unsafe { GetLastError() };
@@ -332,9 +332,9 @@ impl Drop for OverlappedRead {
     fn drop(&mut self) {
         unsafe {
             if self.pending {
-                CancelIoEx(self.handle, &mut *self.overlapped);
+                CancelIoEx(self.handle, &*self.overlapped);
                 let mut transferred = 0;
-                let _ = GetOverlappedResult(self.handle, &mut *self.overlapped, &mut transferred, 1);
+                let _ = GetOverlappedResult(self.handle, &*self.overlapped, &mut transferred, 1);
             }
             CloseHandle(self.event);
         }

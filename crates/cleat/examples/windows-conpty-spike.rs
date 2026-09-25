@@ -112,7 +112,7 @@ mod spike {
 
     impl Pipes {
         fn new() -> Result<Self, String> {
-            let mut attrs = SECURITY_ATTRIBUTES {
+            let attrs = SECURITY_ATTRIBUTES {
                 nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: null_mut(),
                 bInheritHandle: 0,
@@ -124,10 +124,10 @@ mod spike {
             let mut output_write = null_mut();
 
             unsafe {
-                if CreatePipe(&mut input_read, &mut input_write, &mut attrs, 0) == 0 {
+                if CreatePipe(&mut input_read, &mut input_write, &attrs, 0) == 0 {
                     return Err(last_error("CreatePipe input"));
                 }
-                if CreatePipe(&mut output_read, &mut output_write, &mut attrs, 0) == 0 {
+                if CreatePipe(&mut output_read, &mut output_write, &attrs, 0) == 0 {
                     CloseHandle(input_read);
                     CloseHandle(input_write);
                     return Err(last_error("CreatePipe output"));

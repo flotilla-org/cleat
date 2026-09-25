@@ -154,6 +154,8 @@ impl SessionRuntime {
         ((cols as u32).saturating_mul(self.cell_width_px), (rows as u32).saturating_mul(self.cell_height_px))
     }
 
+    /// The Unix actor waits on the PTY master; elsewhere only tests inspect it.
+    #[cfg(any(unix, test))]
     pub(crate) fn pty_child(&self) -> &PtyChild {
         &self.pty_child
     }
@@ -712,7 +714,9 @@ fn is_pty_eof_after_exit(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vt::{passthrough::PassthroughVtEngine, CellFlags, CellWidth, CursorState, ResolvedCell, Rgb, ScreenGrid, VtEngineKind};
+    #[cfg(unix)]
+    use crate::vt::passthrough::PassthroughVtEngine;
+    use crate::vt::{CellFlags, CellWidth, CursorState, ResolvedCell, Rgb, ScreenGrid, VtEngineKind};
 
     #[derive(Debug)]
     struct GridEngine {

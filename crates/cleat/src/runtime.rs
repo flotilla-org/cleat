@@ -81,6 +81,10 @@ pub struct AmbientSessionCoordinates {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DaemonCoordinates {
+    pub generation: Option<u64>,
+    pub alive: bool,
+    pub drain_state: String,
+    pub build: Option<crate::build_info::BuildInfo>,
     pub name: String,
     pub runtime_root: PathBuf,
 }
@@ -126,7 +130,7 @@ impl RuntimeLayout {
     }
 
     pub fn with_daemon(mut self, daemon_name: String) -> Result<Self, String> {
-        validate_runtime_name(&daemon_name)?;
+        validate_daemon_name(&daemon_name)?;
         self.daemon_name = daemon_name;
         Ok(self)
     }
@@ -145,11 +149,140 @@ impl RuntimeLayout {
         } else {
             env::current_dir().map_err(|err| format!("resolve relative runtime root {}: {err}", self.root.display()))?.join(&self.root)
         };
-        Ok(AmbientSessionCoordinates { runtime_root, daemon_name: self.daemon_name.clone(), session_id: session_id.to_string() })
+        Ok(AmbientSessionCoordinates { runtime_root, daemon_name: self.logical_name().to_string(), session_id: session_id.to_string() })
+    }
+
+    /// The logical name remains stable across daemon generations.
+    pub fn logical_name(&self) -> &str {
+        self.daemon_name.split('@').next().unwrap_or(&self.daemon_name)
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        generation_from_daemon_dir(&self.daemon_dir())
     }
 
     pub fn daemon_dir(&self) -> PathBuf {
-        self.root.join(&self.daemon_name)
+        let path = self.root.join(&self.daemon_name);
+        if self.daemon_name.contains('@') {
+            return path;
+        }
+        let target = fs::read_link(&path)
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .or_else(|| fs::read_to_string(&path).ok().map(|s| s.trim().to_string()));
+        if let Some(target) = target {
+            if validate_daemon_name(&target).is_ok() && target.starts_with(&format!("{}@", self.daemon_name)) {
+                return self.root.join(target);
+            }
+        }
+        path
+    }
+
+    /// Freeze a resolved alias before a host begins using its paths.
+    pub fn resolved(&self) -> Result<Self, String> {
+        self.clone().with_daemon(self.daemon_dir().file_name().and_then(|n| n.to_str()).ok_or("invalid daemon path")?.to_string())
+    }
+
+    pub fn generation_names(&self) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        if !self.root.exists() {
+            return Ok(names);
+        }
+        for entry in fs::read_dir(&self.root).map_err(|e| format!("read runtime root: {e}"))? {
+            let entry = entry.map_err(|e| format!("read runtime entry: {e}"))?;
+            if !entry.file_type().map_err(|e| e.to_string())?.is_dir() || !entry.path().join(SESSIONS_DIR).is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_daemon_name(&name).is_ok()
+                && (name == self.daemon_name || (!self.daemon_name.contains('@') && name.starts_with(&format!("{}@", self.daemon_name))))
+            {
+                names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Serialize adoption/allocation, while the socket bind still elects the host.
+    pub fn prepare_generation(&self) -> Result<Self, String> {
+        crate::platform::ipc::validate_session_socket_path(&self.socket_path())?;
+        self.ensure_root()?;
+        if self.daemon_name.contains('@') {
+            self.ensure_daemon_dirs()?;
+            return Ok(self.clone());
+        }
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.root.join(format!(".{}.generation.lock", self.logical_name())))
+            .map_err(|e| format!("open generation lock: {e}"))?;
+        lock.lock().map_err(|e| format!("lock generation: {e}"))?;
+        let alias = self.root.join(&self.daemon_name);
+        let legacy = alias.is_dir() && !alias.is_symlink();
+        let mut current = self.resolved()?;
+        // Recover an absent alias without starting a successor to a live host.
+        if !legacy && current.generation().is_none() {
+            if let Some(generation) = self.generation_names()?.iter().filter_map(|n| n.rsplit_once('@')?.1.parse::<u64>().ok()).max() {
+                self.set_current_generation(generation)?;
+                current = self.resolved()?;
+            }
+        }
+        if legacy {
+            let alive =
+                current.daemon_pid_path().exists() && crate::platform::daemon::is_session_daemon_alive(self.root(), current.daemon_name());
+            if alive || crate::platform::ipc::try_connect_session_stream(&current.socket_path()).is_ok() {
+                return Ok(current);
+            }
+            let adopted = self.root.join(format!("{}@1", self.daemon_name));
+            if adopted.exists() {
+                return Err(format!("cannot adopt legacy daemon: {} already exists", adopted.display()));
+            }
+            fs::rename(&alias, &adopted).map_err(|e| format!("adopt legacy daemon: {e}"))?;
+            // Its stale registration must not immediately advance the adopted generation.
+            let _ = fs::remove_file(adopted.join("daemon.pid"));
+            self.set_current_generation(1)?;
+            return self.resolved();
+        }
+        if current.generation().is_some()
+            && current.daemon_dir().is_dir()
+            && crate::platform::daemon::is_session_daemon_alive(self.root(), current.daemon_name())
+        {
+            return Ok(current);
+        }
+        let next = self
+            .generation_names()?
+            .iter()
+            .filter_map(|n| n.rsplit_once('@')?.1.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("daemon generation exhausted")?;
+        let next_layout = self.clone().with_daemon(format!("{}@{next}", self.daemon_name))?;
+        next_layout.ensure_daemon_dirs()?;
+        self.set_current_generation(next)?;
+        Ok(next_layout)
+    }
+
+    /// Publish a current generation atomically. The caller serializes generation changes.
+    pub fn set_current_generation(&self, generation: u64) -> Result<(), String> {
+        if generation == 0 {
+            return Err("generation must be positive".into());
+        }
+        let target = format!("{}@{generation}", self.logical_name());
+        let temporary = self.root.join(format!(".alias-{}", Uuid::new_v4()));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &temporary).map_err(|e| format!("create daemon alias: {e}"))?;
+        #[cfg(not(unix))]
+        fs::write(&temporary, format!("{target}\n")).map_err(|e| format!("write daemon alias: {e}"))?;
+        let result = fs::rename(&temporary, self.root.join(self.logical_name())).map_err(|e| format!("publish daemon alias: {e}"));
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
     }
 
     pub fn sessions_dir(&self) -> PathBuf {
@@ -193,6 +326,7 @@ impl RuntimeLayout {
         validate_runtime_name(&id)?;
         let dir = self.session_dir(&id);
         fs::create_dir_all(&dir).map_err(|err| format!("create session dir {}: {err}", dir.display()))?;
+        ensure_hosting_epoch(&dir)?;
         Ok(self.session_metadata(id, vt_engine, cwd, cmd))
     }
 
@@ -287,6 +421,41 @@ fn platform_state_dir() -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn platform_state_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from).filter(|path| path.is_absolute()).map(|home| home.join(".local/state"))
+}
+
+pub(crate) fn generation_from_daemon_dir(dir: &Path) -> Option<u64> {
+    dir.file_name()?.to_str()?.rsplit_once('@')?.1.parse().ok()
+}
+
+/// Validate a logical daemon name or an explicit positive generation.
+pub fn validate_daemon_name(name: &str) -> Result<(), String> {
+    if let Some((logical, generation)) = name.rsplit_once('@') {
+        validate_runtime_name(logical)?;
+        let value = generation.parse::<u64>().map_err(|_| format!("invalid daemon generation: {name}"))?;
+        if value == 0 || value.to_string() != generation {
+            return Err(format!("invalid daemon generation: {name}"));
+        }
+        Ok(())
+    } else {
+        validate_runtime_name(name)
+    }
+}
+
+pub fn hosting_epoch(dir: &Path) -> Result<u64, String> {
+    match fs::read_to_string(dir.join("epoch")) {
+        Ok(value) => value.trim().parse::<u64>().ok().filter(|v| *v > 0).ok_or_else(|| "invalid hosting epoch".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
+        Err(e) => Err(format!("read hosting epoch: {e}")),
+    }
+}
+
+pub(crate) fn ensure_hosting_epoch(dir: &Path) -> Result<(), String> {
+    use std::io::Write;
+    match fs::OpenOptions::new().write(true).create_new(true).open(dir.join("epoch")) {
+        Ok(mut file) => file.write_all(b"1\n").map_err(|e| format!("write hosting epoch: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => hosting_epoch(dir).map(|_| ()),
+        Err(e) => Err(format!("create hosting epoch: {e}")),
+    }
 }
 
 #[cfg(test)]

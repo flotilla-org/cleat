@@ -53,12 +53,26 @@ longer pinned to one child process). Survives client restarts.
 _Avoid_: "one daemon per session" (the historical 1:1 model; a daemon now hosts a
 set of sessions).
 
-Daemons are **named** (default: `default`); the socket derives from the name. A
+Daemons are **named** (default: `default`). A **generation** is a daemon's coarse
+epoch: a positive integer, increasing per logical name. The physical directory
+is `<root>/<name>@<generation>/`; `<root>/<name>` aliases the current generation
+(a Unix symlink or Windows text file). Creates target the current generation;
+session-id lookups search generations and refuse multiple live claims. Explicit
+`--server name@N` selects one generation. Ambient coordinates retain the logical
+name. Auto-start advances only after death, never alongside a live current host.
+Live legacy directories remain at their original path; dead ones adopt generation 1.
+The socket derives from the physical generation. A
 daemon auto-starts on first use of its name and, when it hosts no sessions, lingers
 for a grace period before exiting (kills the empty-teardown race without leaving a
 resident process forever). A daemon is an **isolation boundary** — analogous to a
 k8s namespace: separate project checkouts, an agent loop's process backing, test
 scratch space. It is *not* an organizational grouping mechanism.
+
+**Hosting epoch**:
+A session's hosting incarnation, distinct from its daemon's generation. Stored as
+a positive integer in `<session directory>/epoch`, initially 1 and interpreted
+as 1 when absent. This generation-layout slice does not increment it; Transfer
+will use it to fence stale holders.
 
 **Ambient daemon**:
 The daemon a command targets when none is named: the daemon hosting the session

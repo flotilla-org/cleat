@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub runtime_root: Option<PathBuf>,
 
-    #[arg(long, global = true, value_parser = parse_runtime_name, help = "Select daemon (explicit > CLEAT_DAEMON > default)")]
+    #[arg(long, global = true, value_parser = parse_daemon_name, help = "Select daemon (explicit > CLEAT_DAEMON > default)")]
     pub server: Option<String>,
 
     #[command(subcommand)]
@@ -567,7 +567,10 @@ fn check_foreground_nesting(
         std::path::absolute(path).map_err(|err| format!("resolve runtime root: {err}"))
     };
     let source = format!("{} / {}", ambient.daemon_name(), ambient.session_id());
-    if id == Some(ambient.session_id()) && daemon == ambient.daemon_name() && absolute(root)? == absolute(ambient.runtime_root())? {
+    if id == Some(ambient.session_id())
+        && daemon.split('@').next() == Some(ambient.daemon_name())
+        && absolute(root)? == absolute(ambient.runtime_root())?
+    {
         return Err(format!("cannot attach to {source} from inside itself: this would create an output loop. Detach with Ctrl-] then d, or use a fresh terminal tab."));
     }
     Ok(())
@@ -585,8 +588,50 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Ok(daemon_target) => daemon_target,
         Err(err) => return ExecResult::Err(err),
     };
-    let service = match service.with_daemon(daemon_target.name().to_string()) {
+    let service = match service.with_daemon(
+        match &daemon_target {
+            DaemonTarget::Running(daemon) => daemon.address(),
+            _ => daemon_target.name(),
+        }
+        .to_string(),
+    ) {
         Ok(service) => service,
+        Err(err) => return ExecResult::Err(err),
+    };
+    let session_id = match &cli.command {
+        Command::Attach { id, .. } => id.as_deref(),
+        Command::Watch { id, .. }
+        | Command::Packets { id, .. }
+        | Command::Tag { id, .. }
+        | Command::Capture { id }
+        | Command::Transcript { id, .. }
+        | Command::Detach { id }
+        | Command::Kill { id, .. }
+        | Command::SendKeys { id, .. }
+        | Command::Inspect { id, .. }
+        | Command::Signal { id, .. }
+        | Command::Record { id }
+        | Command::Mark { id, .. }
+        | Command::Send { id, .. }
+        | Command::Escape { id }
+        | Command::Interrupt { id }
+        | Command::Wait { id, .. }
+        | Command::Expect { id, .. } => Some(id.as_str()),
+        Command::Replay { session, .. } => session.as_deref(),
+        _ => None,
+    };
+    let service = match session_id
+        .map(|id| {
+            if matches!(&cli.command, Command::Attach { no_create: false, .. }) {
+                service.for_recreation(id)
+            } else {
+                service.for_session(id)
+            }
+        })
+        .transpose()
+    {
+        Ok(Some(target)) => target,
+        Ok(None) => service,
         Err(err) => return ExecResult::Err(err),
     };
     let service = &service;
@@ -715,23 +760,27 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         }
         Command::Version { daemon, json } => {
             let client = crate::build_info::BuildInfo::current();
-            let daemon_build = if daemon {
-                match service.daemon_build_info() {
-                    Ok(build) => build,
+            let daemon_status = if daemon {
+                match service.daemon_build_status() {
+                    Ok(status) => Some(status),
                     Err(err) => return ExecResult::Err(err),
                 }
             } else {
                 None
             };
+            let generation = daemon_status.as_ref().and_then(|status| status.generation);
+            let daemon_build = daemon_status.and_then(|status| status.build);
             let output = if json {
                 let mut report = serde_json::json!({ "client": client });
                 if daemon {
                     report["daemon"] = serde_json::json!(daemon_build);
+                    report["generation"] = serde_json::json!(generation);
                 }
                 report.to_string()
             } else if daemon {
                 format!(
-                    "client: {client}\ndaemon: {}",
+                    "client: {client}\ngeneration: {}\ndaemon: {}",
+                    generation.map(|n| n.to_string()).unwrap_or_else(|| "legacy".into()),
                     daemon_build.map(|build| build.to_string()).unwrap_or_else(|| "unknown (daemon does not report build metadata)".into())
                 )
             } else {
@@ -752,7 +801,17 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(Some(
                     daemons
                         .iter()
-                        .map(|daemon| format!("{}\t{}", daemon.name, daemon.runtime_root.display()))
+                        .map(|daemon| {
+                            format!(
+                                "{}\t{}\tgeneration {}\t{}\t{}\t{}",
+                                daemon.name,
+                                daemon.runtime_root.display(),
+                                daemon.generation.map(|n| n.to_string()).unwrap_or_else(|| "legacy".into()),
+                                if daemon.alive { "alive" } else { "dead" },
+                                daemon.drain_state,
+                                daemon.build.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "unknown build".into())
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ))
@@ -1013,7 +1072,7 @@ pub fn resolve_daemon_target(
     service: &SessionService,
 ) -> Result<DaemonTarget, String> {
     if let Some(explicit) = explicit {
-        validate_runtime_name(explicit)?;
+        crate::runtime::validate_daemon_name(explicit)?;
         return Ok(DaemonTarget::AutoStart(explicit.to_string()));
     }
 
@@ -1391,6 +1450,8 @@ fn format_inspect_human(result: &crate::protocol::InspectResult) -> String {
     table.load_preset(NOTHING);
 
     table.add_row(vec!["session", &result.session.id]);
+    table.add_row(vec!["generation", &result.generation.map(|n| n.to_string()).unwrap_or_else(|| "legacy".into())]);
+    table.add_row(vec!["hosting_epoch", &result.hosting_epoch.to_string()]);
     table.add_row(vec!["state", &result.session.state]);
     table.add_row(vec!["vt_engine", &format!("{} ({})", result.session.vt_engine, result.session.vt_engine_status)]);
     table.add_row(vec!["functional_vt", if result.session.functional_vt_available { "yes" } else { "no" }]);
@@ -1503,6 +1564,11 @@ fn parse_repeat(value: &str) -> Result<usize, String> {
     }
 }
 
+fn parse_daemon_name(value: &str) -> Result<String, String> {
+    crate::runtime::validate_daemon_name(value)?;
+    Ok(value.to_string())
+}
+
 #[cfg(test)]
 mod nesting_tests {
     use super::check_foreground_nesting;
@@ -1514,6 +1580,8 @@ mod nesting_tests {
         let source = RuntimeLayout::new(root.clone()).with_daemon("work".into()).unwrap().session_coordinates("alpha").unwrap();
         let check = |root: &std::path::Path, daemon, id| check_foreground_nesting(root, daemon, id, Some(&source));
         assert!(check(&root, "work", Some("alpha")).unwrap_err().contains("output loop"));
+        assert!(check(&root, "work@2", Some("alpha")).unwrap_err().contains("output loop"));
+        assert!(check(&root, "work@2", Some("beta")).is_ok());
         assert!(check(&root, "work", Some("beta")).is_ok());
         assert!(check(&root, "other", Some("alpha")).is_ok());
         assert!(check(&root.join("other"), "work", Some("alpha")).is_ok());

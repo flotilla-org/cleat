@@ -1547,7 +1547,7 @@ fn legacy_mouse_byte(value: u16) -> Option<u8> {
     u8::try_from(encoded).ok()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod idle_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1600,12 +1600,16 @@ mod idle_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let engine_polls = polls.clone();
         let engine_dropped = dropped.clone();
+        #[cfg(unix)]
+        let command = "printf final-output; exit 7";
+        #[cfg(windows)]
+        let command = "echo final-output & exit /b 7";
         let actor = SessionActor::spawn(24, Arc::new(|| {}), move || {
             let session = crate::runtime::SessionMetadata {
                 id: "exited-idle".into(),
                 vt_engine: vt::default_vt_engine_kind(),
                 cwd: None,
-                cmd: Some("printf final-output; exit 7".into()),
+                cmd: Some(command.into()),
                 tags: vec![],
                 environment: vec![],
                 record: false,

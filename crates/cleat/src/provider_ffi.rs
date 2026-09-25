@@ -14,8 +14,8 @@ use crate::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
         TerminalFocusEvent, TerminalGeometry, TerminalImagePlacement, TerminalImageResource, TerminalInputEvent, TerminalModifiers,
         TerminalMouseButtons, TerminalMouseEvent, TerminalMouseEventKind, TerminalPasteEvent, TerminalRenderUpdate,
-        TerminalRenderUpdateOpKind, TerminalRgb, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalStyleColor,
-        TerminalStyleColorTag, TerminalTextEvent, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
+        TerminalRenderUpdateOpKind, TerminalResizeEvent, TerminalRgb, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot,
+        TerminalStyleColor, TerminalStyleColorTag, TerminalTextEvent, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
         TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
     },
     provider_daemon::{ChannelSlot, DaemonConnection},
@@ -1514,8 +1514,8 @@ pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: 
         SessionBackend::Daemon(daemon) => {
             let (cols, rows) = (cols.max(1), rows.max(1));
             if let Ok(mut slot) = daemon.slot.lock() {
-                slot.desired_cols = cols;
-                slot.desired_rows = rows;
+                slot.desired_geometry.cols = cols;
+                slot.desired_geometry.rows = rows;
             }
             // Best-effort while connected; the desired size is re-asserted on
             // every reconnect, so a send failure is not a caller error.
@@ -1554,7 +1554,18 @@ pub unsafe extern "C" fn cleat_session_update_geometry(session: *mut CleatSessio
             }
             session.geometry = geometry;
         }
-        SessionBackend::Daemon(_) => {
+        SessionBackend::Daemon(daemon) => {
+            let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(geometry);
+            let resize = {
+                let Ok(mut slot) = daemon.slot.lock() else {
+                    return false;
+                };
+                slot.desired_geometry.cell_width_px = cell_width_px as f32;
+                slot.desired_geometry.cell_height_px = cell_height_px as f32;
+                slot.desired_geometry
+            };
+            // Like grid resizes, retain offline changes for the next open.
+            let _ = daemon.connection.send_input(daemon.channel, TerminalInputEvent::Resize(resize));
             session.geometry = geometry;
             notify_wake(&session.wake);
         }
@@ -2293,8 +2304,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     })?;
     let (channel, slot) = connection.open_session_channel(
         metadata.id.clone(),
-        cols,
-        rows,
+        daemon_geometry_from_desc(desc),
         channel_role_from_ffi(desc.role)?,
         attachment_identity_from_desc(desc)?,
     );
@@ -2308,12 +2318,26 @@ fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         .ok_or_else(|| "attach requires a session id".to_string())?;
     let (channel, slot) = connection.open_session_channel(
         id.clone(),
-        desc.cols.max(1),
-        desc.rows.max(1),
+        daemon_geometry_from_desc(desc),
         channel_role_from_ffi(desc.role)?,
         attachment_identity_from_desc(desc)?,
     );
     Ok(DaemonSession { id, connection: Arc::clone(connection), channel, slot, images: Vec::new(), links: Vec::new() })
+}
+
+fn daemon_geometry_from_desc(desc: CleatSessionDesc) -> TerminalResizeEvent {
+    let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(TerminalGeometry::from_cell_size(
+        desc.cols.max(1),
+        desc.rows.max(1),
+        desc.cell_width_px,
+        desc.cell_height_px,
+    ));
+    TerminalResizeEvent {
+        cols: desc.cols.max(1),
+        rows: desc.rows.max(1),
+        cell_width_px: cell_width_px as f32,
+        cell_height_px: cell_height_px as f32,
+    }
 }
 
 fn channel_role_from_ffi(role: u32) -> Result<crate::packet::ChannelRole, String> {

@@ -52,6 +52,8 @@ actual returned buffer length, not just the header's declared length. `commit()`
 returns the owned descriptors to the caller; it has no wire effect. CLOEXEC is
 applied per received descriptor (atomically on Linux); O_NONBLOCK and O_APPEND
 are shared open-file-description flags and must not be toggled during receipt.
+macOS transport sockets also enable SO_NOSIGPIPE so framing and response writes
+cannot terminate an embedded host that retains the default signal disposition.
 On platforms without atomic ancillary CLOEXEC, callers must serialize concurrent
 fork/exec with receipt. No quiescence or session authority is implied by ACK.
 

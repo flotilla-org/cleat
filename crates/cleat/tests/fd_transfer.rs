@@ -253,4 +253,16 @@ fn disconnected_peer_does_not_signal_embedded_host() {
     let file = File::open("/dev/null").unwrap();
     assert!(fd_transfer::send(&mut sender, &manifest(), &[file.as_fd(); 5]).is_err());
     assert!(is_open(file.as_raw_fd()));
+
+    // Also cover ordinary framing writes on the receiving side, after the
+    // peer has supplied rights and disconnected before ACK/NACK.
+    let descriptors: Vec<OwnedFd> = (0..5).map(|_| File::open("/dev/null").unwrap().into()).collect();
+    for version in [1, 99] {
+        let (mut sender, mut receiver) = pair();
+        let mut sent = manifest();
+        sent.version = version;
+        raw_send(&mut sender, &descriptors, 1, &serde_json::to_vec(&sent).unwrap());
+        drop(sender);
+        assert!(fd_transfer::receive(&mut receiver).is_err());
+    }
 }

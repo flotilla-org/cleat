@@ -55,6 +55,8 @@ pub struct Rejection {
 }
 
 pub fn send(stream: &mut UnixStream, manifest: &FdTransferManifest, fds: &[BorrowedFd<'_>]) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    suppress_sigpipe(stream)?;
     validate_fd_manifest(&manifest.fds, fds.len())?;
     let json = serde_json::to_vec(manifest).map_err(|err| format!("serialize FD transfer manifest: {err}"))?;
     if json.len() > MAX_MANIFEST_BYTES {
@@ -83,6 +85,8 @@ pub fn send(stream: &mut UnixStream, manifest: &FdTransferManifest, fds: &[Borro
 }
 
 pub fn receive(stream: &mut UnixStream) -> Result<ReceivedTransfer, String> {
+    #[cfg(target_os = "macos")]
+    suppress_sigpipe(stream)?;
     let (marker, fds) = receive_descriptors(stream)?;
     if marker != TRANSFER_MARKER {
         return Err("invalid FD transfer marker".to_string());
@@ -118,6 +122,28 @@ pub fn receive(stream: &mut UnixStream) -> Result<ReceivedTransfer, String> {
             Err(reason)
         }
     }
+}
+
+// Rust's UnixStream::write uses MSG_NOSIGNAL on Linux. On Darwin it relies
+// on SO_NOSIGPIPE, which may be absent on socketpairs or externally adopted
+// sockets. Set it for all framing/ACK/NACK writes as well as the initial send.
+#[cfg(target_os = "macos")]
+fn suppress_sigpipe(stream: &UnixStream) -> Result<(), String> {
+    let enabled: libc::c_int = 1;
+    // SAFETY: setsockopt reads one live integer from the borrowed pointer.
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as _,
+        )
+    };
+    if result < 0 {
+        return Err(format!("suppress transfer SIGPIPE: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Own every installed descriptor before any fallible validation, including a

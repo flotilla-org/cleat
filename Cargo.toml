@@ -8,3 +8,24 @@ license = "Apache-2.0 OR MIT"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Embedders (e.g. Wheelhouse) build Cleat in the dev profile by default, where
+# unoptimised PNG decoding of large Kitty images dominates image latency.
+# Optimise just the decode path: png and its inflate/checksum dependencies.
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.adler2]
+opt-level = 3
+
+[profile.dev.package.simd-adler32]
+opt-level = 3

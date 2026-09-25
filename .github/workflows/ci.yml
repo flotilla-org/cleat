@@ -93,6 +93,18 @@ jobs:
       - run: cargo build -p cleat --locked --no-default-features
       - run: cargo test -p cleat --locked --no-default-features
 
+  macos-transfer:
+    name: macOS transfer primitives
+    runs-on: macos-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p cleat --all-targets --locked --no-default-features -- -D warnings
+      - run: cargo test -p cleat --locked --no-default-features --test fd_transfer --test transfer_state --test child_observation
+
   windows-core:
     name: Windows build and core tests
     runs-on: windows-latest

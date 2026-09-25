@@ -9,6 +9,15 @@ use crate::asciicast::{encode_event, encode_header, CleatMeta, Event, EventCode,
 
 pub const CAST_FILE_NAME: &str = "session.cast";
 
+/// Portable VT replay payload shared by recordings and transfer manifests.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplaySnapshot {
+    pub engine: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub state: String,
+}
+
 const COALESCE_SIZE_THRESHOLD: usize = 4096;
 
 /// Return the byte length of the longest prefix of `bytes` that is complete
@@ -197,6 +206,13 @@ impl SessionRecorder {
         Ok(recorder)
     }
 
+    /// Record a hosting change beside the session-recreated boundary event.
+    /// This uses the standard asciicast marker code, with JSON string data.
+    pub fn transferred(&mut self, epoch: u64, address: &str, time: Duration) {
+        let data = serde_json::json!({"event": "transferred", "epoch": epoch, "address": address}).to_string();
+        self.event(EventCode::Marker, &data, time);
+    }
+
     /// Pause recording. Flushes the buffer first. Output/input calls become no-ops.
     pub fn pause(&mut self, time: Duration) {
         if !self.paused {
@@ -280,7 +296,8 @@ impl SessionRecorder {
     /// Flush buffer, write a snapshot event with code 'S', reset output_bytes_since_snapshot.
     pub fn write_snapshot(&mut self, vt_state: &str, engine: &str, cols: u16, rows: u16, time: Duration) {
         self.flush();
-        let data = serde_json::json!({"engine": engine, "cols": cols, "rows": rows, "state": vt_state}).to_string();
+        let data = serde_json::to_string(&ReplaySnapshot { engine: engine.into(), cols, rows, state: vt_state.into() })
+            .expect("snapshot strings serialize");
         let event = Event { time, code: EventCode::Custom('S'), data };
         self.write_event(&event);
         self.output_bytes_since_snapshot = 0;

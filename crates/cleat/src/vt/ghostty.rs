@@ -1287,6 +1287,33 @@ mod history_tests {
     }
 
     #[test]
+    fn cursor_sync_investigation_control_cases() {
+        let mut engine = GhosttyVtEngine::new(20, 3);
+        engine.feed(b"ready\x1b[?25h").unwrap();
+        assert!(engine.render_update(DirtyState::Full).unwrap().cursor.visible);
+        engine.feed(b"\x1b[?2026h\x1b[?25lx\x1b[?25h\x1b[?2026l").unwrap();
+        assert!(engine.render_update(DirtyState::Partial).unwrap().cursor.visible);
+        // Intentional hiding outside a synchronized batch must remain observable.
+        engine.feed(b"\x1b[?25l").unwrap();
+        assert!(!engine.render_update(DirtyState::Partial).unwrap().cursor.visible);
+    }
+
+    #[test]
+    fn synchronized_repaint_does_not_publish_hidden_cursor_mid_batch() {
+        let mut engine = GhosttyVtEngine::new(20, 3);
+        engine.feed(b"ready\x1b[?25h").unwrap();
+        let before = engine.render_update(DirtyState::Full).unwrap();
+        assert!(before.cursor.visible);
+        engine.feed(b"\x1b[?2026h\x1b[?25l").unwrap();
+        let during = engine.render_update(DirtyState::Partial).unwrap();
+        engine.feed(b"x\x1b[?25h\x1b[?2026l").unwrap();
+        let after = engine.render_update(DirtyState::Partial).unwrap();
+        eprintln!("cursor visible: before={} during={} after={}", before.cursor.visible, during.cursor.visible, after.cursor.visible);
+        assert!(after.cursor.visible);
+        assert!(during.cursor.visible, "published intermediate hidden cursor inside synchronized repaint");
+    }
+
+    #[test]
     fn attachment_captures_are_lazy_shared_and_invalidated_by_output() {
         let mut engine = GhosttyVtEngine::new(20, 3);
         engine.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive").unwrap();

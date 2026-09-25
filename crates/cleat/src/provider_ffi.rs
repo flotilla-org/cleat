@@ -1958,6 +1958,10 @@ pub unsafe extern "C" fn cleat_session_scroll_viewport(
 /// Use `cleat_session_render_update` instead; the first update after a channel
 /// opens is full-dirty and carries the complete grid.
 ///
+/// A snapshot reads current state even inside a synchronized-output batch
+/// (mode 2026); hosts that present frames should use render updates, which
+/// withhold intermediate state until the batch completes.
+///
 /// # Safety
 ///
 /// `session` must be a valid session pointer. `out` must point to writable

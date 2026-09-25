@@ -13,6 +13,12 @@
 //!   update) with no new generation, so no damage is acknowledged unseen.
 //! - First frame: a consumer with no completed presentation to retain is
 //!   rendered from current state; deferring would leave it with nothing.
+//! - Engine damage is never consumed while held: renders are skipped and
+//!   the daemon's screen-activity flush records activity only, so the
+//!   completed frame carries every row written during the batch.
+//! - Full-grid state reads (`Snapshot`, `FullSnapshot`) are not gated: no
+//!   retained grid is kept, and they serve diagnostics and read/wait verbs
+//!   rather than incremental presentation. Presenting hosts use render updates.
 //! - Resize and full reset end the batch inside the engine (Ghostty resets
 //!   mode 2026 on both), so the next publication is immediate.
 //! - An abandoned batch is ended after [`SYNCHRONIZED_OUTPUT_DEADLINE`] from
@@ -103,20 +109,36 @@ impl PresentationGate {
     /// Record a published presentation. Only the frame-wide state is kept:
     /// consumers already hold the cells, and a retained update carries no ops.
     pub(crate) fn retain(&mut self, update: &TerminalRenderUpdate) {
+        // Exhaustive, so a new frame-wide field cannot be silently dropped.
+        let TerminalRenderUpdate {
+            cols,
+            rows,
+            geometry,
+            viewport_kind,
+            scrollback_offset_rows,
+            scrollbar,
+            terminal_modes,
+            render_generation,
+            cursor,
+            dirty: _,
+            ops: _,
+            image_resources,
+            image_placements,
+        } = update;
         self.retained = Some(TerminalRenderUpdate {
-            cols: update.cols,
-            rows: update.rows,
-            geometry: update.geometry,
-            viewport_kind: update.viewport_kind,
-            scrollback_offset_rows: update.scrollback_offset_rows,
-            scrollbar: update.scrollbar,
-            terminal_modes: update.terminal_modes,
-            render_generation: update.render_generation,
-            cursor: update.cursor,
+            cols: *cols,
+            rows: *rows,
+            geometry: *geometry,
+            viewport_kind: *viewport_kind,
+            scrollback_offset_rows: *scrollback_offset_rows,
+            scrollbar: *scrollbar,
+            terminal_modes: *terminal_modes,
+            render_generation: *render_generation,
+            cursor: *cursor,
             dirty: DirtyState::Clean,
             ops: Vec::new(),
-            image_resources: update.image_resources.clone(),
-            image_placements: update.image_placements.clone(),
+            image_resources: image_resources.clone(),
+            image_placements: image_placements.clone(),
         });
     }
 }

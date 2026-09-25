@@ -577,7 +577,9 @@ fn wait_actor_ready_kqueue(pty_fd: RawFd, command_fd: RawFd, timeout: Option<Dur
             .map(|timeout| libc::timespec { tv_sec: timeout.as_secs() as libc::time_t, tv_nsec: timeout.subsec_nanos() as libc::c_long });
         match kqueue.kevent(&changes, &mut events, timeout) {
             Ok(event_count) => break event_count,
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) if timeout.is_none() => continue,
+            // Let the caller recompute the remaining time to its deadline.
+            Err(Errno::EINTR) => return Ok(ActorReadiness::default()),
             Err(err) => return Err(format!("kqueue actor fds: {err}")),
         }
     };
@@ -617,7 +619,9 @@ fn wait_actor_ready_epoll(pty_fd: RawFd, command_fd: RawFd, timeout: Option<Dura
     let event_count = loop {
         match epoll.wait(&mut events, poll_timeout(timeout)) {
             Ok(event_count) => break event_count,
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) if timeout.is_none() => continue,
+            // Let the caller recompute the remaining time to its deadline.
+            Err(Errno::EINTR) => return Ok(ActorReadiness::default()),
             Err(err) => return Err(format!("epoll actor fds: {err}")),
         }
     };
@@ -647,7 +651,9 @@ fn wait_actor_ready_poll(pty_fd: RawFd, command_fd: RawFd, timeout: Option<Durat
     loop {
         match poll(&mut fds, poll_timeout(timeout)) {
             Ok(_) => break,
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) if timeout.is_none() => continue,
+            // Let the caller recompute the remaining time to its deadline.
+            Err(Errno::EINTR) => return Ok(ActorReadiness::default()),
             Err(err) => return Err(format!("poll actor fds: {err}")),
         }
     }
@@ -1272,7 +1278,8 @@ fn session_actor_handle_command(
             let _ = reply.send(Ok(runtime.last_pty_output_at()));
         }
         SessionCommand::FlushScreenActivity => {
-            runtime.flush_screen_activity();
+            // A held batch's damage belongs to the frame published after it.
+            runtime.flush_screen_activity(!state.presentation.is_held());
         }
         SessionCommand::FlushRecording { reply } => {
             runtime.flush_recording();

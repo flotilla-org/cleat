@@ -179,10 +179,13 @@ fn cleanup_on_all_non_commit_paths() {
     for mode in ["eof", "timeout", "ack_failure", "oversize"] {
         let (mut sender, mut receiver) = pair();
         receiver.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
-        let before: Vec<_> = (0..1024).map(is_open).collect();
+        let mut before: Vec<_> = (0..1024).map(is_open).collect();
         if mode == "ack_failure" {
             raw_send(&mut sender, &original[..5], 1, &serde_json::to_vec(&manifest()).unwrap());
-            sender.shutdown(std::net::Shutdown::Read).unwrap();
+            // SHUT_RD does not reliably reject the peer's next write on
+            // Darwin. Close the peer entirely to force a failed ACK.
+            before[sender.as_raw_fd() as usize] = false;
+            drop(sender);
         } else {
             let raw: Vec<_> = original[..5].iter().map(AsRawFd::as_raw_fd).collect();
             sendmsg::<()>(sender.as_raw_fd(), &[IoSlice::new(&[1])], &[ControlMessage::ScmRights(&raw)], MsgFlags::empty(), None).unwrap();
@@ -193,7 +196,7 @@ fn cleanup_on_all_non_commit_paths() {
                 sender.write_all(&u32::MAX.to_be_bytes()).unwrap();
             }
         }
-        assert!(fd_transfer::receive(&mut receiver).is_err());
+        assert!(fd_transfer::receive(&mut receiver).is_err(), "mode {mode}");
         assert_eq!(before, (0..1024).map(is_open).collect::<Vec<_>>());
     }
 }

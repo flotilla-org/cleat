@@ -33,8 +33,7 @@ and index mapping; the adopting caller must validate required roles, descriptor
 types, append mode, and snapshot/engine compatibility before adoption.
 
 The current support window is `[1, 1]`. A manifest is accepted only if its version
-is in the receiver's window and its nonzero minimum is no greater than its version
-or the receiver's version. Future versions are rejected even if their advertised
+is in the receiver's window AND its minimum satisfies `1 <= minimum <= version`. Future versions are rejected even if their advertised
 minimum overlaps: there is no implicit downgrade. The version envelope is parsed
 before the body, so even an unknown future schema gets an explicit NACK.
 A validation ACK is byte 1. A NACK is byte 2, u32 JSON length, then
@@ -64,7 +63,10 @@ epoch installed: reread before recovery, do not blindly retry. The recording
 `transferred` event is an asciicast `m` marker whose string data is JSON:
 `{"event":"transferred","epoch":2,"address":"..."}`. Standard readers can ignore
 it; capture output slicing skips it while preserving surrounding output and the
-original recording. This slice defines emission but does not wire callers.
+original recording. This structured marker is distinct from a user label:
+lookup by the plain name `transferred` will not match its JSON payload. Marker
+indexing/discovery and a naming policy belong to the later actor integration.
+This slice defines emission but does not wire callers.
 
 `ChildObserver` registers before exit, then waits with a bounded timeout. Linux
 uses pidfd_open/poll/waitid(WNOWAIT); `from_pidfd` accepts a transferred pidfd.

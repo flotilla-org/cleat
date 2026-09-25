@@ -67,7 +67,6 @@ impl VersionHeader {
         if self.min_supported_version == 0
             || self.min_supported_version > self.version
             || !(MIN_SUPPORTED_VERSION..=MANIFEST_VERSION).contains(&self.version)
-            || self.min_supported_version > MANIFEST_VERSION
         {
             return Err(format!("unsupported manifest version {} (minimum {})", self.version, self.min_supported_version));
         }

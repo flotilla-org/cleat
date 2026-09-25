@@ -35,8 +35,8 @@ use crate::{
     platform::ipc::{shutdown_stream, try_connect_session_stream, SessionStream},
     protocol::AttachmentIdentity,
     provider::{
-        DirtyState, TerminalCursor, TerminalInputEvent, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalScrollbarState,
-        TerminalViewportKind,
+        DirtyState, TerminalCursor, TerminalInputEvent, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalResizeEvent,
+        TerminalScrollbarState, TerminalViewportKind,
     },
     runtime::RuntimeLayout,
     vt,
@@ -132,8 +132,7 @@ pub(crate) struct ChannelSlot {
     pub role_state: Option<crate::packet::RoleState>,
     pub last: LastKnown,
     /// Size the caller wants; re-asserted after every reconnect.
-    pub desired_cols: u16,
-    pub desired_rows: u16,
+    pub desired_geometry: TerminalResizeEvent,
     /// Role the caller wants; requested on every (re)open with take=false —
     /// control lost across a disconnect is re-taken explicitly, not silently.
     pub desired_role: ChannelRole,
@@ -260,8 +259,7 @@ impl DaemonConnection {
     pub(crate) fn open_session_channel(
         &self,
         session_id: String,
-        cols: u16,
-        rows: u16,
+        geometry: TerminalResizeEvent,
         role: ChannelRole,
         identity: AttachmentIdentity,
     ) -> (u32, Arc<Mutex<ChannelSlot>>) {
@@ -273,9 +271,8 @@ impl DaemonConnection {
             pending_links: Vec::new(),
             view_state: Default::default(),
             role_state: None,
-            last: LastKnown::new(cols, rows),
-            desired_cols: cols,
-            desired_rows: rows,
+            last: LastKnown::new(geometry.cols, geometry.rows),
+            desired_geometry: geometry,
             desired_role: role,
             identity: identity.clone(),
             granted_role: None,
@@ -289,7 +286,7 @@ impl DaemonConnection {
             (channel, state.connected)
         };
         if connected {
-            let _ = self.send_open_frame(channel, &session_id, cols, rows, role, &identity);
+            let _ = self.send_open_frame(channel, &session_id, geometry, role, &identity);
         } else {
             // The caller may have just spawned the daemon (session create);
             // cut the reconnect backoff short.
@@ -368,8 +365,7 @@ impl DaemonConnection {
         &self,
         channel: u32,
         session_id: &str,
-        cols: u16,
-        rows: u16,
+        geometry: TerminalResizeEvent,
         role: ChannelRole,
         identity: &AttachmentIdentity,
     ) -> Result<(), String> {
@@ -382,8 +378,9 @@ impl DaemonConnection {
         }))?;
         // The daemon does not resize on channel open; assert the size this
         // client wants so a session created detached comes up at view size.
-        // (A watcher's resize is dropped daemon-side, which is the intent.)
-        self.send_resize(channel, cols, rows)
+        // Watcher geometry is retained for promotion but does not size the PTY.
+        // Use the existing input event to carry pixels without a protocol bump.
+        self.send_input(channel, TerminalInputEvent::Resize(geometry))
     }
 
     fn send_frame_result(&self, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
@@ -449,7 +446,7 @@ impl DaemonConnection {
             let mut state = recover_lock(&self.state);
             state.connected = true;
             state.directory.replace(snapshot);
-            let reopen: Vec<(u32, String, u16, u16, ChannelRole, AttachmentIdentity)> = state
+            let reopen: Vec<(u32, String, TerminalResizeEvent, ChannelRole, AttachmentIdentity)> = state
                 .channels
                 .iter()
                 .filter_map(|(channel, slot)| {
@@ -466,20 +463,13 @@ impl DaemonConnection {
                     slot.pending_images.clear();
                     slot.images = Default::default();
                     slot.pending_links.clear();
-                    Some((
-                        *channel,
-                        slot.session_id.clone(),
-                        slot.desired_cols,
-                        slot.desired_rows,
-                        slot.desired_role,
-                        slot.identity.clone(),
-                    ))
+                    Some((*channel, slot.session_id.clone(), slot.desired_geometry, slot.desired_role, slot.identity.clone()))
                 })
                 .collect();
             reopen
         };
-        for (channel, session_id, cols, rows, role, identity) in reopen {
-            let _ = self.send_open_frame(channel, &session_id, cols, rows, role, &identity);
+        for (channel, session_id, geometry, role, identity) in reopen {
+            let _ = self.send_open_frame(channel, &session_id, geometry, role, &identity);
         }
         (self.wake)();
         true
@@ -710,7 +700,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        packet::{Ack, Input, Resize},
+        packet::{Ack, Input},
         platform::ipc::{bind_session_listener, SessionListener},
     };
 
@@ -782,6 +772,10 @@ mod tests {
         }
     }
 
+    fn geometry(cols: u16, rows: u16) -> TerminalResizeEvent {
+        TerminalResizeEvent { cols, rows, cell_width_px: 9.0, cell_height_px: 18.0 }
+    }
+
     fn directory_entry(session_id: &str) -> DirectoryEntry {
         DirectoryEntry {
             session_id: session_id.to_string(),
@@ -849,7 +843,7 @@ mod tests {
         assert_eq!(connection.with_directory(|directory| directory.entries.len()), 1);
 
         let (channel, slot) =
-            connection.open_session_channel("alpha".to_string(), 100, 40, ChannelRole::Controller, AttachmentIdentity::default());
+            connection.open_session_channel("alpha".to_string(), geometry(100, 40), ChannelRole::Controller, AttachmentIdentity::default());
         let open = PacketFrame::read(&mut server).expect("open frame");
         assert_eq!((open.channel, open.msg_type), (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL));
         assert_eq!(open.decode::<OpenChannel>().expect("open payload"), OpenChannel {
@@ -860,8 +854,8 @@ mod tests {
             identity: AttachmentIdentity::default(),
         });
         let resize = PacketFrame::read(&mut server).expect("resize frame");
-        assert_eq!((resize.channel, resize.msg_type), (channel, MSG_SESSION_RESIZE));
-        assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 100, rows: 40 });
+        assert_eq!((resize.channel, resize.msg_type), (channel, MSG_SESSION_INPUT));
+        assert_eq!(resize.decode::<Input>().expect("resize payload").event, TerminalInputEvent::Resize(geometry(100, 40)));
 
         PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket::live(render_update(7)))
             .expect("render frame")
@@ -900,11 +894,11 @@ mod tests {
             let mut server = daemon.accept(vec![directory_entry("alpha")]);
             wait_until(|| connection.is_connected());
             let (channel, slot) =
-                connection.open_session_channel("alpha".into(), 80, 24, ChannelRole::Watcher, AttachmentIdentity::default());
+                connection.open_session_channel("alpha".into(), geometry(80, 24), ChannelRole::Watcher, AttachmentIdentity::default());
             let _ = PacketFrame::read(&mut server).unwrap();
             let _ = PacketFrame::read(&mut server).unwrap();
             let (other, sibling) =
-                connection.open_session_channel("alpha".into(), 80, 24, ChannelRole::Watcher, AttachmentIdentity::default());
+                connection.open_session_channel("alpha".into(), geometry(80, 24), ChannelRole::Watcher, AttachmentIdentity::default());
             let _ = PacketFrame::read(&mut server).unwrap();
             let _ = PacketFrame::read(&mut server).unwrap();
             PacketFrame::new(channel, MSG_SESSION_IMAGE_FILE, &ImageFile {
@@ -978,7 +972,7 @@ mod tests {
         let mut server = daemon.accept(vec![directory_entry("alpha")]);
         wait_until(|| connection.is_connected());
         let (channel, slot) =
-            connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller, AttachmentIdentity::default());
+            connection.open_session_channel("alpha".to_string(), geometry(80, 24), ChannelRole::Controller, AttachmentIdentity::default());
         let _open = PacketFrame::read(&mut server).expect("open frame");
         let _resize = PacketFrame::read(&mut server).expect("resize frame");
 
@@ -987,8 +981,7 @@ mod tests {
         drop(server);
         wait_until(|| !connection.is_connected());
         if let Ok(mut slot) = slot.lock() {
-            slot.desired_cols = 120;
-            slot.desired_rows = 50;
+            slot.desired_geometry = TerminalResizeEvent { cell_width_px: 12.0, cell_height_px: 24.0, ..geometry(120, 50) };
             slot.pending = Some(render_update(99));
             slot.pending_images.push(crate::image_backing::RetainedImage::from_owned(crate::provider::TerminalImageBytes {
                 image_id: 1,
@@ -1016,7 +1009,10 @@ mod tests {
             assert!(slot.pending_links.is_empty());
         }
         let resize = PacketFrame::read(&mut server).expect("resize frame");
-        assert_eq!(resize.decode::<Resize>().expect("resize payload"), Resize { cols: 120, rows: 50 });
+        assert_eq!(
+            resize.decode::<Input>().expect("resize payload").event,
+            TerminalInputEvent::Resize(TerminalResizeEvent { cell_width_px: 12.0, cell_height_px: 24.0, ..geometry(120, 50) })
+        );
         PacketFrame::new(channel, MSG_SESSION_ROLE, &crate::packet::RoleState {
             role: ChannelRole::Controller,
             controller: None,
@@ -1047,9 +1043,9 @@ mod tests {
         let mut server = daemon.accept(vec![directory_entry("alpha"), directory_entry("beta")]);
         wait_until(|| connection.is_connected());
         let (closed_channel, closed_slot) =
-            connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller, AttachmentIdentity::default());
+            connection.open_session_channel("alpha".to_string(), geometry(80, 24), ChannelRole::Controller, AttachmentIdentity::default());
         let (live_channel, _live_slot) =
-            connection.open_session_channel("beta".to_string(), 80, 24, ChannelRole::Controller, AttachmentIdentity::default());
+            connection.open_session_channel("beta".to_string(), geometry(80, 24), ChannelRole::Controller, AttachmentIdentity::default());
         for _ in 0..4 {
             PacketFrame::read(&mut server).expect("initial open/resize frames");
         }
@@ -1080,7 +1076,7 @@ mod tests {
             identity: AttachmentIdentity::default(),
         });
         let resize = PacketFrame::read(&mut server).expect("resize frame");
-        assert_eq!((resize.channel, resize.msg_type), (live_channel, MSG_SESSION_RESIZE));
+        assert_eq!((resize.channel, resize.msg_type), (live_channel, MSG_SESSION_INPUT));
         server.set_read_timeout(Some(std::time::Duration::from_millis(100))).expect("set read timeout");
         assert!(PacketFrame::read(&mut server).is_err(), "closed channel must not be reopened");
 
@@ -1132,7 +1128,7 @@ mod tests {
         let (_temp, layout) = test_layout();
         let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
         let (channel, slot) =
-            connection.open_session_channel("alpha".to_string(), 80, 24, ChannelRole::Controller, AttachmentIdentity::default());
+            connection.open_session_channel("alpha".to_string(), geometry(80, 24), ChannelRole::Controller, AttachmentIdentity::default());
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _state = connection.state.lock().expect("state lock");

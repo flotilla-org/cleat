@@ -2178,6 +2178,7 @@ fn sync_packet_geometry(hosted: &mut HostedSession) -> Result<(), String> {
     if let Some(size) = hosted.packet_control.application_cell_size() {
         if size != hosted.applied_cell_size {
             hosted.actor.set_cell_size(size.0, size.1)?;
+            eprintln!("session {}: set_cell_size {}x{}", hosted.metadata.id, size.0, size.1);
             hosted.applied_cell_size = size;
         }
     }
@@ -3936,7 +3937,7 @@ fn handle_packet_frame(
                             let local_wheel = event.kind == TerminalMouseEventKind::Wheel
                                 && (session.history
                                     || session.role == ChannelRole::Watcher
-                                    || (!modes.mouse_tracking && !(modes.active_alternate_screen && modes.alternate_scroll)));
+                                    || !(modes.mouse_tracking || modes.active_alternate_screen && modes.alternate_scroll));
                             if local_wheel {
                                 let delta =
                                     if event.wheel_delta_y.is_finite() { (event.wheel_delta_y.round() as i64).saturating_neg() } else { 0 };

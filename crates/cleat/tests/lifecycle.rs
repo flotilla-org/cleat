@@ -1702,6 +1702,134 @@ fn daemon_provider_uses_client_supplied_id() {
     service.kill("client-chosen-id").expect("kill daemon session");
 }
 
+// Use the same child and descriptor for embedded and daemon hosting. The child
+// records the actual CSI 16t reply and emits a placement sized in cells.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn provider_cell_pixel_geometry_matches_across_hostings() {
+    use cleat::provider_ffi::*;
+
+    struct DaemonProcess(std::process::Child);
+    impl Drop for DaemonProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for backend in [CLEAT_PROVIDER_BACKEND_IN_PROCESS, CLEAT_PROVIDER_BACKEND_DAEMON] {
+        let temp = tempfile::Builder::new().prefix("cleat-pixels-").tempdir_in("/tmp").unwrap();
+        let root = temp.path().to_string_lossy();
+        let log = temp.path().join("daemon.log");
+        let _daemon = (backend == CLEAT_PROVIDER_BACKEND_DAEMON).then(|| {
+            let child = Command::new(std::env::var("CARGO_BIN_EXE_cleat").unwrap())
+                .args(["--runtime-root", root.as_ref(), "--server", DEFAULT_DAEMON_NAME, "serve"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap();
+            let daemon = DaemonProcess(child);
+            wait_for_socket(&RuntimeLayout::new(temp.path().to_path_buf()).socket_path());
+            daemon
+        });
+        let script = temp.path().join("query.py");
+        std::fs::write(
+            &script,
+            r#"
+import os, signal, sys, tty
+from pathlib import Path
+signal.alarm(15)
+tty.setraw(0)
+root = Path(sys.argv[1])
+(root / 'ready').touch()
+for n in range(4):
+    os.read(0, 1)
+    os.write(1, b'\x1b[16t')
+    reply = b''
+    while not reply.endswith(b't'):
+        reply += os.read(0, 1)
+    (root / 'reply.tmp').write_bytes(reply)
+    (root / 'reply.tmp').replace(root / ('reply' + str(n)))
+    os.write(1, ('\x1b_Ga=T,t=d,f=24,i=2,p=1,s=1,v=2,c=14,r=7,q=2;////////\x1b\\').encode())
+os.read(0, 1)
+"#,
+        )
+        .unwrap();
+        let command = format!("python3 {} {}", script.display(), temp.path().display());
+        unsafe {
+            let provider = cleat_provider_open(&CleatProviderDesc {
+                abi_version: CLEAT_PROVIDER_ABI_VERSION,
+                requested_features: ProviderFeatures::CELL_SNAPSHOTS.bits(),
+                backend,
+                runtime_root: root.as_ptr(),
+                runtime_root_len: root.len(),
+                ..CleatProviderDesc::default()
+            });
+            assert!(!provider.is_null());
+            let mut desc = CleatSessionDesc {
+                cols: 80,
+                rows: 24,
+                cell_width_px: 9.0,
+                cell_height_px: 18.0,
+                vt_engine: CLEAT_PROVIDER_VT_GHOSTTY,
+                command: command.as_ptr(),
+                command_len: command.len(),
+                id: b"pixels".as_ptr(),
+                id_len: 6,
+                ..CleatSessionDesc::default()
+            };
+            let mut session = cleat_session_create(provider, &desc);
+            assert!(!session.is_null());
+            wait_until("query child ready", || temp.path().join("ready").exists());
+            for (n, (width, height)) in [(9, 18), (10, 20), (12, 24), (12, 24)].into_iter().enumerate() {
+                if n == 1 && backend == CLEAT_PROVIDER_BACKEND_DAEMON {
+                    cleat_session_destroy(session);
+                    desc.cell_width_px = width as f32;
+                    desc.cell_height_px = height as f32;
+                    session = cleat_session_attach(provider, &desc);
+                    assert!(!session.is_null());
+                } else if n == 1 || n == 2 {
+                    assert!(cleat_session_update_geometry(session, &CleatTerminalGeometry {
+                        cell_width_px: width as f32,
+                        cell_height_px: height as f32,
+                        ..CleatTerminalGeometry::default()
+                    }));
+                } else if n == 3 {
+                    assert!(cleat_session_resize(session, 90, 30));
+                }
+                if backend == CLEAT_PROVIDER_BACKEND_DAEMON {
+                    wait_until("controller grant", || cleat_session_role(session) == CLEAT_ROLE_CONTROLLER);
+                }
+                assert!(cleat_session_write_bytes(session, b"x".as_ptr(), 1));
+                let reply = temp.path().join(format!("reply{n}"));
+                wait_until("cell size reply", || reply.exists());
+                assert_eq!(std::fs::read(reply).unwrap(), format!("\x1b[6;{height};{width}t").as_bytes(), "backend={backend}, stage={n}");
+                wait_until("placement with host pixel dimensions", || {
+                    let mut update = CleatRenderUpdate::default();
+                    assert!(cleat_session_render_update(session, &mut update));
+                    let matches = update.image_placement_count > 0
+                        && std::slice::from_raw_parts(update.image_placements, update.image_placement_count)
+                            .iter()
+                            .any(|p| p.pixel_width == 14 * width && p.pixel_height == 7 * height);
+                    cleat_session_release_render_update(session, &mut update);
+                    matches
+                });
+            }
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+            if backend == CLEAT_PROVIDER_BACKEND_DAEMON {
+                service_for(temp.path()).kill("pixels").unwrap();
+                let log = std::fs::read_to_string(&log).unwrap();
+                for size in ["9x18", "10x20", "12x24"] {
+                    assert!(log.contains(&format!("session pixels: set_cell_size {size}")), "{log}");
+                }
+            }
+        }
+    }
+}
+
 // Drives the daemon FFI surface end to end through the C ABI functions:
 // session identity, role grant, directory snapshot, attach-by-id,
 // take-control preemption, and closed-channel notification when the session

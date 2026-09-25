@@ -434,14 +434,7 @@ impl SessionRuntime {
 
         let activity = self.screen_activity.json_snapshot(Instant::now());
         InspectResult {
-            generation: self
-                .session_dir
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.rsplit_once('@'))
-                .and_then(|(_, n)| n.parse().ok()),
+            generation: self.session_dir.parent().and_then(|p| p.parent()).and_then(crate::runtime::generation_from_daemon_dir),
             hosting_epoch: self.hosting_epoch,
             session: crate::protocol::SessionInspect {
                 id: self.session.id.clone(),

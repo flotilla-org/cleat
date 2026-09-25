@@ -1580,6 +1580,8 @@ mod nesting_tests {
         let source = RuntimeLayout::new(root.clone()).with_daemon("work".into()).unwrap().session_coordinates("alpha").unwrap();
         let check = |root: &std::path::Path, daemon, id| check_foreground_nesting(root, daemon, id, Some(&source));
         assert!(check(&root, "work", Some("alpha")).unwrap_err().contains("output loop"));
+        assert!(check(&root, "work@2", Some("alpha")).unwrap_err().contains("output loop"));
+        assert!(check(&root, "work@2", Some("beta")).is_ok());
         assert!(check(&root, "work", Some("beta")).is_ok());
         assert!(check(&root, "other", Some("alpha")).is_ok());
         assert!(check(&root.join("other"), "work", Some("alpha")).is_ok());

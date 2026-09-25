@@ -88,7 +88,7 @@ Every daemon exports its coordinates into each session child, following the same
 - `$CLEAT_DAEMON` — the daemon name used for ambient command targeting
 - `$CLEAT_SESSION` — the current session ID
 
-This makes bare commands inside a session use that session's daemon and state root. `cleat daemons` discovers daemon directories at the ambient root and the well-known XDG/platform roots. Discovery is intentionally best-effort, not exhaustive: private roots that are not ambient can remain undiscoverable, and each daemon's own Directory remains authoritative for its sessions. Use `cleat daemons --json` for structured `{name, runtime_root}` coordinates.
+This makes bare commands inside a session use that session's daemon and state root. `cleat daemons` discovers daemon directories at the ambient root and the well-known XDG/platform roots. Discovery is intentionally best-effort, not exhaustive: private roots that are not ambient can remain undiscoverable, and each daemon's own Directory remains authoritative for its sessions. Use `cleat daemons --json` for structured `{name, runtime_root, generation, alive, drain_state, build}` entries. `generation` is null for legacy hosts, and `drain_state` is `serving` in this slice; draining is introduced separately. Build identity is retained for dead generations.
 
 Runtime layout v2 is daemon-scoped:
 

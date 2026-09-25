@@ -167,7 +167,13 @@ impl SessionService {
             if target_dir.exists() {
                 return Err(format!("session {id} exists in multiple daemons; use --server to select the target daemon instead"));
             }
-            std::fs::rename(&source_dir, &target_dir).map_err(|e| format!("adopt retained session {id} for recreation: {e}"))?;
+            std::fs::rename(&source_dir, &target_dir).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    format!("session {id} retained state changed during recreation; retry the attach")
+                } else {
+                    format!("adopt retained session {id} for recreation: {e}")
+                }
+            })?;
         }
         Ok(target)
     }

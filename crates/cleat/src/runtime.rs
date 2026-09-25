@@ -158,7 +158,7 @@ impl RuntimeLayout {
     }
 
     pub fn generation(&self) -> Option<u64> {
-        self.daemon_dir().file_name()?.to_str()?.rsplit_once('@')?.1.parse().ok()
+        generation_from_daemon_dir(&self.daemon_dir())
     }
 
     pub fn daemon_dir(&self) -> PathBuf {
@@ -421,6 +421,10 @@ fn platform_state_dir() -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn platform_state_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from).filter(|path| path.is_absolute()).map(|home| home.join(".local/state"))
+}
+
+pub(crate) fn generation_from_daemon_dir(dir: &Path) -> Option<u64> {
+    dir.file_name()?.to_str()?.rsplit_once('@')?.1.parse().ok()
 }
 
 /// Validate a logical daemon name or an explicit positive generation.

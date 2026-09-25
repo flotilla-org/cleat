@@ -5027,6 +5027,37 @@ mod tests {
         assert_eq!(host.screen_grid().unwrap().cells[8].graphemes, vec!['+' as u32]);
     }
 
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_repaint_keeps_outer_cursor_visible_across_transport_chunks() {
+        use crate::vt::ghostty::GhosttyVtEngine;
+        let mut source = GhosttyVtEngine::new(20, 3);
+        let mut host = GhosttyVtEngine::new(20, 3);
+        let mut renderer = PacketTerminalRenderer::new(20, 3);
+        source.feed(b"prompt> \x1b[?25h").unwrap();
+        let mut bytes = Vec::new();
+        renderer.apply_and_render(&mut bytes, &source.render_update(crate::provider::DirtyState::Full).unwrap()).unwrap();
+        host.feed(&bytes).unwrap();
+        assert!(host.render_update(crate::provider::DirtyState::Full).unwrap().cursor.visible);
+        // The source only echoes a character: it never requests cursor hiding.
+        source.feed(b"a").unwrap();
+        let update = source.render_update(crate::provider::DirtyState::Partial).unwrap();
+        assert!(update.cursor.visible);
+        bytes.clear();
+        renderer.apply_and_render(&mut bytes, &update).unwrap();
+        let split = b"\x1b[?2026h\x1b[?25l".len();
+        host.feed(&bytes[..split]).unwrap();
+        let intermediate = host.render_update(crate::provider::DirtyState::Partial).unwrap();
+        host.feed(&bytes[split..]).unwrap();
+        let completed = host.render_update(crate::provider::DirtyState::Partial).unwrap();
+        assert!(completed.cursor.visible);
+        eprintln!(
+            "source visible={}, outer mid-batch={}, outer completed={}",
+            update.cursor.visible, intermediate.cursor.visible, completed.cursor.visible
+        );
+        assert!(intermediate.cursor.visible, "attach repaint exposed a hidden cursor although source cursor stayed visible");
+    }
+
     #[test]
     fn packet_render_batches_repaint_with_cursor_hidden() {
         let mut renderer = PacketTerminalRenderer::new(2, 2);

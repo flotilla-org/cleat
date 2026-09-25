@@ -143,3 +143,14 @@ fn terminate_daemon(layout: &RuntimeLayout) {
         assert_ne!(terminated, 0);
     }
 }
+
+#[test]
+fn recreation_rejects_path_components_before_mutating_the_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("unused");
+    let service = SessionService::new(RuntimeLayout::new(root.clone()));
+    for id in ["..", "../outside", "a/b"] {
+        assert!(service.for_recreation(id).is_err());
+    }
+    assert!(!root.exists());
+}

@@ -111,6 +111,7 @@ impl SessionService {
     /// Resolve an id through the logical alias. Prefer live claims; retain dead
     /// recordings as recreatable husks when no live generation claims the id.
     pub fn for_session(&self, id: &str) -> Result<Self, String> {
+        validate_runtime_name(id)?;
         if self.layout.daemon_name().contains('@') {
             return Ok(self.clone());
         }

@@ -134,18 +134,29 @@ impl PtyChild {
             }
             SignalTarget::Leader => nix::sys::signal::kill(self.pid, signal).map_err(|err| format!("kill: {err}")),
             SignalTarget::Tree => {
-                // The forkpty child is a session leader, so its pid doubles as its
-                // process-group id. Children stay in that group unless they setsid.
-                let leader_pgid = self.pid;
-                killpg_ignoring_dead(leader_pgid, signal)?;
-                if let Ok(fg_pgid) = tcgetpgrp(self.master_fd.as_fd()) {
-                    if fg_pgid != leader_pgid {
-                        killpg_ignoring_dead(fg_pgid, signal)?;
-                    }
-                }
+                let tree = self.process_tree();
+                self.signal_tree(&tree, signal)?;
                 Ok(())
             }
         }
+    }
+
+    pub(crate) fn process_tree(&self) -> crate::platform::signals::ProcessTree {
+        crate::platform::signals::ProcessTree::capture(self.leader_pid())
+    }
+
+    pub(crate) fn signal_tree(&self, tree: &crate::platform::signals::ProcessTree, signal: Signal) -> Result<(), String> {
+        // Capture the foreground group before signaling anything: terminating
+        // the leader may make tcgetpgrp fail as the controlling tty hangs up.
+        let foreground = tcgetpgrp(self.master_fd.as_fd()).ok();
+        let groups = [self.leader_pid(), foreground.map_or(self.leader_pid(), |pgid| pgid.as_raw() as u32)];
+        let descendants = tree.signal_outside_groups(signal, &groups);
+        let foreground = match foreground {
+            Some(pgid) if pgid != self.pid => killpg_ignoring_dead(pgid, signal),
+            _ => Ok(()),
+        };
+        let leader = killpg_ignoring_dead(self.pid, signal);
+        descendants.and(foreground).and(leader)
     }
 }
 

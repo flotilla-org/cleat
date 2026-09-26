@@ -104,6 +104,9 @@ jobs:
           components: clippy
       - run: cargo clippy -p cleat --all-targets --locked --no-default-features -- -D warnings
       - run: cargo test -p cleat --locked --no-default-features --test fd_transfer --test transfer_state --test child_observation
+      - run: cargo test -p cleat --locked --no-default-features --test lifecycle tree_signal
+      - run: cargo test -p cleat --locked --no-default-features --test lifecycle delete_escalates
+      - run: cargo test -p cleat --locked --no-default-features --test lifecycle kill_terminates_background_children
 
   windows-core:
     name: Windows build and core tests

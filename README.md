@@ -109,6 +109,8 @@ Runtime layout v2 is daemon-scoped:
 
 **Linger and cleanup.** A daemon starts on first use of its name. When it has no live sessions, it lingers for 120 seconds before exiting so a burst of commands does not repeatedly bounce the daemon. When a child process exits, its session is removed unless it has a recording that makes it recreatable.
 
+**Unix termination.** `cleat kill <id>` (HTTP `DELETE /sessions/{id}`) sends TERM to the session tree, then KILL to surviving processes after a two-second grace period. DELETE acknowledges the request with 204 before the grace period ends; other sessions remain serviceable. Tree signals include the leader group, the foreground job-control group, and discoverable descendants, including children that called `setsid`. Cleanup retains process identities across leader exit and includes descendants born during grace. Descendant walking is best-effort: children already reparented before the initial snapshot cannot be recovered by ancestry. Explicit `signal --target tree` sends only the requested signal and does not schedule escalation.
+
 **Recording and recreation.** CLI-created sessions record by default. Use `--no-record` to opt out, and `cleat record <id>` to enable recording on a running session. Recording is the persistence floor: a daemon crash or host reboot loses the PTY and process state, but a preserved recording can seed scrollback when the session is recreated.
 
 ## Behavioral Model

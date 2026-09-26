@@ -4021,11 +4021,200 @@ fn kill_terminates_background_children_in_leader_process_group() {
 
     service.kill(&info.id).expect("kill session");
 
-    wait_until("background child to die after cleat kill", || {
-        // SAFETY: signal 0 performs existence and permission checks only.
-        let rc = unsafe { libc::kill(child_pid, 0) };
-        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    // Container PID 1 may not reap orphaned zombies. They have terminated and
+    // released their files even though kill(pid, 0) still reports existence.
+    wait_until("background child to die after cleat kill", || !signal_fixture_is_running(child_pid));
+}
+
+// A real PTY/process fixture: snapshots alone cannot prove setsid and job-control
+// behavior. Keep a cleanup guard so a failing regression does not leak processes.
+struct SignalFixturePids(Vec<i32>);
+
+impl Drop for SignalFixturePids {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            // SAFETY: these are fixture processes, retained until test teardown.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+    }
+}
+
+fn signal_fixture_is_running(pid: i32) -> bool {
+    let mut system = sysinfo::System::new();
+    let pid = sysinfo::Pid::from_u32(pid as u32);
+    system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, sysinfo::ProcessRefreshKind::nothing());
+    system.process(pid).is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
+}
+
+fn run_tree_signal_fixture(mode: &str, delete: bool) {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let script = temp.path().join("tree.py");
+    let ready = temp.path().join("ready");
+    std::fs::write(
+        &script,
+        r#"
+import os, signal, sys, time
+mode, ready = sys.argv[1:]
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+if mode == 'ignore':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if mode == 'late':
+    def on_term(signum, frame):
+        if os.fork() == 0:
+            os.setsid()
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            with open(ready + '.late', 'w') as f:
+                f.write(str(os.getpid()))
+            while True:
+                time.sleep(1)
+    signal.signal(signal.SIGTERM, on_term)
+pid = os.fork()
+if pid == 0:
+    if mode == 'foreground':
+        os.setpgid(0, 0)
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        os.tcsetpgrp(0, os.getpgrp())
+    else:
+        os.setsid()
+    if mode in ('ignore', 'orphan', 'late'):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(ready, 'w') as f:
+        f.write(str(os.getpid()))
+    while True:
+        time.sleep(1)
+os.waitpid(pid, 0)
+if mode == 'late':
+    while True:
+        time.sleep(1)
+"#,
+    )
+    .expect("write fixture");
+    let command = format!("exec python3 {} {} {}", script.display(), mode, ready.display());
+    let info = service.create(Some("tree".into()), Some(VtEngineKind::Passthrough), None, Some(command), true).expect("create");
+    let mut pids = SignalFixturePids(vec![]);
+    wait_until("fixture readiness", || {
+        std::fs::read_to_string(&ready).ok().and_then(|s| s.parse::<i32>().ok()).is_some_and(|pid| {
+            pids.0.push(pid);
+            true
+        })
     });
+    let leader = service.inspect(&info.id).expect("inspect").process.leader_pid as i32;
+    pids.0.push(leader);
+    if mode == "foreground" {
+        assert_eq!(service.inspect(&info.id).unwrap().process.foreground_pgid, Some(pids.0[0] as u32));
+        assert_ne!(pids.0[0], leader);
+    }
+    if delete {
+        let started = Instant::now();
+        let response = http_session_request(
+            temp.path(),
+            &info.id,
+            &format!("DELETE /sessions/{} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n", info.id),
+        );
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+        assert!(started.elapsed() < Duration::from_secs(1), "DELETE must not wait out the grace period");
+        // The daemon must keep serving while termination is pending.
+        service.list().expect("list during grace");
+    } else {
+        service.signal(&info.id, libc::SIGTERM, cleat::protocol::SignalTarget::Tree).expect("tree signal");
+    }
+    if mode == "late" {
+        wait_until("child forked during grace", || {
+            std::fs::read_to_string(temp.path().join("ready.late")).ok().and_then(|s| s.parse::<i32>().ok()).is_some_and(|pid| {
+                pids.0.push(pid);
+                true
+            })
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while pids.0.iter().any(|pid| signal_fixture_is_running(*pid)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(pids.0.iter().all(|pid| !signal_fixture_is_running(*pid)), "tree processes survived {mode}");
+    wait_until("session retirement", || service.inspect(&info.id).is_err());
+}
+
+#[test]
+fn tree_signal_reaches_setsid_child() {
+    run_tree_signal_fixture("escape", false);
+}
+
+#[test]
+fn tree_signal_reaches_distinct_foreground_group() {
+    run_tree_signal_fixture("foreground", false);
+}
+
+#[test]
+fn delete_escalates_term_ignoring_tree() {
+    run_tree_signal_fixture("ignore", true);
+}
+
+#[test]
+fn delete_escalates_escaped_child_after_leader_exits() {
+    run_tree_signal_fixture("orphan", true);
+}
+
+#[test]
+fn delete_escalates_children_born_during_grace() {
+    run_tree_signal_fixture("late", true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn delete_releases_paused_recorders_for_two_interactive_shells() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    // Reproduce with zsh when installed; bash exercises the same interactive
+    // TERM/HUP resistance on CI hosts without zsh.
+    let shell = if Command::new("zsh").arg("--version").output().is_ok() { "zsh -f -i" } else { "bash --noprofile --norc -i" };
+    let mut pids = SignalFixturePids(vec![]);
+    let mut casts = Vec::new();
+    for id in ["first", "second"] {
+        service.create(Some(id.into()), Some(VtEngineKind::Passthrough), None, Some(format!("exec {shell}")), true).unwrap();
+        let ready = temp.path().join(format!("{id}.ready"));
+        service.send_keys(id, format!("trap '' TERM HUP; echo $$ > {}\n", ready.display()).as_bytes()).unwrap();
+        wait_until("interactive shell ready", || std::fs::read_to_string(&ready).is_ok_and(|s| s.trim().parse::<i32>().is_ok()));
+        pids.0.push(std::fs::read_to_string(ready).unwrap().trim().parse().unwrap());
+        service.record(id, false).expect("pause recorder");
+        casts.push(service.session_dir(id).join(CAST_FILE_NAME));
+    }
+    let daemon_pid = std::fs::read_to_string(daemon_pid_path(temp.path(), "first")).unwrap();
+    let open_recordings = || {
+        std::fs::read_dir(format!("/proc/{}/fd", daemon_pid.trim()))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .filter(|path| {
+                casts.iter().any(|cast| {
+                    path.as_os_str() == cast.as_os_str()
+                        || path.as_os_str() == std::ffi::OsStr::new(&format!("{} (deleted)", cast.display()))
+                })
+            })
+            .count()
+    };
+    assert_eq!(open_recordings(), 2, "paused recorders retain their file descriptors");
+    for cast in &casts {
+        std::fs::remove_file(cast).unwrap();
+    }
+    for id in ["first", "second"] {
+        let response = http_session_request(
+            temp.path(),
+            id,
+            &format!("DELETE /sessions/{id} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"),
+        );
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+    }
+    assert!(pids.0.iter().all(|pid| signal_fixture_is_running(*pid)), "shells must resist the initial TERM");
+    assert_eq!(service.list().unwrap().len(), 2, "daemon serves requests during grace");
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while pids.0.iter().any(|pid| signal_fixture_is_running(*pid)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(pids.0.iter().all(|pid| !signal_fixture_is_running(*pid)), "both interactive leaders must exit");
+    wait_until("deleted recording descriptors released", || open_recordings() == 0);
 }
 
 #[test]

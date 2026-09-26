@@ -225,6 +225,26 @@ impl SessionRecorder {
         Ok(recorder)
     }
 
+    /// Continue in this session directory's own cast file when the handed-over
+    /// descriptor names a different file: a transfer across runtime roots copies
+    /// the recording, and the adopter must append to the copy.
+    #[cfg(unix)]
+    pub fn rebind_to_session_dir(&mut self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let cast_path = self.session_dir.join(CAST_FILE_NAME);
+        let Ok(on_disk) = std::fs::metadata(&cast_path) else {
+            return Ok(());
+        };
+        let held = self.cast_file.metadata().map_err(|err| format!("stat transferred cast file: {err}"))?;
+        if (held.dev(), held.ino()) != (on_disk.dev(), on_disk.ino()) {
+            self.cast_file = OpenOptions::new()
+                .append(true)
+                .open(&cast_path)
+                .map_err(|err| format!("open copied cast file {}: {err}", cast_path.display()))?;
+        }
+        self.refresh_offset()
+    }
+
     /// Resynchronize the byte offset with the shared cast file.
     pub fn refresh_offset(&mut self) -> Result<(), String> {
         self.bytes_written = self.cast_file.metadata().map_err(|err| format!("stat transferred cast file: {err}"))?.len();

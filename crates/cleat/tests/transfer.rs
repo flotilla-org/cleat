@@ -388,6 +388,7 @@ fn a_stalled_target_never_blocks_the_servicing_loop_and_leaves_the_session() {
     root.launch_shell("stuck");
     root.launch_shell("bystander");
     let before = root.inspect(&["inspect", "stuck"]);
+    let mut watcher = Watcher::attach(&root, "stuck");
     let _target = StallingTarget::start(&root, "stall");
 
     let started = Instant::now();
@@ -419,7 +420,29 @@ fn a_stalled_target_never_blocks_the_servicing_loop_and_leaves_the_session() {
     assert!(err.contains("timed out"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(10));
     assert_left_in_place(&root, "stuck", &before, "after-stall");
+    watcher.render();
     root.ok(&["tag", "stuck", "+thawed"]);
+}
+
+#[test]
+fn transfer_across_runtime_roots_copies_the_session_directory() {
+    let root = Root::new();
+    let elsewhere = Root::new();
+    root.launch_shell("travelling");
+    root.ok(&["send", "travelling", "echo here-$((1+2))"]);
+    wait_for_output(&root.cast("default@1", "travelling"), "here-3");
+    let before = root.inspect(&["inspect", "travelling"]);
+
+    let destination = elsewhere.path().to_str().unwrap();
+    let result = root.transfer("travelling", "other", &["--to-runtime-root", destination], &[]).unwrap();
+    assert_eq!((result.address.as_str(), result.hosting_epoch), ("daemon:other@1", 2));
+    assert!(!root.session_dir("default@1", "travelling").exists(), "the source directory is removed after the copy");
+    let moved = elsewhere.inspect(&["--server", "other", "inspect", "travelling"]);
+    assert_eq!((moved.hosting_epoch, moved.process.leader_pid), (2, before.process.leader_pid));
+    elsewhere.ok(&["--server", "other", "send", "travelling", "echo there-$((2+2))"]);
+    let cast = elsewhere.cast("other@1", "travelling");
+    wait_for_output(&cast, "there-4");
+    assert!(recorded_output(&cast).contains("here-3"), "the copied recording keeps its history");
 }
 
 #[test]

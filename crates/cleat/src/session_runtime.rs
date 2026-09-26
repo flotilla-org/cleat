@@ -263,7 +263,7 @@ impl SessionRuntime {
             let _ = self.vt_engine.drain_replies();
         }
         if let Some(recorder) = &mut self.recorder {
-            recorder.refresh_offset()?;
+            recorder.rebind_to_session_dir()?;
         }
         self.pty_child.arm();
         Ok(())

@@ -1,5 +1,5 @@
 //! Manual measurements of the real packet renderer, excluding VT parsing and transport encoding.
-//! Run with `cargo test -p cleat --release --locked packet_repaint_measurements -- --ignored --nocapture`.
+//! Run with `cargo test -p cleat --release --locked --no-default-features packet_repaint_measurements -- --ignored --nocapture`.
 
 use std::{hint::black_box, time::Instant};
 

@@ -792,13 +792,15 @@ impl PacketTerminalRenderer {
         });
         self.geometry.resize((update.cols, update.rows), self.viewport.unwrap_or((update.cols, update.rows)));
         let resized = self.cols != update.cols || self.rows != update.rows;
-        let modes_changed = self.terminal_modes != update.terminal_modes;
+        // Only switching screen buffers invalidates retained content. The other
+        // TerminalModeState fields control input, not cell interpretation.
+        let screen_changed = self.terminal_modes.active_alternate_screen != update.terminal_modes.active_alternate_screen;
         if resized {
             self.cols = update.cols;
             self.rows = update.rows;
             self.cells = vec![vec![crate::provider::TerminalRenderCell::default(); self.cols as usize]; self.rows as usize];
         }
-        if self.terminal_modes.active_alternate_screen != update.terminal_modes.active_alternate_screen {
+        if screen_changed {
             if let Some(keyboard) = &self.keyboard {
                 keyboard.lock().map_err(|_| "keyboard mode poisoned")?.leave_screen(writer).map_err(|e| e.to_string())?;
             }
@@ -809,7 +811,7 @@ impl PacketTerminalRenderer {
             keyboard.lock().map_err(|_| "keyboard mode poisoned")?.enter_screen(writer).map_err(|e| e.to_string())?;
         }
         let mut dirty_rows = std::collections::BTreeSet::new();
-        if self.needs_full_repaint || resized || modes_changed {
+        if self.needs_full_repaint || resized || screen_changed {
             dirty_rows.extend(self.geometry.y..self.geometry.y.saturating_add(self.viewport.map_or(self.rows, |size| size.1)));
         }
         for op in &update.ops {
@@ -5483,6 +5485,59 @@ mod tests {
     }
 
     #[test]
+    fn packet_render_mode_changes_only_repaint_when_switching_screens() {
+        use vt::{MouseReportFormat, MouseTrackingMode, TerminalModeState};
+
+        let default = TerminalModeState::default();
+        let cases = [
+            TerminalModeState { active_alternate_screen: true, ..default },
+            TerminalModeState { application_cursor_keys: true, ..default },
+            TerminalModeState { alternate_scroll: true, ..default },
+            TerminalModeState { mouse_tracking: true, ..default },
+            TerminalModeState { mouse_tracking_mode: MouseTrackingMode::X10, ..default },
+            TerminalModeState { mouse_tracking_mode: MouseTrackingMode::Normal, ..default },
+            TerminalModeState { mouse_tracking_mode: MouseTrackingMode::Button, ..default },
+            TerminalModeState { mouse_tracking_mode: MouseTrackingMode::Any, ..default },
+            TerminalModeState { mouse_report_format: MouseReportFormat::Sgr, ..default },
+            TerminalModeState { mouse_report_format: MouseReportFormat::SgrPixels, ..default },
+            TerminalModeState { mouse_sgr: true, ..default },
+            TerminalModeState { mouse_sgr_pixels: true, ..default },
+        ];
+        for changed in cases {
+            let mut renderer = PacketTerminalRenderer::new(2, 3);
+            let mut update = TerminalRenderUpdate { cols: 2, rows: 3, ..Default::default() };
+            renderer.apply_and_render(&mut Vec::new(), &update).unwrap();
+            // Exercise both setting and resetting each field, with and without
+            // a concurrent row replacement. Input modes must preserve dirty rows.
+            for replace_row in [false, true] {
+                update.ops = if replace_row {
+                    vec![TerminalRenderUpdateOp {
+                        kind: TerminalRenderUpdateOpKind::RowReplace,
+                        rows: vec![TerminalRenderRow { row: 1, ..Default::default() }],
+                        ..Default::default()
+                    }]
+                } else {
+                    vec![]
+                };
+                for current in [changed, default] {
+                    update.terminal_modes = current;
+                    let mut output = Vec::new();
+                    renderer.apply_and_render(&mut output, &update).unwrap();
+                    let painted_rows = output.windows(b";1H\x1b[0m".len()).filter(|bytes| *bytes == b";1H\x1b[0m").count();
+                    let expected = if changed.active_alternate_screen { 3 } else { usize::from(replace_row) };
+                    assert_eq!(painted_rows, expected, "mode {changed:?} -> {current:?}, replace_row={replace_row}");
+                    assert_eq!(renderer.terminal_modes, current, "mode state must still advance");
+                    if changed.active_alternate_screen || changed.application_cursor_keys {
+                        let mode = if changed.active_alternate_screen { 1049 } else { 1 };
+                        let suffix = if current == default { 'l' } else { 'h' };
+                        assert!(String::from_utf8_lossy(&output).contains(&format!("\x1b[?{mode}{suffix}")));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn packet_render_repaints_every_row_for_full_repaint_triggers() {
         fn painted_rows(output: &[u8]) -> usize {
             output.windows(b";1H\x1b[0m".len()).filter(|bytes| *bytes == b";1H\x1b[0m").count()
@@ -5494,14 +5549,6 @@ mod tests {
         let mut resized_output = Vec::new();
         resized_renderer.apply_and_render(&mut resized_output, &base).expect("render resize");
         assert_eq!(painted_rows(&resized_output), 2);
-
-        let mut mode_renderer = PacketTerminalRenderer::new(2, 2);
-        mode_renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");
-        let mut mode_update = base.clone();
-        mode_update.terminal_modes.application_cursor_keys = true;
-        let mut mode_output = Vec::new();
-        mode_renderer.apply_and_render(&mut mode_output, &mode_update).expect("render mode change");
-        assert_eq!(painted_rows(&mode_output), 2);
 
         let mut full_renderer = PacketTerminalRenderer::new(2, 2);
         full_renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");

@@ -10,6 +10,12 @@
 //! backoff, re-opens session channels after a reconnect (the daemon responds
 //! with a full render), applies directory deltas, and parks incoming render
 //! updates in per-channel slots for the FFI caller to consume.
+//!
+//! A channel whose session is transferred to another daemon is redirected:
+//! the daemon sends the new address, then closes the channel. The connection
+//! re-homes the channel's slot on a follower connection to the new daemon,
+//! reopening it with the role it last held, and routes the caller's
+//! operations there. The caller's channel id and slot stay valid.
 
 use std::{
     collections::HashMap,
@@ -27,10 +33,10 @@ use http::StatusCode;
 use crate::{
     http_uds,
     packet::{
-        ChannelRole, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, OpenChannel, PacketFrame, RenderPacket,
-        CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR,
-        MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE,
-        MSG_SESSION_ROLE, PROTOCOL_VERSION,
+        ChannelRedirect, ChannelRole, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, OpenChannel,
+        PacketFrame, RenderPacket, SessionRedirect, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA,
+        MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_CONTROL_REDIRECT,
+        MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE, PROTOCOL_VERSION,
     },
     platform::ipc::{shutdown_stream, try_connect_session_stream, SessionStream},
     protocol::AttachmentIdentity,
@@ -197,6 +203,15 @@ struct ConnectionState {
     next_channel: u32,
     channels: HashMap<u32, Arc<Mutex<ChannelSlot>>>,
     directory: DirectoryState,
+    /// Redirects received for channels whose close has not arrived yet.
+    pending_redirects: HashMap<u32, SessionRedirect>,
+}
+
+/// Where a redirected channel lives now.
+#[derive(Clone)]
+struct ChannelRoute {
+    connection: Arc<DaemonConnection>,
+    channel: u32,
 }
 
 /// One multiplexed packet connection to a named daemon, shared by every
@@ -212,6 +227,11 @@ pub(crate) struct DaemonConnection {
     writer: Mutex<Option<SessionStream>>,
     state: Mutex<ConnectionState>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Redirected channels, by the caller's channel id. Never held across a
+    /// call into the routed connection.
+    routes: Mutex<HashMap<u32, ChannelRoute>>,
+    /// One connection per daemon that redirected channels moved to.
+    followers: Mutex<HashMap<(std::path::PathBuf, String), Arc<DaemonConnection>>>,
 }
 
 impl DaemonConnection {
@@ -228,8 +248,11 @@ impl DaemonConnection {
                 next_channel: 1,
                 channels: HashMap::new(),
                 directory: DirectoryState::default(),
+                pending_redirects: HashMap::new(),
             }),
             reader: Mutex::new(None),
+            routes: Mutex::new(HashMap::new()),
+            followers: Mutex::new(HashMap::new()),
         });
         let thread_connection = Arc::clone(&connection);
         let handle = std::thread::Builder::new()
@@ -246,6 +269,18 @@ impl DaemonConnection {
 
     pub(crate) fn is_connected(&self) -> bool {
         self.state.lock().map(|state| state.connected).unwrap_or(false)
+    }
+
+    /// Connectivity of the daemon that currently hosts `channel`'s session.
+    pub(crate) fn channel_connected(&self, channel: u32) -> bool {
+        match self.route(channel) {
+            Some(route) => route.connection.channel_connected(route.channel),
+            None => self.is_connected(),
+        }
+    }
+
+    fn route(&self, channel: u32) -> Option<ChannelRoute> {
+        recover_lock(&self.routes).get(&channel).cloned()
     }
 
     pub(crate) fn with_directory<R>(&self, read: impl FnOnce(&DirectoryState) -> R) -> R {
@@ -274,15 +309,26 @@ impl DaemonConnection {
             last: LastKnown::new(geometry.cols, geometry.rows),
             desired_geometry: geometry,
             desired_role: role,
-            identity: identity.clone(),
+            identity,
             granted_role: None,
             closed: None,
         }));
+        let channel = self.register_slot(Arc::clone(&slot));
+        (channel, slot)
+    }
+
+    /// Give `slot` a channel on this connection and open it (now, or on the
+    /// next connect) with the slot's desired geometry and role.
+    fn register_slot(&self, slot: Arc<Mutex<ChannelSlot>>) -> u32 {
+        let (session_id, geometry, role, identity) = {
+            let slot = recover_lock(&slot);
+            (slot.session_id.clone(), slot.desired_geometry, slot.desired_role, slot.identity.clone())
+        };
         let (channel, connected) = {
             let mut state = recover_lock(&self.state);
             let channel = state.next_channel;
             state.next_channel = state.next_channel.wrapping_add(1).max(1);
-            state.channels.insert(channel, Arc::clone(&slot));
+            state.channels.insert(channel, slot);
             (channel, state.connected)
         };
         if connected {
@@ -292,12 +338,50 @@ impl DaemonConnection {
             // cut the reconnect backoff short.
             self.retry_now.store(true, Ordering::SeqCst);
         }
-        (channel, slot)
+        channel
+    }
+
+    /// Follow a transferred session: re-home the channel's slot on the new
+    /// daemon, re-requesting the role it last held.
+    fn follow_redirect(&self, channel: u32, slot: Arc<Mutex<ChannelSlot>>, redirect: SessionRedirect) {
+        if let Some(reason) = redirect.incompatibility(PROTOCOL_VERSION) {
+            recover_lock(&slot).closed = Some(reason);
+            return;
+        }
+        let layout = match RuntimeLayout::new(redirect.runtime_root.clone().into()).with_daemon(redirect.daemon.clone()) {
+            Ok(layout) => layout,
+            Err(err) => {
+                recover_lock(&slot).closed = Some(format!("session {} moved to an invalid address: {err}", redirect.session_id));
+                return;
+            }
+        };
+        {
+            let mut slot = recover_lock(&slot);
+            // The grant died with the old host; the role it held is re-requested.
+            if let Some(role) = slot.granted_role.take() {
+                slot.desired_role = role;
+            }
+            slot.pending = None;
+            slot.pending_images.clear();
+            slot.images = Default::default();
+            slot.pending_links.clear();
+        }
+        let follower = {
+            let mut followers = recover_lock(&self.followers);
+            let key = (layout.root().to_path_buf(), layout.daemon_name().to_string());
+            Arc::clone(followers.entry(key).or_insert_with(|| DaemonConnection::open(layout, Vec::new(), Arc::clone(&self.wake))))
+        };
+        recover_lock(&self.state).channels.remove(&channel);
+        let routed = follower.register_slot(slot);
+        recover_lock(&self.routes).insert(channel, ChannelRoute { connection: follower, channel: routed });
     }
 
     /// Request a role change (take=true requests exclusive control and demotes
     /// the other controllers). The grant arrives asynchronously as a RoleState.
     pub(crate) fn request_role(&self, channel: u32, role: ChannelRole, take: bool) -> Result<(), String> {
+        if let Some(route) = self.route(channel) {
+            return route.connection.request_role(route.channel, role, take);
+        }
         {
             let state = recover_lock(&self.state);
             if let Some(slot) = state.channels.get(&channel) {
@@ -308,6 +392,10 @@ impl DaemonConnection {
     }
 
     pub(crate) fn close_session_channel(&self, channel: u32) {
+        let route = recover_lock(&self.routes).remove(&channel);
+        if let Some(route) = route {
+            return route.connection.close_session_channel(route.channel);
+        }
         let removed = {
             let mut state = recover_lock(&self.state);
             state.channels.remove(&channel).is_some()
@@ -322,6 +410,9 @@ impl DaemonConnection {
     }
 
     pub(crate) fn send_input(&self, channel: u32, event: TerminalInputEvent) -> Result<(), String> {
+        if let Some(route) = self.route(channel) {
+            return route.connection.send_input(route.channel, event);
+        }
         let state = recover_lock(&self.state);
         if !state.connected {
             return Err("daemon connection is down; input was not sent".into());
@@ -346,18 +437,30 @@ impl DaemonConnection {
     }
 
     pub(crate) fn send_resize(&self, channel: u32, cols: u16, rows: u16) -> Result<(), String> {
+        if let Some(route) = self.route(channel) {
+            return route.connection.send_resize(route.channel, cols, rows);
+        }
         self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_RESIZE, &crate::packet::Resize { cols, rows }))
     }
 
     pub(crate) fn size_policy(&self, channel: u32, fixed: Option<crate::packet::Resize>) -> Result<(), String> {
+        if let Some(route) = self.route(channel) {
+            return route.connection.size_policy(route.channel, fixed);
+        }
         self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_SIZE_POLICY, &fixed))
     }
 
     pub(crate) fn send_viewport(&self, channel: u32, command: crate::provider::ViewportCommand) -> Result<(), String> {
+        if let Some(route) = self.route(channel) {
+            return route.connection.send_viewport(route.channel, command);
+        }
         self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_VIEWPORT, &crate::packet::Viewport { command }))
     }
 
     pub(crate) fn send_ack(&self, channel: u32, generation: u64) -> Result<(), String> {
+        if let Some(route) = self.route(channel) {
+            return route.connection.send_ack(route.channel, generation);
+        }
         self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_ACK, &crate::packet::Ack { generation }))
     }
 
@@ -403,6 +506,10 @@ impl DaemonConnection {
     }
 
     pub(crate) fn shutdown(&self) {
+        let followers: Vec<_> = recover_lock(&self.followers).drain().map(|(_, follower)| follower).collect();
+        for follower in followers {
+            follower.shutdown();
+        }
         self.stop.store(true, Ordering::SeqCst);
         if let Some(stream) = recover_lock(&self.writer).take() {
             shutdown_stream(&stream);
@@ -523,14 +630,23 @@ impl DaemonConnection {
                     (self.wake)();
                 }
             }
+            (CHANNEL_CONTROL, MSG_CONTROL_REDIRECT) => {
+                if let Ok(redirect) = frame.decode::<ChannelRedirect>() {
+                    recover_lock(&self.state).pending_redirects.insert(redirect.channel, redirect.redirect);
+                }
+            }
             (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
                 if let Ok(error) = frame.decode::<ControlError>() {
-                    let slot = {
-                        let state = recover_lock(&self.state);
-                        state.channels.get(&error.channel).cloned()
+                    let (slot, redirect) = {
+                        let mut state = recover_lock(&self.state);
+                        let redirect = state.pending_redirects.remove(&error.channel);
+                        (state.channels.get(&error.channel).cloned(), redirect)
                     };
                     if let Some(slot) = slot {
-                        recover_lock(&slot).closed = Some(error.message);
+                        match redirect {
+                            Some(redirect) => self.follow_redirect(error.channel, slot, redirect),
+                            None => recover_lock(&slot).closed = Some(error.message),
+                        }
                         (self.wake)();
                     }
                 }
@@ -1030,6 +1146,98 @@ mod tests {
         assert_eq!((input.channel, input.msg_type), (channel, MSG_SESSION_INPUT));
         assert_eq!(input.decode::<Input>().expect("input payload"), Input { event: TerminalInputEvent::RawBytes(b"fresh".to_vec()) });
 
+        connection.shutdown();
+    }
+
+    fn role_state(role: ChannelRole) -> crate::packet::RoleState {
+        crate::packet::RoleState {
+            role,
+            controller: None,
+            denial_reason: None,
+            participants: Vec::new(),
+            exclusive: None,
+            fixed_size: None,
+        }
+    }
+
+    fn redirect_to(layout: &RuntimeLayout, session_id: &str, protocol_version: u16) -> SessionRedirect {
+        SessionRedirect {
+            session_id: session_id.to_string(),
+            address: format!("daemon:{}", layout.daemon_name()),
+            runtime_root: layout.root().display().to_string(),
+            daemon: layout.daemon_name().to_string(),
+            hosting_epoch: 2,
+            protocol_version,
+            min_supported_version: protocol_version,
+        }
+    }
+
+    fn send_redirect_and_close(server: &mut SessionStream, channel: u32, redirect: SessionRedirect) {
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_REDIRECT, &ChannelRedirect { channel, redirect }).unwrap().write(server).unwrap();
+        PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_ERROR, &ControlError { channel, message: "session alpha moved".to_string() })
+            .unwrap()
+            .write(server)
+            .unwrap();
+    }
+
+    #[test]
+    fn redirected_channel_reopens_at_the_new_daemon_with_its_role() {
+        let (_source_temp, source) = test_layout();
+        let (_target_temp, target) = test_layout();
+        let source_daemon = FakeDaemon::bind(&source);
+        let target_daemon = FakeDaemon::bind(&target);
+        let connection = DaemonConnection::open(source, Vec::new(), Arc::new(|| {}));
+        let mut server = source_daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let identity = AttachmentIdentity { kind: crate::protocol::AttachmentKind::Tool, name: "driver".into() };
+        let (channel, slot) = connection.open_session_channel("alpha".into(), geometry(90, 30), ChannelRole::Controller, identity.clone());
+        let _open = PacketFrame::read(&mut server).unwrap();
+        let _resize = PacketFrame::read(&mut server).unwrap();
+        PacketFrame::new(channel, MSG_SESSION_ROLE, &role_state(ChannelRole::Controller)).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).granted_role == Some(ChannelRole::Controller));
+
+        send_redirect_and_close(&mut server, channel, redirect_to(&target, "alpha", PROTOCOL_VERSION));
+        let mut moved = target_daemon.accept(vec![directory_entry("alpha")]);
+        let open = PacketFrame::read(&mut moved).expect("reopen at the new daemon");
+        let open = open.decode::<OpenChannel>().unwrap();
+        assert_eq!((open.session_id.as_str(), open.role, open.take, open.identity), ("alpha", ChannelRole::Controller, false, identity));
+        let resize = PacketFrame::read(&mut moved).unwrap();
+        assert_eq!(resize.decode::<Input>().unwrap().event, TerminalInputEvent::Resize(geometry(90, 30)));
+        PacketFrame::new(open.channel, MSG_SESSION_ROLE, &role_state(ChannelRole::Controller)).unwrap().write(&mut moved).unwrap();
+        PacketFrame::new(open.channel, MSG_SESSION_RENDER, &RenderPacket::live(render_update(3))).unwrap().write(&mut moved).unwrap();
+        wait_until(|| {
+            let slot = recover_lock(&slot);
+            slot.granted_role == Some(ChannelRole::Controller) && slot.pending.is_some()
+        });
+        assert!(recover_lock(&slot).closed.is_none());
+        assert!(connection.channel_connected(channel));
+
+        // The caller's channel id keeps working: input reaches the new host.
+        connection.send_input(channel, TerminalInputEvent::RawBytes(b"after".to_vec())).unwrap();
+        let input = PacketFrame::read(&mut moved).unwrap();
+        assert_eq!((input.channel, input.msg_type), (open.channel, MSG_SESSION_INPUT));
+        assert_eq!(input.decode::<Input>().unwrap().event, TerminalInputEvent::RawBytes(b"after".to_vec()));
+        connection.close_session_channel(channel);
+        let close = PacketFrame::read(&mut moved).unwrap();
+        assert_eq!(close.decode::<crate::packet::CloseChannel>().unwrap().channel, open.channel);
+        connection.shutdown();
+    }
+
+    #[test]
+    fn a_redirect_to_an_incompatible_protocol_closes_the_channel_with_the_reason() {
+        let (_source_temp, source) = test_layout();
+        let (_target_temp, target) = test_layout();
+        let source_daemon = FakeDaemon::bind(&source);
+        let connection = DaemonConnection::open(source, Vec::new(), Arc::new(|| {}));
+        let mut server = source_daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let (channel, slot) =
+            connection.open_session_channel("alpha".into(), geometry(80, 24), ChannelRole::Watcher, AttachmentIdentity::default());
+        let _open = PacketFrame::read(&mut server).unwrap();
+        send_redirect_and_close(&mut server, channel, redirect_to(&target, "alpha", PROTOCOL_VERSION + 1));
+        wait_until(|| recover_lock(&slot).closed.is_some());
+        let reason = recover_lock(&slot).closed.clone().unwrap();
+        assert!(reason.contains(&format!("speaking protocol {}", PROTOCOL_VERSION + 1)), "{reason}");
         connection.shutdown();
     }
 

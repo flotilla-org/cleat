@@ -589,3 +589,18 @@ fn cleat_attach_and_watch_follow_the_move_with_a_notice() {
         assert!(status.success(), "{status:?}");
     }
 }
+
+#[test]
+fn a_second_transfer_keeps_the_forked_hosts_status_forwarding() {
+    let root = Root::new();
+    root.launch_shell("hopping");
+    root.transfer("hopping", "second", &[], &[]).unwrap();
+    let result = root.transfer("hopping", "third", &[], &[]).unwrap();
+    assert_eq!((result.address.as_str(), result.hosting_epoch), ("daemon:third@1", 3));
+    let cast = root.cast("third@1", "hopping");
+    let transfers: Vec<_> = markers(&cast).into_iter().map(|marker| marker["address"].clone()).collect();
+    assert_eq!(transfers, vec![serde_json::json!("daemon:second@1"), serde_json::json!("daemon:third@1")]);
+    root.ok(&["send", "hopping", "exit 9"]);
+    let exit = wait_for_exit(&cast);
+    assert_eq!((exit.code, exit.data.as_str()), (EventCode::Exit, "9"));
+}

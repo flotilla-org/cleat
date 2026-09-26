@@ -3717,8 +3717,9 @@ fn handle_http_request(
     }
 }
 
-/// Control operations that wait while a session is frozen for transfer. PTY
-/// input keeps flowing; anything that changes roles, geometry, tags, the
+/// Control operations that wait while a session is frozen for transfer (see
+/// also `Route::mutates_session`, the stale-holder list). PTY input keeps
+/// flowing; anything that changes roles, geometry, tags, the
 /// recording's markers, or the session's lifetime does not.
 fn route_waits_for_transfer(route: &http_uds::Route) -> bool {
     use http_uds::Route;

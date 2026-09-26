@@ -95,7 +95,10 @@ impl Route {
     }
 
     /// Operations a stale holder must never perform (ruling 11): anything
-    /// that reaches the PTY or changes the session's control state.
+    /// that reaches the PTY or changes the session's control state. The
+    /// transfer freeze (`route_waits_for_transfer` in `session.rs`) is a
+    /// different list on purpose: PTY input flows during a transfer. Review
+    /// both when adding a route.
     pub(crate) fn mutates_session(&self) -> bool {
         matches!(
             self,

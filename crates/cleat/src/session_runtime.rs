@@ -87,6 +87,10 @@ pub(crate) struct TransferSource {
     pub recording_paused: bool,
     pub pty_master: std::os::fd::OwnedFd,
     pub recording: Option<std::fs::File>,
+    /// This host forked the child (and so reaps it).
+    pub forked_here: bool,
+    /// The status stream this host adopted from the child's forker, if any.
+    pub upstream_status: Option<std::os::fd::OwnedFd>,
 }
 
 /// The adopting half: descriptors and state received in a transfer manifest.
@@ -308,6 +312,8 @@ impl SessionRuntime {
             recording_paused: self.recorder.as_ref().is_some_and(SessionRecorder::is_paused),
             pty_master,
             recording,
+            forked_here: self.pty_child.forked_here(),
+            upstream_status: self.pty_child.duplicate_status_stream()?,
         })
     }
 

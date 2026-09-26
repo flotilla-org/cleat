@@ -63,8 +63,11 @@ enum OutgoingPhase {
     Probing,
     Handshaking {
         protocol: TargetProtocol,
-        status_writer: UnixStream,
-        child_pid: u32,
+        /// Our end of a fresh `child_status` stream; `None` when an adopted
+        /// session passes its upstream stream through.
+        status_writer: Option<UnixStream>,
+        /// Set when this host forked the child and must keep reaping it.
+        forked_pid: Option<u32>,
     },
     /// Committed here; waiting for the target to publish the session before
     /// attachments are redirected to it.
@@ -365,16 +368,16 @@ impl TransferHub {
             eprintln!("transfer of {id}: hosting epoch advanced to {epoch}, expected {expected}");
         }
         let address = format!("daemon:{}", transfer.target.daemon_name());
-        let OutgoingPhase::Handshaking { status_writer, child_pid, .. } = std::mem::replace(&mut transfer.phase, OutgoingPhase::Probing)
+        let OutgoingPhase::Handshaking { status_writer, forked_pid, .. } = std::mem::replace(&mut transfer.phase, OutgoingPhase::Probing)
         else {
             unreachable!("phase checked above");
         };
         let reap = match hosted.actor.commit_transfer(epoch, address.clone()) {
             Ok(reap) => reap,
             Err(err) => {
-                // Committed regardless: keep reaping the child we forked.
+                // Committed regardless: keep reaping the child if we forked it.
                 eprintln!("transfer of {id}: releasing the session actor failed after commit: {err}");
-                Some(child_pid)
+                forked_pid
             }
         };
         let redirect = SessionRedirect {
@@ -392,8 +395,8 @@ impl TransferHub {
             unreachable!("session checked above");
         };
         broadcast_directory_remove(&id, packet_clients)?;
-        if let Some(pid) = reap {
-            self.forwarders.push(StatusForwarder { pid: pid as libc::pid_t, writer: status_writer });
+        if let (Some(pid), Some(writer)) = (reap, status_writer) {
+            self.forwarders.push(StatusForwarder { pid: pid as libc::pid_t, writer });
         }
         let dropped_clients = std::mem::take(&mut transfer.dropped_clients);
         transfer.phase = OutgoingPhase::Committing(Box::new(Committed {
@@ -599,16 +602,26 @@ fn prepare_outgoing(
         }
         Err(err) => eprintln!("transfer of {id}: no pidfd for the child ({err}); the adopter observes it by pid"),
     }
-    let (status_writer, status_reader) = match UnixStream::pair() {
-        Ok(pair) => pair,
-        Err(err) => {
-            let _ = hosted.actor.abort_transfer();
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("create child status stream: {err}")));
+    // The host that forked the child forwards its status. A session adopted
+    // here passes that host's stream on, so the status reaches its newest host.
+    let status_writer = match source.upstream_status {
+        Some(upstream) => {
+            fds.push(upstream);
+            None
         }
+        None => match UnixStream::pair() {
+            Ok((writer, reader)) => {
+                fds.push(reader.into());
+                Some(writer)
+            }
+            Err(err) => {
+                let _ = hosted.actor.abort_transfer();
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("create child status stream: {err}")));
+            }
+        },
     };
-    fds.push(status_reader.into());
     roles.push(FdRole::child_status());
-    let manifest_child_pid = source.child_pid;
+    let forked_pid = source.forked_here.then_some(source.child_pid);
     let version = test_manifest_version().unwrap_or(MANIFEST_VERSION);
     let manifest = FdTransferManifest {
         version,
@@ -632,7 +645,7 @@ fn prepare_outgoing(
         let _ = hosted.actor.abort_transfer();
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "transfer worker stopped".into()));
     }
-    transfer.phase = OutgoingPhase::Handshaking { protocol, status_writer, child_pid: manifest_child_pid };
+    transfer.phase = OutgoingPhase::Handshaking { protocol, status_writer, forked_pid };
     Ok(())
 }
 

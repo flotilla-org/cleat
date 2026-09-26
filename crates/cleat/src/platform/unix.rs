@@ -130,6 +130,21 @@ impl PtyChild {
         owned.then(|| self.leader_pid())
     }
 
+    pub fn forked_here(&self) -> bool {
+        matches!(self.ownership, ChildOwnership::Owned)
+    }
+
+    /// A duplicate of the exit-status stream an adopted child arrived with, to
+    /// pass on when this host transfers it again.
+    pub fn duplicate_status_stream(&self) -> Result<Option<OwnedFd>, String> {
+        match &self.ownership {
+            ChildOwnership::Adopted(AdoptedChild { status: Some(status), .. }) => {
+                status.try_clone().map(|stream| Some(stream.into())).map_err(|err| format!("duplicate child status stream: {err}"))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn is_released(&self) -> bool {
         matches!(self.ownership, ChildOwnership::Released)
     }

@@ -628,6 +628,15 @@ pub(crate) fn upgrade_error(reader: &mut impl Read, status: StatusCode) -> Strin
 }
 
 pub(crate) fn read_response_head(reader: &mut impl Read) -> std::io::Result<HttpResponse> {
+    read_response_head_for(reader, true)
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn read_transfer_response_head(reader: &mut impl Read) -> std::io::Result<HttpResponse> {
+    read_response_head_for(reader, false)
+}
+
+fn read_response_head_for(reader: &mut impl Read, requires_output_admission: bool) -> std::io::Result<HttpResponse> {
     let mut bytes = Vec::new();
     let header_end = loop {
         if let Some(header_end) = header_end_index(&bytes) {
@@ -655,6 +664,7 @@ pub(crate) fn read_response_head(reader: &mut impl Read) -> std::io::Result<Http
     }
     let code = parsed.code.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing HTTP response status"))?;
     if code == 101
+        && requires_output_admission
         && !parsed.headers.iter().any(|header| header.name.eq_ignore_ascii_case("x-cleat-output-admission") && header.value == b"1")
     {
         return Err(Error::new(ErrorKind::InvalidData, "daemon lacks output cycle admission; upgrade/restart the daemon"));
@@ -738,7 +748,7 @@ pub(crate) fn write_switching_protocols(writer: &mut impl Write, context: &crate
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn write_transfer_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
-    write_switching_protocols_for(writer, TRANSFER_UPGRADE, &crate::output_admission::OutputContext::External)
+    write!(writer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {TRANSFER_UPGRADE}\r\n\r\n")
 }
 
 pub(crate) fn write_packet_switching_protocols(
@@ -936,6 +946,18 @@ fn mouse_report_format_name(format: vt::MouseReportFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_upgrade_does_not_claim_output_admission() {
+        let mut bytes = Vec::new();
+        write_transfer_switching_protocols(&mut bytes).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("x-cleat-output-admission"));
+        bytes.extend_from_slice(b"transfer bytes");
+        let mut input = bytes.as_slice();
+        assert_eq!(read_transfer_response_head(&mut input).unwrap().status, StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(input, b"transfer bytes");
+        assert!(read_response_head(&mut bytes.as_slice()).is_err());
+    }
 
     #[test]
     fn output_upgrade_requires_daemon_admission_acknowledgement() {

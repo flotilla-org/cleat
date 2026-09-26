@@ -51,6 +51,8 @@ requires an existing source session directory, and canonicalizes the physical
 daemon directory. Runtime-root and daemon symlink aliases collapse to the same
 identity, preserving physical generation suffixes. Equal names in separate
 live generations remain distinct, including while the logical alias changes.
+Legacy directories use a pinned `name@legacy` address so publishing a drain
+sidecar alias cannot reinterpret the old source as its successor.
 
 For local declarations on Linux the daemon obtains the socket peer PID from
 `SO_PEERCRED` and reads its initial environment through `/proc/<pid>/environ`. If that environment
@@ -74,8 +76,10 @@ Before inserting an edge, admission searches for a path from target back to
 source. A per-user OS file lock serializes the check plus lease publication
 across local daemons and runtime roots. Acquisition is nonblocking: contention
 returns a `coordinator busy; retry output admission` error without stalling
-the daemon event loop. A rejected activity membership stops that subscription
-(including on contention), so the client must reconnect to retry. Each stream or packet channel owns a
+the daemon event loop. Activity membership checks retry on the next daemon
+tick when busy, retaining their leases and emitting no activity events until
+admission succeeds. A real cycle stops the subscription with an error. Each
+stream or packet channel owns a
 separate locked lease, including duplicate subscriptions. Role changes keep
 that lease; channel close, detach, connection failure, session exit, and failed
 admission drop it. Daemon crashes release OS locks; the next admission removes

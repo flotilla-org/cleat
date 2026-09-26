@@ -547,7 +547,7 @@ mod tests {
             (RUNTIME_DIR_ENV, coordinates.runtime_root().display().to_string()),
             (AMBIENT_DAEMON_ENV, "agent-loop".to_string()),
             (AMBIENT_SESSION_ENV, "worker".to_string()),
-            (OUTPUT_DAEMON_ENV, "agent-loop".to_string()),
+            (OUTPUT_DAEMON_ENV, "agent-loop@legacy".to_string()),
         ]);
     }
 

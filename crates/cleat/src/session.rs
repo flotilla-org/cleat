@@ -2580,7 +2580,10 @@ fn service_activity_subscriptions(
         };
         let current = matching_activity_sessions(sessions, &client.selectors, stable_threshold_ms);
         if let Err(message) = client.admit_activity(layout, &current) {
-            client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: CHANNEL_CONTROL, message })?;
+            if matches!(message, crate::output_admission::AdmissionError::Busy) {
+                continue;
+            }
+            client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: CHANNEL_CONTROL, message: message.to_string() })?;
             client.screen_activity_stable_ms = None;
             client.known_activity_sessions.clear();
             client.activity_output_leases.clear();
@@ -3296,7 +3299,7 @@ fn handle_http_request(
             )?;
             if let Some(activity) = &activity {
                 if let Err(message) = client.admit_activity(state.layout, &activity.sessions) {
-                    return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                    return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                         .map_err(|err| format!("write activity admission error: {err}"));
                 }
             }
@@ -3344,7 +3347,7 @@ fn handle_http_request(
                 match crate::output_admission::admit(output_context.as_ref().expect("validated output context"), state.layout, &id) {
                     Ok(lease) => lease,
                     Err(message) => {
-                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                             .map_err(|err| format!("write output cycle error: {err}"))
                     }
                 };
@@ -3443,7 +3446,7 @@ fn handle_http_request(
                 match crate::output_admission::admit(output_context.as_ref().expect("validated output context"), state.layout, &id) {
                     Ok(lease) => lease,
                     Err(message) => {
-                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                             .map_err(|err| format!("write output cycle error: {err}"))
                     }
                 };
@@ -4059,7 +4062,11 @@ impl PacketClient {
         })
     }
 
-    fn admit_activity(&mut self, layout: &RuntimeLayout, sessions: &[ActivitySession]) -> Result<(), String> {
+    fn admit_activity(
+        &mut self,
+        layout: &RuntimeLayout,
+        sessions: &[ActivitySession],
+    ) -> Result<(), crate::output_admission::AdmissionError> {
         self.activity_output_leases.retain(|id, _| sessions.iter().any(|session| &session.session_id == id));
         for session in sessions {
             if !self.activity_output_leases.contains_key(&session.session_id) {
@@ -4624,7 +4631,8 @@ fn open_packet_channel(
     let output_lease = match crate::output_admission::admit(&packet_clients[index].output_context, layout, &open.session_id) {
         Ok(lease) => lease,
         Err(message) => {
-            packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message })?;
+            packet_clients[index]
+                .enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message: message.to_string() })?;
             return Ok(());
         }
     };

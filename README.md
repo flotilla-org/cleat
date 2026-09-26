@@ -19,8 +19,11 @@ A future Rust VT engine may be added later. Until then, treat Ghostty as the onl
 Daemons reject direct and indirect output cycles across local daemons, including
 read-only watchers and packet channels. Acyclic nesting remains available with a
 visible containing-session indicator. This requires upgraded clients **and**
-daemons; older clients receive an upgrade-required error. SSH/remote output
-subscriptions are currently unsupported. See [output admission and rollout](docs/output-cycle-admission.md).
+daemons; restart old clients, daemons, and containing sessions before claiming
+protection. Older clients receive an upgrade-required error. SSH/remote output
+subscriptions are admitted untracked, with an acknowledgement warning that cycle
+protection does not cover remote relationships. No graph edge is recorded for
+them. See [output admission and rollout](docs/output-cycle-admission.md).
 
 ## Development
 

@@ -707,21 +707,32 @@ pub(crate) fn write_no_content(writer: &mut impl Write) -> std::io::Result<()> {
     write_response(writer, response)
 }
 
-pub(crate) fn write_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
-    write_switching_protocols_for(writer, "cleat-attach/1")
+pub(crate) fn write_switching_protocols(writer: &mut impl Write, context: &crate::output_admission::OutputContext) -> std::io::Result<()> {
+    write_switching_protocols_for(writer, "cleat-attach/1", context)
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn write_transfer_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
-    write_switching_protocols_for(writer, TRANSFER_UPGRADE)
+    write_switching_protocols_for(writer, TRANSFER_UPGRADE, &crate::output_admission::OutputContext::External)
 }
 
-pub(crate) fn write_packet_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
-    write_switching_protocols_for(writer, "cleat-packet/1")
+pub(crate) fn write_packet_switching_protocols(
+    writer: &mut impl Write,
+    context: &crate::output_admission::OutputContext,
+) -> std::io::Result<()> {
+    write_switching_protocols_for(writer, "cleat-packet/1", context)
 }
 
-fn write_switching_protocols_for(writer: &mut impl Write, upgrade: &str) -> std::io::Result<()> {
-    write!(writer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\nx-cleat-output-admission: 1\r\n\r\n")
+fn write_switching_protocols_for(
+    writer: &mut impl Write,
+    upgrade: &str,
+    context: &crate::output_admission::OutputContext,
+) -> std::io::Result<()> {
+    write!(writer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\nx-cleat-output-admission: 1\r\n")?;
+    if let Some(warning) = context.warning() {
+        write!(writer, "x-cleat-output-warning: {warning}\r\n")?;
+    }
+    write!(writer, "\r\n")
 }
 
 pub(crate) fn request_has_upgrade_token(request: &HttpRequest, token: &str) -> bool {
@@ -906,7 +917,7 @@ mod tests {
         let legacy = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: cleat-attach/1\r\n\r\n";
         assert!(read_response_head(&mut &legacy[..]).unwrap_err().to_string().contains("upgrade/restart"));
         let mut current = Vec::new();
-        write_packet_switching_protocols(&mut current).unwrap();
+        write_packet_switching_protocols(&mut current, &crate::output_admission::OutputContext::External).unwrap();
         current.extend_from_slice(b"unread packet bytes");
         let mut input = current.as_slice();
         assert_eq!(read_response_head(&mut input).unwrap().status, StatusCode::SWITCHING_PROTOCOLS);

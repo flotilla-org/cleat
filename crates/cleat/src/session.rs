@@ -6316,3 +6316,7 @@ mod packet_keyboard_tests {
         assert_eq!(kitty_bytes, b"\x1b[97;5u\x1b[97;5:2u\x1b[97;1:3u");
     }
 }
+
+#[cfg(test)]
+#[path = "session_repaint_measurements.rs"]
+mod repaint_measurements;

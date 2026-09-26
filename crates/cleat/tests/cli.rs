@@ -88,7 +88,8 @@ fn help_lists_expected_subcommands() {
         "interrupt",
         "escape",
         "wait",
-        "expect"
+        "expect",
+        "transfer"
     ]);
     assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
 }

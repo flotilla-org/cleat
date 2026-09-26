@@ -1237,7 +1237,7 @@ fn start_session(
     .map_err(|err| format!("write session create request: {err}"))?;
     let response = http_uds::read_response(&mut stream).map_err(|err| format!("read session create response: {err}"))?;
     if response.status != StatusCode::OK {
-        return Err(http_error_message(http_uds::HttpResponse { status: response.status, body: response.body }));
+        return Err(http_error_message(response));
     }
     let response: http_uds::CreateSessionResponse =
         serde_json::from_slice(&response.body).map_err(|err| format!("parse session create response: {err}"))?;
@@ -1371,7 +1371,8 @@ fn connect_foreground_upgrade(
         let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read {role} upgrade response: {err}"))?;
         match response.status {
             StatusCode::SWITCHING_PROTOCOLS => {
-                return Ok(ForegroundAttach { transport: ForegroundTransport::Legacy(Arc::new(Mutex::new(stream))) })
+                let _ = response.write_output_warning(&mut std::io::stderr());
+                return Ok(ForegroundAttach { transport: ForegroundTransport::Legacy(Arc::new(Mutex::new(stream))) });
             }
             StatusCode::CONFLICT => {
                 let mut body = String::new();

@@ -946,6 +946,7 @@ impl SessionService {
         if response.status != StatusCode::SWITCHING_PROTOCOLS {
             return Err(http_uds::upgrade_error(&mut stream, response.status));
         }
+        let _ = response.write_output_warning(&mut std::io::stderr());
 
         let mut client = crate::packet::PacketClient::new(stream);
         let hello = client.read_frame().map_err(|err| format!("read packet hello: {err}"))?;

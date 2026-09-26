@@ -679,6 +679,7 @@ pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]
     if response.status != StatusCode::SWITCHING_PROTOCOLS {
         return Err(http_uds::upgrade_error(&mut stream, response.status));
     }
+    let _ = response.write_output_warning(&mut std::io::stderr());
 
     let hello = PacketFrame::read(&mut stream).map_err(|err| format!("read packet hello: {err}"))?;
     if hello.channel != CHANNEL_CONTROL || hello.msg_type != MSG_CONTROL_HELLO {

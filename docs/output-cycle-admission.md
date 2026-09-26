@@ -100,6 +100,7 @@ clients send that declaration when `SSH_CONNECTION` or `SSH_CLIENT` is present,
 so SSH attach/watch and packet subscriptions remain available. The HTTP 101
 acknowledgement includes `x-cleat-output-admission: 1` and the warning field
 `x-cleat-output-warning: cycle protection does not cover remote relationships`.
+Supplied clients print this warning to stderr when opening the connection.
 Admission acknowledges the declared scope; it does not assert cross-host safety.
 Custom remote transports must also declare `remote`; they must not label a
 forwarded stream `external`. A future distributed admission protocol is needed

@@ -432,6 +432,9 @@ impl TransferHub {
         if sessions.contains_key(id) || self.pending_adoptions.contains_key(id) {
             return Err(format!("session {id} is already live on this daemon"));
         }
+        if std::fs::read_to_string(layout.daemon_dir().join("drain-state")).is_ok_and(|state| state.trim() == "draining") {
+            return Err(format!("daemon:{} is draining and accepts no new sessions", layout.daemon_name()));
+        }
         if layout.session_dir(id).exists() {
             return Err(format!("this daemon retains state for session {id}; purge it (cleat kill --purge) before transferring here"));
         }

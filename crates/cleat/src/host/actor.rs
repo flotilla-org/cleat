@@ -522,6 +522,10 @@ pub(crate) enum SessionCommand {
         after: u64,
         reply: mpsc::Sender<Result<Option<u64>, String>>,
     },
+    #[cfg(unix)]
+    TerminateTree {
+        reply: mpsc::Sender<Result<crate::platform::signals::ProcessTree, String>>,
+    },
     DispatchSignal {
         signal: i32,
         target: SignalTarget,
@@ -1086,6 +1090,11 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::ResolveNextMarker { after, reply })
     }
 
+    #[cfg(unix)]
+    pub(crate) fn terminate_tree(&self) -> Result<crate::platform::signals::ProcessTree, String> {
+        self.request_result(|reply| SessionCommand::TerminateTree { reply })
+    }
+
     pub(crate) fn dispatch_signal(&self, signal: i32, target: SignalTarget) -> Result<(), String> {
         self.request_result(|reply| SessionCommand::DispatchSignal { signal, target, reply })
     }
@@ -1552,6 +1561,10 @@ fn session_actor_handle_command(
         }
         SessionCommand::ResolveNextMarker { after, reply } => {
             let _ = reply.send(Ok(runtime.resolve_next_marker_after(after)));
+        }
+        #[cfg(unix)]
+        SessionCommand::TerminateTree { reply } => {
+            let _ = reply.send(runtime.terminate_tree());
         }
         SessionCommand::DispatchSignal { signal, target, reply } => {
             let _ = reply.send(runtime.dispatch_signal(signal, target));

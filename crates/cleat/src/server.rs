@@ -23,6 +23,25 @@ use crate::{
     vt::VtEngineKind,
 };
 
+// A total response deadline, rather than an idle timeout that a trickling peer
+// could extend indefinitely. Windows pipe reads honor the same timeout contract.
+struct DaemonResponseReader<'a> {
+    stream: &'a mut SessionStream,
+    deadline: Instant,
+}
+
+impl std::io::Read for DaemonResponseReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon response deadline exceeded"))?;
+        set_stream_read_timeout(self.stream, Some(remaining)).map_err(std::io::Error::other)?;
+        self.stream.read(buffer)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartBound {
     Offset(u64),
@@ -75,6 +94,23 @@ pub struct TransferOptions {
     pub drop_incompatible: bool,
     /// Bound on everything before the target is ready; defaults to 10 s.
     pub timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DrainGeneration {
+    pub name: String,
+    pub generation: Option<u64>,
+    pub build: Option<crate::build_info::BuildInfo>,
+    pub session_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DrainReport {
+    pub changed: bool,
+    pub installed: crate::build_info::BuildInfo,
+    pub old: DrainGeneration,
+    pub current: DrainGeneration,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,17 +277,116 @@ impl SessionService {
     }
 
     pub(crate) fn daemon_build_status(&self) -> Result<crate::build_info::DaemonBuildStatus, String> {
-        let path = self.layout.socket_path();
-        let mut stream = try_connect_session_stream(&path).map_err(|err| format!("connect {}: {err}", path.display()))?;
-        set_stream_read_timeout(&stream, Some(Duration::from_secs(2)))?;
-        http_uds::write_request(&mut stream, Method::GET, "/", &[]).map_err(|err| format!("write HTTP request: {err}"))?;
-        let response = http_uds::read_response(&mut stream).map_err(|err| format!("read HTTP response: {err}"))?;
+        self.daemon_status_at("/")
+    }
+
+    fn daemon_status_at(&self, endpoint: &str) -> Result<crate::build_info::DaemonBuildStatus, String> {
+        let response = self.daemon_request(Method::GET, endpoint)?;
         if response.status != StatusCode::OK {
             return Err(http_error_message(response));
         }
         let status: crate::build_info::DaemonBuildStatus =
             serde_json::from_slice(&response.body).map_err(|err| format!("parse daemon build status: {err}"))?;
         Ok(status)
+    }
+
+    /// Roll the logical alias to this binary without moving any live sessions.
+    pub fn drain(&self) -> Result<DrainReport, String> {
+        self.drain_using(
+            |layout| crate::platform::daemon::spawn_daemon_process(layout.root(), layout.daemon_name()),
+            Duration::from_secs(10),
+        )
+    }
+
+    fn drain_using(
+        &self,
+        start: impl FnOnce(&RuntimeLayout) -> Result<(), String>,
+        health_deadline: Duration,
+    ) -> Result<DrainReport, String> {
+        if self.layout.daemon_name().contains('@') {
+            return Err("server drain requires a logical name; use --server without @generation".into());
+        }
+        let _lock = self.layout.lock_generations()?;
+        let old_service = Self::new(self.layout.resolved()?);
+        let old_status = old_service.daemon_build_status()?;
+        let installed = crate::build_info::BuildInfo::current();
+        if installed.git_sha.is_none() {
+            return Err("installed client has no git SHA; rebuild with revision metadata before draining".into());
+        }
+        let old = DrainGeneration {
+            name: old_service.layout.daemon_name().to_string(),
+            generation: old_service.layout.generation(),
+            build: old_status.build,
+            session_count: old_status.session_count,
+        };
+        if old
+            .build
+            .as_ref()
+            .is_some_and(|build| build.git_sha == installed.git_sha && build.protocol_version == installed.protocol_version)
+        {
+            return Ok(DrainReport { changed: false, installed, current: old.clone(), old, warning: None });
+        }
+        // Query the count separately: pre-drain daemons don't include it in status.
+        let response = old_service.daemon_request(Method::GET, "/sessions")?;
+        if response.status != StatusCode::OK {
+            return Err(http_error_message(response));
+        }
+        #[derive(serde::Deserialize)]
+        struct SessionCount {
+            sessions: Vec<serde::de::IgnoredAny>,
+        }
+        let sessions: SessionCount = serde_json::from_slice(&response.body).map_err(|e| format!("read old sessions: {e}"))?;
+        let mut old = DrainGeneration { session_count: sessions.sessions.len(), ..old };
+        let successor = self.layout.allocate_generation()?;
+        let new_service = Self::new(successor.clone());
+        start(&successor)?;
+        let deadline = Instant::now() + health_deadline;
+        let status = loop {
+            match new_service.daemon_status_at("/healthz") {
+                Ok(status) => break status,
+                Err(err) if Instant::now() >= deadline => {
+                    return Err(format!("successor {} failed health check; alias unchanged: {err}", successor.daemon_name()));
+                }
+                Err(_) => thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        if status
+            .build
+            .as_ref()
+            .is_none_or(|build| build.git_sha != installed.git_sha || build.protocol_version != installed.protocol_version)
+        {
+            return Err("successor build does not match installed client; alias unchanged".into());
+        }
+        self.layout.set_current_generation(successor.generation().ok_or("missing successor generation")?)?;
+        let warning = match old_service.daemon_request(Method::POST, "/drain") {
+            Ok(response) if response.status == StatusCode::OK => {
+                let status: crate::build_info::DaemonBuildStatus =
+                    serde_json::from_slice(&response.body).map_err(|e| format!("alias moved, but invalid drain response: {e}"))?;
+                old.session_count = status.session_count;
+                None
+            }
+            Ok(response) if response.status == StatusCode::NOT_FOUND || response.status == StatusCode::METHOD_NOT_ALLOWED => {
+                Some(format!("{} cannot be told to drain; left serving. New sessions use {}", old.name, successor.daemon_name()))
+            }
+            Ok(response) => return Err(format!("alias moved, but old daemon drain failed: {}", http_error_message(response))),
+            Err(err) => return Err(format!("alias moved, but old daemon drain failed: {err}")),
+        };
+        let current = DrainGeneration {
+            name: successor.daemon_name().to_string(),
+            generation: successor.generation(),
+            build: status.build,
+            session_count: status.session_count,
+        };
+        Ok(DrainReport { changed: true, installed, old, current, warning })
+    }
+
+    fn daemon_request(&self, method: Method, path: &str) -> Result<http_uds::HttpResponse, String> {
+        let mut stream = try_connect_session_stream(&self.layout.socket_path()).map_err(|err| format!("connect daemon: {err}"))?;
+        set_stream_read_timeout(&stream, Some(Duration::from_secs(2)))?;
+        crate::platform::ipc::set_stream_write_timeout(&stream, Some(Duration::from_secs(2)))?;
+        http_uds::write_request(&mut stream, method, path, &[]).map_err(|err| format!("write daemon request: {err}"))?;
+        let mut reader = DaemonResponseReader { stream: &mut stream, deadline: Instant::now() + Duration::from_secs(2) };
+        http_uds::read_response(&mut reader).map_err(|err| format!("read daemon response: {err}"))
     }
 
     pub fn discover_daemons(&self) -> Vec<DaemonCoordinates> {
@@ -276,16 +411,19 @@ impl SessionService {
                 if validate_daemon_name(name).is_err() {
                     continue;
                 }
-                let layout = RuntimeLayout::new(root.clone()).with_daemon(name.to_string()).expect("validated daemon");
+                let address = if name.contains('@') { name.to_string() } else { format!("{name}@legacy") };
+                let layout = RuntimeLayout::new(root.clone()).with_daemon(address.clone()).expect("validated daemon");
                 let service = Self::new(layout.clone());
-                let status = service.daemon_build_info();
+                let status = service.daemon_build_status();
                 daemons.push(DaemonCoordinates {
-                    name: name.to_string(),
+                    name: address,
                     runtime_root: root.clone(),
                     generation: layout.generation(),
                     alive: status.is_ok(),
-                    drain_state: "serving".to_string(),
-                    build: status.ok().flatten().or_else(|| {
+                    drain_state: status.as_ref().map(|s| s.drain_state.clone()).unwrap_or_else(|_| {
+                        std::fs::read_to_string(layout.daemon_dir().join("drain-state")).unwrap_or_else(|_| "serving".into())
+                    }),
+                    build: status.ok().and_then(|s| s.build).or_else(|| {
                         std::fs::read(layout.daemon_dir().join("build.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok())
                     }),
                 });
@@ -445,7 +583,15 @@ impl SessionService {
 
         let mut sessions = Vec::new();
         for daemon_name in self.daemon_names(scope)? {
-            let daemon_service = self.with_daemon(daemon_name)?;
+            let mut daemon_service = self.with_daemon(daemon_name)?;
+            if daemon_service.layout.daemon_name().ends_with("@legacy") {
+                let logical = self.with_daemon(daemon_service.layout.logical_name().to_string())?;
+                // Preserve pre-generation adoption on list, but never follow the
+                // logical alias when enumerating a retired legacy host.
+                if logical.layout.generation().is_none() {
+                    daemon_service = logical;
+                }
+            }
             sessions.extend(daemon_service.list_one_daemon_with_selectors(selectors)?);
         }
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
@@ -466,7 +612,7 @@ impl SessionService {
                         continue;
                     }
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()).filter(|name| validate_daemon_name(name).is_ok()) {
-                        names.push(name.to_string());
+                        names.push(if name.contains('@') { name.to_string() } else { format!("{name}@legacy") });
                     }
                 }
                 names.sort();
@@ -479,7 +625,7 @@ impl SessionService {
         if !self.layout.sessions_dir().is_dir() {
             return Ok(vec![]);
         }
-        if self.layout.generation().is_some() && !is_session_daemon_alive(self.layout.root(), self.layout.daemon_name()) {
+        if self.layout.daemon_name().contains('@') && !is_session_daemon_alive(self.layout.root(), self.layout.daemon_name()) {
             let mut sessions = sweep_dead_daemon_sessions(&self.layout, "daemon generation is dead; session is recreatable".into())?;
             sessions.retain(|session| session_matches_selectors(session, selectors));
             return Ok(sessions);
@@ -556,7 +702,10 @@ impl SessionService {
 
     fn wait_for_session_shutdown(&self, id: &str) {
         for _ in 0..50 {
-            if !self.layout.session_dir(id).exists() || self.inspect(id).is_err() {
+            // Shutdown polling must never auto-start the daemon it is waiting on.
+            if !self.layout.session_dir(id).exists()
+                || self.http_json::<_, crate::protocol::InspectResult>(id, Method::GET, &format!("/sessions/{id}"), &()).is_err()
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
@@ -1586,3 +1735,7 @@ mod tests {
         assert!(request.ends_with(r#"{"text":"DONE","since_offset":123,"timeout_ms":500}"#), "{request}");
     }
 }
+
+#[cfg(test)]
+#[path = "server_drain_tests.rs"]
+mod drain_tests;

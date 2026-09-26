@@ -162,7 +162,10 @@ impl RuntimeLayout {
     }
 
     pub fn daemon_dir(&self) -> PathBuf {
-        let path = self.root.join(&self.daemon_name);
+        if self.daemon_name.ends_with("@legacy") {
+            return self.root.join(self.logical_name());
+        }
+        let path = self.alias_path();
         if self.daemon_name.contains('@') {
             return path;
         }
@@ -180,7 +183,8 @@ impl RuntimeLayout {
 
     /// Freeze a resolved alias before a host begins using its paths.
     pub fn resolved(&self) -> Result<Self, String> {
-        self.clone().with_daemon(self.daemon_dir().file_name().and_then(|n| n.to_str()).ok_or("invalid daemon path")?.to_string())
+        let name = self.daemon_dir().file_name().and_then(|n| n.to_str()).ok_or("invalid daemon path")?.to_string();
+        self.clone().with_daemon(if name.contains('@') { name } else { format!("{name}@legacy") })
     }
 
     pub fn generation_names(&self) -> Result<Vec<String>, String> {
@@ -197,9 +201,11 @@ impl RuntimeLayout {
                 continue;
             };
             if validate_daemon_name(&name).is_ok()
-                && (name == self.daemon_name || (!self.daemon_name.contains('@') && name.starts_with(&format!("{}@", self.daemon_name))))
+                && (name == self.daemon_name
+                    || (self.daemon_name.ends_with("@legacy") && name == self.logical_name())
+                    || (!self.daemon_name.contains('@') && name.starts_with(&format!("{}@", self.daemon_name))))
             {
-                names.push(name);
+                names.push(if name.contains('@') { name } else { format!("{name}@legacy") });
             }
         }
         names.sort();
@@ -216,7 +222,8 @@ impl RuntimeLayout {
         }
         let _lock = self.lock_generations()?;
         let alias = self.root.join(&self.daemon_name);
-        let legacy = alias.is_dir() && !alias.is_symlink();
+        let sidecar = self.root.join(format!(".{}.current", self.logical_name()));
+        let legacy = alias.is_dir() && !alias.is_symlink() && !sidecar.exists() && !sidecar.is_symlink();
         let mut current = self.resolved()?;
         // Recover an absent alias without starting a successor to a live host.
         if !legacy && current.generation().is_none() {
@@ -247,24 +254,13 @@ impl RuntimeLayout {
         {
             return Ok(current);
         }
-        let next = self
-            .generation_names()?
-            .iter()
-            .filter_map(|n| n.rsplit_once('@')?.1.parse::<u64>().ok())
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("daemon generation exhausted")?;
-        let next_layout = self.clone().with_daemon(format!("{}@{next}", self.daemon_name))?;
-        next_layout.ensure_daemon_dirs()?;
-        self.set_current_generation(next)?;
+        let next_layout = self.allocate_generation()?;
+        self.set_current_generation(next_layout.generation().ok_or("missing allocated generation")?)?;
         Ok(next_layout)
     }
 
-    /// Take the per-name layout lock that serializes generation allocation,
-    /// adoption, and session directories moving into this name's generations.
-    /// Released when the returned file drops.
-    pub fn lock_generations(&self) -> Result<fs::File, String> {
+    /// Held across allocation, startup, health verification and alias publication.
+    pub(crate) fn lock_generations(&self) -> Result<fs::File, String> {
         self.ensure_root()?;
         let lock = fs::OpenOptions::new()
             .create(true)
@@ -274,6 +270,35 @@ impl RuntimeLayout {
             .map_err(|e| format!("open generation lock: {e}"))?;
         lock.lock().map_err(|e| format!("lock generation: {e}"))?;
         Ok(lock)
+    }
+
+    /// Reserve the next directory without publishing it. Caller holds the layout lock.
+    pub(crate) fn allocate_generation(&self) -> Result<Self, String> {
+        let next = self
+            .generation_names()?
+            .iter()
+            .filter_map(|n| n.rsplit_once('@')?.1.parse::<u64>().ok())
+            .chain(self.generation())
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("daemon generation exhausted")?;
+        let next_layout = self.clone().with_daemon(format!("{}@{next}", self.logical_name()))?;
+        next_layout.ensure_daemon_dirs()?;
+        Ok(next_layout)
+    }
+
+    // A live legacy host owns <name>/ and may keep reopening files there. Never
+    // move it. Use a sidecar alias while that directory exists.
+    fn alias_path(&self) -> PathBuf {
+        let path = self.root.join(&self.daemon_name);
+        if !self.daemon_name.contains('@') && path.is_dir() && !path.is_symlink() {
+            let sidecar = self.root.join(format!(".{}.current", self.logical_name()));
+            if sidecar.exists() || sidecar.is_symlink() {
+                return sidecar;
+            }
+        }
+        path
     }
 
     /// Publish a current generation atomically. The caller serializes generation changes.
@@ -287,7 +312,11 @@ impl RuntimeLayout {
         std::os::unix::fs::symlink(&target, &temporary).map_err(|e| format!("create daemon alias: {e}"))?;
         #[cfg(not(unix))]
         fs::write(&temporary, format!("{target}\n")).map_err(|e| format!("write daemon alias: {e}"))?;
-        let result = fs::rename(&temporary, self.root.join(self.logical_name())).map_err(|e| format!("publish daemon alias: {e}"));
+        let mut alias = self.root.join(self.logical_name());
+        if alias.is_dir() && !alias.is_symlink() {
+            alias = self.root.join(format!(".{}.current", self.logical_name()));
+        }
+        let result = fs::rename(&temporary, alias).map_err(|e| format!("publish daemon alias: {e}"));
         if result.is_err() {
             let _ = fs::remove_file(temporary);
         }
@@ -440,6 +469,9 @@ pub(crate) fn generation_from_daemon_dir(dir: &Path) -> Option<u64> {
 pub fn validate_daemon_name(name: &str) -> Result<(), String> {
     if let Some((logical, generation)) = name.rsplit_once('@') {
         validate_runtime_name(logical)?;
+        if generation == "legacy" {
+            return Ok(());
+        }
         let value = generation.parse::<u64>().map_err(|_| format!("invalid daemon generation: {name}"))?;
         if value == 0 || value.to_string() != generation {
             return Err(format!("invalid daemon generation: {name}"));

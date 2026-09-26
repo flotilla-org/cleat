@@ -172,6 +172,7 @@ fn update_dirty_state(update: &TerminalRenderUpdate) -> DirtyState {
 
 #[derive(Default)]
 pub(crate) struct DirectoryState {
+    pub daemon: Option<crate::packet::DirectoryDaemon>,
     pub entries: HashMap<String, DirectoryEntry>,
     /// Bumped on every snapshot or delta application; FFI callers poll this to
     /// notice changes and re-read the whole (small) list.
@@ -182,12 +183,16 @@ pub(crate) struct DirectoryState {
 
 impl DirectoryState {
     fn replace(&mut self, snapshot: DirectorySnapshot) {
+        self.daemon = snapshot.daemon;
         self.entries = snapshot.sessions.into_iter().map(|entry| (entry.session_id.clone(), entry)).collect();
         self.generation = self.generation.wrapping_add(1);
         self.populated = true;
     }
 
     fn apply_delta(&mut self, delta: DirectoryDelta) {
+        if let Some(daemon) = delta.daemon {
+            self.daemon = Some(daemon);
+        }
         for entry in delta.upserted {
             self.entries.insert(entry.session_id.clone(), entry);
         }
@@ -880,7 +885,7 @@ mod tests {
                 .expect("hello frame")
                 .write(&mut stream)
                 .expect("write hello");
-            PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, &DirectorySnapshot { sessions })
+            PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_SNAPSHOT, &DirectorySnapshot { daemon: None, sessions })
                 .expect("snapshot frame")
                 .write(&mut stream)
                 .expect("write snapshot");
@@ -1304,6 +1309,7 @@ mod tests {
         let mut retagged = directory_entry("alpha");
         retagged.tags = vec!["project=uishell".to_string(), "purpose=test".to_string()];
         PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+            daemon: None,
             upserted: vec![retagged, directory_entry("beta")],
             removed_session_ids: Vec::new(),
         })
@@ -1318,6 +1324,7 @@ mod tests {
         });
 
         PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+            daemon: None,
             upserted: Vec::new(),
             removed_session_ids: vec!["alpha".to_string()],
         })

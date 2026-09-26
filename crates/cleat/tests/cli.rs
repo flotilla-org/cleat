@@ -70,6 +70,7 @@ fn help_lists_expected_subcommands() {
         "packets",
         "launch",
         "list",
+        "server",
         "version",
         "daemons",
         "tag",
@@ -1127,4 +1128,11 @@ fn version_json_reports_client_without_starting_daemon() {
     let cli = Cli::try_parse_from(["cleat", "--server", "version-test", "version", "--daemon"]).unwrap();
     assert!(execute(cli, &service).expect_err("absent daemon").contains("connect"));
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn drain_parses_nested_command_and_global_server_option() {
+    let cli = Cli::try_parse_from(["cleat", "server", "drain", "--server", "fleet", "--json"]).unwrap();
+    assert_eq!(cli.server.as_deref(), Some("fleet"));
+    assert_eq!(cli.command, Command::Server { command: cli::ServerCommand::Drain { json: true } });
 }

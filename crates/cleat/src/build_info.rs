@@ -70,6 +70,14 @@ pub(crate) struct DaemonBuildStatus {
     pub generation: Option<u64>,
     #[serde(default)]
     pub build: Option<BuildInfo>,
+    #[serde(default = "serving_state")]
+    pub drain_state: String,
+    #[serde(default)]
+    pub session_count: usize,
+}
+
+pub(crate) fn serving_state() -> String {
+    "serving".into()
 }
 
 #[cfg(test)]

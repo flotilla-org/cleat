@@ -143,6 +143,15 @@ fn parse_boolish(value: &str) -> Option<bool> {
 }
 
 #[derive(Debug, Subcommand, PartialEq)]
+pub enum ServerCommand {
+    /// Start this binary's generation and let the old daemon's sessions finish
+    Drain {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum Command {
     /// Attach to a session interactively
     #[command(after_long_help = "By default, creates a new session if the ID does not exist (equivalent\n\
@@ -231,6 +240,11 @@ pub enum Command {
         all: bool,
         #[arg(long = "selector", value_name = "TAG", allow_hyphen_values = true, help = "Require an exact opaque tag match; repeatable")]
         selectors: Vec<String>,
+    },
+    /// Manage daemon generations
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
     },
     /// Show client build information and optionally query the running daemon
     Version {
@@ -792,6 +806,34 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
+        Command::Server { command: ServerCommand::Drain { json } } => match service.drain() {
+            Ok(report) if json => match serde_json::to_string(&report) {
+                Ok(output) => ExecResult::Ok(Some(output)),
+                Err(err) => ExecResult::Err(format!("serialize drain report: {err}")),
+            },
+            Ok(report) => {
+                if !report.changed {
+                    ExecResult::Ok(Some("nothing to drain".into()))
+                } else {
+                    let build = |generation: &crate::server::DrainGeneration| {
+                        generation.build.as_ref().map(ToString::to_string).unwrap_or_else(|| "unknown build".into())
+                    };
+                    let mut output = format!(
+                        "{}: {} ({} sessions remaining)\n{}: {}",
+                        report.old.name,
+                        build(&report.old),
+                        report.old.session_count,
+                        report.current.name,
+                        build(&report.current)
+                    );
+                    if let Some(warning) = report.warning {
+                        output.push_str(&format!("\nwarning: {warning}"));
+                    }
+                    ExecResult::Ok(Some(output))
+                }
+            }
+            Err(err) => ExecResult::Err(err),
+        },
         Command::Version { daemon, json } => {
             let client = crate::build_info::BuildInfo::current();
             let daemon_status = if daemon {

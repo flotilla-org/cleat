@@ -352,54 +352,195 @@ pub(crate) struct SessionMouseEvent {
 }
 
 pub(crate) enum SessionCommand {
-    RetainInputSources { sources: Vec<u128>, reply: mpsc::Sender<Result<(), String>> },
-    Key { source: u128, event: Box<crate::provider::TerminalKeyEvent>, reply: mpsc::Sender<Result<usize, String>> },
-    ReleaseInput { source: u128, reply: mpsc::Sender<Result<(), String>> },
-    SetAttachmentView { id: u128, command: ViewportCommand, reply: mpsc::Sender<Result<bool, String>> },
-    CaptureAttachmentView { id: u128, reply: mpsc::Sender<Result<Option<crate::provider::CapturedView>, String>> },
-    ReleaseAttachmentView { id: u128 },
-    Focus { focused: bool, reply: mpsc::Sender<Result<(), String>> },
-    Resize { cols: u16, rows: u16, reply: mpsc::Sender<Result<(), String>> },
-    SetCellSize { cell_width_px: u32, cell_height_px: u32, reply: mpsc::Sender<Result<(), String>> },
-    WriteInput { bytes: Vec<u8>, reply: mpsc::Sender<Result<(), String>> },
-    Wheel { event: SessionWheelEvent, reply: mpsc::Sender<Result<usize, String>> },
-    ApplicationWheel { event: SessionWheelEvent, reply: mpsc::Sender<Result<usize, String>> },
-    Mouse { source: u128, event: SessionMouseEvent, reply: mpsc::Sender<Result<usize, String>> },
-    Paste { text: Vec<u8>, reply: mpsc::Sender<Result<usize, String>> },
-    ScrollViewport { command: ViewportCommand, reply: mpsc::Sender<Result<ViewportCommandOutcome, String>> },
-    Snapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
-    RenderUpdate { reply: mpsc::Sender<Result<TerminalRenderUpdate, String>> },
-    PacketRender { full: bool, reply: mpsc::Sender<Result<Option<crate::image_delivery::RenderBundle>, String>> },
-    FullSnapshot { reply: mpsc::Sender<Result<TerminalSnapshot, String>> },
-    ImageResourceData { image_id: u32, generation: u64, callback: ImageResourceDataCallback, reply: mpsc::Sender<Result<bool, String>> },
-    Inspect { has_controller: bool, watcher_count: usize, reply: mpsc::Sender<Result<InspectResult, String>> },
-    ApplyAttachState { cols: u16, rows: u16, capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<RawOutputReplay, String>> },
-    ReplayPayload { capabilities: vt::ClientCapabilities, reply: mpsc::Sender<Result<RawOutputReplay, String>> },
-    CaptureText { reply: mpsc::Sender<Result<String, String>> },
-    ValidateTextMatching { reply: mpsc::Sender<Result<(), String>> },
-    ScreenContains { text: String, reply: mpsc::Sender<Result<bool, String>> },
-    LastPtyOutputAt { reply: mpsc::Sender<Result<Option<Instant>, String>> },
+    RetainInputSources {
+        sources: Vec<u128>,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    Key {
+        source: u128,
+        event: Box<crate::provider::TerminalKeyEvent>,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
+    ReleaseInput {
+        source: u128,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    SetAttachmentView {
+        id: u128,
+        command: ViewportCommand,
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
+    CaptureAttachmentView {
+        id: u128,
+        reply: mpsc::Sender<Result<Option<crate::provider::CapturedView>, String>>,
+    },
+    ReleaseAttachmentView {
+        id: u128,
+    },
+    Focus {
+        focused: bool,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    SetCellSize {
+        cell_width_px: u32,
+        cell_height_px: u32,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    WriteInput {
+        bytes: Vec<u8>,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    Wheel {
+        event: SessionWheelEvent,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
+    ApplicationWheel {
+        event: SessionWheelEvent,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
+    Mouse {
+        source: u128,
+        event: SessionMouseEvent,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
+    Paste {
+        text: Vec<u8>,
+        reply: mpsc::Sender<Result<usize, String>>,
+    },
+    ScrollViewport {
+        command: ViewportCommand,
+        reply: mpsc::Sender<Result<ViewportCommandOutcome, String>>,
+    },
+    Snapshot {
+        reply: mpsc::Sender<Result<TerminalSnapshot, String>>,
+    },
+    RenderUpdate {
+        reply: mpsc::Sender<Result<TerminalRenderUpdate, String>>,
+    },
+    PacketRender {
+        full: bool,
+        reply: mpsc::Sender<Result<Option<crate::image_delivery::RenderBundle>, String>>,
+    },
+    FullSnapshot {
+        reply: mpsc::Sender<Result<TerminalSnapshot, String>>,
+    },
+    ImageResourceData {
+        image_id: u32,
+        generation: u64,
+        callback: ImageResourceDataCallback,
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
+    Inspect {
+        has_controller: bool,
+        watcher_count: usize,
+        reply: mpsc::Sender<Result<InspectResult, String>>,
+    },
+    ApplyAttachState {
+        cols: u16,
+        rows: u16,
+        capabilities: vt::ClientCapabilities,
+        reply: mpsc::Sender<Result<RawOutputReplay, String>>,
+    },
+    ReplayPayload {
+        capabilities: vt::ClientCapabilities,
+        reply: mpsc::Sender<Result<RawOutputReplay, String>>,
+    },
+    CaptureText {
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    ValidateTextMatching {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    ScreenContains {
+        text: String,
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
+    LastPtyOutputAt {
+        reply: mpsc::Sender<Result<Option<Instant>, String>>,
+    },
     FlushScreenActivity,
-    FlushRecording { reply: mpsc::Sender<Result<(), String>> },
-    RecordingActive { reply: mpsc::Sender<Result<bool, String>> },
-    RecordAttach { reply: mpsc::Sender<Result<(), String>> },
-    RecordDetach { reply: mpsc::Sender<Result<(), String>> },
-    WriteInputWithMark { bytes: Vec<u8>, marker_name: String, reply: mpsc::Sender<Result<u64, String>> },
-    PasteWithMark { text: Vec<u8>, marker_name: String, reply: mpsc::Sender<Result<u64, String>> },
-    SetRecording { enable: bool, reply: mpsc::Sender<Result<(), String>> },
-    Mark { name: Option<String>, reply: mpsc::Sender<Result<u64, String>> },
-    UpdateTags { add: Vec<String>, remove: Vec<String>, reply: mpsc::Sender<Result<Vec<String>, String>> },
-    ResolveMarker { name: String, reply: mpsc::Sender<Result<Option<u64>, String>> },
-    ResolveNextMarker { after: u64, reply: mpsc::Sender<Result<Option<u64>, String>> },
-    DispatchSignal { signal: i32, target: SignalTarget, reply: mpsc::Sender<Result<(), String>> },
-    ShouldKeepSessionDir { reply: mpsc::Sender<Result<bool, String>> },
-    MarkObserved { generation: u64, reply: mpsc::Sender<bool> },
-    ScrollbackExtent { reply: mpsc::Sender<TerminalScrollbackExtent> },
-    ScrollbarState { reply: mpsc::Sender<TerminalScrollbarState> },
-    SetQueryPassthrough { enabled: bool, reply: mpsc::Sender<Result<(), String>> },
-    SubscribeRawOutput { reply: mpsc::Sender<RawOutputTap> },
-    RecoverRawOutput { capabilities: Vec<vt::ClientCapabilities>, reply: mpsc::Sender<Result<RawOutputRecovery, String>> },
-    Stop { terminate: bool },
+    FlushRecording {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    RecordingActive {
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
+    RecordAttach {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    RecordDetach {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    WriteInputWithMark {
+        bytes: Vec<u8>,
+        marker_name: String,
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
+    PasteWithMark {
+        text: Vec<u8>,
+        marker_name: String,
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
+    SetRecording {
+        enable: bool,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    Mark {
+        name: Option<String>,
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
+    UpdateTags {
+        add: Vec<String>,
+        remove: Vec<String>,
+        reply: mpsc::Sender<Result<Vec<String>, String>>,
+    },
+    ResolveMarker {
+        name: String,
+        reply: mpsc::Sender<Result<Option<u64>, String>>,
+    },
+    ResolveNextMarker {
+        after: u64,
+        reply: mpsc::Sender<Result<Option<u64>, String>>,
+    },
+    #[cfg(unix)]
+    TerminateTree(mpsc::Sender<Result<crate::platform::signals::ProcessTree, String>>),
+    DispatchSignal {
+        signal: i32,
+        target: SignalTarget,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    ShouldKeepSessionDir {
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
+    MarkObserved {
+        generation: u64,
+        reply: mpsc::Sender<bool>,
+    },
+    ScrollbackExtent {
+        reply: mpsc::Sender<TerminalScrollbackExtent>,
+    },
+    ScrollbarState {
+        reply: mpsc::Sender<TerminalScrollbarState>,
+    },
+    SetQueryPassthrough {
+        enabled: bool,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    SubscribeRawOutput {
+        reply: mpsc::Sender<RawOutputTap>,
+    },
+    RecoverRawOutput {
+        capabilities: Vec<vt::ClientCapabilities>,
+        reply: mpsc::Sender<Result<RawOutputRecovery, String>>,
+    },
+    Stop {
+        terminate: bool,
+    },
 }
 
 pub(crate) struct SessionActor {
@@ -888,6 +1029,11 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::ResolveNextMarker { after, reply })
     }
 
+    #[cfg(unix)]
+    pub(crate) fn terminate_tree(&self) -> Result<crate::platform::signals::ProcessTree, String> {
+        self.request_result(SessionCommand::TerminateTree)
+    }
+
     pub(crate) fn dispatch_signal(&self, signal: i32, target: SignalTarget) -> Result<(), String> {
         self.request_result(|reply| SessionCommand::DispatchSignal { signal, target, reply })
     }
@@ -1321,6 +1467,10 @@ fn session_actor_handle_command(
         }
         SessionCommand::ResolveNextMarker { after, reply } => {
             let _ = reply.send(Ok(runtime.resolve_next_marker_after(after)));
+        }
+        #[cfg(unix)]
+        SessionCommand::TerminateTree(reply) => {
+            let _ = reply.send(runtime.terminate_tree());
         }
         SessionCommand::DispatchSignal { signal, target, reply } => {
             let _ = reply.send(runtime.dispatch_signal(signal, target));

@@ -1585,7 +1585,18 @@ impl PacketChannelRef {
     }
 }
 
+#[cfg(unix)]
+const SESSION_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+struct PendingTermination {
+    deadline: Instant,
+    tree: crate::platform::signals::ProcessTree,
+}
+
 struct HostedSession {
+    #[cfg(unix)]
+    termination_started: bool,
     metadata: SessionMetadata,
     actor: SessionActor,
     raw_output_tap: RawOutputTap,
@@ -1621,6 +1632,8 @@ impl HostedSession {
         })?;
         let raw_output_tap = actor.subscribe_raw_output()?;
         Ok(Self {
+            #[cfg(unix)]
+            termination_started: false,
             applied_size: (session.initial_size.cols, session.initial_size.rows),
             applied_cell_size: (1, 1),
             metadata: session,
@@ -1925,6 +1938,8 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     .map_err(|e| format!("write daemon build identity: {e}"))?;
 
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
+    #[cfg(unix)]
+    let mut pending_terminations: Vec<PendingTermination> = Vec::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
     let mut pending_http_handshakes: Vec<PendingHttpHandshake> = Vec::new();
     let mut next_packet_client_id: u64 = 1;
@@ -1967,6 +1982,16 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         }
 
         let mut did_work = false;
+        #[cfg(unix)]
+        pending_terminations.retain(|pending| {
+            if Instant::now() < pending.deadline {
+                return true;
+            }
+            if let Err(err) = pending.tree.kill_survivors() {
+                eprintln!("cleat: session termination escalation failed: {err}");
+            }
+            false
+        });
 
         loop {
             match retry_interrupted(|| listener.accept()) {
@@ -1996,6 +2021,8 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                         continue;
                     }
                     let mut http_state = HttpRequestState {
+                        #[cfg(unix)]
+                        pending_terminations: &mut pending_terminations,
                         layout: &layout,
                         sessions: &mut sessions,
                         packet_clients: &mut packet_clients,
@@ -2081,7 +2108,17 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         service_activity_subscriptions(&sessions, &mut packet_clients)?;
         flush_packet_clients(&mut packet_clients);
 
-        if sessions.is_empty() {
+        let termination_pending = {
+            #[cfg(unix)]
+            {
+                !pending_terminations.is_empty()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        if sessions.is_empty() && !termination_pending {
             let idle_started = idle_since.get_or_insert_with(Instant::now);
             if idle_started.elapsed() >= SESSION_DAEMON_IDLE_LINGER {
                 break;
@@ -2754,6 +2791,8 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
 }
 
 struct HttpRequestState<'a> {
+    #[cfg(unix)]
+    pending_terminations: &'a mut Vec<PendingTermination>,
     layout: &'a RuntimeLayout,
     sessions: &'a mut HashMap<String, HostedSession>,
     packet_clients: &'a mut Vec<PacketClient>,
@@ -2955,9 +2994,16 @@ fn handle_http_request(
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
         }
         http_uds::Route::SessionDelete { id } => {
-            let Some(hosted) = state.sessions.get(&id) else {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
                 return write_http_not_found(stream);
             };
+            #[cfg(unix)]
+            if !hosted.termination_started {
+                let tree = hosted.actor.terminate_tree()?;
+                state.pending_terminations.push(PendingTermination { deadline: Instant::now() + SESSION_TERMINATION_GRACE, tree });
+                hosted.termination_started = true;
+            }
+            #[cfg(not(unix))]
             hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Tree)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
         }

@@ -8,8 +8,8 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 9 adds physical key identity and extended structured keyboard input.
-pub const PROTOCOL_VERSION: u16 = 9;
+/// Version 10 adds daemon build and drain metadata to Directory snapshots and deltas.
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -82,13 +82,25 @@ impl ControlHello {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectorySnapshot {
+    #[serde(default)]
+    pub daemon: Option<DirectoryDaemon>,
     pub sessions: Vec<DirectoryEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryDelta {
+    #[serde(default)]
+    pub daemon: Option<DirectoryDaemon>,
     pub upserted: Vec<DirectoryEntry>,
     pub removed_session_ids: Vec<String>,
+}
+
+/// Host metadata accompanies snapshots and changes independently of session selectors.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryDaemon {
+    pub generation: Option<u64>,
+    pub build: crate::build_info::BuildInfo,
+    pub drain_state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,9 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn retained_image_delivery_requires_protocol_version_eight() {
-        assert_eq!(PROTOCOL_VERSION, 9);
-        assert!(!ControlHello::current().accepts(7));
+    fn daemon_directory_metadata_requires_protocol_version_ten() {
+        assert_eq!(PROTOCOL_VERSION, 10);
+        assert!(!ControlHello::current().accepts(9));
     }
 
     #[test]
@@ -486,6 +498,7 @@ mod tests {
     fn buffer_reader_skips_unknown_message_payload_by_length() {
         let unknown = PacketFrame { channel: CHANNEL_CONTROL, msg_type: 250, payload: vec![1, 2, 3, 4] };
         let directory = DirectorySnapshot {
+            daemon: None,
             sessions: vec![DirectoryEntry {
                 session_id: "alpha".to_string(),
                 tags: vec!["role=impl".to_string()],
@@ -600,6 +613,7 @@ mod tests {
         };
         let mut bytes = Vec::new();
         PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+            daemon: None,
             upserted: Vec::new(),
             removed_session_ids: Vec::new(),
         })

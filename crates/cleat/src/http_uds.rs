@@ -24,6 +24,7 @@ pub(crate) type HttpRequest = Request<Vec<u8>>;
 pub(crate) enum Route {
     Root,
     Health,
+    Drain,
     PacketConnect,
     Sessions,
     SessionCreate,
@@ -507,6 +508,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
     match (request.method(), path) {
         (&Method::GET, "/") => Route::Root,
         (&Method::GET, "/healthz") => Route::Health,
+        (&Method::POST, "/drain") => Route::Drain,
         (&Method::POST, "/connect") => Route::PacketConnect,
         (&Method::GET, "/sessions") => Route::Sessions,
         (&Method::POST, "/sessions") => Route::SessionCreate,

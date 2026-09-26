@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::hash_map::DefaultHasher,
     fs,
     hash::{Hash, Hasher},
@@ -27,6 +28,8 @@ use windows_sys::Win32::{
 #[derive(Debug)]
 pub struct SessionStream {
     handle: HANDLE,
+    read_timeout: Cell<Option<Duration>>,
+    write_timeout: Cell<Option<Duration>>,
 }
 
 pub struct SessionListener {
@@ -51,7 +54,7 @@ impl SessionListener {
 
         let instance = pending.take().expect("pending checked");
         *pending = Some(PendingPipeInstance::new(&self.pipe_name)?);
-        Ok((SessionStream { handle: instance.into_handle() }, ()))
+        Ok((SessionStream::new(instance.into_handle()), ()))
     }
 }
 
@@ -66,6 +69,10 @@ impl Drop for SessionListener {
 }
 
 impl SessionStream {
+    fn new(handle: HANDLE) -> Self {
+        Self { handle, read_timeout: Cell::new(None), write_timeout: Cell::new(None) }
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         let process = unsafe { GetCurrentProcess() };
         let mut handle = null_mut();
@@ -73,7 +80,10 @@ impl SessionStream {
         if ok == 0 {
             Err(io::Error::last_os_error())
         } else {
-            Ok(Self { handle })
+            let stream = Self::new(handle);
+            stream.read_timeout.set(self.read_timeout.get());
+            stream.write_timeout.set(self.write_timeout.get());
+            Ok(stream)
         }
     }
 
@@ -92,13 +102,13 @@ impl Drop for SessionStream {
 
 impl Read for SessionStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        overlapped_read_blocking(self.handle, buf)
+        overlapped_read_blocking(self.handle, buf, self.read_timeout.get())
     }
 }
 
 impl Write for SessionStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        overlapped_write_blocking(self.handle, buf)
+        overlapped_write_blocking(self.handle, buf, self.write_timeout.get())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -117,7 +127,7 @@ pub fn validate_session_socket_path(_socket_path: &Path) -> Result<(), String> {
 pub fn try_connect_session_stream(socket_path: &Path) -> io::Result<SessionStream> {
     let pipe_name = pipe_name_from_marker_file(socket_path)?;
     let handle = open_pipe(&pipe_name)?;
-    Ok(SessionStream { handle })
+    Ok(SessionStream::new(handle))
 }
 
 pub fn bind_session_listener(socket_path: &Path) -> Result<SessionListener, String> {
@@ -139,11 +149,13 @@ pub fn set_stream_nonblocking(_stream: &SessionStream, _nonblocking: bool) -> Re
     Ok(())
 }
 
-pub fn set_stream_read_timeout(_stream: &SessionStream, _timeout: Option<Duration>) -> Result<(), String> {
+pub fn set_stream_read_timeout(stream: &SessionStream, timeout: Option<Duration>) -> Result<(), String> {
+    stream.read_timeout.set(timeout);
     Ok(())
 }
 
-pub fn set_stream_write_timeout(_stream: &SessionStream, _timeout: Option<Duration>) -> Result<(), String> {
+pub fn set_stream_write_timeout(stream: &SessionStream, timeout: Option<Duration>) -> Result<(), String> {
+    stream.write_timeout.set(timeout);
     Ok(())
 }
 
@@ -345,7 +357,7 @@ impl Drop for OverlappedRead {
 // directly in Rust match patterns.
 const ERROR_PIPE_LISTING_ALIAS: u32 = ERROR_PIPE_LISTENING;
 
-fn overlapped_read_blocking(handle: HANDLE, buf: &mut [u8]) -> io::Result<usize> {
+fn overlapped_read_blocking(handle: HANDLE, buf: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
     let event = unsafe { CreateEventW(null(), 1, 0, null()) };
     if event.is_null() {
         return Err(io::Error::last_os_error());
@@ -358,7 +370,7 @@ fn overlapped_read_blocking(handle: HANDLE, buf: &mut [u8]) -> io::Result<usize>
         Ok(read as usize)
     } else {
         match unsafe { GetLastError() } {
-            ERROR_IO_PENDING => wait_overlapped(handle, &mut overlapped),
+            ERROR_IO_PENDING => wait_overlapped(handle, &mut overlapped, timeout),
             err => Err(io_error_from_code(err)),
         }
     };
@@ -375,7 +387,7 @@ fn overlapped_read_blocking(handle: HANDLE, buf: &mut [u8]) -> io::Result<usize>
     }
 }
 
-fn overlapped_write_blocking(handle: HANDLE, buf: &[u8]) -> io::Result<usize> {
+fn overlapped_write_blocking(handle: HANDLE, buf: &[u8], timeout: Option<Duration>) -> io::Result<usize> {
     let event = unsafe { CreateEventW(null(), 1, 0, null()) };
     if event.is_null() {
         return Err(io::Error::last_os_error());
@@ -388,7 +400,7 @@ fn overlapped_write_blocking(handle: HANDLE, buf: &[u8]) -> io::Result<usize> {
         Ok(written as usize)
     } else {
         match unsafe { GetLastError() } {
-            ERROR_IO_PENDING => wait_overlapped(handle, &mut overlapped),
+            ERROR_IO_PENDING => wait_overlapped(handle, &mut overlapped, timeout),
             ERROR_BROKEN_PIPE | ERROR_OPERATION_ABORTED => Ok(0),
             err => Err(io_error_from_code(err)),
         }
@@ -399,8 +411,8 @@ fn overlapped_write_blocking(handle: HANDLE, buf: &[u8]) -> io::Result<usize> {
     result
 }
 
-fn wait_overlapped(handle: HANDLE, overlapped: &mut OVERLAPPED) -> io::Result<usize> {
-    match unsafe { WaitForSingleObject(overlapped.hEvent, u32::MAX) } {
+fn wait_overlapped(handle: HANDLE, overlapped: &mut OVERLAPPED, timeout: Option<Duration>) -> io::Result<usize> {
+    match unsafe { WaitForSingleObject(overlapped.hEvent, timeout.map(wait_timeout_ms).unwrap_or(u32::MAX)) } {
         WAIT_OBJECT_0 => {
             let mut transferred = 0;
             let ok = unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, 0) };
@@ -410,7 +422,20 @@ fn wait_overlapped(handle: HANDLE, overlapped: &mut OVERLAPPED) -> io::Result<us
                 Ok(transferred as usize)
             }
         }
-        status => Err(io::Error::other(format!("WaitForSingleObject overlapped returned {status}"))),
+        status => {
+            // The kernel may still own the stack OVERLAPPED and caller's buffer.
+            // Cancel and reap before either can be freed, including on timeout.
+            unsafe {
+                CancelIoEx(handle, overlapped);
+                let mut transferred = 0;
+                let _ = GetOverlappedResult(handle, overlapped, &mut transferred, 1);
+            }
+            if status == WAIT_TIMEOUT {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "named-pipe operation timed out"))
+            } else {
+                Err(io::Error::other(format!("WaitForSingleObject overlapped returned {status}")))
+            }
+        }
     }
 }
 
@@ -504,6 +529,34 @@ mod tests {
     use std::{io::Read, thread};
 
     use super::*;
+
+    #[test]
+    fn read_timeout_cancels_pending_io_and_stream_remains_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("socket");
+        let listener = bind_session_listener(&socket_path).unwrap();
+        let (timed_out_tx, timed_out_rx) = std::sync::mpsc::channel();
+        let client = thread::spawn(move || {
+            let mut stream = connect_session_stream(&socket_path).unwrap();
+            set_stream_read_timeout(&stream, Some(Duration::from_millis(30))).unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).unwrap_err().kind(), io::ErrorKind::TimedOut);
+            timed_out_tx.send(()).unwrap();
+            set_stream_read_timeout(&stream, Some(Duration::from_secs(2))).unwrap();
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [42]);
+        });
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(1)),
+                Err(err) => panic!("accept: {err}"),
+            }
+        };
+        timed_out_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        stream.write_all(&[42]).unwrap();
+        client.join().unwrap();
+    }
 
     #[test]
     fn pending_read_reports_eof_when_peer_closes() {

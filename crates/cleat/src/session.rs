@@ -1939,6 +1939,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     )
     .map_err(|e| format!("write daemon build identity: {e}"))?;
 
+    let mut draining = false;
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
     #[cfg(unix)]
     let mut pending_terminations: Vec<PendingTermination> = Vec::new();
@@ -2026,6 +2027,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                         #[cfg(unix)]
                         pending_terminations: &mut pending_terminations,
                         layout: &layout,
+                        draining: &mut draining,
                         sessions: &mut sessions,
                         packet_clients: &mut packet_clients,
                         next_packet_client_id: &mut next_packet_client_id,
@@ -2122,7 +2124,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         };
         if sessions.is_empty() && !termination_pending {
             let idle_started = idle_since.get_or_insert_with(Instant::now);
-            if idle_started.elapsed() >= SESSION_DAEMON_IDLE_LINGER {
+            if draining || idle_started.elapsed() >= SESSION_DAEMON_IDLE_LINGER {
                 break;
             }
         } else {
@@ -2135,7 +2137,11 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     }
 
     let _ = fs::remove_file(&socket_path);
-    // Retain the registration so the next auto-start advances the generation.
+    // Retain recordings and their stale registration as recreatable husks.
+    // Remove an empty drained generation, including its build and pid files.
+    if draining && layout.generation().is_some() && fs::read_dir(layout.sessions_dir()).is_ok_and(|mut entries| entries.next().is_none()) {
+        let _ = fs::remove_dir_all(layout.daemon_dir());
+    }
     Ok(())
 }
 
@@ -2390,6 +2396,14 @@ fn directory_entry_for_session(
     })
 }
 
+fn directory_daemon(layout: &RuntimeLayout, draining: bool) -> crate::packet::DirectoryDaemon {
+    crate::packet::DirectoryDaemon {
+        generation: layout.generation(),
+        build: crate::build_info::BuildInfo::current(),
+        drain_state: if draining { "draining" } else { "serving" }.into(),
+    }
+}
+
 fn directory_snapshot_for_sessions(
     layout: &RuntimeLayout,
     sessions: &HashMap<String, HostedSession>,
@@ -2404,7 +2418,7 @@ fn directory_snapshot_for_sessions(
         }
     }
     entries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    Ok(DirectorySnapshot { sessions: entries })
+    Ok(DirectorySnapshot { daemon: None, sessions: entries })
 }
 
 fn activity_snapshot_for_sessions(
@@ -2485,11 +2499,13 @@ fn broadcast_directory_upsert(entry: DirectoryEntry, packet_clients: &mut Vec<Pa
         if directory_entry_matches_selectors(&entry, &client.selectors) {
             client.known_directory_sessions.insert(entry.session_id.clone());
             client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                daemon: None,
                 upserted: vec![entry.clone()],
                 removed_session_ids: Vec::new(),
             })?;
         } else if client.known_directory_sessions.remove(&entry.session_id) {
             client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                daemon: None,
                 upserted: Vec::new(),
                 removed_session_ids: vec![entry.session_id.clone()],
             })?;
@@ -2502,6 +2518,7 @@ fn broadcast_directory_remove(session_id: &str, packet_clients: &mut Vec<PacketC
     for client in packet_clients {
         if client.known_directory_sessions.remove(session_id) {
             client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                daemon: None,
                 upserted: Vec::new(),
                 removed_session_ids: vec![session_id.to_string()],
             })?;
@@ -2796,6 +2813,7 @@ struct HttpRequestState<'a> {
     #[cfg(unix)]
     pending_terminations: &'a mut Vec<PendingTermination>,
     layout: &'a RuntimeLayout,
+    draining: &'a mut bool,
     sessions: &'a mut HashMap<String, HostedSession>,
     packet_clients: &'a mut Vec<PacketClient>,
     next_packet_client_id: &'a mut u64,
@@ -2897,9 +2915,32 @@ fn handle_http_request(
                 "build": crate::build_info::BuildInfo::current(),
                 "session": state.layout.logical_name(),
                 "ok": true,
+                "drain_state": if *state.draining { "draining" } else { "serving" },
+                "session_count": state.sessions.len(),
             }),
         )
         .map_err(|err| format!("write HTTP response: {err}")),
+        http_uds::Route::Drain => {
+            fs::write(state.layout.daemon_dir().join("drain-state"), "draining").map_err(|e| format!("persist drain state: {e}"))?;
+            *state.draining = true;
+            let metadata = directory_daemon(state.layout, true);
+            for client in state.packet_clients.iter_mut() {
+                // A failed subscriber must not prevent draining or affect other clients.
+                let _ = client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                    daemon: Some(metadata.clone()),
+                    upserted: Vec::new(),
+                    removed_session_ids: Vec::new(),
+                });
+            }
+            http_uds::write_json(
+                stream,
+                StatusCode::OK,
+                &serde_json::json!({
+                    "drain_state": "draining", "session_count": state.sessions.len(),
+                }),
+            )
+            .map_err(|err| format!("write drain response: {err}"))
+        }
         http_uds::Route::Sessions => {
             let mut sessions = Vec::new();
             for hosted in state.sessions.values() {
@@ -2922,6 +2963,15 @@ fn handle_http_request(
             }
             let session: SessionMetadata =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP session create request: {err}"))?;
+            if *state.draining && !state.sessions.contains_key(&session.id) {
+                let current = state.layout.clone().with_daemon(state.layout.logical_name().to_string())?.resolved()?;
+                return http_uds::write_error(
+                    stream,
+                    StatusCode::CONFLICT,
+                    &format!("daemon {} is draining; create sessions on {}", state.layout.daemon_name(), current.daemon_name()),
+                )
+                .map_err(|err| format!("write drain refusal: {err}"));
+            }
             crate::runtime::validate_runtime_name(&session.id)?;
             crate::runtime::validate_environment(&session.environment)?;
             session.vt_engine.ensure_available()?;
@@ -2966,7 +3016,8 @@ fn handle_http_request(
             }
             let mut selectors = subscribe.selectors;
             crate::runtime::normalize_tags(&mut selectors);
-            let directory = directory_snapshot_for_sessions(state.layout, state.sessions, state.packet_clients, &selectors)?;
+            let mut directory = directory_snapshot_for_sessions(state.layout, state.sessions, state.packet_clients, &selectors)?;
+            directory.daemon = Some(directory_daemon(state.layout, *state.draining));
             let activity = subscribe
                 .screen_activity_stable_ms
                 .map(|stable_threshold_ms| activity_snapshot_for_sessions(state.sessions, &selectors, stable_threshold_ms));
@@ -4739,6 +4790,20 @@ pub(crate) fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String
             layout.logical_name()
         ));
     }
+    // A drained generation may have already removed its pid and directory.
+    // Missing registration alone means "starting" elsewhere, so also compare
+    // the current alias before preparing paths that could resurrect an old host.
+    let current = layout.clone().with_daemon(layout.logical_name().to_string())?;
+    let retired = layout.daemon_name().contains('@') && layout.generation() < current.generation();
+    if retired {
+        return try_connect_session_stream(&layout.socket_path()).map(|_| ()).map_err(|_| {
+            format!(
+                "daemon generation {} is retired; recreate the session through --server {}",
+                layout.daemon_name(),
+                layout.logical_name()
+            )
+        });
+    }
     let prepared = layout.prepare_generation()?;
     let layout = &prepared;
     validate_session_socket_path(&layout.socket_path())?;
@@ -5764,9 +5829,15 @@ mod tests {
     #[test]
     fn packet_client_backlog_overflow_marks_client_dead_not_daemon_fatal() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
-        let mut client =
-            super::PacketClient::new(1, stream, Vec::new(), None, &crate::packet::DirectorySnapshot { sessions: Vec::new() }, None)
-                .expect("create packet client");
+        let mut client = super::PacketClient::new(
+            1,
+            stream,
+            Vec::new(),
+            None,
+            &crate::packet::DirectorySnapshot { daemon: None, sessions: Vec::new() },
+            None,
+        )
+        .expect("create packet client");
         client.pending_output = super::PendingOutput::from(vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1]);
 
         let frame = crate::packet::PacketFrame { channel: 1, msg_type: 0, payload: vec![0; 64] };
@@ -5783,9 +5854,15 @@ mod tests {
     #[test]
     fn dead_packet_client_does_not_hold_the_controller_slot() {
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("unix stream pair");
-        let mut client =
-            super::PacketClient::new(7, stream, Vec::new(), None, &crate::packet::DirectorySnapshot { sessions: Vec::new() }, None)
-                .expect("create packet client");
+        let mut client = super::PacketClient::new(
+            7,
+            stream,
+            Vec::new(),
+            None,
+            &crate::packet::DirectorySnapshot { daemon: None, sessions: Vec::new() },
+            None,
+        )
+        .expect("create packet client");
         let holder = super::PacketChannelRef { client_id: 7, channel: 1 };
 
         assert!(super::packet_controller_holder_is_live(holder, std::slice::from_ref(&client)));

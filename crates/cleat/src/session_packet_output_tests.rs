@@ -48,7 +48,7 @@ fn client(id: u64, channels: u32, image: &Image) -> (PacketClient, UnixStream) {
     let (stream, peer) = UnixStream::pair().unwrap();
     stream.set_nonblocking(true).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
-    let mut client = PacketClient::new(id, stream, vec![], None, &DirectorySnapshot { sessions: vec![] }, None).unwrap();
+    let mut client = PacketClient::new(id, stream, vec![], None, &DirectorySnapshot { daemon: None, sessions: vec![] }, None).unwrap();
     for id in 1..=channels {
         client.channels.insert(id, channel(id, image.clone()));
     }
@@ -147,7 +147,11 @@ fn benchmark_image_fallback() {
             for frame in frames {
                 assert_eq!(frame.msg_type, MSG_SESSION_INPUT);
                 client
-                    .enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta { upserted: vec![], removed_session_ids: vec![] })
+                    .enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                        daemon: None,
+                        upserted: vec![],
+                        removed_session_ids: vec![],
+                    })
                     .unwrap();
             }
         }
@@ -194,7 +198,9 @@ fn image_prefetch_is_bounded_and_rotates_across_service_passes() {
     client.queue_image_frames(|| Duration::ZERO).unwrap();
     assert_eq!(client.pending_output.len(), IMAGE_OUTPUT_HIGH_WATER);
     assert_eq!(client.image_output_cursor, cursor);
-    client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta { upserted: vec![], removed_session_ids: vec![] }).unwrap();
+    client
+        .enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta { daemon: None, upserted: vec![], removed_session_ids: vec![] })
+        .unwrap();
     assert!(!client.dead);
 }
 

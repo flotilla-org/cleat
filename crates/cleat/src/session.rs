@@ -847,14 +847,21 @@ impl PacketTerminalRenderer {
             // otherwise flashes the current background across the whole row.
             let row = self.cells.get(grid_row as usize).map(Vec::as_slice).unwrap_or_default();
             let painted_cols = row.len().saturating_sub(self.geometry.x as usize).min(visible_cols as usize);
+            let mut next_ascii_col = None;
             for (col, cell) in row.iter().skip(self.geometry.x as usize).take(visible_cols as usize).enumerate() {
                 if cell.style.width == crate::provider::TerminalCellWidth::SpacerTail && col > 0 {
                     continue;
                 }
-                // The host can assign a different width to a grapheme (for
-                // example VS16 emoji with mode 2027). Grid coordinates, not
-                // the host's advancing cursor, determine the next cell.
-                write!(writer, "\x1b[{};{}H", row_index + 1, col + 1).map_err(|err| format!("position packet cell: {err}"))?;
+                // Only a blank or a single printable ASCII codepoint has a
+                // host-independent one-column advance. Position explicitly on
+                // both sides of every other glyph (including VS16 emoji), and
+                // whenever a spacer or cropping breaks the contiguous run.
+                let ascii = cell.style.width == crate::provider::TerminalCellWidth::Narrow
+                    && (cell.graphemes.is_empty() || matches!(cell.graphemes.as_slice(), [0x20..=0x7e]));
+                if !ascii || next_ascii_col != Some(col) {
+                    write!(writer, "\x1b[{};{}H", row_index + 1, col + 1).map_err(|err| format!("position packet cell: {err}"))?;
+                }
+                next_ascii_col = ascii.then_some(col + 1);
                 let clipped_left = col == 0
                     && self.geometry.x > 0
                     && row.get(self.geometry.x as usize - 1).is_some_and(|c| c.style.width == crate::provider::TerminalCellWidth::Wide);
@@ -5524,6 +5531,39 @@ mod tests {
     }
 
     #[test]
+    fn packet_render_ascii_runs_keep_unicode_position_boundaries() {
+        use crate::provider::{TerminalCellWidth, TerminalRenderCell};
+        // Include empty blanks, style changes, combining marks, wide cells,
+        // and a narrow cell containing multiple ASCII codepoints.
+        let mut cells = ["A", "B", "", "☁️", "C", "D", "e\u{301}", "E", "F", "界", "", "G", "H", "ij", "K"]
+            .into_iter()
+            .map(|text| TerminalRenderCell { graphemes: text.chars().map(u32::from).collect(), ..Default::default() })
+            .collect::<Vec<_>>();
+        cells[1].style.resolved_fg.r = 127;
+        cells[9].style.width = TerminalCellWidth::Wide;
+        cells[10].style.width = TerminalCellWidth::SpacerTail;
+        let update = TerminalRenderUpdate {
+            cols: cells.len() as u16,
+            rows: 1,
+            ops: vec![TerminalRenderUpdateOp {
+                kind: TerminalRenderUpdateOpKind::RowReplace,
+                rows: vec![TerminalRenderRow { row: 0, cells, ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        PacketTerminalRenderer::new(update.cols, 1).apply_and_render(&mut output, &update).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        for col in [1, 4, 5, 7, 8, 10, 12, 14, 15] {
+            assert!(output.contains(&format!("\x1b[1;{col}H")), "missing position at {col}: {output:?}");
+        }
+        for col in [2, 3, 6, 9, 11, 13] {
+            assert!(!output.contains(&format!("\x1b[1;{col}H")), "unnecessary position at {col}: {output:?}");
+        }
+    }
+
+    #[test]
     fn packet_render_bounds_use_only_spare_cells_and_can_be_hidden() {
         let mut renderer = PacketTerminalRenderer::new(2, 1);
         renderer.bounds = true;
@@ -6316,3 +6356,7 @@ mod packet_keyboard_tests {
         assert_eq!(kitty_bytes, b"\x1b[97;5u\x1b[97;5:2u\x1b[97;1:3u");
     }
 }
+
+#[cfg(test)]
+#[path = "session_repaint_measurements.rs"]
+mod repaint_measurements;

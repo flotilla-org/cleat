@@ -127,17 +127,29 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
     let mut read_stream = read_handle;
     let alive = Arc::new(AtomicBool::new(true));
     let alive_out = Arc::clone(&alive);
+    let nested_in =
+        crate::runtime::ambient_session_coordinates()?.map(|source| format!("nested in {}/{}", source.daemon_name(), source.session_id()));
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut stdout = std::io::stdout().lock();
         let mut watcher_state = None;
+        if let Some(message) = &nested_in {
+            render_watcher_message_at_rows(&mut stdout, current_terminal_size().1, message)?;
+            stdout.flush().map_err(|err| format!("flush nesting indicator: {err}"))?;
+        }
         loop {
             match Frame::read(&mut read_stream) {
                 Ok(Frame::Output(bytes)) => {
                     write_attach_output(&mut stdout, &bytes, watcher_state.as_ref())?;
+                    if let Some(message) = &nested_in {
+                        render_watcher_message_at_rows(&mut stdout, current_terminal_size().1, message)?;
+                    }
                     stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
                 }
                 Ok(Frame::SeatState(state)) => {
                     update_watcher_chrome(&mut stdout, &mut watcher_state, state)?;
+                    if let Some(message) = &nested_in {
+                        render_watcher_message_at_rows(&mut stdout, current_terminal_size().1, message)?;
+                    }
                     stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
                 }
                 Ok(_) => {}
@@ -1454,7 +1466,7 @@ fn connect_foreground_upgrade(
                     }
                 }
             }
-            other => return Err(format!("unexpected {role} response: {other}")),
+            other => return Err(http_uds::upgrade_error(&mut stream, other)),
         }
         if Instant::now() >= deadline {
             return Err(format!("session {id} controller seat is held"));
@@ -2211,7 +2223,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             remove_packet_channels_for_session(&session_id, &mut packet_clients);
         }
 
-        service_activity_subscriptions(&sessions, &mut packet_clients)?;
+        service_activity_subscriptions(&layout, &sessions, &mut packet_clients)?;
         flush_packet_clients(&mut packet_clients);
 
         let termination_pending = {
@@ -2553,7 +2565,11 @@ fn matching_activity_sessions(
     activity_sessions
 }
 
-fn service_activity_subscriptions(sessions: &HashMap<String, HostedSession>, packet_clients: &mut Vec<PacketClient>) -> Result<(), String> {
+fn service_activity_subscriptions(
+    layout: &RuntimeLayout,
+    sessions: &HashMap<String, HostedSession>,
+    packet_clients: &mut Vec<PacketClient>,
+) -> Result<(), String> {
     for client in packet_clients {
         if client.dead {
             continue;
@@ -2562,6 +2578,13 @@ fn service_activity_subscriptions(sessions: &HashMap<String, HostedSession>, pac
             continue;
         };
         let current = matching_activity_sessions(sessions, &client.selectors, stable_threshold_ms);
+        if let Err(message) = client.admit_activity(layout, &current) {
+            client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: CHANNEL_CONTROL, message })?;
+            client.screen_activity_stable_ms = None;
+            client.known_activity_sessions.clear();
+            client.activity_output_leases.clear();
+            continue;
+        }
 
         let current_ids = current.iter().map(|session| session.session_id.clone()).collect::<HashSet<_>>();
         for session in current {
@@ -3017,6 +3040,22 @@ fn handle_http_request(
     state: &mut HttpRequestState<'_>,
     response_committed: &mut bool,
 ) -> Result<(), String> {
+    // All output transports require an explicit upgraded-client declaration.
+    // Validate before touching a session, sending a replay or granting a role.
+    let output_context = if matches!(
+        http_uds::route(&request),
+        http_uds::Route::SessionAttach { .. } | http_uds::Route::SessionWatch { .. } | http_uds::Route::PacketConnect
+    ) {
+        match crate::output_admission::verify(&request, stream) {
+            Ok(context) => Some(context),
+            Err(message) => {
+                return http_uds::write_error(stream, StatusCode::UPGRADE_REQUIRED, &message)
+                    .map_err(|err| format!("write output admission error: {err}"))
+            }
+        }
+    } else {
+        None
+    };
     let route = http_uds::route(&request);
     if let Some(id) = route.session_id() {
         let holder_epoch = match http_uds::request_hosting_epoch(&request) {
@@ -3245,8 +3284,21 @@ fn handle_http_request(
             #[cfg(unix)]
             set_stream_nonblocking(&packet_stream, true).map_err(|err| format!("set HTTP packet stream nonblocking: {err}"))?;
             let client_id = *state.next_packet_client_id;
-            let mut client =
-                PacketClient::new(client_id, packet_stream, selectors, subscribe.screen_activity_stable_ms, &directory, activity.as_ref())?;
+            let mut client = PacketClient::new(
+                client_id,
+                packet_stream,
+                selectors,
+                subscribe.screen_activity_stable_ms,
+                &directory,
+                activity.as_ref(),
+                output_context.expect("validated packet output context"),
+            )?;
+            if let Some(activity) = &activity {
+                if let Err(message) = client.admit_activity(state.layout, &activity.sessions) {
+                    return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                        .map_err(|err| format!("write activity admission error: {err}"));
+                }
+            }
             client.enqueue_control(MSG_CONTROL_HELLO, &advertised_hello())?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
             if let Some(activity) = activity {
@@ -3286,6 +3338,14 @@ fn handle_http_request(
             };
             let body: http_uds::AttachRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP attach request: {err}"))?;
+            let output_lease =
+                match crate::output_admission::admit(output_context.as_ref().expect("validated output context"), state.layout, &id) {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                            .map_err(|err| format!("write output cycle error: {err}"))
+                    }
+                };
             vacate_dead_packet_controller(hosted, state.packet_clients);
             let seat_is_held = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
             if seat_is_held && body.strict {
@@ -3324,6 +3384,7 @@ fn handle_http_request(
             };
             let attach_stream = stream.try_clone().map_err(|err| format!("clone HTTP attach stream: {err}"))?;
             let mut client = ActiveClient::new(attach_stream, capabilities, normalize_attachment_identity(body.identity))?;
+            client._output_lease = output_lease;
             if !grant_controller {
                 client.denial_reason = Some(RoleDenialReason {
                     held_by: if hosted.active_client.is_some() { ControllerHolder::Stream } else { ControllerHolder::Packet },
@@ -3375,10 +3436,19 @@ fn handle_http_request(
             };
             let body: http_uds::AttachRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP watch request: {err}"))?;
+            let output_lease =
+                match crate::output_admission::admit(output_context.as_ref().expect("validated output context"), state.layout, &id) {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                            .map_err(|err| format!("write output cycle error: {err}"))
+                    }
+                };
             let capabilities = attach_capabilities_from_http(body.capabilities);
             let replay = hosted.actor.replay_payload(capabilities)?;
             let watch_stream = stream.try_clone().map_err(|err| format!("clone HTTP watch stream: {err}"))?;
             let mut watcher = ActiveClient::new(watch_stream, capabilities, normalize_attachment_identity(body.identity))?;
+            watcher._output_lease = output_lease;
             watcher.enqueue_frame(&Frame::SeatState(SeatState {
                 role: "watcher".to_string(),
                 controller: controller_identity(hosted, state.packet_clients),
@@ -3812,6 +3882,8 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 }
 
 struct PacketClient {
+    activity_output_leases: HashMap<String, Option<crate::output_admission::OutputLease>>,
+    output_context: crate::output_admission::OutputContext,
     image_output_cursor: u32,
     id: u64,
     stream: SessionStream,
@@ -3830,6 +3902,7 @@ struct PacketClient {
 }
 
 struct PacketSessionChannel {
+    _output_lease: Option<crate::output_admission::OutputLease>,
     session_id: String,
     role: ChannelRole,
     requested_role: ChannelRole,
@@ -3957,6 +4030,7 @@ impl PacketClient {
         screen_activity_stable_ms: Option<u64>,
         initial_directory: &DirectorySnapshot,
         initial_activity: Option<&ActivitySnapshot>,
+        output_context: crate::output_admission::OutputContext,
     ) -> Result<Self, String> {
         let input_reader = ActiveClientReader::new(&stream)?;
         Ok(Self {
@@ -3964,6 +4038,8 @@ impl PacketClient {
             stream,
             pending_output: PendingOutput::new(),
             image_output_cursor: 0,
+            output_context,
+            activity_output_leases: HashMap::new(),
             input_reader,
             input_buffer: Vec::new(),
             channels: HashMap::new(),
@@ -3977,6 +4053,17 @@ impl PacketClient {
             known_directory_sessions: initial_directory.sessions.iter().map(|entry| entry.session_id.clone()).collect(),
             dead: false,
         })
+    }
+
+    fn admit_activity(&mut self, layout: &RuntimeLayout, sessions: &[ActivitySession]) -> Result<(), String> {
+        self.activity_output_leases.retain(|id, _| sessions.iter().any(|session| &session.session_id == id));
+        for session in sessions {
+            if !self.activity_output_leases.contains_key(&session.session_id) {
+                let lease = crate::output_admission::admit(&self.output_context, layout, &session.session_id)?;
+                self.activity_output_leases.insert(session.session_id.clone(), lease);
+            }
+        }
+        Ok(())
     }
 
     fn enqueue_control<T: serde::Serialize>(&mut self, msg_type: u8, value: &T) -> Result<(), String> {
@@ -4530,6 +4617,14 @@ fn open_packet_channel(
         return Ok(());
     }
 
+    let output_lease = match crate::output_admission::admit(&packet_clients[index].output_context, layout, &open.session_id) {
+        Ok(lease) => lease,
+        Err(message) => {
+            packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message })?;
+            return Ok(());
+        }
+    };
+
     // Probe render state before granting a role: a session whose VT engine
     // cannot serve it (e.g. the passthrough placeholder) must fail this one
     // channel, not demote the current controller or tear down the daemon.
@@ -4564,6 +4659,7 @@ fn open_packet_channel(
         hosted.packet_render_cache.store(update.clone());
     }
     packet_clients[index].channels.insert(open.channel, PacketSessionChannel {
+        _output_lease: output_lease,
         session_id: session_id.clone(),
         role: granted,
         requested_role: open.role,
@@ -4909,6 +5005,7 @@ impl From<Vec<u8>> for PendingOutput {
 }
 
 struct ActiveClient {
+    _output_lease: Option<crate::output_admission::OutputLease>,
     stream: SessionStream,
     pending_output: PendingOutput,
     input_reader: ActiveClientReader,
@@ -4929,6 +5026,7 @@ impl ActiveClient {
             capabilities,
             identity,
             denial_reason: None,
+            _output_lease: None,
         })
     }
 
@@ -5998,7 +6096,7 @@ mod tests {
             let request = read_http_request_for_test(&mut stream);
             tx.send(request).expect("send request");
             stream
-                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n")
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\nx-cleat-output-admission: 1\r\n\r\n")
                 .expect("write response");
         });
 
@@ -6144,6 +6242,7 @@ mod tests {
             None,
             &crate::packet::DirectorySnapshot { daemon: None, sessions: Vec::new() },
             None,
+            crate::output_admission::OutputContext::External,
         )
         .expect("create packet client");
         client.pending_output = super::PendingOutput::from(vec![0; super::MAX_PENDING_CLIENT_OUTPUT_BYTES - 1]);
@@ -6169,6 +6268,7 @@ mod tests {
             None,
             &crate::packet::DirectorySnapshot { daemon: None, sessions: Vec::new() },
             None,
+            crate::output_admission::OutputContext::External,
         )
         .expect("create packet client");
         let holder = super::PacketChannelRef { client_id: 7, channel: 1 };

@@ -112,13 +112,13 @@ fn http_packet_stream_with_selectors(root: &std::path::Path, id: &str, selectors
     if body.is_empty() {
         write!(
             stream,
-            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",
+            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n",
         )
         .expect("write packet upgrade request");
     } else {
         write!(
             stream,
-            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n{}",
+            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n{}",
             body.len(),
             body
         )
@@ -141,7 +141,7 @@ fn http_activity_stream(root: &std::path::Path, id: &str, selectors: &[String], 
     .to_string();
     write!(
         stream,
-        "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n{}",
+        "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n{}",
         body.len(),
         body
     )
@@ -389,7 +389,7 @@ fn http_upgrade_stream(
     );
     write!(
         stream,
-        "POST /sessions/{id}/{action} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n{}",
+        "POST /sessions/{id}/{action} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n{}",
         body.len(),
         body
     )
@@ -423,7 +423,7 @@ fn http_attach_with_seat_options(
     .to_string();
     write!(
         stream,
-        "POST /sessions/{id}/attach HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n{}",
+        "POST /sessions/{id}/attach HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n{}",
         body.len(),
         body
     )
@@ -593,7 +593,7 @@ fn launch_from_creates_a_sibling_in_the_source_daemon() {
     let mut observer = UnixStream::connect(temp.path().join("source-daemon/socket")).expect("connect source daemon");
     write!(
         observer,
-        "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n"
+        "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n"
     )
     .expect("write packet upgrade request");
     let response = read_http_response_head(&mut observer);

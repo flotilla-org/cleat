@@ -139,17 +139,11 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
         loop {
             match Frame::read(&mut read_stream) {
                 Ok(Frame::Output(bytes)) => {
-                    write_attach_output(&mut stdout, &bytes, watcher_state.as_ref())?;
-                    if let Some(message) = &nested_in {
-                        render_watcher_message_at_rows(&mut stdout, current_terminal_size().1, message)?;
-                    }
+                    write_attach_output(&mut stdout, &bytes, watcher_state.as_ref(), nested_in.as_deref())?;
                     stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
                 }
                 Ok(Frame::SeatState(state)) => {
-                    update_watcher_chrome(&mut stdout, &mut watcher_state, state)?;
-                    if let Some(message) = &nested_in {
-                        render_watcher_message_at_rows(&mut stdout, current_terminal_size().1, message)?;
-                    }
+                    update_watcher_chrome(&mut stdout, &mut watcher_state, state, nested_in.as_deref())?;
                     stdout.flush().map_err(|err| format!("flush stdout: {err}"))?;
                 }
                 Ok(_) => {}
@@ -1076,30 +1070,42 @@ fn render_packet_cell(writer: &mut impl Write, cell: &crate::provider::TerminalR
     Ok(())
 }
 
-fn write_attach_output(writer: &mut impl Write, bytes: &[u8], watcher_state: Option<&SeatState>) -> Result<(), String> {
+fn write_attach_output(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    watcher_state: Option<&SeatState>,
+    nested_in: Option<&str>,
+) -> Result<(), String> {
     writer.write_all(bytes).map_err(|err| format!("write stdout: {err}"))?;
     if let Some(state) = watcher_state {
-        render_seat_chrome(writer, state)?;
+        render_seat_chrome(writer, state, nested_in)?;
+    } else if let Some(message) = nested_in {
+        render_watcher_message_at_rows(writer, current_terminal_size().1, message)?;
     }
     Ok(())
 }
 
-fn update_watcher_chrome(writer: &mut impl Write, watcher_state: &mut Option<SeatState>, state: SeatState) -> Result<(), String> {
+fn update_watcher_chrome(
+    writer: &mut impl Write,
+    watcher_state: &mut Option<SeatState>,
+    state: SeatState,
+    nested_in: Option<&str>,
+) -> Result<(), String> {
     if state.role == "watcher" {
-        render_seat_chrome(writer, &state)?;
+        render_seat_chrome(writer, &state, nested_in)?;
         *watcher_state = Some(state);
-    } else if watcher_state.take().is_some() {
-        render_seat_chrome(writer, &state)?;
+    } else if watcher_state.take().is_some() || nested_in.is_some() {
+        render_seat_chrome(writer, &state, nested_in)?;
     }
     Ok(())
 }
 
-fn render_seat_chrome(writer: &mut impl Write, state: &SeatState) -> Result<(), String> {
+fn render_seat_chrome(writer: &mut impl Write, state: &SeatState, nested_in: Option<&str>) -> Result<(), String> {
     let (_, rows) = current_terminal_size();
-    render_seat_chrome_at_rows(writer, state, rows)
+    render_seat_chrome_at_rows(writer, state, rows, nested_in)
 }
 
-fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: u16) -> Result<(), String> {
+fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: u16, nested_in: Option<&str>) -> Result<(), String> {
     if rows == 0 {
         return Ok(());
     }
@@ -1109,9 +1115,13 @@ fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: 
             .as_ref()
             .map(|identity| sanitize_attachment_name(identity.display_name()))
             .unwrap_or_else(|| "none".to_string());
-        return render_watcher_message_at_rows(writer, rows, &format!("watching — controller: {controller}"));
+        let nesting = nested_in.map(|source| format!("{source} | ")).unwrap_or_default();
+        return render_watcher_message_at_rows(writer, rows, &format!("{nesting}watching — controller: {controller}"));
     }
 
+    if let Some(message) = nested_in {
+        return render_watcher_message_at_rows(writer, rows, message);
+    }
     writer.write_all(b"\x1b7").map_err(|err| format!("save cursor for watcher banner: {err}"))?;
     write!(writer, "\x1b[r\x1b[{};1H\x1b[2K", rows).map_err(|err| format!("clear watcher banner: {err}"))?;
     writer.write_all(b"\x1b8").map_err(|err| format!("restore cursor after watcher banner: {err}"))
@@ -6168,6 +6178,7 @@ mod tests {
                 }),
             },
             24,
+            None,
         )
         .expect("render watcher chrome");
 
@@ -6190,6 +6201,7 @@ mod tests {
                 }),
             },
             24,
+            None,
         )
         .expect("render sanitized watcher chrome");
 
@@ -6201,9 +6213,48 @@ mod tests {
     }
 
     #[test]
+    fn nested_watcher_chrome_composes_nesting_and_controller_on_one_row() {
+        let state = crate::protocol::SeatState {
+            role: "watcher".into(),
+            controller: Some(crate::protocol::AttachmentIdentity {
+                kind: crate::protocol::AttachmentKind::Supervisor,
+                name: "crew-runner".into(),
+            }),
+        };
+        for rows in [1, 24] {
+            let mut output = Vec::new();
+            super::render_seat_chrome_at_rows(&mut output, &state, rows, Some("nested in source/shell")).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("nested in source/shell | watching — controller: crew-runner"));
+            assert_eq!(output.matches("\x1b[2K").count(), 1, "must paint one combined banner");
+        }
+        let mut output = Vec::new();
+        super::write_attach_output(&mut output, b"terminal output", Some(&state), Some("nested in source/shell")).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("terminal output"));
+        assert!(output.contains("nested in source/shell | watching — controller: crew-runner"));
+        assert_eq!(output.matches("\x1b[2K").count(), 1);
+
+        let mut watcher_state = Some(state);
+        let mut output = Vec::new();
+        super::update_watcher_chrome(
+            &mut output,
+            &mut watcher_state,
+            crate::protocol::SeatState { role: "controller".into(), controller: None },
+            Some("nested in source/shell"),
+        )
+        .unwrap();
+        assert!(watcher_state.is_none());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("nested in source/shell"));
+        assert!(!output.contains("watching"));
+        assert_eq!(output.matches("\x1b[2K").count(), 1);
+    }
+
+    #[test]
     fn controller_output_does_not_render_watcher_chrome() {
         let mut output = Vec::new();
-        super::write_attach_output(&mut output, b"last terminal row", None).expect("relay controller output");
+        super::write_attach_output(&mut output, b"last terminal row", None, None).expect("relay controller output");
 
         assert_eq!(output, b"last terminal row");
     }

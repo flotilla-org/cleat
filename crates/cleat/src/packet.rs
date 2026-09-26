@@ -20,6 +20,9 @@ pub const MSG_CONTROL_CLOSE_CHANNEL: u8 = 5;
 pub const MSG_CONTROL_ERROR: u8 = 6;
 pub const MSG_CONTROL_ACTIVITY_SNAPSHOT: u8 = 7;
 pub const MSG_CONTROL_ACTIVITY_EVENT: u8 = 8;
+/// Precedes the `ControlError` that closes a channel whose session moved to
+/// another host. Clients that do not know it ignore it and see the close.
+pub const MSG_CONTROL_REDIRECT: u8 = 9;
 
 pub const MSG_SESSION_RENDER: u8 = 16;
 pub const MSG_SESSION_ACK: u8 = 17;
@@ -232,6 +235,44 @@ pub struct CloseChannel {
     pub reason: Option<String>,
 }
 
+/// Where a transferred session went. Carried by the packet redirect and by
+/// HTTP 421 responses from the host it left.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRedirect {
+    pub session_id: String,
+    /// `daemon:<name@generation>`.
+    pub address: String,
+    pub runtime_root: String,
+    /// Physical daemon name, `<name>@<generation>`.
+    pub daemon: String,
+    pub hosting_epoch: u64,
+    /// The packet protocol range the new host speaks.
+    pub protocol_version: u16,
+    pub min_supported_version: u16,
+}
+
+impl SessionRedirect {
+    pub fn accepts_protocol(&self, version: u16) -> bool {
+        (self.min_supported_version..=self.protocol_version).contains(&version)
+    }
+
+    /// Why a client speaking `version` cannot follow, if it cannot.
+    pub fn incompatibility(&self, version: u16) -> Option<String> {
+        (!self.accepts_protocol(version)).then(|| {
+            format!(
+                "session {} moved to {}, a daemon speaking protocol {} (this client speaks {version})",
+                self.session_id, self.address, self.protocol_version
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelRedirect {
+    pub channel: u32,
+    pub redirect: SessionRedirect,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlError {
     pub channel: u32,
@@ -352,6 +393,11 @@ pub struct PacketClient<S> {
 impl<S: Read + Write> PacketClient<S> {
     pub fn new(stream: S) -> Self {
         Self { stream, buffer: Vec::new() }
+    }
+
+    /// The underlying transport, e.g. to set socket timeouts.
+    pub fn get_ref(&self) -> &S {
+        &self.stream
     }
 
     pub fn open_channel(&mut self, channel: u32, session_id: &str, role: ChannelRole) -> std::io::Result<()> {

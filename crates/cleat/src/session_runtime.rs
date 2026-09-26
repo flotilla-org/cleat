@@ -10,7 +10,7 @@ use std::{
 use crate::{
     conpty_startup::{ConptyStartup, StartupStep},
     da::DeviceAttributeTracker,
-    platform::pty::{exit_code_from_wait_status, PtyChild},
+    platform::{pty::PtyChild, ChildExit},
     protocol::{InspectResult, SignalTarget},
     provider::{
         DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, ViewportCommand,
@@ -32,6 +32,11 @@ const SNAPSHOT_INTERVAL_BYTES: u64 = 256 * 1024;
 /// no throughput; it only guarantees commands drain between slices. Two
 /// reads keeps a slice around ~100ms even for a debug-build VT engine.
 const PTY_READ_BUDGET_PER_PUMP: usize = 2 * PTY_READ_BUFFER_SIZE;
+/// Output a releasing host may read between its transfer snapshot and the
+/// commit. The adopter replays it into its engine; a transfer that outruns
+/// this bound fails and the session stays where it is.
+#[cfg(unix)]
+const TRANSFER_TAIL_LIMIT: usize = 16 * 1024 * 1024;
 
 pub(crate) struct SessionRuntime {
     session: SessionMetadata,
@@ -56,6 +61,50 @@ pub(crate) struct SessionRuntime {
     // reported a pixel size yet.
     cell_width_px: u32,
     cell_height_px: u32,
+    /// Output read since a transfer snapshot, while a transfer is pending.
+    #[cfg(unix)]
+    transfer_tail: Option<TransferTail>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct TransferTail {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+/// Everything a releasing host hands an adopter, captured on the session's
+/// actor so the snapshot and the output tail share one cut point.
+#[cfg(unix)]
+pub(crate) struct TransferSource {
+    pub session: SessionMetadata,
+    pub size: crate::runtime::TerminalSize,
+    pub cell_pixel_size: (u16, u16),
+    pub child_pid: u32,
+    pub hosting_epoch: u64,
+    pub replay_snapshot: crate::recording::ReplaySnapshot,
+    pub markers: HashMap<String, u64>,
+    pub recording_paused: bool,
+    pub pty_master: std::os::fd::OwnedFd,
+    pub recording: Option<std::fs::File>,
+    /// This host forked the child (and so reaps it).
+    pub forked_here: bool,
+    /// The status stream this host adopted from the child's forker, if any.
+    pub upstream_status: Option<std::os::fd::OwnedFd>,
+}
+
+/// The adopting half: descriptors and state received in a transfer manifest.
+#[cfg(unix)]
+pub(crate) struct AdoptedSession {
+    pub session_dir: PathBuf,
+    pub session: SessionMetadata,
+    pub cell_pixel_size: (u16, u16),
+    pub hosting_epoch: u64,
+    pub replay_snapshot: crate::recording::ReplaySnapshot,
+    pub markers: HashMap<String, u64>,
+    pub recording_paused: bool,
+    pub pty_child: PtyChild,
+    pub recording: Option<std::fs::File>,
 }
 
 pub(crate) struct PtyOutput {
@@ -148,10 +197,163 @@ impl SessionRuntime {
             pending_screen_activity_at: None,
             cell_width_px: 0,
             cell_height_px: 0,
+            #[cfg(unix)]
+            transfer_tail: None,
         };
         // Establish a clean activity baseline before the child emits output.
         let _ = runtime.vt_engine.screen_grid();
         Ok(runtime)
+    }
+
+    /// Build the runtime for a session transferred from another host. The
+    /// engine is seeded from the manifest's replay snapshot; the child is
+    /// not armed and the PTY must not be read until [`Self::resume_adopted`].
+    #[cfg(unix)]
+    pub(crate) fn adopt(adopted: AdoptedSession, mut vt_engine: Box<dyn VtEngine>) -> Result<Self, String> {
+        let snapshot = &adopted.replay_snapshot;
+        vt_engine.resize(snapshot.cols.max(1), snapshot.rows.max(1))?;
+        let (cell_width_px, cell_height_px) = (u32::from(adopted.cell_pixel_size.0), u32::from(adopted.cell_pixel_size.1));
+        if cell_width_px > 0 && cell_height_px > 0 {
+            vt_engine.set_cell_size(cell_width_px, cell_height_px)?;
+        }
+        vt_engine.feed(snapshot.state.as_bytes())?;
+        // The releasing host already answered every query in this history.
+        let _ = vt_engine.drain_replies();
+        adopted.pty_child.set_nonblocking()?;
+        let recorder = adopted
+            .recording
+            .map(|file| {
+                let mut recorder = SessionRecorder::adopt_append(&adopted.session_dir, file)?;
+                if adopted.recording_paused {
+                    recorder.pause(Duration::ZERO);
+                }
+                Ok::<_, String>(recorder)
+            })
+            .transpose()?;
+        let detached_da = match adopted.session.vt_engine {
+            vt::VtEngineKind::Passthrough => Some(DeviceAttributeTracker::new()),
+            vt::VtEngineKind::Ghostty => None,
+        };
+        let mut runtime = Self {
+            hosting_epoch: adopted.hosting_epoch,
+            session: adopted.session,
+            session_dir: adopted.session_dir,
+            pty_child: adopted.pty_child,
+            conpty_startup: None,
+            vt_engine,
+            detached_da,
+            recorder,
+            markers: adopted.markers,
+            held_keys: Default::default(),
+            held_buttons: Default::default(),
+            epoch: Instant::now(),
+            last_pty_output_at: None,
+            screen_activity: ScreenActivityTracker::new(unix_timestamp_millis(SystemTime::now())),
+            pending_screen_activity_at: None,
+            cell_width_px,
+            cell_height_px,
+            transfer_tail: None,
+        };
+        let _ = runtime.vt_engine.screen_grid();
+        Ok(runtime)
+    }
+
+    /// Commit an adoption: replay the output the releasing host read after its
+    /// snapshot, then take over the recording and the child.
+    #[cfg(unix)]
+    pub(crate) fn resume_adopted(&mut self, tail: &[u8]) -> Result<(), String> {
+        if !tail.is_empty() {
+            self.vt_engine.feed(tail)?;
+            let _ = self.vt_engine.drain_replies();
+        }
+        if let Some(recorder) = &mut self.recorder {
+            recorder.rebind_to_session_dir()?;
+        }
+        self.pty_child.arm();
+        Ok(())
+    }
+
+    /// Capture the transfer snapshot and descriptors, and start collecting the
+    /// output read after it. PTY output keeps flowing and is still recorded.
+    #[cfg(unix)]
+    pub(crate) fn prepare_transfer(&mut self) -> Result<TransferSource, String> {
+        if self.transfer_tail.is_some() {
+            return Err(format!("session {} is already transferring", self.session.id));
+        }
+        if self.pty_child.is_released() {
+            return Err(format!("session {} was already transferred", self.session.id));
+        }
+        if !self.vt_engine.supports_replay() {
+            return Err(format!(
+                "session {} cannot transfer: its {} VT engine has no replay snapshot",
+                self.session.id,
+                self.session.vt_engine.as_str()
+            ));
+        }
+        // No payload means nothing has been drawn yet: the empty screen.
+        let payload = replay_snapshot_payload(&mut *self.vt_engine).unwrap_or_default();
+        let (cols, rows) = self.vt_engine.size();
+        let pty_master = self.pty_child.duplicate_master()?;
+        let recording = self.recorder.as_ref().map(SessionRecorder::append_handle).transpose()?;
+        self.transfer_tail = Some(TransferTail::default());
+        Ok(TransferSource {
+            session: self.session.clone(),
+            size: crate::runtime::TerminalSize { cols, rows },
+            cell_pixel_size: (clamp_u16(self.cell_width_px), clamp_u16(self.cell_height_px)),
+            child_pid: self.pty_child.leader_pid(),
+            hosting_epoch: self.hosting_epoch,
+            replay_snapshot: crate::recording::ReplaySnapshot {
+                engine: self.session.vt_engine.as_str().to_string(),
+                cols,
+                rows,
+                state: String::from_utf8_lossy(&payload).into_owned(),
+            },
+            markers: self.markers.clone(),
+            recording_paused: self.recorder.as_ref().is_some_and(SessionRecorder::is_paused),
+            pty_master,
+            recording,
+            forked_here: self.pty_child.forked_here(),
+            upstream_status: self.pty_child.duplicate_status_stream()?,
+        })
+    }
+
+    /// Stop collecting a transfer tail; the session stays here.
+    #[cfg(unix)]
+    pub(crate) fn abort_transfer(&mut self) {
+        self.transfer_tail = None;
+    }
+
+    /// The output read since the transfer snapshot. The caller stops reading
+    /// the PTY from here until it commits or aborts.
+    #[cfg(unix)]
+    pub(crate) fn transfer_tail(&mut self) -> Result<Vec<u8>, String> {
+        let tail = self.transfer_tail.take().ok_or_else(|| format!("session {} is not transferring", self.session.id))?;
+        if tail.overflowed {
+            return Err(format!("session {} produced more than {TRANSFER_TAIL_LIMIT} bytes during the transfer", self.session.id));
+        }
+        if let Some(recorder) = &mut self.recorder {
+            recorder.flush_final();
+        }
+        Ok(tail.bytes)
+    }
+
+    /// Hand the session to its adopter: mark the recording, close this host's
+    /// recording descriptor, and give up the child without signalling it.
+    /// Returns the pid this host must keep reaping.
+    #[cfg(unix)]
+    pub(crate) fn commit_transfer(&mut self, epoch: u64, address: &str) -> Option<u32> {
+        if let Some(mut recorder) = self.recorder.take() {
+            recorder.flush_final();
+            recorder.transferred(epoch, address, self.epoch.elapsed());
+            recorder.flush();
+        }
+        self.hosting_epoch = epoch;
+        self.pty_child.release()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn is_released(&self) -> bool {
+        self.pty_child.is_released()
     }
 
     fn pty_pixel_size(&self, cols: u16, rows: u16) -> (u32, u32) {
@@ -543,16 +745,34 @@ impl SessionRuntime {
         self.read_available_output_inner(queries_forwarded_to_client, true)
     }
 
-    pub(crate) fn exit_code_if_exited(&self) -> Result<Option<i32>, String> {
-        self.pty_child.exited().map(|status| status.as_ref().map(exit_code_from_wait_status))
+    pub(crate) fn child_exit_if_exited(&self) -> Result<Option<ChildExit>, String> {
+        #[cfg(unix)]
+        {
+            self.pty_child.exit_state()
+        }
+        #[cfg(not(unix))]
+        {
+            self.pty_child
+                .exited()
+                .map(|status| status.as_ref().map(|status| ChildExit::Code(crate::platform::pty::exit_code_from_wait_status(status))))
+        }
     }
 
-    pub(crate) fn record_exit_code(&mut self, code: i32) {
+    pub(crate) fn record_exit(&mut self, exit: ChildExit) {
         if let Some(ref mut recorder) = self.recorder {
             // Flush any held-back incomplete UTF-8 bytes before the exit
             // event so they appear in the correct order in the cast file.
             recorder.flush_final();
-            recorder.event(crate::asciicast::EventCode::Exit, &code.to_string(), self.epoch.elapsed());
+            match exit {
+                ChildExit::Code(code) => recorder.event(crate::asciicast::EventCode::Exit, &code.to_string(), self.epoch.elapsed()),
+                // An exit without a status is not an exit code: say so with a
+                // structured marker (like `transferred`) instead of inventing one.
+                ChildExit::Unknown => recorder.event(
+                    crate::asciicast::EventCode::Marker,
+                    &serde_json::json!({"event": "exit", "status": "unknown"}).to_string(),
+                    self.epoch.elapsed(),
+                ),
+            }
         }
     }
 
@@ -603,6 +823,14 @@ impl SessionRuntime {
                     self.last_pty_output_at = Some(Instant::now());
                     self.vt_engine.feed(bytes)?;
                     self.record_output(bytes);
+                    #[cfg(unix)]
+                    if let Some(tail) = &mut self.transfer_tail {
+                        if tail.bytes.len().saturating_add(bytes.len()) > TRANSFER_TAIL_LIMIT {
+                            tail.overflowed = true;
+                        } else if !tail.overflowed {
+                            tail.bytes.extend_from_slice(bytes);
+                        }
+                    }
 
                     // Drain engine replies every iteration so the buffer never accumulates
                     // stale replies across authority changes. Only a raw-stream controller
@@ -707,6 +935,11 @@ fn write_replay_snapshot(engine: &mut dyn VtEngine, recorder: &mut SessionRecord
 
 fn replay_snapshot_payload(engine: &mut dyn VtEngine) -> Option<Vec<u8>> {
     engine.replay_payload(&vt::ClientCapabilities::conservative_fallback()).ok().flatten()
+}
+
+#[cfg(unix)]
+fn clamp_u16(value: u32) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 fn unix_timestamp_millis(time: SystemTime) -> u64 {

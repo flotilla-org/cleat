@@ -44,6 +44,8 @@ fn manifest() -> FdTransferManifest {
         child_pid: 42,
         hosting_epoch: 3,
         replay_snapshot: ReplaySnapshot { engine: "passthrough".into(), cols: 100, rows: 30, state: "\x1b[Hscreen".into() },
+        markers: Default::default(),
+        recording_paused: false,
     }
 }
 fn pair() -> (UnixStream, UnixStream) {

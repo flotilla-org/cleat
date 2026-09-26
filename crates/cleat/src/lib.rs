@@ -45,4 +45,6 @@ pub mod fd_transfer;
 #[cfg(unix)]
 pub mod hosting_epoch;
 #[cfg(unix)]
+mod transfer;
+#[cfg(unix)]
 pub mod transfer_manifest;

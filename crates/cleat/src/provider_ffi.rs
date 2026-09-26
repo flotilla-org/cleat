@@ -1470,7 +1470,7 @@ pub unsafe extern "C" fn cleat_session_connection_state(session: *const CleatSes
             };
             if closed {
                 CLEAT_SESSION_CLOSED
-            } else if !daemon.connection.is_connected() {
+            } else if !daemon.connection.channel_connected(daemon.channel) {
                 CLEAT_SESSION_DISCONNECTED
             } else if streaming {
                 CLEAT_SESSION_STREAMING

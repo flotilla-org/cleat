@@ -71,8 +71,8 @@ scratch space. It is *not* an organizational grouping mechanism.
 **Hosting epoch**:
 A session's hosting incarnation, distinct from its daemon's generation. Stored as
 a positive integer in `<session directory>/epoch`, initially 1 and interpreted
-as 1 when absent. This generation-layout slice does not increment it; Transfer
-will use it to fence stale holders.
+as 1 when absent. Each Transfer advances it by one at commit; a holder that
+states an older epoch is stale and its mutating operations are refused.
 
 **Ambient daemon**:
 The daemon a command targets when none is named: the daemon hosting the session
@@ -224,4 +224,6 @@ _Avoid_: restore, reattach (reattach implies the live process survived).
 **Transfer** (a.k.a. handoff):
 Moving a running session's PTY between hostings via FD transfer, preserving the
 running process (e.g. promoting an embedded session to a daemon before the client
-exits). Lossless. Deferred — not in the first persistence cut.
+exits). Lossless. Daemon-to-daemon transfer (`cleat transfer`) exists on Unix: the
+source releases, the target adopts, attachments follow a redirect, and the hosting
+epoch fences stale holders. Embedded hostings follow in a later slice.

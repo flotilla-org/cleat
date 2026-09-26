@@ -3,7 +3,8 @@
 The synchronous `fd_transfer` primitive operates on an existing `UnixStream`
 between any two hostings. Run it on a worker, never the daemon servicing loop.
 It is adapted from `ceda0b99` (closed PR #166); sibling/daemon-specific behavior
-was deliberately excluded. This slice has no callers or adoption protocol.
+was deliberately excluded. Daemon-to-daemon transfer (`cleat transfer`, below)
+is its first caller.
 
 A transfer sends one marker byte with SCM_RIGHTS, a big-endian u32 JSON byte
 length, then the manifest. Bounds are 16 descriptors and 1 MiB of JSON. Callers
@@ -17,6 +18,10 @@ current `size`, `cell_pixel_size` (width/height, zero when unknown), `child_pid`
 `S` payload shape: `{engine, cols, rows, state}`, where state is the UTF-8 replay
 payload generated with conservative client capabilities by the source VT engine,
 as in `write_replay_snapshot`. It represents the current screen, not scrollback.
+`hosting_epoch` is the epoch the adopter will hold: the source's current epoch
+plus one, which the source writes to `<session directory>/epoch` when it commits.
+Optional `markers` (name to cast offset) and `recording_paused` carry recording
+state the adopter needs for marker-relative capture and `cleat record`.
 
 | Role | Descriptor contract |
 | --- | --- |
@@ -83,3 +88,51 @@ status, never fabricate an exit code.
 
 References: [Linux waitid](https://man7.org/linux/man-pages/man2/waitpid.2.html),
 [macOS kqueue](https://keith.github.io/xcode-man-pages/kqueue.2.html).
+
+## Daemon-to-daemon transfer (issue #254)
+
+`cleat transfer ID --to NAME` asks the session's daemon to release it. The
+source freezes the session (role changes, geometry, tags, recording control and
+lifetime operations wait; PTY input and output keep flowing and are recorded),
+then a worker thread runs the exchange below over a fresh connection to the
+target daemon's socket. The servicing loop only polls the worker's channel and
+checks the deadline on its normal tick; worker socket timeouts are a backstop.
+
+1. **Probe.** `GET /` reports the target's `packet_protocol` range. The source
+   applies the compatibility gate: every attached packet client negotiated the
+   source's own protocol version, so a target that refuses that version would
+   strand them, and stream attachments can never follow. Such clients are listed
+   and the transfer refused unless `--drop-incompatible`.
+2. **Transport.** `POST /transfer` with `Upgrade: cleat-transfer/1`, then
+   `fd_transfer::send`. Roles sent: `pty_master` (a duplicate), `recording` (a
+   fresh O_APPEND open of the cast), `pidfd` (Linux, when available), and
+   `child_status` (one end of a socketpair). At the snapshot the source actor
+   starts collecting the PTY output it reads afterwards (bounded at 16 MiB).
+3. **Adoption.** The target validates the id (not live, no retained directory,
+   daemon not draining), that the epoch exceeds any it has seen for the id,
+   required roles and descriptor kinds (terminal device, O_APPEND regular file,
+   socket) and engine compatibility; builds the runtime seeded from the snapshot
+   without reading the PTY; and replies `READY` (byte 1, u32 0) or `REFUSED`
+   (byte 2, u32 length, `Rejection` JSON).
+4. **Commit.** On READY within the deadline the source stops reading the PTY,
+   advances the epoch (an ambiguous post-rename sync error counts as committed;
+   a definitive failure still aborts), writes the `transferred` marker with
+   address `daemon:<name@generation>`, closes its recording descriptor, renames
+   the session directory into the target's `sessions/` under the target name's
+   layout lock (copying across runtime roots), and closes every packet channel
+   with `MSG_CONTROL_REDIRECT` (the new address, epoch and protocol range)
+   followed by the usual `ControlError`. It sends `COMMIT` (byte 1, u32 length,
+   the output tail) and keeps answering HTTP requests for the id with 421 and the
+   redirect for 30 seconds. The target replays the tail into its engine, starts
+   reading the PTY, publishes a Directory delta, and replies `COMMITTED`.
+   On REFUSED, a transport failure, or the deadline the source resumes and
+   unfreezes and nothing is destroyed; the target never adopts without COMMIT,
+   except that a target whose COMMIT frame is lost adopts without the tail when
+   it finds the directory already moved at the new epoch.
+
+The source keeps reaping the child and forwards its raw wait status on
+`child_status` while it lives. The adopter observes the child through the pidfd
+(Linux) or kqueue (macOS), waits briefly for the forwarded status once it sees
+the exit, and otherwise records `{"event":"exit","status":"unknown"}` as a
+marker instead of an exit event. Mutating HTTP requests may carry
+`x-cleat-hosting-epoch`; a mismatch is refused as a stale holder.

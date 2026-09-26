@@ -17,6 +17,11 @@ use crate::{
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const DAEMON_INSTANCE_HEADER: &str = "x-cleat-daemon-pid";
+/// The hosting epoch a holder believes a session is at. Mutating requests
+/// that carry it are refused when it is stale.
+pub(crate) const HOSTING_EPOCH_HEADER: &str = "x-cleat-hosting-epoch";
+/// Upgrade token of the daemon-to-daemon transfer connection.
+pub(crate) const TRANSFER_UPGRADE: &str = "cleat-transfer/1";
 
 pub(crate) type HttpRequest = Request<Vec<u8>>;
 
@@ -48,7 +53,88 @@ pub(crate) enum Route {
     SessionSnapshot { id: String },
     SessionTags { id: String },
     SessionWait { id: String },
+    SessionTransfer { id: String },
+    Transfer,
     NotFound,
+}
+
+impl Route {
+    /// The session a per-session route addresses.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        match self {
+            Route::SessionDelete { id }
+            | Route::SessionAttach { id }
+            | Route::SessionWatch { id }
+            | Route::SessionDetach { id }
+            | Route::SessionExpect { id }
+            | Route::SessionInspect { id }
+            | Route::SessionInput { id }
+            | Route::SessionPasteWithMark { id }
+            | Route::SessionKeys { id }
+            | Route::SessionKeysWithMark { id }
+            | Route::SessionMark { id }
+            | Route::SessionRecord { id }
+            | Route::SessionResolveMarker { id }
+            | Route::SessionResolveNextMarker { id }
+            | Route::SessionResize { id }
+            | Route::SessionScreen { id }
+            | Route::SessionSignal { id }
+            | Route::SessionSnapshot { id }
+            | Route::SessionTags { id }
+            | Route::SessionWait { id }
+            | Route::SessionTransfer { id } => Some(id),
+            Route::Root
+            | Route::Health
+            | Route::Drain
+            | Route::PacketConnect
+            | Route::Sessions
+            | Route::SessionCreate
+            | Route::Transfer
+            | Route::NotFound => None,
+        }
+    }
+
+    /// Operations a stale holder must never perform (ruling 11): anything
+    /// that reaches the PTY or changes the session's control state. The
+    /// transfer freeze (`route_waits_for_transfer` in `session.rs`) is a
+    /// different list on purpose: PTY input flows during a transfer. Review
+    /// both when adding a route.
+    pub(crate) fn mutates_session(&self) -> bool {
+        matches!(
+            self,
+            Route::SessionDelete { .. }
+                | Route::SessionDetach { .. }
+                | Route::SessionInput { .. }
+                | Route::SessionPasteWithMark { .. }
+                | Route::SessionKeys { .. }
+                | Route::SessionKeysWithMark { .. }
+                | Route::SessionMark { .. }
+                | Route::SessionRecord { .. }
+                | Route::SessionResize { .. }
+                | Route::SessionSignal { .. }
+                | Route::SessionTags { .. }
+                | Route::SessionTransfer { .. }
+        )
+    }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Serialize)]
+pub(crate) struct RedirectResponse {
+    pub error: String,
+    pub redirect: crate::packet::SessionRedirect,
+    pub stale_holder: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SessionTransferRequest {
+    /// Runtime root of the target daemon.
+    pub runtime_root: String,
+    /// Physical target daemon, `<name>@<generation>`.
+    pub daemon: String,
+    #[serde(default)]
+    pub drop_incompatible: bool,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -433,6 +519,48 @@ pub(crate) fn write_request(writer: &mut impl Write, method: Method, path: &str,
     writer.write_all(body)
 }
 
+/// A request that states the holder's hosting epoch, when it knows one.
+pub(crate) fn write_request_with_epoch(
+    writer: &mut impl Write,
+    method: Method,
+    path: &str,
+    body: &[u8],
+    hosting_epoch: Option<u64>,
+) -> std::io::Result<()> {
+    let Some(epoch) = hosting_epoch else {
+        return write_request(writer, method, path, body);
+    };
+    write!(
+        writer,
+        "{method} {path} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{HOSTING_EPOCH_HEADER}: {epoch}\r\n\r\n",
+        body.len()
+    )?;
+    writer.write_all(body)
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn write_transfer_upgrade_request(writer: &mut impl Write) -> std::io::Result<()> {
+    write!(
+        writer,
+        "POST /transfer HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nConnection: Upgrade\r\nUpgrade: {TRANSFER_UPGRADE}\r\n\r\n"
+    )
+}
+
+/// The holder epoch a request states, if any. A malformed value is an error,
+/// never silently treated as absent.
+pub(crate) fn request_hosting_epoch(request: &HttpRequest) -> Result<Option<u64>, String> {
+    let Some(value) = request.headers().get(HOSTING_EPOCH_HEADER) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|epoch| *epoch > 0)
+        .map(Some)
+        .ok_or_else(|| format!("invalid {HOSTING_EPOCH_HEADER} header"))
+}
+
 pub(crate) fn write_session_create_request(writer: &mut impl Write, body: &[u8], expected_daemon_pid: u32) -> std::io::Result<()> {
     write!(
         writer,
@@ -512,6 +640,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
         (&Method::POST, "/connect") => Route::PacketConnect,
         (&Method::GET, "/sessions") => Route::Sessions,
         (&Method::POST, "/sessions") => Route::SessionCreate,
+        (&Method::POST, "/transfer") => Route::Transfer,
         _ => {
             let Some(rest) = path.strip_prefix("/sessions/") else {
                 return Route::NotFound;
@@ -541,6 +670,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::GET, Some("snapshot"), None) => Route::SessionSnapshot { id: id.to_string() },
                 (&Method::POST, Some("tags"), None) => Route::SessionTags { id: id.to_string() },
                 (&Method::POST, Some("wait"), None) => Route::SessionWait { id: id.to_string() },
+                (&Method::POST, Some("transfer"), None) => Route::SessionTransfer { id: id.to_string() },
                 _ => Route::NotFound,
             }
         }
@@ -564,6 +694,11 @@ pub(crate) fn write_no_content(writer: &mut impl Write) -> std::io::Result<()> {
 
 pub(crate) fn write_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
     write_switching_protocols_for(writer, "cleat-attach/1")
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn write_transfer_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
+    write_switching_protocols_for(writer, TRANSFER_UPGRADE)
 }
 
 pub(crate) fn write_packet_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {

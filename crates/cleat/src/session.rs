@@ -77,6 +77,15 @@ struct PacketForegroundAttach {
     initial_update: TerminalRenderUpdate,
     images: ImageReceiver,
     initial_role: RoleState,
+    identity: AttachmentIdentity,
+}
+
+/// A foreground channel's opening state: granted role, first render, and
+/// the image files acquired while waiting for them.
+struct ForegroundChannel {
+    role: RoleState,
+    update: TerminalRenderUpdate,
+    images: ImageReceiver,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -362,8 +371,13 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let channel = packet.channel;
     let initial_update = packet.initial_update;
     let mut images = packet.images;
+    let identity = packet.identity.clone();
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut read_stream = read_handle;
+        // A transferred session announces its new address before closing the
+        // channel; the relay follows it once.
+        let mut redirect: Option<crate::packet::SessionRedirect> = None;
+        let mut followed = false;
         {
             let mut stdout = std::io::stdout().lock();
             let mut chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
@@ -442,11 +456,43 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     chrome.view = view;
                     chrome.paint(&mut stdout, None)?;
                 }
+                (CHANNEL_CONTROL, crate::packet::MSG_CONTROL_REDIRECT) => {
+                    let moved = frame.decode::<crate::packet::ChannelRedirect>().map_err(|e| e.to_string())?;
+                    if moved.channel == channel {
+                        redirect = Some(moved.redirect);
+                    }
+                }
                 (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
                     let error = frame.decode::<ControlError>().map_err(|e| e.to_string())?;
                     if error.channel == channel {
-                        alive_out.store(false, Ordering::SeqCst);
-                        return Ok(());
+                        let Some(moved) = redirect.take().filter(|_| !followed) else {
+                            alive_out.store(false, Ordering::SeqCst);
+                            return Ok(());
+                        };
+                        let role = if controller_out.load(Ordering::SeqCst) { ChannelRole::Controller } else { ChannelRole::Watcher };
+                        let (stream, opened) = match follow_foreground_redirect(&moved, identity.clone(), role) {
+                            Ok(followed) => followed,
+                            Err(err) => {
+                                alive_out.store(false, Ordering::SeqCst);
+                                return Err(err);
+                            }
+                        };
+                        read_stream = stream.try_clone().map_err(|e| e.to_string())?;
+                        *write_stream.lock().map_err(|_| "packet stream poisoned")? = stream;
+                        followed = true;
+                        images = opened.images;
+                        controller_out.store(opened.role.role == ChannelRole::Controller, Ordering::SeqCst);
+                        let mut chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
+                        chrome.role = opened.role;
+                        chrome.hint = Some((format!("cleat: session moved to {}", moved.address), Instant::now() + Duration::from_secs(5)));
+                        chrome.renderer.needs_full_repaint = true;
+                        chrome.renderer.images.set_assets(images.commit(&opened.update.image_resources)?);
+                        chrome.paint(&mut stdout, Some(&opened.update))?;
+                        drop(chrome);
+                        write_packet_frame(
+                            &write_stream,
+                            PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: opened.update.render_generation }),
+                        )?;
                     }
                 }
                 _ => {}
@@ -1257,11 +1303,43 @@ pub fn attach_packet_foreground(
     strict: bool,
     take: bool,
 ) -> Result<ForegroundAttach, String> {
-    const FOREGROUND_CHANNEL: u32 = 1;
     let (mut stream, directory) = crate::provider_daemon::connect_packet_stream(layout, &[])?;
     if !directory.sessions.iter().any(|entry| entry.session_id == id) {
         return Err(format!("session {id} was not present in packet directory"));
     }
+    let opened = open_foreground_channel(&mut stream, id, identity.clone(), role, take)?;
+    if strict && opened.role.role != ChannelRole::Controller {
+        let holder = opened
+            .role
+            .controller
+            .as_ref()
+            .map(|identity| format!("{} ({})", identity.name, identity.kind.as_str()))
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(format!("session {id} controller seat is held by {holder}"));
+    }
+    Ok(ForegroundAttach {
+        transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
+            session_name: id.to_owned(),
+            stream: Arc::new(Mutex::new(stream)),
+            channel: FOREGROUND_CHANNEL,
+            initial_update: opened.update,
+            initial_role: opened.role,
+            images: opened.images,
+            identity,
+        })),
+    })
+}
+
+const FOREGROUND_CHANNEL: u32 = 1;
+
+/// Open the foreground channel and wait for its role grant and first render.
+fn open_foreground_channel(
+    stream: &mut SessionStream,
+    id: &str,
+    identity: AttachmentIdentity,
+    role: ChannelRole,
+    take: bool,
+) -> Result<ForegroundChannel, String> {
     let (cols, rows) = current_terminal_size();
     PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
         channel: FOREGROUND_CHANNEL,
@@ -1271,18 +1349,18 @@ pub fn attach_packet_foreground(
         identity,
     })
     .map_err(|err| format!("encode foreground packet channel: {err}"))?
-    .write(&mut stream)
+    .write(stream)
     .map_err(|err| format!("open foreground packet channel: {err}"))?;
     PacketFrame::new(FOREGROUND_CHANNEL, MSG_SESSION_RESIZE, &Resize { cols, rows })
         .map_err(|err| format!("encode foreground packet resize: {err}"))?
-        .write(&mut stream)
+        .write(stream)
         .map_err(|err| format!("resize foreground packet channel: {err}"))?;
 
     let mut images = ImageReceiver::default();
     let mut initial_role = None;
     let mut initial_update = None;
     while initial_role.is_none() || initial_update.is_none() {
-        let frame = PacketFrame::read(&mut stream).map_err(|err| format!("read foreground packet handshake: {err}"))?;
+        let frame = PacketFrame::read(stream).map_err(|err| format!("read foreground packet handshake: {err}"))?;
         match (frame.channel, frame.msg_type) {
             (FOREGROUND_CHANNEL, MSG_SESSION_ROLE) => {
                 initial_role = Some(frame.decode::<RoleState>().map_err(|err| format!("decode foreground role: {err}"))?);
@@ -1296,7 +1374,7 @@ pub fn attach_packet_foreground(
                     acquired,
                 })
                 .map_err(|e| e.to_string())?
-                .write(&mut stream)
+                .write(stream)
                 .map_err(|e| e.to_string())?;
             }
             (FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE) => {
@@ -1314,25 +1392,24 @@ pub fn attach_packet_foreground(
             _ => {}
         }
     }
-    let initial_role = initial_role.expect("role checked above");
-    if strict && initial_role.role != ChannelRole::Controller {
-        let holder = initial_role
-            .controller
-            .as_ref()
-            .map(|identity| format!("{} ({})", identity.name, identity.kind.as_str()))
-            .unwrap_or_else(|| "unknown".to_string());
-        return Err(format!("session {id} controller seat is held by {holder}"));
+    Ok(ForegroundChannel { role: initial_role.expect("role checked above"), update: initial_update.expect("render checked above"), images })
+}
+
+/// Reopen a foreground channel at the daemon a transferred session moved to,
+/// asking for the role the channel held.
+fn follow_foreground_redirect(
+    redirect: &crate::packet::SessionRedirect,
+    identity: AttachmentIdentity,
+    role: ChannelRole,
+) -> Result<(SessionStream, ForegroundChannel), String> {
+    if let Some(reason) = redirect.incompatibility(crate::packet::PROTOCOL_VERSION) {
+        return Err(reason);
     }
-    Ok(ForegroundAttach {
-        transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
-            session_name: id.to_owned(),
-            stream: Arc::new(Mutex::new(stream)),
-            channel: FOREGROUND_CHANNEL,
-            initial_update: initial_update.expect("render checked above"),
-            initial_role,
-            images,
-        })),
-    })
+    let layout = RuntimeLayout::new(PathBuf::from(&redirect.runtime_root)).with_daemon(redirect.daemon.clone())?;
+    let (mut stream, _) = crate::provider_daemon::connect_packet_stream(&layout, &[])
+        .map_err(|err| format!("session {} moved to {}, but reconnecting failed: {err}", redirect.session_id, redirect.address))?;
+    let opened = open_foreground_channel(&mut stream, &redirect.session_id, identity, role, false)?;
+    Ok((stream, opened))
 }
 
 pub fn watch_foreground(layout: &RuntimeLayout, id: &str, identity: AttachmentIdentity) -> Result<ForegroundAttach, String> {
@@ -1624,12 +1701,17 @@ struct HostedSession {
     /// the servicing loop skip full-grid snapshots while nothing has rendered.
     screen_stable_snapshot_generation: Option<u64>,
     should_keep_session_dir: bool,
+    /// This host's hosting epoch for the session; holders stating another
+    /// epoch are stale.
+    hosting_epoch: u64,
+    /// Frozen for an outgoing transfer: role changes, resize, tags and
+    /// control operations wait; PTY input and output keep flowing.
+    transferring: bool,
 }
 
 impl HostedSession {
     fn spawn(session_dir: PathBuf, session: SessionMetadata, coordinates: AmbientSessionCoordinates) -> Result<Self, String> {
-        let should_keep_session_dir = session.record;
-        let actor_session_dir = session_dir;
+        let actor_session_dir = session_dir.clone();
         let actor_session = session.clone();
         let actor = SessionActor::spawn(session.initial_size.rows, Arc::new(|| {}), move || {
             crate::session_runtime::SessionRuntime::spawn_in_daemon(
@@ -1639,6 +1721,12 @@ impl HostedSession {
                 &coordinates,
             )
         })?;
+        let hosting_epoch = crate::runtime::hosting_epoch(&session_dir)?;
+        Self::from_actor(session, actor, hosting_epoch)
+    }
+
+    fn from_actor(session: SessionMetadata, actor: SessionActor, hosting_epoch: u64) -> Result<Self, String> {
+        let should_keep_session_dir = session.record;
         let raw_output_tap = actor.subscribe_raw_output()?;
         Ok(Self {
             #[cfg(unix)]
@@ -1659,6 +1747,8 @@ impl HostedSession {
             pending_expects: Vec::new(),
             screen_stable_snapshot_generation: None,
             should_keep_session_dir,
+            hosting_epoch,
+            transferring: false,
         })
     }
 
@@ -1958,6 +2048,8 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     let mut idle_since = Some(Instant::now());
     let mut last_registration_check = Instant::now();
     let mut registration_was_lost = false;
+    #[cfg(unix)]
+    let mut transfers = transfer_host::TransferHub::new();
 
     loop {
         // Self-fencing watchdog: the pid file registers which process owns
@@ -2038,6 +2130,8 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                         sessions: &mut sessions,
                         packet_clients: &mut packet_clients,
                         next_packet_client_id: &mut next_packet_client_id,
+                        #[cfg(unix)]
+                        transfers: &mut transfers,
                     };
                     let mut response_committed = false;
                     if let Err(err) =
@@ -2064,6 +2158,10 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         }
 
         did_work |= service_packet_clients(&layout, &mut sessions, &mut packet_clients)?;
+        #[cfg(unix)]
+        {
+            did_work |= transfers.service(&layout, &mut sessions, &mut packet_clients)?;
+        }
         let session_ids: Vec<String> = sessions.keys().cloned().collect();
         for session_id in session_ids {
             let Some(hosted) = sessions.get_mut(&session_id) else {
@@ -2074,15 +2172,12 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                 let session_did_work = service_hosted_session(&layout, &session_id, hosted, &mut packet_clients)?;
                 // Exit state is read from the observation mirror — never a
                 // blocking round-trip into a possibly-busy actor.
-                let exit_code = hosted.actor.observation().exit_code();
-                if exit_code.is_none() && hosted.actor.worker_finished() {
+                let exited = hosted.actor.observation().exited();
+                if !exited && hosted.actor.worker_finished() {
                     return Err("session actor stopped without reporting an exit".to_string());
                 }
-                let should_keep_session_dir = if exit_code.is_some() {
-                    Some(finish_exited_session(&layout, &session_id, hosted, &mut packet_clients)?)
-                } else {
-                    None
-                };
+                let should_keep_session_dir =
+                    if exited { Some(finish_exited_session(&layout, &session_id, hosted, &mut packet_clients)?) } else { None };
                 Ok((session_did_work, should_keep_session_dir))
             });
             match service_result {
@@ -2129,7 +2224,11 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                 false
             }
         };
-        if sessions.is_empty() && !termination_pending {
+        #[cfg(unix)]
+        let transfers_busy = transfers.busy(draining);
+        #[cfg(not(unix))]
+        let transfers_busy = false;
+        if sessions.is_empty() && !termination_pending && !transfers_busy {
             let idle_started = idle_since.get_or_insert_with(Instant::now);
             if draining || idle_started.elapsed() >= SESSION_DAEMON_IDLE_LINGER {
                 break;
@@ -2229,6 +2328,10 @@ fn controller_identity(hosted: &HostedSession, packet_clients: &[PacketClient]) 
 }
 
 fn sync_packet_geometry(hosted: &mut HostedSession) -> Result<(), String> {
+    // Geometry and focus changes wait for an outgoing transfer to settle.
+    if hosted.transferring {
+        return Ok(());
+    }
     let focused = hosted.active_client.is_some() || hosted.packet_control.focused();
     if focused != hosted.focused {
         hosted.actor.request_result(|reply| crate::host::actor::SessionCommand::Focus { focused, reply })?;
@@ -2824,6 +2927,8 @@ struct HttpRequestState<'a> {
     sessions: &'a mut HashMap<String, HostedSession>,
     packet_clients: &'a mut Vec<PacketClient>,
     next_packet_client_id: &'a mut u64,
+    #[cfg(unix)]
+    transfers: &'a mut transfer_host::TransferHub,
 }
 
 #[cfg(any(unix, windows))]
@@ -2912,21 +3017,65 @@ fn handle_http_request(
     state: &mut HttpRequestState<'_>,
     response_committed: &mut bool,
 ) -> Result<(), String> {
-    match http_uds::route(&request) {
-        http_uds::Route::Root | http_uds::Route::Health => http_uds::write_json(
-            stream,
-            StatusCode::OK,
-            &serde_json::json!({
-                "service": "cleat-session",
-                "generation": state.layout.generation(),
-                "build": crate::build_info::BuildInfo::current(),
-                "session": state.layout.logical_name(),
-                "ok": true,
-                "drain_state": if *state.draining { "draining" } else { "serving" },
-                "session_count": state.sessions.len(),
-            }),
-        )
-        .map_err(|err| format!("write HTTP response: {err}")),
+    let route = http_uds::route(&request);
+    if let Some(id) = route.session_id() {
+        let holder_epoch = match http_uds::request_hosting_epoch(&request) {
+            Ok(epoch) => epoch,
+            Err(err) => {
+                return http_uds::write_error(stream, StatusCode::BAD_REQUEST, &err)
+                    .map_err(|err| format!("write HTTP error response: {err}"))
+            }
+        };
+        match state.sessions.get(id) {
+            None =>
+            {
+                #[cfg(unix)]
+                if let Some(redirect) = state.transfers.redirect_for(id) {
+                    return transfer_host::write_moved(stream, redirect, holder_epoch);
+                }
+            }
+            Some(hosted) => {
+                if let Some(held) = holder_epoch.filter(|held| route.mutates_session() && *held != hosted.hosting_epoch) {
+                    #[cfg(unix)]
+                    return transfer_host::write_stale_holder(stream, id, hosted.hosting_epoch, held)
+                        .map_err(|err| format!("write HTTP stale-holder response: {err}"));
+                    #[cfg(not(unix))]
+                    return http_uds::write_error(
+                        stream,
+                        StatusCode::CONFLICT,
+                        &format!(
+                            "stale holder: session {id} is at hosting epoch {}; this holder's epoch {held} is stale",
+                            hosted.hosting_epoch
+                        ),
+                    )
+                    .map_err(|err| format!("write HTTP stale-holder response: {err}"));
+                }
+                if hosted.transferring && route_waits_for_transfer(&route) {
+                    return http_uds::write_error(stream, StatusCode::CONFLICT, &transferring_message(id))
+                        .map_err(|err| format!("write HTTP transferring response: {err}"));
+                }
+            }
+        }
+    }
+    match route {
+        http_uds::Route::Root | http_uds::Route::Health => {
+            let hello = advertised_hello();
+            http_uds::write_json(
+                stream,
+                StatusCode::OK,
+                &serde_json::json!({
+                    "service": "cleat-session",
+                    "generation": state.layout.generation(),
+                    "build": crate::build_info::BuildInfo::current(),
+                    "session": state.layout.logical_name(),
+                    "packet_protocol": {"version": hello.version, "min_supported_version": hello.min_supported_version},
+                    "ok": true,
+                    "drain_state": if *state.draining { "draining" } else { "serving" },
+                    "session_count": state.sessions.len(),
+                }),
+            )
+            .map_err(|err| format!("write HTTP response: {err}"))
+        }
         http_uds::Route::Drain => {
             fs::write(state.layout.daemon_dir().join("drain-state"), "draining").map_err(|e| format!("persist drain state: {e}"))?;
             *state.draining = true;
@@ -2947,6 +3096,59 @@ fn handle_http_request(
                 }),
             )
             .map_err(|err| format!("write drain response: {err}"))
+        }
+        http_uds::Route::Transfer => {
+            if !http_uds::request_has_upgrade_token(&request, http_uds::TRANSFER_UPGRADE) {
+                return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "missing Upgrade: cleat-transfer/1")
+                    .map_err(|err| format!("write HTTP transfer upgrade error: {err}"));
+            }
+            #[cfg(unix)]
+            {
+                let transfer_stream = stream.try_clone().map_err(|err| format!("clone HTTP transfer stream: {err}"))?;
+                *response_committed = true;
+                http_uds::write_transfer_switching_protocols(stream)
+                    .map_err(|err| format!("write HTTP transfer upgrade response: {err}"))?;
+                state.transfers.accept_incoming(transfer_stream);
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            http_uds::write_error(stream, StatusCode::NOT_IMPLEMENTED, "session transfer is only supported on Unix")
+                .map_err(|err| format!("write HTTP transfer error: {err}"))
+        }
+        http_uds::Route::SessionTransfer { id } => 'transfer: {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
+                break 'transfer write_http_not_found(stream);
+            };
+            let body: http_uds::SessionTransferRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP transfer request: {err}"))?;
+            if !body.daemon.contains('@') {
+                break 'transfer http_uds::write_error(stream, StatusCode::BAD_REQUEST, "transfer target must name a daemon generation")
+                    .map_err(|err| format!("write HTTP transfer error: {err}"));
+            }
+            let target = RuntimeLayout::new(PathBuf::from(&body.runtime_root)).with_daemon(body.daemon.clone())?;
+            if target.daemon_name() == state.layout.daemon_name() && same_path(target.root(), state.layout.root()) {
+                break 'transfer http_uds::write_error(
+                    stream,
+                    StatusCode::BAD_REQUEST,
+                    &format!("session {id} is already hosted by daemon:{}", target.daemon_name()),
+                )
+                .map_err(|err| format!("write HTTP transfer error: {err}"));
+            }
+            if hosted.actor.observation().exited() {
+                break 'transfer http_uds::write_error(stream, StatusCode::CONFLICT, &format!("session {id} has exited"))
+                    .map_err(|err| format!("write HTTP transfer error: {err}"));
+            }
+            #[cfg(unix)]
+            {
+                let response = stream.try_clone().map_err(|err| format!("clone HTTP transfer response stream: {err}"))?;
+                *response_committed = true;
+                let timeout = Duration::from_millis(body.timeout_ms.clamp(100, 600_000));
+                state.transfers.start_outgoing(hosted, response, target, body.drop_incompatible, timeout);
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            http_uds::write_error(stream, StatusCode::NOT_IMPLEMENTED, "session transfer is only supported on Unix")
+                .map_err(|err| format!("write HTTP transfer error: {err}"))
         }
         http_uds::Route::Sessions => {
             let mut sessions = Vec::new();
@@ -2982,12 +3184,23 @@ fn handle_http_request(
             crate::runtime::validate_runtime_name(&session.id)?;
             crate::runtime::validate_environment(&session.environment)?;
             session.vt_engine.ensure_available()?;
+            #[cfg(unix)]
+            if state.transfers.adoption_pending(&session.id) {
+                return http_uds::write_error(
+                    stream,
+                    StatusCode::CONFLICT,
+                    &format!("session {} is being transferred to this daemon", session.id),
+                )
+                .map_err(|err| format!("write HTTP error response: {err}"));
+            }
             let mut created = false;
             if !state.sessions.contains_key(&session.id) {
                 let session_dir = state.layout.session_dir(&session.id);
                 fs::create_dir_all(&session_dir).map_err(|err| format!("create session dir {}: {err}", session_dir.display()))?;
                 let coordinates = state.layout.session_coordinates(&session.id)?;
                 let hosted = HostedSession::spawn(session_dir, session.clone(), coordinates)?;
+                #[cfg(unix)]
+                state.transfers.note_epoch(&session.id, hosted.hosting_epoch);
                 state.sessions.insert(session.id.clone(), hosted);
                 created = true;
             }
@@ -3034,7 +3247,7 @@ fn handle_http_request(
             let client_id = *state.next_packet_client_id;
             let mut client =
                 PacketClient::new(client_id, packet_stream, selectors, subscribe.screen_activity_stable_ms, &directory, activity.as_ref())?;
-            client.enqueue_control(MSG_CONTROL_HELLO, &ControlHello::current())?;
+            client.enqueue_control(MSG_CONTROL_HELLO, &advertised_hello())?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
             if let Some(activity) = activity {
                 client.enqueue_control(MSG_CONTROL_ACTIVITY_SNAPSHOT, &activity)?;
@@ -3280,6 +3493,10 @@ fn handle_http_request(
                     hosted.actor.write_input(bytes)?;
                 }
                 http_uds::InputRequest::Resize { cols, rows } => {
+                    if hosted.transferring {
+                        return http_uds::write_error(stream, StatusCode::CONFLICT, &transferring_message(&id))
+                            .map_err(|err| format!("write HTTP transferring response: {err}"));
+                    }
                     hosted.actor.resize(cols, rows)?;
                     broadcast_directory_upsert(
                         directory_entry_for_session(state.layout, hosted, state.packet_clients)?,
@@ -3498,6 +3715,48 @@ fn handle_http_request(
             http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
         }
     }
+}
+
+/// Control operations that wait while a session is frozen for transfer (see
+/// also `Route::mutates_session`, the stale-holder list). PTY input keeps
+/// flowing; anything that changes roles, geometry, tags, the
+/// recording's markers, or the session's lifetime does not.
+fn route_waits_for_transfer(route: &http_uds::Route) -> bool {
+    use http_uds::Route;
+    matches!(
+        route,
+        Route::SessionDelete { .. }
+            | Route::SessionAttach { .. }
+            | Route::SessionWatch { .. }
+            | Route::SessionDetach { .. }
+            | Route::SessionKeysWithMark { .. }
+            | Route::SessionPasteWithMark { .. }
+            | Route::SessionMark { .. }
+            | Route::SessionRecord { .. }
+            | Route::SessionResize { .. }
+            | Route::SessionSignal { .. }
+            | Route::SessionTags { .. }
+            | Route::SessionTransfer { .. }
+    )
+}
+
+fn transferring_message(id: &str) -> String {
+    format!("session {id} is transferring; retry when it completes")
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+/// The packet protocol range this daemon advertises. Debug builds can
+/// advertise another version to exercise the transfer compatibility gate.
+fn advertised_hello() -> ControlHello {
+    #[cfg(debug_assertions)]
+    if let Some(version) = std::env::var("CLEAT_TEST_PACKET_PROTOCOL_VERSION").ok().and_then(|value| value.parse::<u16>().ok()) {
+        return ControlHello { version, min_supported_version: version };
+    }
+    ControlHello::current()
 }
 
 fn write_http_not_found(stream: &mut SessionStream) -> Result<(), String> {
@@ -4201,6 +4460,10 @@ fn apply_packet_role_request(
     let Some(hosted) = sessions.get_mut(&session_id) else {
         return Ok(());
     };
+    // Role changes wait for an outgoing transfer; the client keeps its role.
+    if hosted.transferring {
+        return Ok(());
+    }
     let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
     let requester = PacketChannelRef { client_id: packet_clients[index].id, channel };
     let (granted, denial_reason) = grant_packet_role(hosted, packet_clients, requester, request.role, request.take)?;
@@ -4261,6 +4524,11 @@ fn open_packet_channel(
         })?;
         return Ok(());
     };
+    if hosted.transferring {
+        packet_clients[index]
+            .enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message: transferring_message(&open.session_id) })?;
+        return Ok(());
+    }
 
     // Probe render state before granting a role: a session whose VT engine
     // cannot serve it (e.g. the passthrough placeholder) must fail this one
@@ -6225,6 +6493,10 @@ mod tests {
         assert_eq!(replay, None);
     }
 }
+
+#[cfg(unix)]
+#[path = "session_transfer.rs"]
+mod transfer_host;
 
 #[cfg(all(test, unix))]
 #[path = "session_packet_output_tests.rs"]

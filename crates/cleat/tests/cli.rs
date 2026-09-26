@@ -88,7 +88,8 @@ fn help_lists_expected_subcommands() {
         "interrupt",
         "escape",
         "wait",
-        "expect"
+        "expect",
+        "transfer"
     ]);
     assert!(!subcommands.contains(&"create".to_string()), "create should not be visible in help");
 }
@@ -572,6 +573,7 @@ fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,
         server: Some(cleat::runtime::DEFAULT_DAEMON_NAME.to_string()),
+        hosting_epoch: None,
         command: Command::SendKeys {
             id: "demo".into(),
             literal: false,

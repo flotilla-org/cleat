@@ -383,6 +383,11 @@ impl<S: Read + Write> PacketClient<S> {
         Self { stream, buffer: Vec::new() }
     }
 
+    /// The underlying transport, e.g. to set socket timeouts.
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
     pub fn open_channel(&mut self, channel: u32, session_id: &str, role: ChannelRole) -> std::io::Result<()> {
         self.write(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
             channel,

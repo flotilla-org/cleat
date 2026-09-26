@@ -154,10 +154,15 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))
 }
 
+/// The servicing loop owns the deadline and reports it; socket timeouts are
+/// only a backstop that frees the worker shortly after.
+const SOCKET_TIMEOUT_SLACK: Duration = Duration::from_secs(1);
+
 fn connect(socket: &PathBuf, deadline: Instant) -> Result<UnixStream, String> {
     let stream = UnixStream::connect(socket).map_err(|err| format!("connect to target daemon {}: {err}", socket.display()))?;
-    stream.set_read_timeout(Some(remaining(deadline))).map_err(|err| format!("set transfer read timeout: {err}"))?;
-    stream.set_write_timeout(Some(remaining(deadline))).map_err(|err| format!("set transfer write timeout: {err}"))?;
+    let timeout = remaining(deadline) + SOCKET_TIMEOUT_SLACK;
+    stream.set_read_timeout(Some(timeout)).map_err(|err| format!("set transfer read timeout: {err}"))?;
+    stream.set_write_timeout(Some(timeout)).map_err(|err| format!("set transfer write timeout: {err}"))?;
     Ok(stream)
 }
 

@@ -354,3 +354,45 @@ fn output_admission_checks_activity_snapshots_and_dynamic_membership_before_even
         assert_ne!(frame.msg_type, cleat::packet::MSG_CONTROL_ACTIVITY_EVENT, "rejected membership must not produce activity feedback");
     }
 }
+
+#[test]
+fn output_admission_activity_membership_retries_transient_coordinator_contention() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let a = Session::new("one");
+    let b = Session::new("two");
+    let (mut packet, head) = b.connect("filtered-activity", Some(&a.context()));
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    for _ in 0..3 {
+        PacketFrame::read(&mut packet).unwrap();
+    }
+
+    // Hold the documented shared coordinator while a new member becomes
+    // eligible. Existing clients must remain usable and receive no unadmitted
+    // activity events; the next tick after unlock must complete admission.
+    let directory = std::path::PathBuf::from(format!("/tmp/cleat-output-{}", unsafe { libc::geteuid() }));
+    std::fs::create_dir_all(&directory).unwrap();
+    let lock =
+        std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(directory.join("admission.lock")).unwrap();
+    lock.lock().unwrap();
+    b.service.update_tags("same", vec!["observe".into()], vec![]).unwrap();
+    packet.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    loop {
+        match PacketFrame::read(&mut packet) {
+            Ok(frame) => assert_eq!(
+                frame.msg_type,
+                cleat::packet::MSG_CONTROL_DIRECTORY_DELTA,
+                "busy activity admission must wait without errors or activity events"
+            ),
+            Err(error) => {
+                assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{error}");
+                break;
+            }
+        }
+    }
+    lock.unlock().unwrap();
+    packet.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let frame = PacketFrame::read(&mut packet).unwrap();
+    assert_eq!(frame.msg_type, cleat::packet::MSG_CONTROL_ACTIVITY_EVENT);
+    assert!(matches!(frame.decode::<cleat::packet::ActivityEvent>().unwrap(), cleat::packet::ActivityEvent::MembershipAdded { .. }));
+    rejected(&a, "watch", Some(&b.context()), 409, "cycle");
+}

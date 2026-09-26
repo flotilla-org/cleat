@@ -6,7 +6,8 @@ attach/watch, packet controller/watcher channels, the daemon provider/FFI,
 the packet-debug CLI, and screen-activity subscriptions. Activity subscriptions
 hold a lease for each selected session; a membership change that would close
 a cycle stops that subscription with a control error before emitting activity
-events. Directory metadata alone is not a terminal-output subscription. A channel rejected for a cycle does not exist, so
+events. Directory metadata alone is not a terminal-output subscription.
+A channel rejected for a cycle does not exist, so
 subsequent input/resize frames on that channel cannot affect the session.
 Ordinary acyclic nesting needs no flag. Foreground clients show `nested in
 <daemon>/<session>`; matching session names alone are not a cycle.
@@ -18,7 +19,7 @@ header `x-cleat-output-context` containing one of:
 
 ```json
 {"version":1,"context":{"kind":"external"}}
-{"version":1,"context":{"kind":"session","source":{"runtime_root":"/absolute/root","daemon":"default","session":"shell"}}}
+{"version":1,"context":{"kind":"session","source":{"runtime_root":"/absolute/root","daemon":"default@1","session":"shell"}}}
 ```
 
 `source` is the containing session receiving the client's rendered output.
@@ -48,6 +49,8 @@ requires an existing source session directory, and canonicalizes the physical
 daemon directory. Runtime-root and daemon symlink aliases collapse to the same
 identity, preserving physical generation suffixes. Equal names in separate
 live generations remain distinct, including while the logical alias changes.
+Legacy directories use a pinned `name@legacy` address so publishing a drain
+sidecar alias cannot reinterpret the old source as its successor.
 
 On Linux the daemon obtains the socket peer PID from `SO_PEERCRED` and reads
 its initial environment through `/proc/<pid>/environ`. If that environment
@@ -71,8 +74,10 @@ Before inserting an edge, admission searches for a path from target back to
 source. A per-user OS file lock serializes the check plus lease publication
 across local daemons and runtime roots. Acquisition is nonblocking: contention
 returns a `coordinator busy; retry output admission` error without stalling
-the daemon event loop. A rejected activity membership stops that subscription
-(including on contention), so the client must reconnect to retry. Each stream or packet channel owns a
+the daemon event loop. Activity membership checks retry on the next daemon
+tick when busy, retaining their leases and emitting no activity events until
+admission succeeds. A real cycle stops the subscription with an error. Each
+stream or packet channel owns a
 separate locked lease, including duplicate subscriptions. Role changes keep
 that lease; channel close, detach, connection failure, session exit, and failed
 admission drop it. Daemon crashes release OS locks; the next admission removes

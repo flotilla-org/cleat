@@ -228,15 +228,26 @@ pub enum MouseReportFormat {
     SgrPixels,
 }
 
+/// Modes exposed to packet consumers. Only `active_alternate_screen` invalidates
+/// displayed content: switching buffers clears or restores the outer screen.
+/// The remaining fields affect input and do not change how cells are drawn.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalModeState {
+    /// Selects the displayed buffer; both transitions require a full repaint.
     pub active_alternate_screen: bool,
+    /// Selects cursor-key input encoding; does not affect displayed cells.
     pub application_cursor_keys: bool,
+    /// Routes wheel input to cursor keys on the alternate screen; no redraw effect.
     pub alternate_scroll: bool,
+    /// Summary of whether mouse input is reported; no redraw effect.
     pub mouse_tracking: bool,
+    /// Selects which mouse events are reported; no redraw effect.
     pub mouse_tracking_mode: MouseTrackingMode,
+    /// Selects mouse input encoding and coordinate units; no redraw effect.
     pub mouse_report_format: MouseReportFormat,
+    /// Raw SGR mouse-encoding flag; changes input bytes, not cell interpretation.
     pub mouse_sgr: bool,
+    /// Raw pixel mouse-coordinate flag; does not change grid geometry or glyph widths.
     pub mouse_sgr_pixels: bool,
 }
 

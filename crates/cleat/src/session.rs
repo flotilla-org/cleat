@@ -804,13 +804,15 @@ impl PacketTerminalRenderer {
         });
         self.geometry.resize((update.cols, update.rows), self.viewport.unwrap_or((update.cols, update.rows)));
         let resized = self.cols != update.cols || self.rows != update.rows;
-        let modes_changed = self.terminal_modes != update.terminal_modes;
+        // Only switching screen buffers invalidates retained content. The other
+        // TerminalModeState fields control input, not cell interpretation.
+        let screen_changed = self.terminal_modes.active_alternate_screen != update.terminal_modes.active_alternate_screen;
         if resized {
             self.cols = update.cols;
             self.rows = update.rows;
             self.cells = vec![vec![crate::provider::TerminalRenderCell::default(); self.cols as usize]; self.rows as usize];
         }
-        if self.terminal_modes.active_alternate_screen != update.terminal_modes.active_alternate_screen {
+        if screen_changed {
             if let Some(keyboard) = &self.keyboard {
                 keyboard.lock().map_err(|_| "keyboard mode poisoned")?.leave_screen(writer).map_err(|e| e.to_string())?;
             }
@@ -821,7 +823,7 @@ impl PacketTerminalRenderer {
             keyboard.lock().map_err(|_| "keyboard mode poisoned")?.enter_screen(writer).map_err(|e| e.to_string())?;
         }
         let mut dirty_rows = std::collections::BTreeSet::new();
-        if self.needs_full_repaint || resized || modes_changed {
+        if self.needs_full_repaint || resized || screen_changed {
             dirty_rows.extend(self.geometry.y..self.geometry.y.saturating_add(self.viewport.map_or(self.rows, |size| size.1)));
         }
         for op in &update.ops {
@@ -1597,7 +1599,18 @@ impl PacketChannelRef {
     }
 }
 
+#[cfg(unix)]
+const SESSION_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+struct PendingTermination {
+    deadline: Instant,
+    tree: crate::platform::signals::ProcessTree,
+}
+
 struct HostedSession {
+    #[cfg(unix)]
+    termination_started: bool,
     metadata: SessionMetadata,
     actor: SessionActor,
     raw_output_tap: RawOutputTap,
@@ -1633,6 +1646,8 @@ impl HostedSession {
         })?;
         let raw_output_tap = actor.subscribe_raw_output()?;
         Ok(Self {
+            #[cfg(unix)]
+            termination_started: false,
             applied_size: (session.initial_size.cols, session.initial_size.rows),
             applied_cell_size: (1, 1),
             metadata: session,
@@ -1936,7 +1951,10 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     )
     .map_err(|e| format!("write daemon build identity: {e}"))?;
 
+    let mut draining = false;
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
+    #[cfg(unix)]
+    let mut pending_terminations: Vec<PendingTermination> = Vec::new();
     let mut packet_clients: Vec<PacketClient> = Vec::new();
     let mut pending_http_handshakes: Vec<PendingHttpHandshake> = Vec::new();
     let mut next_packet_client_id: u64 = 1;
@@ -1979,6 +1997,16 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         }
 
         let mut did_work = false;
+        #[cfg(unix)]
+        pending_terminations.retain(|pending| {
+            if Instant::now() < pending.deadline {
+                return true;
+            }
+            if let Err(err) = pending.tree.kill_survivors() {
+                eprintln!("cleat: session termination escalation failed: {err}");
+            }
+            false
+        });
 
         loop {
             match retry_interrupted(|| listener.accept()) {
@@ -2008,7 +2036,10 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                         continue;
                     }
                     let mut http_state = HttpRequestState {
+                        #[cfg(unix)]
+                        pending_terminations: &mut pending_terminations,
                         layout: &layout,
+                        draining: &mut draining,
                         sessions: &mut sessions,
                         packet_clients: &mut packet_clients,
                         next_packet_client_id: &mut next_packet_client_id,
@@ -2093,9 +2124,19 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         service_activity_subscriptions(&layout, &sessions, &mut packet_clients)?;
         flush_packet_clients(&mut packet_clients);
 
-        if sessions.is_empty() {
+        let termination_pending = {
+            #[cfg(unix)]
+            {
+                !pending_terminations.is_empty()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        if sessions.is_empty() && !termination_pending {
             let idle_started = idle_since.get_or_insert_with(Instant::now);
-            if idle_started.elapsed() >= SESSION_DAEMON_IDLE_LINGER {
+            if draining || idle_started.elapsed() >= SESSION_DAEMON_IDLE_LINGER {
                 break;
             }
         } else {
@@ -2108,7 +2149,11 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     }
 
     let _ = fs::remove_file(&socket_path);
-    // Retain the registration so the next auto-start advances the generation.
+    // Retain recordings and their stale registration as recreatable husks.
+    // Remove an empty drained generation, including its build and pid files.
+    if draining && layout.generation().is_some() && fs::read_dir(layout.sessions_dir()).is_ok_and(|mut entries| entries.next().is_none()) {
+        let _ = fs::remove_dir_all(layout.daemon_dir());
+    }
     Ok(())
 }
 
@@ -2363,6 +2408,14 @@ fn directory_entry_for_session(
     })
 }
 
+fn directory_daemon(layout: &RuntimeLayout, draining: bool) -> crate::packet::DirectoryDaemon {
+    crate::packet::DirectoryDaemon {
+        generation: layout.generation(),
+        build: crate::build_info::BuildInfo::current(),
+        drain_state: if draining { "draining" } else { "serving" }.into(),
+    }
+}
+
 fn directory_snapshot_for_sessions(
     layout: &RuntimeLayout,
     sessions: &HashMap<String, HostedSession>,
@@ -2377,7 +2430,7 @@ fn directory_snapshot_for_sessions(
         }
     }
     entries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    Ok(DirectorySnapshot { sessions: entries })
+    Ok(DirectorySnapshot { daemon: None, sessions: entries })
 }
 
 fn activity_snapshot_for_sessions(
@@ -2416,7 +2469,10 @@ fn service_activity_subscriptions(
         };
         let current = matching_activity_sessions(sessions, &client.selectors, stable_threshold_ms);
         if let Err(message) = client.admit_activity(layout, &current) {
-            client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: CHANNEL_CONTROL, message })?;
+            if matches!(message, crate::output_admission::AdmissionError::Busy) {
+                continue;
+            }
+            client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: CHANNEL_CONTROL, message: message.to_string() })?;
             client.screen_activity_stable_ms = None;
             client.known_activity_sessions.clear();
             client.activity_output_leases.clear();
@@ -2469,11 +2525,13 @@ fn broadcast_directory_upsert(entry: DirectoryEntry, packet_clients: &mut Vec<Pa
         if directory_entry_matches_selectors(&entry, &client.selectors) {
             client.known_directory_sessions.insert(entry.session_id.clone());
             client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                daemon: None,
                 upserted: vec![entry.clone()],
                 removed_session_ids: Vec::new(),
             })?;
         } else if client.known_directory_sessions.remove(&entry.session_id) {
             client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                daemon: None,
                 upserted: Vec::new(),
                 removed_session_ids: vec![entry.session_id.clone()],
             })?;
@@ -2486,6 +2544,7 @@ fn broadcast_directory_remove(session_id: &str, packet_clients: &mut Vec<PacketC
     for client in packet_clients {
         if client.known_directory_sessions.remove(session_id) {
             client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                daemon: None,
                 upserted: Vec::new(),
                 removed_session_ids: vec![session_id.to_string()],
             })?;
@@ -2777,7 +2836,10 @@ pub fn run_session_daemon(_root: &Path, _session: &SessionMetadata) -> Result<()
 }
 
 struct HttpRequestState<'a> {
+    #[cfg(unix)]
+    pending_terminations: &'a mut Vec<PendingTermination>,
     layout: &'a RuntimeLayout,
+    draining: &'a mut bool,
     sessions: &'a mut HashMap<String, HostedSession>,
     packet_clients: &'a mut Vec<PacketClient>,
     next_packet_client_id: &'a mut u64,
@@ -2895,9 +2957,32 @@ fn handle_http_request(
                 "build": crate::build_info::BuildInfo::current(),
                 "session": state.layout.logical_name(),
                 "ok": true,
+                "drain_state": if *state.draining { "draining" } else { "serving" },
+                "session_count": state.sessions.len(),
             }),
         )
         .map_err(|err| format!("write HTTP response: {err}")),
+        http_uds::Route::Drain => {
+            fs::write(state.layout.daemon_dir().join("drain-state"), "draining").map_err(|e| format!("persist drain state: {e}"))?;
+            *state.draining = true;
+            let metadata = directory_daemon(state.layout, true);
+            for client in state.packet_clients.iter_mut() {
+                // A failed subscriber must not prevent draining or affect other clients.
+                let _ = client.enqueue_control(MSG_CONTROL_DIRECTORY_DELTA, &DirectoryDelta {
+                    daemon: Some(metadata.clone()),
+                    upserted: Vec::new(),
+                    removed_session_ids: Vec::new(),
+                });
+            }
+            http_uds::write_json(
+                stream,
+                StatusCode::OK,
+                &serde_json::json!({
+                    "drain_state": "draining", "session_count": state.sessions.len(),
+                }),
+            )
+            .map_err(|err| format!("write drain response: {err}"))
+        }
         http_uds::Route::Sessions => {
             let mut sessions = Vec::new();
             for hosted in state.sessions.values() {
@@ -2920,6 +3005,15 @@ fn handle_http_request(
             }
             let session: SessionMetadata =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP session create request: {err}"))?;
+            if *state.draining && !state.sessions.contains_key(&session.id) {
+                let current = state.layout.clone().with_daemon(state.layout.logical_name().to_string())?.resolved()?;
+                return http_uds::write_error(
+                    stream,
+                    StatusCode::CONFLICT,
+                    &format!("daemon {} is draining; create sessions on {}", state.layout.daemon_name(), current.daemon_name()),
+                )
+                .map_err(|err| format!("write drain refusal: {err}"));
+            }
             crate::runtime::validate_runtime_name(&session.id)?;
             crate::runtime::validate_environment(&session.environment)?;
             session.vt_engine.ensure_available()?;
@@ -2964,7 +3058,8 @@ fn handle_http_request(
             }
             let mut selectors = subscribe.selectors;
             crate::runtime::normalize_tags(&mut selectors);
-            let directory = directory_snapshot_for_sessions(state.layout, state.sessions, state.packet_clients, &selectors)?;
+            let mut directory = directory_snapshot_for_sessions(state.layout, state.sessions, state.packet_clients, &selectors)?;
+            directory.daemon = Some(directory_daemon(state.layout, *state.draining));
             let activity = subscribe
                 .screen_activity_stable_ms
                 .map(|stable_threshold_ms| activity_snapshot_for_sessions(state.sessions, &selectors, stable_threshold_ms));
@@ -2983,7 +3078,7 @@ fn handle_http_request(
             )?;
             if let Some(activity) = &activity {
                 if let Err(message) = client.admit_activity(state.layout, &activity.sessions) {
-                    return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                    return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                         .map_err(|err| format!("write activity admission error: {err}"));
                 }
             }
@@ -3007,9 +3102,16 @@ fn handle_http_request(
             http_uds::write_json(stream, StatusCode::OK, &result).map_err(|err| format!("write HTTP inspect response: {err}"))
         }
         http_uds::Route::SessionDelete { id } => {
-            let Some(hosted) = state.sessions.get(&id) else {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
                 return write_http_not_found(stream);
             };
+            #[cfg(unix)]
+            if !hosted.termination_started {
+                let tree = hosted.actor.terminate_tree()?;
+                state.pending_terminations.push(PendingTermination { deadline: Instant::now() + SESSION_TERMINATION_GRACE, tree });
+                hosted.termination_started = true;
+            }
+            #[cfg(not(unix))]
             hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Tree)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
         }
@@ -3023,7 +3125,7 @@ fn handle_http_request(
                 match crate::output_admission::admit(output_context.as_ref().expect("validated output context"), state.layout, &id) {
                     Ok(lease) => lease,
                     Err(message) => {
-                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                             .map_err(|err| format!("write output cycle error: {err}"))
                     }
                 };
@@ -3121,7 +3223,7 @@ fn handle_http_request(
                 match crate::output_admission::admit(output_context.as_ref().expect("validated output context"), state.layout, &id) {
                     Ok(lease) => lease,
                     Err(message) => {
-                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message)
+                        return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                             .map_err(|err| format!("write output cycle error: {err}"))
                     }
                 };
@@ -3690,7 +3792,11 @@ impl PacketClient {
         })
     }
 
-    fn admit_activity(&mut self, layout: &RuntimeLayout, sessions: &[ActivitySession]) -> Result<(), String> {
+    fn admit_activity(
+        &mut self,
+        layout: &RuntimeLayout,
+        sessions: &[ActivitySession],
+    ) -> Result<(), crate::output_admission::AdmissionError> {
         self.activity_output_leases.retain(|id, _| sessions.iter().any(|session| &session.session_id == id));
         for session in sessions {
             if !self.activity_output_leases.contains_key(&session.session_id) {
@@ -4246,7 +4352,8 @@ fn open_packet_channel(
     let output_lease = match crate::output_admission::admit(&packet_clients[index].output_context, layout, &open.session_id) {
         Ok(lease) => lease,
         Err(message) => {
-            packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message })?;
+            packet_clients[index]
+                .enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message: message.to_string() })?;
             return Ok(());
         }
     };
@@ -4788,6 +4895,20 @@ pub(crate) fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String
             layout.daemon_name(),
             layout.logical_name()
         ));
+    }
+    // A drained generation may have already removed its pid and directory.
+    // Missing registration alone means "starting" elsewhere, so also compare
+    // the current alias before preparing paths that could resurrect an old host.
+    let current = layout.clone().with_daemon(layout.logical_name().to_string())?;
+    let retired = layout.daemon_name().contains('@') && layout.generation() < current.generation();
+    if retired {
+        return try_connect_session_stream(&layout.socket_path()).map(|_| ()).map_err(|_| {
+            format!(
+                "daemon generation {} is retired; recreate the session through --server {}",
+                layout.daemon_name(),
+                layout.logical_name()
+            )
+        });
     }
     let prepared = layout.prepare_generation()?;
     let layout = &prepared;
@@ -5581,6 +5702,59 @@ mod tests {
     }
 
     #[test]
+    fn packet_render_mode_changes_only_repaint_when_switching_screens() {
+        use vt::{MouseReportFormat, MouseTrackingMode, TerminalModeState};
+
+        let default = TerminalModeState::default();
+        let cases = [
+            TerminalModeState { active_alternate_screen: true, ..default },
+            TerminalModeState { application_cursor_keys: true, ..default },
+            TerminalModeState { alternate_scroll: true, ..default },
+            TerminalModeState { mouse_tracking: true, ..default },
+            TerminalModeState { mouse_tracking_mode: MouseTrackingMode::X10, ..default },
+            TerminalModeState { mouse_tracking_mode: MouseTrackingMode::Normal, ..default },
+            TerminalModeState { mouse_tracking_mode: MouseTrackingMode::Button, ..default },
+            TerminalModeState { mouse_tracking_mode: MouseTrackingMode::Any, ..default },
+            TerminalModeState { mouse_report_format: MouseReportFormat::Sgr, ..default },
+            TerminalModeState { mouse_report_format: MouseReportFormat::SgrPixels, ..default },
+            TerminalModeState { mouse_sgr: true, ..default },
+            TerminalModeState { mouse_sgr_pixels: true, ..default },
+        ];
+        for changed in cases {
+            let mut renderer = PacketTerminalRenderer::new(2, 3);
+            let mut update = TerminalRenderUpdate { cols: 2, rows: 3, ..Default::default() };
+            renderer.apply_and_render(&mut Vec::new(), &update).unwrap();
+            // Exercise both setting and resetting each field, with and without
+            // a concurrent row replacement. Input modes must preserve dirty rows.
+            for replace_row in [false, true] {
+                update.ops = if replace_row {
+                    vec![TerminalRenderUpdateOp {
+                        kind: TerminalRenderUpdateOpKind::RowReplace,
+                        rows: vec![TerminalRenderRow { row: 1, ..Default::default() }],
+                        ..Default::default()
+                    }]
+                } else {
+                    vec![]
+                };
+                for current in [changed, default] {
+                    update.terminal_modes = current;
+                    let mut output = Vec::new();
+                    renderer.apply_and_render(&mut output, &update).unwrap();
+                    let painted_rows = output.windows(b";1H\x1b[0m".len()).filter(|bytes| *bytes == b";1H\x1b[0m").count();
+                    let expected = if changed.active_alternate_screen { 3 } else { usize::from(replace_row) };
+                    assert_eq!(painted_rows, expected, "mode {changed:?} -> {current:?}, replace_row={replace_row}");
+                    assert_eq!(renderer.terminal_modes, current, "mode state must still advance");
+                    if changed.active_alternate_screen || changed.application_cursor_keys {
+                        let mode = if changed.active_alternate_screen { 1049 } else { 1 };
+                        let suffix = if current == default { 'l' } else { 'h' };
+                        assert!(String::from_utf8_lossy(&output).contains(&format!("\x1b[?{mode}{suffix}")));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn packet_render_repaints_every_row_for_full_repaint_triggers() {
         fn painted_rows(output: &[u8]) -> usize {
             output.windows(b";1H\x1b[0m".len()).filter(|bytes| *bytes == b";1H\x1b[0m").count()
@@ -5592,14 +5766,6 @@ mod tests {
         let mut resized_output = Vec::new();
         resized_renderer.apply_and_render(&mut resized_output, &base).expect("render resize");
         assert_eq!(painted_rows(&resized_output), 2);
-
-        let mut mode_renderer = PacketTerminalRenderer::new(2, 2);
-        mode_renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");
-        let mut mode_update = base.clone();
-        mode_update.terminal_modes.application_cursor_keys = true;
-        let mut mode_output = Vec::new();
-        mode_renderer.apply_and_render(&mut mode_output, &mode_update).expect("render mode change");
-        assert_eq!(painted_rows(&mode_output), 2);
 
         let mut full_renderer = PacketTerminalRenderer::new(2, 2);
         full_renderer.apply_and_render(&mut Vec::new(), &base).expect("render initial frame");
@@ -5774,7 +5940,7 @@ mod tests {
             stream,
             Vec::new(),
             None,
-            &crate::packet::DirectorySnapshot { sessions: Vec::new() },
+            &crate::packet::DirectorySnapshot { daemon: None, sessions: Vec::new() },
             None,
             crate::output_admission::OutputContext::External,
         )
@@ -5800,7 +5966,7 @@ mod tests {
             stream,
             Vec::new(),
             None,
-            &crate::packet::DirectorySnapshot { sessions: Vec::new() },
+            &crate::packet::DirectorySnapshot { daemon: None, sessions: Vec::new() },
             None,
             crate::output_admission::OutputContext::External,
         )

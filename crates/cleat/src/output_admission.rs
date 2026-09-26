@@ -27,7 +27,7 @@ impl SessionIdentity {
         let daemon = directory.file_name().and_then(|name| name.to_str()).ok_or("invalid output daemon directory")?;
         Ok(Self {
             runtime_root: directory.parent().ok_or("missing output runtime root")?.to_owned(),
-            daemon: daemon.to_owned(),
+            daemon: if daemon.contains('@') { daemon.to_owned() } else { format!("{daemon}@legacy") },
             session: session.to_owned(),
         })
     }
@@ -180,20 +180,55 @@ fn coordinator_dir() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub(crate) fn admit(context: &OutputContext, layout: &RuntimeLayout, session: &str) -> Result<Option<OutputLease>, String> {
+#[derive(Debug)]
+pub(crate) enum AdmissionError {
+    Busy,
+    Rejected(String),
+}
+
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("output admission: coordinator busy; retry output admission"),
+            Self::Rejected(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+impl From<String> for AdmissionError {
+    fn from(message: String) -> Self {
+        Self::Rejected(format!("output admission: {message}"))
+    }
+}
+
+pub(crate) fn admit(context: &OutputContext, layout: &RuntimeLayout, session: &str) -> Result<Option<OutputLease>, AdmissionError> {
     let OutputContext::Session { source } = context else { return Ok(None) };
     let target = SessionIdentity::new(layout, session)?;
     admit_at(&coordinator_dir()?, Edge { source: source.clone(), target }).map(Some)
 }
 
-fn admit_at(directory: &Path, edge: Edge) -> Result<OutputLease, String> {
+struct AdmissionLock(File);
+
+impl Drop for AdmissionLock {
+    fn drop(&mut self) {
+        // A concurrent process spawn can briefly inherit this open file
+        // description before exec closes it. Unlock explicitly so that copy
+        // cannot prolong admission contention after this operation finishes.
+        let _ = self.0.unlock();
+    }
+}
+
+fn admit_at(directory: &Path, edge: Edge) -> Result<OutputLease, AdmissionError> {
     let operation = || -> Result<OutputLease, Box<dyn std::error::Error>> {
         let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(directory.join("admission.lock"))?;
         match lock.try_lock() {
             Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err("coordinator busy; retry output admission".into()),
+            Err(std::fs::TryLockError::WouldBlock) => return Err(AdmissionError::Busy.into()),
             Err(e) => return Err(e.into()),
         }
+        let _lock = AdmissionLock(lock);
         let mut edges = Vec::new();
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
@@ -229,7 +264,10 @@ fn admit_at(directory: &Path, edge: Edge) -> Result<OutputLease, String> {
         lease._file.lock_shared()?;
         Ok(lease)
     };
-    operation().map_err(|e| format!("output admission: {e}"))
+    operation().map_err(|error| match error.downcast::<AdmissionError>() {
+        Ok(error) => *error,
+        Err(error) => AdmissionError::from(error.to_string()),
+    })
 }
 
 fn closes_cycle(edges: &[Edge], new: &Edge) -> bool {
@@ -295,12 +333,24 @@ mod tests {
     }
 
     #[test]
+    fn inherited_coordinator_handle_does_not_prolong_a_finished_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::create(dir.path().join("admission.lock")).unwrap();
+        file.lock().unwrap();
+        let lock = AdmissionLock(file);
+        let _inherited = lock.0.try_clone().unwrap();
+        drop(lock);
+        assert!(admit_at(dir.path(), edge("a", "b")).is_ok());
+    }
+
+    #[test]
     fn busy_coordinator_rejects_promptly_without_leaking_an_edge() {
         let dir = tempfile::tempdir().unwrap();
         let lock = File::create(dir.path().join("admission.lock")).unwrap();
         lock.lock().unwrap();
+        let lock = AdmissionLock(lock);
         let error = admit_at(dir.path(), edge("a", "b")).err().expect("busy coordinator must reject");
-        assert!(error.contains("coordinator busy"), "{error}");
+        assert!(matches!(error, AdmissionError::Busy), "{error}");
         drop(lock);
         assert!(admit_at(dir.path(), edge("b", "a")).is_ok());
     }
@@ -322,6 +372,19 @@ mod tests {
             let second = second.join().unwrap();
             assert_ne!(first.is_ok(), second.is_ok());
         });
+    }
+
+    #[test]
+    fn legacy_identity_stays_pinned_when_drain_publishes_a_sidecar_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = RuntimeLayout::new(dir.path().to_owned());
+        fs::create_dir_all(layout.session_dir("a")).unwrap();
+        let legacy = SessionIdentity::new(&layout, "a").unwrap();
+        fs::create_dir_all(dir.path().join("default@2/sessions/a")).unwrap();
+        layout.set_current_generation(2).unwrap();
+        let successor = SessionIdentity::new(&layout, "a").unwrap();
+        assert_ne!(legacy, successor);
+        assert_eq!(legacy.clone().canonical().unwrap(), legacy);
     }
 
     #[cfg(unix)]

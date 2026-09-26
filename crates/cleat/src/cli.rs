@@ -37,6 +37,12 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = parse_daemon_name, help = "Select daemon (explicit > CLEAT_DAEMON > default)")]
     pub server: Option<String>,
 
+    /// Refuse mutating operations unless the session is at this hosting epoch
+    /// (see `cleat inspect`); guards a holder against acting on a session
+    /// that has since been transferred.
+    #[arg(long, global = true, value_name = "EPOCH", value_parser = clap::value_parser!(u64).range(1..))]
+    pub hosting_epoch: Option<u64>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -500,6 +506,31 @@ resolved through the live daemon socket. \n\
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
+    /// Move a live session to another daemon without interrupting it (Unix)
+    #[command(after_long_help = "The session keeps running: its PTY, child process, and recording move\n\
+                           to the target daemon, and its hosting epoch advances by one. Attached\n\
+                           clients follow the move; `cleat attach` and `cleat watch` print a notice.\n\
+                           \n\
+                           A transfer that would strand attached clients on a daemon speaking an\n\
+                           incompatible protocol is refused unless --drop-incompatible is given.\n\
+                           If the target does not become ready in time, nothing moves.")]
+    Transfer {
+        id: String,
+        /// Target daemon, by name or explicit generation (`name@N`)
+        #[arg(long, value_parser = parse_daemon_name)]
+        to: String,
+        /// Runtime root of the target daemon, when it differs from this one
+        #[arg(long, hide = true)]
+        to_runtime_root: Option<PathBuf>,
+        /// Drop attached clients that cannot follow instead of refusing
+        #[arg(long)]
+        drop_incompatible: bool,
+        /// Give up if the target is not ready within this time (default 10s)
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
+        timeout: Option<std::time::Duration>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
     #[command(hide = true)]
     Serve,
 }
@@ -584,6 +615,8 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Command::Launch { from, .. } => from.as_deref(),
         _ => None,
     };
+    let holder = service.clone().with_hosting_epoch(cli.hosting_epoch);
+    let service = &holder;
     let daemon_target = match resolve_daemon_target(cli.server.as_deref(), source, std::env::var_os(AMBIENT_DAEMON_ENV), service) {
         Ok(daemon_target) => daemon_target,
         Err(err) => return ExecResult::Err(err),
@@ -616,6 +649,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         | Command::Escape { id }
         | Command::Interrupt { id }
         | Command::Wait { id, .. }
+        | Command::Transfer { id, .. }
         | Command::Expect { id, .. } => Some(id.as_str()),
         Command::Replay { session, .. } => session.as_deref(),
         _ => None,
@@ -1043,6 +1077,31 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
         }
+        #[cfg(unix)]
+        Command::Transfer { id, to, to_runtime_root, drop_incompatible, timeout, json } => {
+            let root = to_runtime_root.unwrap_or_else(|| service.layout_root().to_path_buf());
+            let target = match crate::server::SessionService::new(crate::runtime::RuntimeLayout::new(root)).with_daemon(to) {
+                Ok(target) => target,
+                Err(err) => return ExecResult::Err(err),
+            };
+            match service.transfer(&id, &target, crate::server::TransferOptions { drop_incompatible, timeout }) {
+                Ok(result) if json => match serde_json::to_string_pretty(&result) {
+                    Ok(json) => ExecResult::Ok(Some(json)),
+                    Err(err) => ExecResult::Err(format!("serialize transfer result: {err}")),
+                },
+                Ok(result) => {
+                    let mut message =
+                        format!("transferred {} to {} (hosting epoch {})", result.session_id, result.address, result.hosting_epoch);
+                    if !result.dropped_clients.is_empty() {
+                        message.push_str(&format!("\ndropped incompatible clients: {}", result.dropped_clients.join(", ")));
+                    }
+                    ExecResult::Ok(Some(message))
+                }
+                Err(err) => ExecResult::Err(err),
+            }
+        }
+        #[cfg(not(unix))]
+        Command::Transfer { .. } => ExecResult::Err("session transfer is only supported on Unix".to_string()),
         Command::Serve => match service.serve() {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),

@@ -435,3 +435,15 @@ mod tests {
         assert!(!result.functional_vt_available);
     }
 }
+
+/// The outcome of `cleat transfer`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferResult {
+    pub session_id: String,
+    /// `daemon:<name@generation>` of the new host.
+    pub address: String,
+    pub hosting_epoch: u64,
+    /// Attached clients that could not follow the move (`--drop-incompatible`).
+    #[serde(default)]
+    pub dropped_clients: Vec<String>,
+}

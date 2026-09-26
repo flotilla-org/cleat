@@ -206,6 +206,42 @@ impl SessionRecorder {
         Ok(recorder)
     }
 
+    /// Continue a recording through a descriptor handed over by another host
+    /// (the `recording` transfer role, opened with O_APPEND). Unlike
+    /// [`Self::reopen_append`] this writes no boundary: the releasing host
+    /// wrote the `transferred` marker. Call [`Self::refresh_offset`] before the
+    /// first event, since the releasing host may append until it commits.
+    pub fn adopt_append(session_dir: &Path, cast_file: File) -> Result<Self, String> {
+        let mut recorder = Self {
+            session_dir: session_dir.to_path_buf(),
+            cast_file,
+            bytes_written: 0,
+            prev_time: Duration::ZERO,
+            coalesce: CoalesceBuffer::new(),
+            output_bytes_since_snapshot: 0,
+            paused: false,
+        };
+        recorder.refresh_offset()?;
+        Ok(recorder)
+    }
+
+    /// Resynchronize the byte offset with the shared cast file.
+    pub fn refresh_offset(&mut self) -> Result<(), String> {
+        self.bytes_written = self.cast_file.metadata().map_err(|err| format!("stat transferred cast file: {err}"))?.len();
+        Ok(())
+    }
+
+    /// An append-mode descriptor for this recording, for handing it to
+    /// another host (the `recording` transfer role requires O_APPEND, so the
+    /// adopter's writes always land after this host's last event).
+    pub fn append_handle(&self) -> Result<File, String> {
+        let cast_path = self.session_dir.join(CAST_FILE_NAME);
+        OpenOptions::new()
+            .append(true)
+            .open(&cast_path)
+            .map_err(|err| format!("open cast file for transfer {}: {err}", cast_path.display()))
+    }
+
     /// Record a hosting change beside the session-recreated boundary event.
     /// This uses the standard asciicast marker code, with JSON string data.
     pub fn transferred(&mut self, epoch: u64, address: &str, time: Duration) {

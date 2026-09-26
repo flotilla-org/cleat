@@ -214,13 +214,7 @@ impl RuntimeLayout {
             self.ensure_daemon_dirs()?;
             return Ok(self.clone());
         }
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.root.join(format!(".{}.generation.lock", self.logical_name())))
-            .map_err(|e| format!("open generation lock: {e}"))?;
-        lock.lock().map_err(|e| format!("lock generation: {e}"))?;
+        let _lock = self.lock_generations()?;
         let alias = self.root.join(&self.daemon_name);
         let legacy = alias.is_dir() && !alias.is_symlink();
         let mut current = self.resolved()?;
@@ -265,6 +259,21 @@ impl RuntimeLayout {
         next_layout.ensure_daemon_dirs()?;
         self.set_current_generation(next)?;
         Ok(next_layout)
+    }
+
+    /// Take the per-name layout lock that serializes generation allocation,
+    /// adoption, and session directories moving into this name's generations.
+    /// Released when the returned file drops.
+    pub fn lock_generations(&self) -> Result<fs::File, String> {
+        self.ensure_root()?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.root.join(format!(".{}.generation.lock", self.logical_name())))
+            .map_err(|e| format!("open generation lock: {e}"))?;
+        lock.lock().map_err(|e| format!("lock generation: {e}"))?;
+        Ok(lock)
     }
 
     /// Publish a current generation atomically. The caller serializes generation changes.

@@ -61,10 +61,10 @@ impl Drop for OldDaemon {
     }
 }
 
-fn wait_until(mut predicate: impl FnMut() -> bool) {
+fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !predicate() {
-        assert!(Instant::now() < deadline, "condition timed out");
+        assert!(Instant::now() < deadline, "timed out waiting for {label}");
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -160,7 +160,7 @@ fn draining_keeps_attachments_rejects_new_ids_and_exits_with_recordings_intact()
         let successor = layout.clone().with_daemon("default@2".into()).unwrap();
         crate::platform::daemon::spawn_daemon_process(successor.root(), successor.daemon_name()).unwrap();
         let successor_service = SessionService::new(successor.clone());
-        wait_until(|| successor_service.daemon_status_at("/healthz").is_ok());
+        wait_until("successor health", || successor_service.daemon_status_at("/healthz").is_ok());
         layout.set_current_generation(2).unwrap();
         let response = old_service.daemon_request(Method::POST, "/drain").unwrap();
         assert_eq!(response.status, StatusCode::OK);
@@ -193,7 +193,9 @@ fn draining_keeps_attachments_rejects_new_ids_and_exits_with_recordings_intact()
         drop(attachment);
         assert!(successor.session_dir("new").is_dir());
         owner.kill("old").unwrap();
-        wait_until(|| !old_layout.daemon_dir().exists() || !is_session_daemon_alive(old_layout.root(), old_layout.daemon_name()));
+        wait_until("drained daemon exit", || {
+            !old_layout.daemon_dir().exists() || !is_session_daemon_alive(old_layout.root(), old_layout.daemon_name())
+        });
         if record {
             assert!(old_layout.session_dir("old").join("session.cast").exists());
             assert!(old_layout.daemon_pid_path().exists());
@@ -250,4 +252,25 @@ fn mismatched_successor_build_does_not_move_alias() {
         .unwrap_err();
     assert!(error.contains("build does not match"), "{error}");
     assert_eq!(layout.generation(), Some(1));
+}
+
+#[test]
+fn auto_start_cannot_resurrect_a_retired_generation_during_or_after_cleanup() {
+    for registration_remains in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = RuntimeLayout::new(temp.path().to_path_buf());
+        let old = layout.prepare_generation().unwrap();
+        if registration_remains {
+            // Model the cleanup window: our process is live, but its socket is gone.
+            std::fs::write(old.daemon_pid_path(), std::process::id().to_string()).unwrap();
+        } else {
+            std::fs::remove_dir_all(old.daemon_dir()).unwrap();
+        }
+        layout.clone().with_daemon("default@2".into()).unwrap().ensure_daemon_dirs().unwrap();
+        layout.set_current_generation(2).unwrap();
+        let error = crate::session::ensure_daemon_started(&old).unwrap_err();
+        assert!(error.contains("retired"), "{error}");
+        assert_eq!(old.daemon_dir().exists(), registration_remains);
+        assert_eq!(layout.generation(), Some(2));
+    }
 }

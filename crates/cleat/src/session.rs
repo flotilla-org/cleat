@@ -4742,6 +4742,20 @@ pub(crate) fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String
             layout.logical_name()
         ));
     }
+    // A drained generation may have already removed its pid and directory.
+    // Missing registration alone means "starting" elsewhere, so also compare
+    // the current alias before preparing paths that could resurrect an old host.
+    let current = layout.clone().with_daemon(layout.logical_name().to_string())?;
+    let retired = layout.daemon_name().contains('@') && layout.generation() < current.generation();
+    if retired {
+        return try_connect_session_stream(&layout.socket_path()).map(|_| ()).map_err(|_| {
+            format!(
+                "daemon generation {} is retired; recreate the session through --server {}",
+                layout.daemon_name(),
+                layout.logical_name()
+            )
+        });
+    }
     let prepared = layout.prepare_generation()?;
     let layout = &prepared;
     validate_session_socket_path(&layout.socket_path())?;

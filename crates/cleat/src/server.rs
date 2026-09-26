@@ -257,6 +257,9 @@ impl SessionService {
         let old_service = Self::new(self.layout.resolved()?);
         let old_status = old_service.daemon_build_status()?;
         let installed = crate::build_info::BuildInfo::current();
+        if installed.git_sha.is_none() {
+            return Err("installed client has no git SHA; rebuild with revision metadata before draining".into());
+        }
         let old = DrainGeneration {
             name: old_service.layout.daemon_name().to_string(),
             generation: old_service.layout.generation(),
@@ -646,7 +649,10 @@ impl SessionService {
 
     fn wait_for_session_shutdown(&self, id: &str) {
         for _ in 0..50 {
-            if !self.layout.session_dir(id).exists() || self.inspect(id).is_err() {
+            // Shutdown polling must never auto-start the daemon it is waiting on.
+            if !self.layout.session_dir(id).exists()
+                || self.http_json::<_, crate::protocol::InspectResult>(id, Method::GET, &format!("/sessions/{id}"), &()).is_err()
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(20));

@@ -8,7 +8,6 @@ use std::{
     fs,
     io::Write,
     os::{fd::OwnedFd, unix::net::UnixStream},
-    path::Path,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
     time::{Duration, Instant},
@@ -18,7 +17,7 @@ use http::StatusCode;
 
 use super::{
     announce_seat_state, broadcast_directory_remove, broadcast_directory_upsert, default_vt_engine, directory_entry_for_session,
-    sync_packet_geometry, write_http_not_found, HostedSession, PacketClient,
+    sync_packet_geometry, HostedSession, PacketClient,
 };
 use crate::{
     child_observation::ChildObserver,
@@ -62,8 +61,21 @@ struct OutgoingTransfer {
 
 enum OutgoingPhase {
     Probing,
-    Handshaking { protocol: TargetProtocol, status_writer: UnixStream },
-    Committing { result: TransferResult, since: Instant },
+    Handshaking {
+        protocol: TargetProtocol,
+        status_writer: UnixStream,
+        child_pid: u32,
+    },
+    /// Committed here; waiting for the target to publish the session before
+    /// attachments are redirected to it.
+    Committing(Box<Committed>),
+}
+
+struct Committed {
+    result: TransferResult,
+    since: Instant,
+    released: HostedSession,
+    redirect: SessionRedirect,
 }
 
 struct PendingAdoption {
@@ -106,10 +118,11 @@ impl TransferHub {
         *seen = (*seen).max(epoch);
     }
 
-    /// True while a transfer is in flight either way; the daemon must not
-    /// linger-exit under it.
-    pub(super) fn busy(&self) -> bool {
-        !self.outgoing.is_empty() || !self.pending_adoptions.is_empty()
+    /// True while a transfer is in flight either way, or (unless draining)
+    /// while this daemon still forwards a released child's exit status: the
+    /// daemon must not linger-exit under either.
+    pub(super) fn busy(&self, draining: bool) -> bool {
+        !self.outgoing.is_empty() || !self.pending_adoptions.is_empty() || (!draining && !self.forwarders.is_empty())
     }
 
     pub(super) fn adoption_pending(&self, id: &str) -> bool {
@@ -218,29 +231,42 @@ impl TransferHub {
             Ok(event) => Some(event),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
-                if matches!(self.outgoing[index].phase, OutgoingPhase::Committing { .. }) {
-                    Some(SourceEvent::Committed(Err("transfer worker stopped before the target confirmed".into())))
+                if matches!(self.outgoing[index].phase, OutgoingPhase::Committing(_)) {
+                    Some(SourceEvent::Committed {
+                        moved: Ok(()),
+                        confirmed: Err("transfer worker stopped before the target confirmed".into()),
+                    })
                 } else {
                     Some(SourceEvent::Handshake(Err(HandshakeFailure::Failed("transfer worker stopped".into()))))
                 }
             }
         };
         let transfer = &mut self.outgoing[index];
-        if let OutgoingPhase::Committing { result, since } = &transfer.phase {
-            let confirmed = match event {
-                Some(SourceEvent::Committed(Ok(()))) => true,
-                Some(SourceEvent::Committed(Err(err))) => {
-                    eprintln!("transfer of {id}: committed, but the target did not confirm: {err}");
-                    true
+        if let OutgoingPhase::Committing(committed) = &mut transfer.phase {
+            match event {
+                Some(SourceEvent::Committed { moved, confirmed }) => {
+                    if let Err(err) = moved {
+                        eprintln!("transfer of {id}: {err}");
+                        committed.result.warning = Some(err);
+                    }
+                    if let Err(err) = confirmed {
+                        eprintln!("transfer of {id}: committed, but the target did not confirm: {err}");
+                    }
                 }
-                _ => since.elapsed() >= transfer::COMMIT_WAIT,
-            };
-            if confirmed {
-                let result = result.clone();
-                transfer.respond(StatusCode::OK, &result);
-                return Ok(None);
+                _ if committed.since.elapsed() >= transfer::COMMITTED_WAIT => {
+                    eprintln!("transfer of {id}: committed, but the target did not confirm in time");
+                }
+                _ => return Ok(Some(false)),
             }
-            return Ok(Some(false));
+            let OutgoingPhase::Committing(committed) = std::mem::replace(&mut transfer.phase, OutgoingPhase::Probing) else {
+                unreachable!("phase matched above");
+            };
+            let Committed { result, mut released, redirect, .. } = *committed;
+            // The target now hosts the session: send attachments there.
+            release_transferred_session(&mut released, &redirect, packet_clients)?;
+            drop(released);
+            transfer.respond(StatusCode::OK, &result);
+            return Ok(None);
         }
         let Some(hosted) = sessions.get_mut(&id) else {
             transfer.respond_error(StatusCode::CONFLICT, &format!("session {id} exited during the transfer"));
@@ -286,14 +312,16 @@ impl TransferHub {
                 }
                 self.commit_outgoing(index, layout, sessions, packet_clients)
             }
-            SourceEvent::Committed(_) => Ok(Some(false)),
+            SourceEvent::Committed { .. } => Ok(Some(false)),
         }
     }
 
     /// READY arrived: commit. Order matters: stop reading the PTY (tail),
-    /// advance the epoch, mark the recording, move the directory, then close
-    /// every channel with a redirect. Only a definitive epoch failure still
-    /// aborts; after that the transfer is committed (ruling on #253).
+    /// advance the epoch, mark the recording and give up the child. The worker
+    /// then moves the directory and sends COMMIT; attachments are redirected
+    /// once the target confirms it hosts the session. Only a definitive epoch
+    /// failure still aborts; after that the transfer is committed (ruling on
+    /// #253).
     fn commit_outgoing(
         &mut self,
         index: usize,
@@ -337,16 +365,18 @@ impl TransferHub {
             eprintln!("transfer of {id}: hosting epoch advanced to {epoch}, expected {expected}");
         }
         let address = format!("daemon:{}", transfer.target.daemon_name());
+        let OutgoingPhase::Handshaking { status_writer, child_pid, .. } = std::mem::replace(&mut transfer.phase, OutgoingPhase::Probing)
+        else {
+            unreachable!("phase checked above");
+        };
         let reap = match hosted.actor.commit_transfer(epoch, address.clone()) {
             Ok(reap) => reap,
             Err(err) => {
+                // Committed regardless: keep reaping the child we forked.
                 eprintln!("transfer of {id}: releasing the session actor failed after commit: {err}");
-                None
+                Some(child_pid)
             }
         };
-        if let Err(err) = move_session_dir(layout, &transfer.target, &id) {
-            eprintln!("transfer of {id}: {err}");
-        }
         let redirect = SessionRedirect {
             session_id: id.clone(),
             address: address.clone(),
@@ -356,24 +386,26 @@ impl TransferHub {
             protocol_version: protocol.version,
             min_supported_version: protocol.min_supported_version,
         };
-        let Some(mut released) = sessions.remove(&id) else {
+        // Hosted no more: nothing here reaches its PTY. Its channels stay open
+        // (ignored) until the target confirms and they can be redirected.
+        let Some(released) = sessions.remove(&id) else {
             unreachable!("session checked above");
         };
-        release_transferred_session(&mut released, &redirect, packet_clients)?;
-        drop(released);
-        let OutgoingPhase::Handshaking { status_writer, .. } = std::mem::replace(&mut transfer.phase, OutgoingPhase::Probing) else {
-            unreachable!("phase checked above");
-        };
+        broadcast_directory_remove(&id, packet_clients)?;
         if let Some(pid) = reap {
             self.forwarders.push(StatusForwarder { pid: pid as libc::pid_t, writer: status_writer });
         }
         let dropped_clients = std::mem::take(&mut transfer.dropped_clients);
-        transfer.phase = OutgoingPhase::Committing {
-            result: TransferResult { session_id: id.clone(), address, hosting_epoch: epoch, dropped_clients },
+        transfer.phase = OutgoingPhase::Committing(Box::new(Committed {
+            result: TransferResult { session_id: id.clone(), address, hosting_epoch: epoch, dropped_clients, warning: None },
             since: Instant::now(),
-        };
+            released,
+            redirect: redirect.clone(),
+        }));
         if let Some(decisions) = &transfer.decisions {
-            let _ = decisions.send(SourceDecision::Commit { tail });
+            let relocation =
+                transfer::Relocation { source: layout.session_dir(&id), target: transfer.target.clone(), session_id: id.clone() };
+            let _ = decisions.send(SourceDecision::Commit { tail, relocation });
         }
         self.moved.insert(id.clone(), MovedSession { redirect, until: Instant::now() + transfer::REDIRECT_GRACE });
         self.note_epoch(&id, epoch);
@@ -576,6 +608,7 @@ fn prepare_outgoing(
     };
     fds.push(status_reader.into());
     roles.push(FdRole::child_status());
+    let manifest_child_pid = source.child_pid;
     let version = test_manifest_version().unwrap_or(MANIFEST_VERSION);
     let manifest = FdTransferManifest {
         version,
@@ -599,7 +632,7 @@ fn prepare_outgoing(
         let _ = hosted.actor.abort_transfer();
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "transfer worker stopped".into()));
     }
-    transfer.phase = OutgoingPhase::Handshaking { protocol, status_writer };
+    transfer.phase = OutgoingPhase::Handshaking { protocol, status_writer, child_pid: manifest_child_pid };
     Ok(())
 }
 
@@ -649,7 +682,7 @@ pub(super) fn unfreeze(hosted: &mut HostedSession, packet_clients: &mut Vec<Pack
 fn release_transferred_session(
     hosted: &mut HostedSession,
     redirect: &SessionRedirect,
-    packet_clients: &mut Vec<PacketClient>,
+    packet_clients: &mut [PacketClient],
 ) -> Result<(), String> {
     let id = &redirect.session_id;
     let message = format!("session {id} moved to {}", redirect.address);
@@ -671,10 +704,10 @@ fn release_transferred_session(
     // Stream attachments cannot follow a redirect; dropping them closes them.
     hosted.active_client = None;
     hosted.watchers.clear();
-    broadcast_directory_remove(id, packet_clients)
+    Ok(())
 }
 
-pub(super) fn write_redirect(stream: &mut SessionStream, redirect: &SessionRedirect, stale_holder: bool) -> std::io::Result<()> {
+fn write_redirect(stream: &mut SessionStream, redirect: &SessionRedirect, stale_holder: bool) -> std::io::Result<()> {
     let error = if stale_holder {
         format!(
             "stale holder: session {} moved to {} at hosting epoch {}; this holder's epoch is stale",
@@ -700,43 +733,6 @@ pub(super) fn write_stale_holder(stream: &mut SessionStream, id: &str, current: 
             "hosting_epoch": current,
         }),
     )
-}
-
-/// Rename into the target's `sessions/` on the same runtime root (under the
-/// target name's layout lock); copy across roots. The recorder's open
-/// descriptor survives either way.
-fn move_session_dir(layout: &RuntimeLayout, target: &RuntimeLayout, id: &str) -> Result<(), String> {
-    let source = layout.session_dir(id);
-    let source = source.as_path();
-    let destination = target.session_dir(id);
-    if destination.exists() {
-        return Err(format!("target session directory {} already exists; left {} in place", destination.display(), source.display()));
-    }
-    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if canonical(layout.root()) == canonical(target.root()) {
-        let _lock = target.lock_generations()?;
-        fs::create_dir_all(target.sessions_dir()).map_err(|err| format!("create {}: {err}", target.sessions_dir().display()))?;
-        return fs::rename(source, &destination)
-            .map_err(|err| format!("move session directory {} to {}: {err}", source.display(), destination.display()));
-    }
-    copy_dir(source, &destination)?;
-    fs::remove_dir_all(source).map_err(|err| format!("remove copied session directory {}: {err}", source.display()))
-}
-
-fn copy_dir(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::create_dir_all(destination).map_err(|err| format!("create {}: {err}", destination.display()))?;
-    for entry in fs::read_dir(source).map_err(|err| format!("read {}: {err}", source.display()))? {
-        let entry = entry.map_err(|err| format!("read {}: {err}", source.display()))?;
-        let path = entry.path();
-        let target = destination.join(entry.file_name());
-        let kind = entry.file_type().map_err(|err| format!("inspect {}: {err}", path.display()))?;
-        if kind.is_dir() {
-            copy_dir(&path, &target)?;
-        } else if kind.is_file() {
-            fs::copy(&path, &target).map_err(|err| format!("copy {}: {err}", path.display()))?;
-        }
-    }
-    Ok(())
 }
 
 /// Build the paused runtime for an offer. Everything here is local and
@@ -828,15 +824,9 @@ fn test_manifest_version() -> Option<u16> {
     None
 }
 
-pub(super) fn not_found_or_redirect(
-    stream: &mut SessionStream,
-    hub: &TransferHub,
-    id: &str,
-    holder_epoch: Option<u64>,
-) -> Result<(), String> {
-    match hub.redirect_for(id) {
-        Some(redirect) => write_redirect(stream, redirect, holder_epoch.is_some_and(|epoch| epoch < redirect.hosting_epoch))
-            .map_err(|err| format!("write HTTP redirect response: {err}")),
-        None => write_http_not_found(stream),
-    }
+/// Answer a request for a session this daemon released: where it went, and
+/// whether the requester's stated epoch is stale.
+pub(super) fn write_moved(stream: &mut SessionStream, redirect: &SessionRedirect, holder_epoch: Option<u64>) -> Result<(), String> {
+    write_redirect(stream, redirect, holder_epoch.is_some_and(|epoch| epoch < redirect.hosting_epoch))
+        .map_err(|err| format!("write HTTP redirect response: {err}"))
 }

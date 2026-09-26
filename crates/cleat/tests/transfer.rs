@@ -344,8 +344,9 @@ impl StallingTarget {
             while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
-                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                        // macOS refuses socket options once the peer has gone.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         let mut request = Vec::new();
                         let mut byte = [0u8; 1];
                         while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {

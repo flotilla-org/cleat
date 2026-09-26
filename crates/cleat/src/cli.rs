@@ -1134,6 +1134,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(result) => {
                     let mut message =
                         format!("transferred {} to {} (hosting epoch {})", result.session_id, result.address, result.hosting_epoch);
+                    if let Some(warning) = &result.warning {
+                        message.push_str(&format!("\nwarning: {warning}"));
+                    }
                     if !result.dropped_clients.is_empty() {
                         message.push_str(&format!("\ndropped incompatible clients: {}", result.dropped_clients.join(", ")));
                     }

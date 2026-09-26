@@ -446,4 +446,8 @@ pub struct TransferResult {
     /// Attached clients that could not follow the move (`--drop-incompatible`).
     #[serde(default)]
     pub dropped_clients: Vec<String>,
+    /// A problem after commit that did not undo it, e.g. the session
+    /// directory could not be moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }

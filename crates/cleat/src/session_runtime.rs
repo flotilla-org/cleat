@@ -279,10 +279,15 @@ impl SessionRuntime {
         if self.pty_child.is_released() {
             return Err(format!("session {} was already transferred", self.session.id));
         }
-        let payload = if self.vt_engine.supports_replay() { replay_snapshot_payload(&mut *self.vt_engine) } else { None };
-        let payload = payload.ok_or_else(|| {
-            format!("session {} cannot transfer: its {} VT engine has no replay snapshot", self.session.id, self.session.vt_engine.as_str())
-        })?;
+        if !self.vt_engine.supports_replay() {
+            return Err(format!(
+                "session {} cannot transfer: its {} VT engine has no replay snapshot",
+                self.session.id,
+                self.session.vt_engine.as_str()
+            ));
+        }
+        // No payload means nothing has been drawn yet: the empty screen.
+        let payload = replay_snapshot_payload(&mut *self.vt_engine).unwrap_or_default();
         let (cols, rows) = self.vt_engine.size();
         let pty_master = self.pty_child.duplicate_master()?;
         let recording = self.recorder.as_ref().map(SessionRecorder::append_handle).transpose()?;

@@ -116,11 +116,10 @@ impl Route {
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct RedirectResponse {
     pub error: String,
     pub redirect: crate::packet::SessionRedirect,
-    #[serde(default)]
     pub stale_holder: bool,
 }
 

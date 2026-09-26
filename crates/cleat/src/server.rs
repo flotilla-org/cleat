@@ -251,7 +251,7 @@ impl SessionService {
         crate::session::ensure_daemon_started(&to.layout)?;
         let target = to.layout.resolved()?;
         let runtime_root = std::path::absolute(target.root()).map_err(|err| format!("resolve target runtime root: {err}"))?;
-        let timeout = options.timeout.unwrap_or(Duration::from_secs(10));
+        let timeout = options.timeout.unwrap_or(crate::transfer::DEFAULT_HANDSHAKE_TIMEOUT);
         let request = http_uds::SessionTransferRequest {
             runtime_root: runtime_root.display().to_string(),
             daemon: target.daemon_name().to_string(),

@@ -2225,7 +2225,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             }
         };
         #[cfg(unix)]
-        let transfers_busy = transfers.busy();
+        let transfers_busy = transfers.busy(draining);
         #[cfg(not(unix))]
         let transfers_busy = false;
         if sessions.is_empty() && !termination_pending && !transfers_busy {
@@ -3027,11 +3027,13 @@ fn handle_http_request(
             }
         };
         match state.sessions.get(id) {
-            #[cfg(unix)]
-            None if state.transfers.redirect_for(id).is_some() => {
-                return transfer_host::not_found_or_redirect(stream, state.transfers, id, holder_epoch);
+            None =>
+            {
+                #[cfg(unix)]
+                if let Some(redirect) = state.transfers.redirect_for(id) {
+                    return transfer_host::write_moved(stream, redirect, holder_epoch);
+                }
             }
-            None => {}
             Some(hosted) => {
                 if let Some(held) = holder_epoch.filter(|held| route.mutates_session() && *held != hosted.hosting_epoch) {
                     #[cfg(unix)]
@@ -3048,13 +3050,9 @@ fn handle_http_request(
                     )
                     .map_err(|err| format!("write HTTP stale-holder response: {err}"));
                 }
-                if hosted.transferring && route_waits_for_transfer(&route, &request) {
-                    return http_uds::write_error(
-                        stream,
-                        StatusCode::CONFLICT,
-                        &format!("session {id} is transferring; retry when it completes"),
-                    )
-                    .map_err(|err| format!("write HTTP transferring response: {err}"));
+                if hosted.transferring && route_waits_for_transfer(&route) {
+                    return http_uds::write_error(stream, StatusCode::CONFLICT, &transferring_message(id))
+                        .map_err(|err| format!("write HTTP transferring response: {err}"));
                 }
             }
         }
@@ -3496,12 +3494,8 @@ fn handle_http_request(
                 }
                 http_uds::InputRequest::Resize { cols, rows } => {
                     if hosted.transferring {
-                        return http_uds::write_error(
-                            stream,
-                            StatusCode::CONFLICT,
-                            &format!("session {id} is transferring; retry when it completes"),
-                        )
-                        .map_err(|err| format!("write HTTP transferring response: {err}"));
+                        return http_uds::write_error(stream, StatusCode::CONFLICT, &transferring_message(&id))
+                            .map_err(|err| format!("write HTTP transferring response: {err}"));
                     }
                     hosted.actor.resize(cols, rows)?;
                     broadcast_directory_upsert(
@@ -3726,7 +3720,7 @@ fn handle_http_request(
 /// Control operations that wait while a session is frozen for transfer. PTY
 /// input keeps flowing; anything that changes roles, geometry, tags, the
 /// recording's markers, or the session's lifetime does not.
-fn route_waits_for_transfer(route: &http_uds::Route, _request: &http_uds::HttpRequest) -> bool {
+fn route_waits_for_transfer(route: &http_uds::Route) -> bool {
     use http_uds::Route;
     matches!(
         route,
@@ -3743,6 +3737,10 @@ fn route_waits_for_transfer(route: &http_uds::Route, _request: &http_uds::HttpRe
             | Route::SessionTags { .. }
             | Route::SessionTransfer { .. }
     )
+}
+
+fn transferring_message(id: &str) -> String {
+    format!("session {id} is transferring; retry when it completes")
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -4526,10 +4524,8 @@ fn open_packet_channel(
         return Ok(());
     };
     if hosted.transferring {
-        packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
-            channel: open.channel,
-            message: format!("session {} is transferring; retry when it completes", open.session_id),
-        })?;
+        packet_clients[index]
+            .enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message: transferring_message(&open.session_id) })?;
         return Ok(());
     }
 

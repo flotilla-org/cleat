@@ -45,10 +45,13 @@ use crate::{
 pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a released session's old host keeps answering with a redirect.
 pub(crate) const REDIRECT_GRACE: Duration = Duration::from_secs(30);
-/// How long an adopter holds a READY session for the source's commit.
-pub(crate) const COMMIT_WAIT: Duration = Duration::from_secs(10);
-/// How long a committed source waits for COMMITTED before reporting anyway.
-const COMMITTED_WAIT: Duration = Duration::from_secs(5);
+/// How long an adopter holds a READY session for the source's commit. The
+/// source moves the session directory before committing; a copy across
+/// runtime roots scales with the recording.
+pub(crate) const COMMIT_WAIT: Duration = Duration::from_secs(60);
+/// How long a committed source waits for COMMITTED, after its directory move,
+/// before reporting anyway.
+pub(crate) const COMMITTED_WAIT: Duration = Duration::from_secs(5);
 /// How long a worker waits for its servicing loop's next decision.
 const DECISION_WAIT: Duration = Duration::from_secs(30);
 
@@ -78,7 +81,11 @@ pub(crate) enum SourceEvent {
     Probed(Result<TargetProtocol, String>),
     /// READY (`Ok`), or why the target did not get there.
     Handshake(Result<(), HandshakeFailure>),
-    Committed(Result<(), String>),
+    /// The directory move's outcome, and whether the target confirmed.
+    Committed {
+        moved: Result<(), String>,
+        confirmed: Result<(), String>,
+    },
 }
 
 pub(crate) enum HandshakeFailure {
@@ -100,8 +107,68 @@ impl HandshakeFailure {
 /// Servicing loop → source worker.
 pub(crate) enum SourceDecision {
     Proceed { manifest: Box<FdTransferManifest>, fds: Vec<OwnedFd> },
-    Commit { tail: Vec<u8> },
+    Commit { tail: Vec<u8>, relocation: Relocation },
     Abort,
+}
+
+/// Where a committed session's directory goes.
+pub(crate) struct Relocation {
+    pub source: PathBuf,
+    pub target: crate::runtime::RuntimeLayout,
+    pub session_id: String,
+}
+
+impl Relocation {
+    /// Rename into the target's `sessions/` on the same runtime root, under
+    /// the target name's layout lock. Across roots, copy into a temporary
+    /// directory and rename that into place, so the target never sees a
+    /// partial copy. Open recording descriptors survive either way.
+    fn apply(&self) -> Result<(), String> {
+        let destination = self.target.session_dir(&self.session_id);
+        let sessions = self.target.sessions_dir();
+        let _lock = self.target.lock_generations()?;
+        if destination.exists() {
+            return Err(format!(
+                "target session directory {} already exists; left {} in place",
+                destination.display(),
+                self.source.display()
+            ));
+        }
+        std::fs::create_dir_all(&sessions).map_err(|err| format!("create {}: {err}", sessions.display()))?;
+        match std::fs::rename(&self.source, &destination) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.raw_os_error() != Some(libc::EXDEV) => {
+                return Err(format!("move session directory {} to {}: {err}", self.source.display(), destination.display()));
+            }
+            Err(_) => {}
+        }
+        let staging = sessions.join(format!(".{}.transfer-{}", self.session_id, uuid::Uuid::new_v4()));
+        let copied = copy_dir(&self.source, &staging).and_then(|()| {
+            std::fs::rename(&staging, &destination)
+                .map_err(|err| format!("publish copied session directory {}: {err}", destination.display()))
+        });
+        if let Err(err) = copied {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+        std::fs::remove_dir_all(&self.source).map_err(|err| format!("remove copied session directory {}: {err}", self.source.display()))
+    }
+}
+
+fn copy_dir(source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(destination).map_err(|err| format!("create {}: {err}", destination.display()))?;
+    for entry in std::fs::read_dir(source).map_err(|err| format!("read {}: {err}", source.display()))? {
+        let entry = entry.map_err(|err| format!("read {}: {err}", source.display()))?;
+        let path = entry.path();
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type().map_err(|err| format!("inspect {}: {err}", path.display()))?;
+        if kind.is_dir() {
+            copy_dir(&path, &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(&path, &target).map_err(|err| format!("copy {}: {err}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The releasing side of the exchange. Every blocking step has a socket
@@ -132,14 +199,17 @@ pub(crate) fn run_source_worker(socket: PathBuf, deadline: Instant, events: Send
         }
     };
     match decisions.recv_timeout(DECISION_WAIT) {
-        Ok(SourceDecision::Commit { tail }) => {
-            let result = (|| {
+        Ok(SourceDecision::Commit { tail, relocation }) => {
+            // Off the servicing loop: a copy across roots scales with the
+            // recording. Committed either way; a failure is reported.
+            let moved = relocation.apply();
+            let confirmed = (|| {
                 stream.set_write_timeout(Some(COMMITTED_WAIT)).map_err(|err| format!("set transfer write timeout: {err}"))?;
                 stream.set_read_timeout(Some(COMMITTED_WAIT)).map_err(|err| format!("set transfer read timeout: {err}"))?;
                 write_frame(&mut stream, COMMIT, &tail).map_err(|err| format!("send transfer commit: {err}"))?;
                 read_committed(&mut stream)
             })();
-            let _ = events.send(SourceEvent::Committed(result));
+            let _ = events.send(SourceEvent::Committed { moved, confirmed });
         }
         Ok(SourceDecision::Abort) | Ok(SourceDecision::Proceed { .. }) | Err(RecvTimeoutError::Timeout) => {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));

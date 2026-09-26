@@ -156,15 +156,26 @@ fn coordinator_dir() -> Result<PathBuf, String> {
     let path = PathBuf::from(format!("/tmp/cleat-output-{}", unsafe { libc::geteuid() }));
     #[cfg(windows)]
     let path = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA required for output coordination")?).join("cleat-output");
+    #[cfg(windows)]
     fs::create_dir_all(&path).map_err(|e| format!("create output coordinator: {e}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("create output coordinator: {e}")),
+        }
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| format!("open output coordinator: {e}"))?;
+        let metadata = directory.metadata().map_err(|e| e.to_string())?;
+        if metadata.uid() != unsafe { libc::geteuid() } {
             return Err("output coordinator must be a directory owned by the current user".into());
         }
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        directory.set_permissions(fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     }
     Ok(path)
 }
@@ -178,7 +189,11 @@ pub(crate) fn admit(context: &OutputContext, layout: &RuntimeLayout, session: &s
 fn admit_at(directory: &Path, edge: Edge) -> Result<OutputLease, String> {
     let operation = || -> Result<OutputLease, Box<dyn std::error::Error>> {
         let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(directory.join("admission.lock"))?;
-        lock.lock()?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err("coordinator busy; retry output admission".into()),
+            Err(e) => return Err(e.into()),
+        }
         let mut edges = Vec::new();
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
@@ -277,6 +292,17 @@ mod tests {
         fs::write(dir.path().join("dead.lease"), b"interrupted write").unwrap();
         assert!(admit_at(dir.path(), edge("a", "b")).is_ok());
         assert!(!dir.path().join("dead.lease").exists());
+    }
+
+    #[test]
+    fn busy_coordinator_rejects_promptly_without_leaking_an_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = File::create(dir.path().join("admission.lock")).unwrap();
+        lock.lock().unwrap();
+        let error = admit_at(dir.path(), edge("a", "b")).err().expect("busy coordinator must reject");
+        assert!(error.contains("coordinator busy"), "{error}");
+        drop(lock);
+        assert!(admit_at(dir.path(), edge("b", "a")).is_ok());
     }
 
     #[test]

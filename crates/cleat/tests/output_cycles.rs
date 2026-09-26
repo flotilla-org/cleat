@@ -16,6 +16,10 @@ use cleat::{
     vt::VtEngineKind,
 };
 
+// Admission deliberately fails fast on coordinator contention. Isolate the
+// independent fixtures; the simultaneous-attempt test supplies its own race.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Session {
     _root: tempfile::TempDir,
     layout: RuntimeLayout,
@@ -94,6 +98,7 @@ fn rejected(session: &Session, action: &str, context: Option<&str>, status: u16,
 
 #[test]
 fn output_admission_rejects_old_clients_and_one_row_self_feedback_before_side_effects() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let session = Session::new("default");
     for action in ["attach", "watch", "connect"] {
         rejected(&session, action, None, 426, "upgrade");
@@ -131,6 +136,7 @@ fn output_admission_rejects_old_clients_and_one_row_self_feedback_before_side_ef
 
 #[test]
 fn output_admission_tracks_watch_and_multihop_across_daemons_and_releases_disconnects() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let a = Session::new("one");
     let b = Session::new("two");
     let c = Session::new("three");
@@ -157,6 +163,7 @@ fn output_admission_tracks_watch_and_multihop_across_daemons_and_releases_discon
 
 #[test]
 fn output_admission_serializes_simultaneous_attempts_in_separate_daemons() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let a = Session::new("one");
     let b = Session::new("two");
     let barrier = std::sync::Barrier::new(2);
@@ -199,6 +206,7 @@ fn output_admission_client_process() {
 
 #[test]
 fn output_admission_cleans_up_killed_clients_and_verifies_linux_peer_coordinates() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let a = Session::new("one");
     let b = Session::new("two");
     for lie in [false, true] {
@@ -240,6 +248,7 @@ fn output_admission_cleans_up_killed_clients_and_verifies_linux_peer_coordinates
 
 #[test]
 fn output_admission_releases_detach_and_failed_strict_admission() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let a = Session::new("one");
     let b = Session::new("two");
     let (_ab, head) = b.connect("attach", Some(&a.context()));
@@ -265,6 +274,7 @@ fn output_admission_releases_detach_and_failed_strict_admission() {
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn output_admission_packet_watcher_blocks_reverse_stream_until_channel_close() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     use cleat::packet::{CloseChannel, MSG_CONTROL_CLOSE_CHANNEL, MSG_SESSION_ROLE};
     let a = Session::new("one");
     let b = Session::with_engine("two", VtEngineKind::Ghostty);
@@ -301,6 +311,7 @@ fn output_admission_packet_watcher_blocks_reverse_stream_until_channel_close() {
 
 #[test]
 fn output_admission_failed_packet_open_does_not_leave_a_lease() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let a = Session::new("one");
     let b = Session::new("two");
     let (mut packet, head) = b.connect("connect", Some(&a.context()));
@@ -325,6 +336,7 @@ fn output_admission_failed_packet_open_does_not_leave_a_lease() {
 
 #[test]
 fn output_admission_checks_activity_snapshots_and_dynamic_membership_before_events() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let a = Session::new("one");
     rejected(&a, "activity", Some(&a.context()), 409, "cycle");
     let (mut packet, head) = a.connect("filtered-activity", Some(&a.context()));

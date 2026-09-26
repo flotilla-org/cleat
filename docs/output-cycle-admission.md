@@ -69,7 +69,10 @@ not reuse an external connection to forward output into a session.
 The graph stores dependencies from containing source session to watched target.
 Before inserting an edge, admission searches for a path from target back to
 source. A per-user OS file lock serializes the check plus lease publication
-across local daemons and runtime roots. Each stream or packet channel owns a
+across local daemons and runtime roots. Acquisition is nonblocking: contention
+returns a `coordinator busy; retry output admission` error without stalling
+the daemon event loop. A rejected activity membership stops that subscription
+(including on contention), so the client must reconnect to retry. Each stream or packet channel owns a
 separate locked lease, including duplicate subscriptions. Role changes keep
 that lease; channel close, detach, connection failure, session exit, and failed
 admission drop it. Daemon crashes release OS locks; the next admission removes

@@ -55,6 +55,13 @@ pub struct FdTransferManifest {
     pub hosting_epoch: u64,
     /// Same JSON payload as recording event S, generated from replay_payload.
     pub replay_snapshot: ReplaySnapshot,
+    /// Named recording markers and their cast offsets, so marker-relative
+    /// capture keeps working on the adopter.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub markers: std::collections::HashMap<String, u64>,
+    /// The recording is paused (`cleat record` off) rather than absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recording_paused: bool,
 }
 
 #[derive(Deserialize)]

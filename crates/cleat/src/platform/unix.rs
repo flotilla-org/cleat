@@ -38,7 +38,33 @@ pub struct PtyChild {
     /// Owned PTY master: dropping `PtyChild` closes it automatically.
     master_fd: OwnedFd,
     pid: Pid,
+    ownership: ChildOwnership,
 }
+
+/// Who answers for the child's lifetime. Only the forking host can reap; a
+/// transfer leaves reaping (and status forwarding) with it.
+enum ChildOwnership {
+    /// Forked by this host, which reaps it.
+    Owned,
+    /// Handed to another host. The releasing daemon's servicing loop reaps it
+    /// and forwards the status; this handle must never signal or reap it.
+    Released,
+    /// Adopted from another host: observed, never reaped.
+    Adopted(AdoptedChild),
+}
+
+struct AdoptedChild {
+    observer: Option<crate::child_observation::ChildObserver>,
+    /// Read end of the source's exit-status forwarding stream.
+    status: Option<std::os::unix::net::UnixStream>,
+    /// False until the transfer commits. An uncommitted adoption must leave
+    /// the child alone when it is discarded.
+    armed: bool,
+}
+
+/// How long an adopter waits for the forwarded status once it has observed
+/// the exit itself. The source reaps on its next servicing tick.
+const FORWARDED_STATUS_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Serializes `forkpty` + `FD_CLOEXEC` below: a concurrent spawn on another
 /// thread must not fork in the window where the new master fd exists without
@@ -59,7 +85,7 @@ impl PtyChild {
         let result = unsafe { forkpty(&winsize, None) }.map_err(|err| format!("forkpty failed: {err}"))?;
         match result {
             ForkptyResult::Parent { master, child } => {
-                let pty = Self { master_fd: master, pid: child };
+                let pty = Self { master_fd: master, pid: child, ownership: ChildOwnership::Owned };
                 // Mark the master close-on-exec: without this, every child forked
                 // afterwards (other sessions' shells) inherits a copy of this
                 // master, so closing ours on teardown is not the last close and
@@ -71,6 +97,72 @@ impl PtyChild {
             ForkptyResult::Child => {
                 exec_child_or_exit(&exec_spec);
             }
+        }
+    }
+
+    /// Take over a live PTY and child transferred from another host. The child
+    /// stays unarmed (never signalled on drop) until [`Self::arm`].
+    pub fn adopt(
+        master_fd: OwnedFd,
+        pid: u32,
+        observer: Option<crate::child_observation::ChildObserver>,
+        status: Option<std::os::unix::net::UnixStream>,
+    ) -> Result<Self, String> {
+        let pid = i32::try_from(pid).ok().filter(|pid| *pid > 0).ok_or_else(|| format!("invalid child pid {pid}"))?;
+        if let Some(status) = &status {
+            status.set_nonblocking(true).map_err(|err| format!("set child status stream nonblocking: {err}"))?;
+        }
+        Ok(Self { master_fd, pid: Pid::from_raw(pid), ownership: ChildOwnership::Adopted(AdoptedChild { observer, status, armed: false }) })
+    }
+
+    /// Commit an adoption: from here this host answers for the session.
+    pub fn arm(&mut self) {
+        if let ChildOwnership::Adopted(adopted) = &mut self.ownership {
+            adopted.armed = true;
+        }
+    }
+
+    /// Hand the child to another host. Returns the pid the caller must keep
+    /// reaping when this host forked it.
+    pub fn release(&mut self) -> Option<u32> {
+        let owned = matches!(self.ownership, ChildOwnership::Owned);
+        self.ownership = ChildOwnership::Released;
+        owned.then(|| self.leader_pid())
+    }
+
+    pub fn forked_here(&self) -> bool {
+        matches!(self.ownership, ChildOwnership::Owned)
+    }
+
+    /// A duplicate of the exit-status stream an adopted child arrived with, to
+    /// pass on when this host transfers it again.
+    pub fn duplicate_status_stream(&self) -> Result<Option<OwnedFd>, String> {
+        match &self.ownership {
+            ChildOwnership::Adopted(AdoptedChild { status: Some(status), .. }) => {
+                status.try_clone().map(|stream| Some(stream.into())).map_err(|err| format!("duplicate child status stream: {err}"))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn is_released(&self) -> bool {
+        matches!(self.ownership, ChildOwnership::Released)
+    }
+
+    /// A duplicate of the PTY master for a transfer. The original stays open
+    /// until the transfer commits.
+    pub fn duplicate_master(&self) -> Result<OwnedFd, String> {
+        self.master_fd.try_clone().map_err(|err| format!("duplicate pty master: {err}"))
+    }
+
+    /// The child's exit, if it has ended. Owned children are reaped here;
+    /// adopted ones combine the forwarded status with local observation.
+    pub fn exit_state(&self) -> Result<Option<super::ChildExit>, String> {
+        match &self.ownership {
+            ChildOwnership::Owned => Ok(self.exited()?.as_ref().map(|status| super::ChildExit::Code(exit_code_from_wait_status(status)))),
+            ChildOwnership::Released => Ok(None),
+            ChildOwnership::Adopted(adopted) if !adopted.armed => Ok(None),
+            ChildOwnership::Adopted(adopted) => adopted.exit_state(self.pid),
         }
     }
 
@@ -124,7 +216,18 @@ impl PtyChild {
         self.foreground_pgid().and_then(resolve_cwd)
     }
 
+    /// Only the host that answers for the child may signal it: never after a
+    /// release, and not before an adoption commits.
+    fn ensure_may_signal(&self) -> Result<(), String> {
+        match &self.ownership {
+            ChildOwnership::Released => Err("session was transferred to another host".to_string()),
+            ChildOwnership::Adopted(adopted) if !adopted.armed => Err("session transfer has not committed".to_string()),
+            _ => Ok(()),
+        }
+    }
+
     pub fn dispatch_signal(&self, signal: i32, target: SignalTarget) -> Result<(), String> {
+        self.ensure_may_signal()?;
         let signal = Signal::try_from(signal).map_err(|err| format!("invalid signal number: {err}"))?;
 
         match target {
@@ -146,6 +249,7 @@ impl PtyChild {
     }
 
     pub(crate) fn signal_tree(&self, tree: &crate::platform::signals::ProcessTree, signal: Signal) -> Result<(), String> {
+        self.ensure_may_signal()?;
         // Capture the foreground group before signaling anything: terminating
         // the leader may make tcgetpgrp fail as the controlling tty hangs up.
         let foreground = tcgetpgrp(self.master_fd.as_fd()).ok();
@@ -167,8 +271,95 @@ fn killpg_ignoring_dead(pgid: Pid, signal: Signal) -> Result<(), String> {
     }
 }
 
+impl AdoptedChild {
+    fn exit_state(&self, pid: Pid) -> Result<Option<super::ChildExit>, String> {
+        use super::ChildExit;
+        match self.poll_forwarded_status() {
+            ForwardedStatus::Status(code) => return Ok(Some(ChildExit::Code(code))),
+            ForwardedStatus::SourceGone => {
+                // Nobody will forward a status any more: report the exit as
+                // unknown once it is observable, never a fabricated code.
+                return Ok(self.observed_exit(pid).then_some(ChildExit::Unknown));
+            }
+            ForwardedStatus::Pending => {}
+        }
+        if !self.observed_exit(pid) {
+            return Ok(None);
+        }
+        // Exit observed first; the live source reaps and forwards shortly.
+        Ok(Some(match self.wait_forwarded_status() {
+            Some(code) => ChildExit::Code(code),
+            None => ChildExit::Unknown,
+        }))
+    }
+
+    fn poll_forwarded_status(&self) -> ForwardedStatus {
+        let Some(stream) = &self.status else {
+            return ForwardedStatus::SourceGone;
+        };
+        let mut frame = [0u8; 4];
+        // SAFETY: recv writes at most frame.len() bytes into the live buffer.
+        let peeked = unsafe { libc::recv(stream.as_raw_fd(), frame.as_mut_ptr().cast(), frame.len(), libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+        let peeked = if peeked < 0 { Err(io::Error::last_os_error()) } else { Ok(peeked as usize) };
+        match peeked {
+            Ok(0) => ForwardedStatus::SourceGone,
+            Ok(4) => match crate::child_observation::receive_status(&mut &*stream) {
+                Ok(Some(status)) => ForwardedStatus::Status(exit_code_from_exit_status(status)),
+                _ => ForwardedStatus::SourceGone,
+            },
+            Ok(_) => ForwardedStatus::Pending,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::Interrupted => ForwardedStatus::Pending,
+            Err(_) => ForwardedStatus::SourceGone,
+        }
+    }
+
+    fn wait_forwarded_status(&self) -> Option<i32> {
+        let stream = self.status.as_ref()?;
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(FORWARDED_STATUS_GRACE));
+        let status = crate::child_observation::receive_status(&mut &*stream).ok().flatten();
+        let _ = stream.set_nonblocking(true);
+        status.map(exit_code_from_exit_status)
+    }
+
+    fn observed_exit(&self, pid: Pid) -> bool {
+        match &self.observer {
+            Some(observer) => match observer.wait(std::time::Duration::ZERO) {
+                Ok(_) => true,
+                Err(err) => err.kind() != io::ErrorKind::TimedOut,
+            },
+            // Without an observer, a vanished pid is the only evidence.
+            None => matches!(nix::sys::signal::kill(pid, None), Err(Errno::ESRCH)),
+        }
+    }
+}
+
+enum ForwardedStatus {
+    Status(i32),
+    SourceGone,
+    Pending,
+}
+
+fn exit_code_from_exit_status(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().or_else(|| status.signal().map(|signal| 128 + signal)).unwrap_or(1)
+}
+
 impl Drop for PtyChild {
     fn drop(&mut self) {
+        match &self.ownership {
+            ChildOwnership::Owned => {}
+            ChildOwnership::Released => return,
+            ChildOwnership::Adopted(adopted) => {
+                // Not ours to reap. A committed adoption still hangs up a live
+                // child as an owned one would; an uncommitted one never
+                // touches it (the source still answers for the session).
+                if adopted.armed && !adopted.observed_exit(self.pid) {
+                    let _ = nix::sys::signal::kill(self.pid, Signal::SIGHUP);
+                }
+                return;
+            }
+        }
         // The owned master fd closes automatically after this runs, hanging up
         // the PTY (which nudges a still-running child to exit via SIGHUP). The
         // daemon must never block on session teardown, so reap opportunistically

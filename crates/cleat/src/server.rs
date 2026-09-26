@@ -81,6 +81,19 @@ pub struct SliceOutcome {
 #[derive(Debug, Clone)]
 pub struct SessionService {
     layout: RuntimeLayout,
+    /// The hosting epoch this holder believes its session is at. Mutating
+    /// requests state it, and the daemon refuses them when it is stale.
+    hosting_epoch: Option<u64>,
+}
+
+/// Options for [`SessionService::transfer`].
+#[derive(Debug, Clone, Default)]
+pub struct TransferOptions {
+    /// Drop attached clients whose protocol the target refuses, instead of
+    /// refusing the transfer.
+    pub drop_incompatible: bool,
+    /// Bound on everything before the target is ready; defaults to 10 s.
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -133,7 +146,13 @@ enum ListScope {
 
 impl SessionService {
     pub fn new(layout: RuntimeLayout) -> Self {
-        Self { layout }
+        Self { layout, hosting_epoch: None }
+    }
+
+    /// State `epoch` as this holder's hosting epoch on every request.
+    pub fn with_hosting_epoch(mut self, epoch: Option<u64>) -> Self {
+        self.hosting_epoch = epoch;
+        self
     }
 
     pub fn discover() -> Result<Self, String> {
@@ -141,7 +160,7 @@ impl SessionService {
     }
 
     pub fn with_daemon(&self, daemon_name: String) -> Result<Self, String> {
-        Ok(Self::new(self.layout.clone().with_daemon(daemon_name)?))
+        Ok(Self::new(self.layout.clone().with_daemon(daemon_name)?).with_hosting_epoch(self.hosting_epoch))
     }
 
     /// Resolve an id through the logical alias. Prefer live claims; retain dead
@@ -159,8 +178,16 @@ impl SessionService {
             .collect();
         // A single candidate needs no connection probe (and existing-only attach
         // must leave its first HTTP response untouched).
-        if names.len() <= 1 {
-            return names.first().map_or_else(|| Ok(self.clone()), |name| self.with_daemon(name.clone()));
+        if names.len() == 1 {
+            return self.with_daemon(names[0].clone());
+        }
+        if names.is_empty() {
+            // Missed in the named daemon: a transferred session lives on in
+            // another daemon on this root. Only a live owner is followed.
+            return match self.daemon_owning_session(id) {
+                Ok(owner) => self.with_daemon(owner.address().to_string()),
+                Err(_) => Ok(self.clone()),
+            };
         }
         let mut live = Vec::new();
         let mut husks = Vec::new();
@@ -212,6 +239,32 @@ impl SessionService {
             })?;
         }
         Ok(target)
+    }
+
+    /// Move a live session to the daemon `to` names (Transfer). The source
+    /// daemon runs the exchange; the session keeps running throughout.
+    #[cfg(unix)]
+    pub fn transfer(&self, id: &str, to: &SessionService, options: TransferOptions) -> Result<crate::protocol::TransferResult, String> {
+        if !self.layout.session_dir(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        crate::session::ensure_daemon_started(&to.layout)?;
+        let target = to.layout.resolved()?;
+        let runtime_root = std::path::absolute(target.root()).map_err(|err| format!("resolve target runtime root: {err}"))?;
+        let timeout = options.timeout.unwrap_or(crate::transfer::DEFAULT_HANDSHAKE_TIMEOUT);
+        let request = http_uds::SessionTransferRequest {
+            runtime_root: runtime_root.display().to_string(),
+            daemon: target.daemon_name().to_string(),
+            drop_incompatible: options.drop_incompatible,
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        };
+        self.http_json_with_read_timeout(
+            id,
+            Method::POST,
+            &format!("/sessions/{id}/transfer"),
+            &request,
+            timeout.saturating_add(Duration::from_secs(15)),
+        )
     }
 
     pub fn layout_root(&self) -> &std::path::Path {
@@ -1146,7 +1199,8 @@ impl SessionService {
         } else {
             serde_json::to_vec(body).map_err(|err| format!("serialize HTTP request: {err}"))?
         };
-        http_uds::write_request(&mut stream, method, path, &body).map_err(|err| format!("write HTTP request: {err}"))?;
+        http_uds::write_request_with_epoch(&mut stream, method, path, &body, self.hosting_epoch)
+            .map_err(|err| format!("write HTTP request: {err}"))?;
         http_uds::read_response(&mut stream).map_err(|err| format!("read HTTP response: {err}"))
     }
 }

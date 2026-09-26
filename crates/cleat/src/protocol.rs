@@ -435,3 +435,19 @@ mod tests {
         assert!(!result.functional_vt_available);
     }
 }
+
+/// The outcome of `cleat transfer`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferResult {
+    pub session_id: String,
+    /// `daemon:<name@generation>` of the new host.
+    pub address: String,
+    pub hosting_epoch: u64,
+    /// Attached clients that could not follow the move (`--drop-incompatible`).
+    #[serde(default)]
+    pub dropped_clients: Vec<String>,
+    /// A problem after commit that did not undo it, e.g. the session
+    /// directory could not be moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}

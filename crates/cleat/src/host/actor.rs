@@ -32,6 +32,7 @@ use super::presentation::{GateTransition, PresentationGate};
 #[cfg(unix)]
 use crate::platform::pty::PtyChild;
 use crate::{
+    platform::ChildExit,
     protocol::{InspectResult, SignalTarget},
     provider::{
         DirtyState, TerminalRenderUpdate, TerminalScrollbackExtent, TerminalScrollbarState, TerminalSnapshot, TerminalViewportKind,
@@ -190,10 +191,10 @@ impl ObservationState {
 
     /// Publish the child's exit code to the mirror (once), waking observers
     /// on the transition.
-    pub(crate) fn record_exit(&mut self, code: i32, wake: &WakeCallback) {
+    pub(crate) fn record_exit(&mut self, exit: ChildExit, wake: &WakeCallback) {
         if let Some(mirror) = &self.mirror {
-            if mirror.exit_code().is_none() {
-                mirror.record_exit(code);
+            if !mirror.exited() {
+                mirror.record_exit(exit);
                 wake();
             }
         }
@@ -257,6 +258,9 @@ impl ObservationState {
 /// Sentinel for "the session has not exited"; exit codes are i32, so this
 /// value is unreachable.
 const EXIT_CODE_UNSET: i64 = i64::MIN;
+/// Sentinel for an exit observed without a status (an adopted child whose
+/// source host could not forward it).
+const EXIT_CODE_UNKNOWN: i64 = i64::MIN + 1;
 
 #[derive(Debug)]
 pub(crate) struct ObservationMirror {
@@ -279,15 +283,26 @@ impl ObservationMirror {
         }
     }
 
-    pub(crate) fn record_exit(&self, code: i32) {
-        self.exit_code.store(code as i64, AtomicOrdering::SeqCst);
+    pub(crate) fn record_exit(&self, exit: ChildExit) {
+        let value = match exit {
+            ChildExit::Code(code) => code as i64,
+            ChildExit::Unknown => EXIT_CODE_UNKNOWN,
+        };
+        self.exit_code.store(value, AtomicOrdering::SeqCst);
     }
 
+    /// The exit code, when the child exited with a known status.
+    #[cfg(test)]
     pub(crate) fn exit_code(&self) -> Option<i32> {
         match self.exit_code.load(AtomicOrdering::SeqCst) {
-            EXIT_CODE_UNSET => None,
+            EXIT_CODE_UNSET | EXIT_CODE_UNKNOWN => None,
             code => Some(code as i32),
         }
+    }
+
+    /// True once the child has exited, whether or not its status is known.
+    pub(crate) fn exited(&self) -> bool {
+        self.exit_code.load(AtomicOrdering::SeqCst) != EXIT_CODE_UNSET
     }
 
     pub(crate) fn store(&self, render_generation: u64, observed_generation: u64, dirty: DirtyState) {
@@ -539,6 +554,29 @@ pub(crate) enum SessionCommand {
     RecoverRawOutput {
         capabilities: Vec<vt::ClientCapabilities>,
         reply: mpsc::Sender<Result<RawOutputRecovery, String>>,
+    },
+    #[cfg(unix)]
+    PrepareTransfer {
+        reply: mpsc::Sender<Result<crate::session_runtime::TransferSource, String>>,
+    },
+    #[cfg(unix)]
+    ReleaseTransfer {
+        reply: mpsc::Sender<Result<Vec<u8>, String>>,
+    },
+    #[cfg(unix)]
+    AbortTransfer {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    #[cfg(unix)]
+    CommitTransfer {
+        epoch: u64,
+        address: String,
+        reply: mpsc::Sender<Result<Option<u32>, String>>,
+    },
+    #[cfg(unix)]
+    ResumeAdopted {
+        tail: Vec<u8>,
+        reply: mpsc::Sender<Result<(), String>>,
     },
     Stop {
         terminate: bool,
@@ -816,6 +854,26 @@ impl SessionActor {
         wake: WakeCallback,
         build_runtime: impl FnOnce() -> Result<SessionRuntime, String> + Send + 'static,
     ) -> Result<Self, String> {
+        Self::spawn_inner(rows, wake, build_runtime, false)
+    }
+
+    /// Spawn the actor for an adopted session. It answers commands but does
+    /// not read the PTY until [`Self::resume_adopted`] commits the adoption.
+    #[cfg(unix)]
+    pub(crate) fn spawn_adopted(
+        rows: u16,
+        wake: WakeCallback,
+        build_runtime: impl FnOnce() -> Result<SessionRuntime, String> + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(rows, wake, build_runtime, true)
+    }
+
+    fn spawn_inner(
+        rows: u16,
+        wake: WakeCallback,
+        build_runtime: impl FnOnce() -> Result<SessionRuntime, String> + Send + 'static,
+        pty_paused: bool,
+    ) -> Result<Self, String> {
         let observation = Arc::new(ObservationMirror::new());
         let actor_observation = observation.clone();
         let (tx, rx) = mpsc::channel();
@@ -824,10 +882,11 @@ impl SessionActor {
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::spawn(move || match build_runtime() {
             Ok(runtime) => {
+                let observation = ObservationState::new_with_mirror(rows, Some(actor_observation));
                 #[cfg(unix)]
-                session_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx, command_wake_reader);
+                session_actor_loop(runtime, wake, observation, ready_tx, rx, command_wake_reader, pty_paused);
                 #[cfg(not(unix))]
-                session_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx);
+                session_actor_loop(runtime, wake, observation, ready_tx, rx, pty_paused);
             }
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
@@ -1043,6 +1102,35 @@ impl SessionActor {
     pub(crate) fn should_keep_session_dir(&self) -> Result<bool, String> {
         self.request_result(|reply| SessionCommand::ShouldKeepSessionDir { reply })
     }
+
+    #[cfg(unix)]
+    pub(crate) fn prepare_transfer(&self) -> Result<crate::session_runtime::TransferSource, String> {
+        self.request_result(|reply| SessionCommand::PrepareTransfer { reply })
+    }
+
+    /// Stop reading the PTY and return the output read since the transfer
+    /// snapshot. Follow with [`Self::commit_transfer`] or [`Self::abort_transfer`].
+    #[cfg(unix)]
+    pub(crate) fn release_transfer(&self) -> Result<Vec<u8>, String> {
+        self.request_result(|reply| SessionCommand::ReleaseTransfer { reply })
+    }
+
+    /// Keep the session here and resume reading the PTY.
+    #[cfg(unix)]
+    pub(crate) fn abort_transfer(&self) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::AbortTransfer { reply })
+    }
+
+    /// Returns the pid this host must keep reaping for the adopter.
+    #[cfg(unix)]
+    pub(crate) fn commit_transfer(&self, epoch: u64, address: String) -> Result<Option<u32>, String> {
+        self.request_result(|reply| SessionCommand::CommitTransfer { epoch, address, reply })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn resume_adopted(&self, tail: Vec<u8>) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::ResumeAdopted { tail, reply })
+    }
 }
 
 /// How long `Drop` waits inline for the worker before handing the join to a
@@ -1093,7 +1181,10 @@ struct SessionActorLoopState {
     observation: ObservationState,
     presentation: PresentationGate,
     exited: bool,
-    exit_code: Option<i32>,
+    exit: Option<ChildExit>,
+    /// The PTY is not read while set: an adoption awaiting its commit, or a
+    /// release awaiting its commit or abort.
+    pty_paused: bool,
     queries_forwarded_to_client: bool,
     raw_output_taps: Vec<SyncSender<RawOutputChunk>>,
     last_raw_output_sequence: u64,
@@ -1102,15 +1193,15 @@ struct SessionActorLoopState {
 fn pump_session_runtime(
     runtime: &mut SessionRuntime,
     exited: &mut bool,
-    exit_code: &mut Option<i32>,
+    exit: &mut Option<ChildExit>,
     queries_forwarded_to_client: bool,
 ) -> Result<PumpResult, String> {
     let mut exited_now = false;
     if !*exited {
-        if let Some(code) = runtime.exit_code_if_exited()? {
-            runtime.record_exit_code(code);
+        if let Some(code) = runtime.child_exit_if_exited()? {
+            runtime.record_exit(code);
             *exited = true;
-            *exit_code = Some(code);
+            *exit = Some(code);
             exited_now = true;
         }
     }
@@ -1170,18 +1261,19 @@ fn sync_terminal_modes_and_wake(runtime: &SessionRuntime, observation: &mut Obse
 fn session_actor_loop(
     mut runtime: SessionRuntime,
     wake: WakeCallback,
-    rows: u16,
-    mirror: Arc<ObservationMirror>,
+    observation: ObservationState,
     ready: mpsc::Sender<Result<ScreenActivityTracker, String>>,
     rx: mpsc::Receiver<SessionCommand>,
     #[cfg(unix)] command_wake: CommandWakeReader,
+    pty_paused: bool,
 ) {
     let mut state = SessionActorLoopState {
         images: Default::default(),
-        observation: ObservationState::new_with_mirror(rows, Some(mirror)),
+        observation,
         presentation: PresentationGate::default(),
         exited: false,
-        exit_code: None,
+        exit: None,
+        pty_paused,
         queries_forwarded_to_client: false,
         raw_output_taps: Vec::new(),
         last_raw_output_sequence: 0,
@@ -1192,7 +1284,7 @@ fn session_actor_loop(
         // forever, so monitoring the PTY here would turn an idle retained
         // terminal into a busy loop. Keep its state available for commands,
         // but do no background work until one arrives.
-        if state.exited {
+        if state.exited || state.pty_paused {
             let Ok(command) = rx.recv() else { break };
             #[cfg(unix)]
             command_wake.drain();
@@ -1516,8 +1608,48 @@ fn session_actor_handle_command(
             );
             let _ = reply.send(result);
         }
+        #[cfg(unix)]
+        SessionCommand::PrepareTransfer { reply } => {
+            let result =
+                if state.exited { Err(format!("session {} has exited", runtime.session_id())) } else { runtime.prepare_transfer() };
+            let _ = reply.send(result);
+        }
+        #[cfg(unix)]
+        SessionCommand::ReleaseTransfer { reply } => {
+            // Drain what is already readable first so the tail ends at a
+            // quiet point, then stop reading until commit or abort.
+            session_actor_pump(runtime, state, wake);
+            let result = if state.exited {
+                runtime.abort_transfer();
+                Err(format!("session {} exited during the transfer", runtime.session_id()))
+            } else {
+                runtime.transfer_tail()
+            };
+            state.pty_paused = result.is_ok();
+            let _ = reply.send(result);
+        }
+        #[cfg(unix)]
+        SessionCommand::AbortTransfer { reply } => {
+            runtime.abort_transfer();
+            state.pty_paused = false;
+            let _ = reply.send(Ok(()));
+        }
+        #[cfg(unix)]
+        SessionCommand::CommitTransfer { epoch, address, reply } => {
+            let _ = reply.send(Ok(runtime.commit_transfer(epoch, &address)));
+        }
+        #[cfg(unix)]
+        SessionCommand::ResumeAdopted { tail, reply } => {
+            let result = runtime.resume_adopted(&tail);
+            if result.is_ok() {
+                state.pty_paused = false;
+                let rows = runtime.inspect(false, 0).terminal.rows;
+                mark_full_and_wake(&mut state.observation, rows, wake);
+            }
+            let _ = reply.send(result);
+        }
         SessionCommand::Stop { terminate } => {
-            if terminate && !state.exited {
+            if terminate && !state.exited && !runtime_released(runtime) {
                 let _ = runtime.dispatch_signal(POSIX_SIGTERM, SignalTarget::Leader);
             }
             stop = true;
@@ -1527,6 +1659,18 @@ fn session_actor_handle_command(
         session_actor_pump(runtime, state, wake);
     }
     stop
+}
+
+fn runtime_released(runtime: &SessionRuntime) -> bool {
+    #[cfg(unix)]
+    {
+        runtime.is_released()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = runtime;
+        false
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -1543,7 +1687,10 @@ fn maybe_panic_actor_for_test(session_id: &str) {
 }
 
 fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoopState, wake: &WakeCallback) {
-    match pump_session_runtime(runtime, &mut state.exited, &mut state.exit_code, state.queries_forwarded_to_client) {
+    if state.pty_paused {
+        return;
+    }
+    match pump_session_runtime(runtime, &mut state.exited, &mut state.exit, state.queries_forwarded_to_client) {
         Ok(result) => {
             // Fires only on pumps that read output, so session creation
             // (whose command handling also pumps) completes first.
@@ -1575,7 +1722,7 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
         }
     }
     if state.exited {
-        if let Some(code) = state.exit_code {
+        if let Some(code) = state.exit {
             state.observation.record_exit(code, wake);
         }
     }

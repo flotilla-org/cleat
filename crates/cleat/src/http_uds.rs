@@ -442,9 +442,10 @@ pub(crate) fn write_session_create_request(writer: &mut impl Write, body: &[u8],
 }
 
 pub(crate) fn write_attach_upgrade_request(writer: &mut impl Write, path: &str, body: &[u8]) -> std::io::Result<()> {
+    let output_context = crate::output_admission::client_header().map_err(std::io::Error::other)?;
     write!(
         writer,
-        "POST {path} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-attach/1\r\nx-cleat-output-context: {output_context}\r\n\r\n",
         body.len()
     )?;
     writer.write_all(body)
@@ -470,6 +471,15 @@ pub(crate) fn read_response(reader: &mut impl Read) -> std::io::Result<HttpRespo
     let mut body = bytes[body_start..].to_vec();
     body.truncate(content_length);
     Ok(HttpResponse { status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?, body })
+}
+
+pub(crate) fn upgrade_error(reader: &mut impl Read, status: StatusCode) -> String {
+    let mut body = Vec::new();
+    let _ = reader.take(65536).read_to_end(&mut body);
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("error").and_then(serde_json::Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| format!("output upgrade rejected: {status}"))
 }
 
 pub(crate) fn read_response_head(reader: &mut impl Read) -> std::io::Result<HttpResponse> {
@@ -499,6 +509,11 @@ pub(crate) fn read_response_head(reader: &mut impl Read) -> std::io::Result<Http
         return Err(Error::new(ErrorKind::UnexpectedEof, "partial HTTP response headers"));
     }
     let code = parsed.code.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing HTTP response status"))?;
+    if code == 101
+        && !parsed.headers.iter().any(|header| header.name.eq_ignore_ascii_case("x-cleat-output-admission") && header.value == b"1")
+    {
+        return Err(Error::new(ErrorKind::InvalidData, "daemon lacks output cycle admission; upgrade/restart the daemon"));
+    }
     Ok(HttpResponse { status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?, body: Vec::new() })
 }
 
@@ -569,7 +584,7 @@ pub(crate) fn write_packet_switching_protocols(writer: &mut impl Write) -> std::
 }
 
 fn write_switching_protocols_for(writer: &mut impl Write, upgrade: &str) -> std::io::Result<()> {
-    write!(writer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\n\r\n")
+    write!(writer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\nx-cleat-output-admission: 1\r\n\r\n")
 }
 
 pub(crate) fn request_has_upgrade_token(request: &HttpRequest, token: &str) -> bool {
@@ -748,6 +763,18 @@ fn mouse_report_format_name(format: vt::MouseReportFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_upgrade_requires_daemon_admission_acknowledgement() {
+        let legacy = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: cleat-attach/1\r\n\r\n";
+        assert!(read_response_head(&mut &legacy[..]).unwrap_err().to_string().contains("upgrade/restart"));
+        let mut current = Vec::new();
+        write_packet_switching_protocols(&mut current).unwrap();
+        current.extend_from_slice(b"unread packet bytes");
+        let mut input = current.as_slice();
+        assert_eq!(read_response_head(&mut input).unwrap().status, StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(input, b"unread packet bytes");
+    }
 
     #[test]
     fn reads_http_request_with_body_split_after_prefix() {

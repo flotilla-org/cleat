@@ -12,7 +12,8 @@ const SESSIONS_DIR: &str = "sessions";
 pub const RUNTIME_DIR_ENV: &str = "CLEAT_RUNTIME_DIR";
 pub const AMBIENT_DAEMON_ENV: &str = "CLEAT_DAEMON";
 pub const AMBIENT_SESSION_ENV: &str = "CLEAT_SESSION";
-pub const AMBIENT_COORDINATE_ENV_NAMES: [&str; 3] = [RUNTIME_DIR_ENV, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV];
+pub const OUTPUT_DAEMON_ENV: &str = "CLEAT_OUTPUT_DAEMON";
+pub const AMBIENT_COORDINATE_ENV_NAMES: [&str; 4] = [RUNTIME_DIR_ENV, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, OUTPUT_DAEMON_ENV];
 pub const DEFAULT_DAEMON_NAME: &str = "default";
 pub const DEFAULT_TERMINAL_COLS: u16 = 80;
 pub const DEFAULT_TERMINAL_ROWS: u16 = 24;
@@ -74,6 +75,7 @@ pub struct RuntimeLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmbientSessionCoordinates {
+    output_daemon: String,
     runtime_root: PathBuf,
     daemon_name: String,
     session_id: String,
@@ -98,15 +100,20 @@ impl AmbientSessionCoordinates {
         &self.daemon_name
     }
 
+    pub fn output_daemon_name(&self) -> &str {
+        &self.output_daemon
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
-    pub fn child_environment(&self) -> [(&'static str, &std::ffi::OsStr); 3] {
+    pub fn child_environment(&self) -> [(&'static str, &std::ffi::OsStr); 4] {
         [
             (RUNTIME_DIR_ENV, self.runtime_root.as_os_str()),
             (AMBIENT_DAEMON_ENV, std::ffi::OsStr::new(&self.daemon_name)),
             (AMBIENT_SESSION_ENV, std::ffi::OsStr::new(&self.session_id)),
+            (OUTPUT_DAEMON_ENV, std::ffi::OsStr::new(&self.output_daemon)),
         ]
     }
 }
@@ -114,7 +121,12 @@ impl AmbientSessionCoordinates {
 pub fn ambient_session_coordinates() -> Result<Option<AmbientSessionCoordinates>, String> {
     let Some(id) = std::env::var(AMBIENT_SESSION_ENV).ok().filter(|id| !id.is_empty()) else { return Ok(None) };
     let daemon = std::env::var(AMBIENT_DAEMON_ENV).unwrap_or_else(|_| DEFAULT_DAEMON_NAME.to_owned());
-    RuntimeLayout::discover()?.with_daemon(daemon)?.session_coordinates(&id).map(Some)
+    let mut coordinates = RuntimeLayout::discover()?.with_daemon(daemon)?.session_coordinates(&id)?;
+    if let Ok(physical) = std::env::var(OUTPUT_DAEMON_ENV) {
+        validate_daemon_name(&physical)?;
+        coordinates.output_daemon = physical;
+    }
+    Ok(Some(coordinates))
 }
 
 impl RuntimeLayout {
@@ -149,7 +161,12 @@ impl RuntimeLayout {
         } else {
             env::current_dir().map_err(|err| format!("resolve relative runtime root {}: {err}", self.root.display()))?.join(&self.root)
         };
-        Ok(AmbientSessionCoordinates { runtime_root, daemon_name: self.logical_name().to_string(), session_id: session_id.to_string() })
+        Ok(AmbientSessionCoordinates {
+            output_daemon: self.resolved()?.daemon_name,
+            runtime_root,
+            daemon_name: self.logical_name().to_string(),
+            session_id: session_id.to_string(),
+        })
     }
 
     /// The logical name remains stable across daemon generations.
@@ -462,11 +479,14 @@ pub(crate) fn ensure_hosting_epoch(dir: &Path) -> Result<(), String> {
 mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
-    use super::{discover_runtime_root, validate_environment, RuntimeLayout, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, RUNTIME_DIR_ENV};
+    use super::{
+        discover_runtime_root, validate_environment, RuntimeLayout, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, OUTPUT_DAEMON_ENV,
+        RUNTIME_DIR_ENV,
+    };
 
     #[test]
     fn session_environment_rejects_reserved_ambient_coordinates() {
-        for name in [RUNTIME_DIR_ENV, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, "cleat_daemon"] {
+        for name in [RUNTIME_DIR_ENV, AMBIENT_DAEMON_ENV, AMBIENT_SESSION_ENV, OUTPUT_DAEMON_ENV, "cleat_daemon", "cleat_output_daemon"] {
             let err = validate_environment(&[(name.to_string(), "spoofed".to_string())]).expect_err("reject reserved environment");
             assert!(err.contains("managed by cleat"), "{err}");
         }
@@ -486,6 +506,7 @@ mod tests {
             (RUNTIME_DIR_ENV, coordinates.runtime_root().display().to_string()),
             (AMBIENT_DAEMON_ENV, "agent-loop".to_string()),
             (AMBIENT_SESSION_ENV, "worker".to_string()),
+            (OUTPUT_DAEMON_ENV, "agent-loop".to_string()),
         ]);
     }
 

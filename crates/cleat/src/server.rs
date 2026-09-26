@@ -783,18 +783,19 @@ impl SessionService {
 
         let socket_path = self.layout.socket_path();
         let mut stream = connect_session_socket(&socket_path)?;
+        let output_context = crate::output_admission::client_header()?;
         let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms })
             .map_err(|err| format!("serialize packet subscription request: {err}"))?;
         write!(
             stream,
-            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",
+            "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {output_context}\r\n\r\n",
             body.len()
         )
         .map_err(|err| format!("write packet upgrade request: {err}"))?;
         stream.write_all(&body).map_err(|err| format!("write packet subscription request: {err}"))?;
         let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read packet upgrade response: {err}"))?;
         if response.status != StatusCode::SWITCHING_PROTOCOLS {
-            return Err(format!("unexpected packet response: {}", response.status));
+            return Err(http_uds::upgrade_error(&mut stream, response.status));
         }
 
         let mut client = crate::packet::PacketClient::new(stream);

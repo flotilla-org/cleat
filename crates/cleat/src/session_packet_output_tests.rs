@@ -27,6 +27,7 @@ fn channel(id: u32, image: Image) -> PacketSessionChannel {
     let mut resident = HashSet::new();
     let transfer = ImageTransfer::new(id, RenderBundle::live(update, vec![image]), &mut resident).unwrap().local_files(false);
     PacketSessionChannel {
+        _output_lease: None,
         session_id: "benchmark".into(),
         role: ChannelRole::Watcher,
         requested_role: ChannelRole::Watcher,
@@ -48,7 +49,16 @@ fn client(id: u64, channels: u32, image: &Image) -> (PacketClient, UnixStream) {
     let (stream, peer) = UnixStream::pair().unwrap();
     stream.set_nonblocking(true).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
-    let mut client = PacketClient::new(id, stream, vec![], None, &DirectorySnapshot { sessions: vec![] }, None).unwrap();
+    let mut client = PacketClient::new(
+        id,
+        stream,
+        vec![],
+        None,
+        &DirectorySnapshot { sessions: vec![] },
+        None,
+        crate::output_admission::OutputContext::External,
+    )
+    .unwrap();
     for id in 1..=channels {
         client.channels.insert(id, channel(id, image.clone()));
     }

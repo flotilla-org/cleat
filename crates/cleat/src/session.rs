@@ -77,6 +77,15 @@ struct PacketForegroundAttach {
     initial_update: TerminalRenderUpdate,
     images: ImageReceiver,
     initial_role: RoleState,
+    identity: AttachmentIdentity,
+}
+
+/// A foreground channel's opening state: granted role, first render, and
+/// the image files acquired while waiting for them.
+struct ForegroundChannel {
+    role: RoleState,
+    update: TerminalRenderUpdate,
+    images: ImageReceiver,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -362,8 +371,13 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let channel = packet.channel;
     let initial_update = packet.initial_update;
     let mut images = packet.images;
+    let identity = packet.identity.clone();
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut read_stream = read_handle;
+        // A transferred session announces its new address before closing the
+        // channel; the relay follows it once.
+        let mut redirect: Option<crate::packet::SessionRedirect> = None;
+        let mut followed = false;
         {
             let mut stdout = std::io::stdout().lock();
             let mut chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
@@ -442,11 +456,43 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     chrome.view = view;
                     chrome.paint(&mut stdout, None)?;
                 }
+                (CHANNEL_CONTROL, crate::packet::MSG_CONTROL_REDIRECT) => {
+                    let moved = frame.decode::<crate::packet::ChannelRedirect>().map_err(|e| e.to_string())?;
+                    if moved.channel == channel {
+                        redirect = Some(moved.redirect);
+                    }
+                }
                 (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
                     let error = frame.decode::<ControlError>().map_err(|e| e.to_string())?;
                     if error.channel == channel {
-                        alive_out.store(false, Ordering::SeqCst);
-                        return Ok(());
+                        let Some(moved) = redirect.take().filter(|_| !followed) else {
+                            alive_out.store(false, Ordering::SeqCst);
+                            return Ok(());
+                        };
+                        let role = if controller_out.load(Ordering::SeqCst) { ChannelRole::Controller } else { ChannelRole::Watcher };
+                        let (stream, opened) = match follow_foreground_redirect(&moved, identity.clone(), role) {
+                            Ok(followed) => followed,
+                            Err(err) => {
+                                alive_out.store(false, Ordering::SeqCst);
+                                return Err(err);
+                            }
+                        };
+                        read_stream = stream.try_clone().map_err(|e| e.to_string())?;
+                        *write_stream.lock().map_err(|_| "packet stream poisoned")? = stream;
+                        followed = true;
+                        images = opened.images;
+                        controller_out.store(opened.role.role == ChannelRole::Controller, Ordering::SeqCst);
+                        let mut chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
+                        chrome.role = opened.role;
+                        chrome.hint = Some((format!("cleat: session moved to {}", moved.address), Instant::now() + Duration::from_secs(5)));
+                        chrome.renderer.needs_full_repaint = true;
+                        chrome.renderer.images.set_assets(images.commit(&opened.update.image_resources)?);
+                        chrome.paint(&mut stdout, Some(&opened.update))?;
+                        drop(chrome);
+                        write_packet_frame(
+                            &write_stream,
+                            PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: opened.update.render_generation }),
+                        )?;
                     }
                 }
                 _ => {}
@@ -1248,11 +1294,43 @@ pub fn attach_packet_foreground(
     strict: bool,
     take: bool,
 ) -> Result<ForegroundAttach, String> {
-    const FOREGROUND_CHANNEL: u32 = 1;
     let (mut stream, directory) = crate::provider_daemon::connect_packet_stream(layout, &[])?;
     if !directory.sessions.iter().any(|entry| entry.session_id == id) {
         return Err(format!("session {id} was not present in packet directory"));
     }
+    let opened = open_foreground_channel(&mut stream, id, identity.clone(), role, take)?;
+    if strict && opened.role.role != ChannelRole::Controller {
+        let holder = opened
+            .role
+            .controller
+            .as_ref()
+            .map(|identity| format!("{} ({})", identity.name, identity.kind.as_str()))
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(format!("session {id} controller seat is held by {holder}"));
+    }
+    Ok(ForegroundAttach {
+        transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
+            session_name: id.to_owned(),
+            stream: Arc::new(Mutex::new(stream)),
+            channel: FOREGROUND_CHANNEL,
+            initial_update: opened.update,
+            initial_role: opened.role,
+            images: opened.images,
+            identity,
+        })),
+    })
+}
+
+const FOREGROUND_CHANNEL: u32 = 1;
+
+/// Open the foreground channel and wait for its role grant and first render.
+fn open_foreground_channel(
+    stream: &mut SessionStream,
+    id: &str,
+    identity: AttachmentIdentity,
+    role: ChannelRole,
+    take: bool,
+) -> Result<ForegroundChannel, String> {
     let (cols, rows) = current_terminal_size();
     PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
         channel: FOREGROUND_CHANNEL,
@@ -1262,18 +1340,18 @@ pub fn attach_packet_foreground(
         identity,
     })
     .map_err(|err| format!("encode foreground packet channel: {err}"))?
-    .write(&mut stream)
+    .write(stream)
     .map_err(|err| format!("open foreground packet channel: {err}"))?;
     PacketFrame::new(FOREGROUND_CHANNEL, MSG_SESSION_RESIZE, &Resize { cols, rows })
         .map_err(|err| format!("encode foreground packet resize: {err}"))?
-        .write(&mut stream)
+        .write(stream)
         .map_err(|err| format!("resize foreground packet channel: {err}"))?;
 
     let mut images = ImageReceiver::default();
     let mut initial_role = None;
     let mut initial_update = None;
     while initial_role.is_none() || initial_update.is_none() {
-        let frame = PacketFrame::read(&mut stream).map_err(|err| format!("read foreground packet handshake: {err}"))?;
+        let frame = PacketFrame::read(stream).map_err(|err| format!("read foreground packet handshake: {err}"))?;
         match (frame.channel, frame.msg_type) {
             (FOREGROUND_CHANNEL, MSG_SESSION_ROLE) => {
                 initial_role = Some(frame.decode::<RoleState>().map_err(|err| format!("decode foreground role: {err}"))?);
@@ -1287,7 +1365,7 @@ pub fn attach_packet_foreground(
                     acquired,
                 })
                 .map_err(|e| e.to_string())?
-                .write(&mut stream)
+                .write(stream)
                 .map_err(|e| e.to_string())?;
             }
             (FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE) => {
@@ -1305,25 +1383,24 @@ pub fn attach_packet_foreground(
             _ => {}
         }
     }
-    let initial_role = initial_role.expect("role checked above");
-    if strict && initial_role.role != ChannelRole::Controller {
-        let holder = initial_role
-            .controller
-            .as_ref()
-            .map(|identity| format!("{} ({})", identity.name, identity.kind.as_str()))
-            .unwrap_or_else(|| "unknown".to_string());
-        return Err(format!("session {id} controller seat is held by {holder}"));
+    Ok(ForegroundChannel { role: initial_role.expect("role checked above"), update: initial_update.expect("render checked above"), images })
+}
+
+/// Reopen a foreground channel at the daemon a transferred session moved to,
+/// asking for the role the channel held.
+fn follow_foreground_redirect(
+    redirect: &crate::packet::SessionRedirect,
+    identity: AttachmentIdentity,
+    role: ChannelRole,
+) -> Result<(SessionStream, ForegroundChannel), String> {
+    if let Some(reason) = redirect.incompatibility(crate::packet::PROTOCOL_VERSION) {
+        return Err(reason);
     }
-    Ok(ForegroundAttach {
-        transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
-            session_name: id.to_owned(),
-            stream: Arc::new(Mutex::new(stream)),
-            channel: FOREGROUND_CHANNEL,
-            initial_update: initial_update.expect("render checked above"),
-            initial_role,
-            images,
-        })),
-    })
+    let layout = RuntimeLayout::new(PathBuf::from(&redirect.runtime_root)).with_daemon(redirect.daemon.clone())?;
+    let (mut stream, _) = crate::provider_daemon::connect_packet_stream(&layout, &[])
+        .map_err(|err| format!("session {} moved to {}, but reconnecting failed: {err}", redirect.session_id, redirect.address))?;
+    let opened = open_foreground_channel(&mut stream, &redirect.session_id, identity, role, false)?;
+    Ok((stream, opened))
 }
 
 pub fn watch_foreground(layout: &RuntimeLayout, id: &str, identity: AttachmentIdentity) -> Result<ForegroundAttach, String> {

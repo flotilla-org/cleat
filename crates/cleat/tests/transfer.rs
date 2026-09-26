@@ -513,3 +513,55 @@ fn the_compatibility_gate_refuses_then_drops_incompatible_clients() {
     let reason = redirect.incompatibility(cleat::packet::PROTOCOL_VERSION).expect("the client cannot follow");
     assert!(reason.contains("speaking protocol 99"), "{reason}");
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn cleat_attach_and_watch_follow_the_move_with_a_notice() {
+    use std::io::Write;
+    let root = Root::new();
+    root.launch_shell("followed");
+    let spawn = |verb: &str, output: &std::fs::File| {
+        root.command(&[verb, "followed"], &[])
+            .stdin(std::process::Stdio::piped())
+            .stdout(output.try_clone().unwrap())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let attach_output = tempfile::NamedTempFile::new().unwrap();
+    let watch_output = tempfile::NamedTempFile::new().unwrap();
+    let mut attach = spawn("attach", attach_output.as_file());
+    let mut watch = spawn("watch", watch_output.as_file());
+    let rendered = |file: &tempfile::NamedTempFile| std::fs::metadata(file.path()).unwrap().len() > 0;
+    wait_until("the initial renders", Duration::from_secs(10), || rendered(&attach_output) && rendered(&watch_output));
+
+    root.transfer("followed", "other", &[], &[]).unwrap();
+    let noticed = |file: &tempfile::NamedTempFile| {
+        String::from_utf8_lossy(&std::fs::read(file.path()).unwrap()).contains("session moved to daemon:other@1")
+    };
+    wait_until("the move notices", Duration::from_secs(10), || noticed(&attach_output) && noticed(&watch_output));
+
+    // The attachment kept its controller role on the new host.
+    let mut stdin = attach.stdin.take().unwrap();
+    stdin.write_all(b"echo typed-$((6*7))\r").unwrap();
+    wait_for_output(&root.cast("other@1", "followed"), "typed-42");
+    let roles: Vec<_> =
+        root.inspect(&["--server", "other", "inspect", "followed"]).attachments.into_iter().map(|attachment| attachment.role).collect();
+    assert!(roles.contains(&"controller".to_string()) && roles.contains(&"watcher".to_string()), "{roles:?}");
+    assert!(attach.try_wait().unwrap().is_none() && watch.try_wait().unwrap().is_none(), "both clients stay attached");
+
+    // A followed channel still closes cleanly when the session ends.
+    root.ok(&["send", "followed", "exit"]);
+    drop(stdin);
+    for child in [&mut attach, &mut watch] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "client did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "{status:?}");
+    }
+}

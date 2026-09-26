@@ -42,13 +42,19 @@ impl SessionIdentity {
 }
 
 /// `external` is an explicit assertion by an upgraded local client, never the
-/// default for omitted metadata. Forwarding across hosts is not supported.
+/// default for omitted metadata. Remote relationships are admitted untracked.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum OutputContext {
     External,
     Remote,
     Session { source: SessionIdentity },
+}
+
+impl OutputContext {
+    pub(crate) fn warning(&self) -> Option<&'static str> {
+        matches!(self, Self::Remote).then_some("cycle protection does not cover remote relationships")
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -95,7 +101,8 @@ pub(crate) fn verify(
     }
     let context = match declaration.context {
         OutputContext::Session { source } => OutputContext::Session { source: source.canonical()? },
-        OutputContext::Remote => return Err("remote output relationships are unsupported by local cycle admission".into()),
+        // Remote sinks are outside local peer corroboration and graph tracking.
+        OutputContext::Remote => return Ok(OutputContext::Remote),
         external => external,
     };
     verify_peer(&context, stream)?;
@@ -287,6 +294,14 @@ fn closes_cycle(edges: &[Edge], new: &Edge) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_admission_creates_no_graph_lease_or_local_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = RuntimeLayout::new(root.path().join("absent"));
+        assert!(admit(&OutputContext::Remote, &layout, "missing").unwrap().is_none());
+        assert!(!layout.root().exists());
+    }
 
     fn identity(daemon: &str, session: &str) -> SessionIdentity {
         SessionIdentity { runtime_root: PathBuf::from("/runtime"), daemon: daemon.into(), session: session.into() }

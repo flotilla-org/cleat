@@ -3088,7 +3088,8 @@ fn handle_http_request(
                 client.enqueue_control(MSG_CONTROL_ACTIVITY_SNAPSHOT, &activity)?;
             }
             *response_committed = true;
-            http_uds::write_packet_switching_protocols(stream).map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
+            http_uds::write_packet_switching_protocols(stream, &client.output_context)
+                .map_err(|err| format!("write HTTP packet upgrade response: {err}"))?;
             maybe_fail_after_http_upgrade("packet")?;
             *state.next_packet_client_id += 1;
             state.packet_clients.push(client);
@@ -3182,7 +3183,8 @@ fn handle_http_request(
             }
             drain_raw_output_tap_before_client_install(state.layout, &id, hosted, &mut client, replay, replay_mode)?;
             *response_committed = true;
-            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
+            http_uds::write_switching_protocols(stream, output_context.as_ref().expect("validated output context"))
+                .map_err(|err| format!("write HTTP attach upgrade response: {err}"))?;
             maybe_fail_after_http_upgrade("attach")?;
             #[cfg(unix)]
             set_stream_nonblocking(&client.stream, true).map_err(|err| format!("set HTTP attach stream nonblocking: {err}"))?;
@@ -3238,7 +3240,8 @@ fn handle_http_request(
             }))?;
             drain_raw_output_tap_before_client_install(state.layout, &id, hosted, &mut watcher, replay, ReplayMode::FreshTerminal)?;
             *response_committed = true;
-            http_uds::write_switching_protocols(stream).map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
+            http_uds::write_switching_protocols(stream, output_context.as_ref().expect("validated output context"))
+                .map_err(|err| format!("write HTTP watch upgrade response: {err}"))?;
             maybe_fail_after_http_upgrade("watch")?;
             #[cfg(unix)]
             set_stream_nonblocking(&watcher.stream, true).map_err(|err| format!("set HTTP watch stream nonblocking: {err}"))?;

@@ -4,8 +4,9 @@ Every live output subscription is admitted by the daemon before replay,
 render capture, role changes, or geometry changes. This covers byte-stream
 attach/watch, packet controller/watcher channels, the daemon provider/FFI,
 the packet-debug CLI, and screen-activity subscriptions. Activity subscriptions
-hold a lease for each selected session; a membership change that would close
-a cycle stops that subscription with a control error before emitting activity
+with a local session source hold a lease for each selected session; a membership
+change that would close a cycle stops that subscription with a control error
+before emitting activity
 events. Directory metadata alone is not a terminal-output subscription.
 A channel rejected for a cycle does not exist, so
 subsequent input/resize frames on that channel cannot affect the session.
@@ -19,6 +20,7 @@ header `x-cleat-output-context` containing one of:
 
 ```json
 {"version":1,"context":{"kind":"external"}}
+{"version":1,"context":{"kind":"remote"}}
 {"version":1,"context":{"kind":"session","source":{"runtime_root":"/absolute/root","daemon":"default@1","session":"shell"}}}
 ```
 
@@ -52,8 +54,8 @@ live generations remain distinct, including while the logical alias changes.
 Legacy directories use a pinned `name@legacy` address so publishing a drain
 sidecar alias cannot reinterpret the old source as its successor.
 
-On Linux the daemon obtains the socket peer PID from `SO_PEERCRED` and reads
-its initial environment through `/proc/<pid>/environ`. If that environment
+For local declarations on Linux the daemon obtains the socket peer PID from
+`SO_PEERCRED` and reads its initial environment through `/proc/<pid>/environ`. If that environment
 identifies a containing session, the declaration must match it; claiming
 `external` or another source fails. Failure to read the peer environment also
 fails closed. On macOS and Windows source declarations are a protocol contract
@@ -92,12 +94,16 @@ that local filesystem/lock namespace. Do not remove the coordinator directory
 while daemons are running. Containers, different users, network filesystems,
 and cross-host relationships are outside the shared graph.
 
-Remote output forwarding is unsupported: `{"version":1,"context":{"kind":"remote"}}`
-is rejected. The supplied clients send that declaration when `SSH_CONNECTION`
-or `SSH_CLIENT` is present, so SSH attach/watch and packet subscriptions fail
-explicitly rather than assert safety across hosts. Custom remote transports
-must also declare `remote`; they must not label a forwarded stream `external`.
-A future distributed admission protocol is needed to support remote nesting.
+Remote output forwarding is admitted untracked: `{"version":1,"context":{"kind":"remote"}}`
+is accepted without local peer corroboration or any graph edge. The supplied
+clients send that declaration when `SSH_CONNECTION` or `SSH_CLIENT` is present,
+so SSH attach/watch and packet subscriptions remain available. The HTTP 101
+acknowledgement includes `x-cleat-output-admission: 1` and the warning field
+`x-cleat-output-warning: cycle protection does not cover remote relationships`.
+Admission acknowledges the declared scope; it does not assert cross-host safety.
+Custom remote transports must also declare `remote`; they must not label a
+forwarded stream `external`. A future distributed admission protocol is needed
+to extend cycle protection to remote relationships.
 
 Finite capture/transcript/replay operations are snapshots or bounded recording
 slices, not live subscriptions, and do not retain graph edges. Arbitrary shell

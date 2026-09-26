@@ -97,13 +97,28 @@ fn rejected(session: &Session, action: &str, context: Option<&str>, status: u16,
 }
 
 #[test]
+fn output_admission_accepts_remote_subscriptions_with_warning() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let session = Session::new("default");
+    for action in ["attach", "watch", "connect", "activity"] {
+        let (_stream, head) = session.connect(action, Some(r#"{"version":1,"context":{"kind":"remote"}}"#));
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(head.contains("x-cleat-output-admission: 1\r\n"), "{head}");
+        assert!(head.contains("x-cleat-output-warning: cycle protection does not cover remote relationships\r\n"), "{head}");
+    }
+    let (_stream, head) = session.connect("watch", Some(r#"{"version":1,"context":{"kind":"external"}}"#));
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(!head.contains("x-cleat-output-warning"), "{head}");
+}
+
+#[test]
 fn output_admission_rejects_old_clients_and_one_row_self_feedback_before_side_effects() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let session = Session::new("default");
     for action in ["attach", "watch", "connect"] {
         rejected(&session, action, None, 426, "upgrade");
         rejected(&session, action, Some(r#"{"version":99,"context":{"kind":"external"}}"#), 426, "version");
-        rejected(&session, action, Some(r#"{"version":1,"context":{"kind":"remote"}}"#), 426, "remote");
+        rejected(&session, action, Some(r#"{"version":1,"context":{"kind":"unknown"}}"#), 426, "invalid");
     }
     for action in ["attach", "watch"] {
         rejected(&session, action, Some(&session.context()), 409, "cycle");
@@ -209,11 +224,12 @@ fn output_admission_cleans_up_killed_clients_and_verifies_linux_peer_coordinates
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let a = Session::new("one");
     let b = Session::new("two");
-    for lie in [false, true] {
+    for kind in ["session", "external", "remote"] {
+        let lie = kind == "external";
         if lie && !cfg!(target_os = "linux") {
             continue;
         }
-        let ready = a._root.path().join(if lie { "lie-ready" } else { "client-ready" });
+        let ready = a._root.path().join(format!("{kind}-ready"));
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "output_admission_client_process"])
             .env("CLEAT_RUNTIME_DIR", a.layout.root())
@@ -221,7 +237,10 @@ fn output_admission_cleans_up_killed_clients_and_verifies_linux_peer_coordinates
             .env("CLEAT_SESSION", "same")
             .env("CLEAT_OUTPUT_DAEMON", a.layout.resolved().unwrap().daemon_name())
             .env("CLEAT_TEST_OUTPUT_SOCKET", b.layout.socket_path())
-            .env("CLEAT_TEST_OUTPUT_CONTEXT", if lie { r#"{"version":1,"context":{"kind":"external"}}"#.to_owned() } else { a.context() })
+            .env(
+                "CLEAT_TEST_OUTPUT_CONTEXT",
+                if kind == "session" { a.context() } else { format!(r#"{{"version":1,"context":{{"kind":"{kind}"}}}}"#) },
+            )
             .env("CLEAT_TEST_OUTPUT_READY", &ready)
             .spawn()
             .unwrap();
@@ -234,6 +253,9 @@ fn output_admission_cleans_up_killed_clients_and_verifies_linux_peer_coordinates
         child.wait().unwrap();
         let response = response.unwrap();
         assert!(response.starts_with(if lie { "HTTP/1.1 426" } else { "HTTP/1.1 101" }), "{response}");
+        if kind == "remote" {
+            assert!(response.contains("x-cleat-output-warning:"), "{response}");
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {

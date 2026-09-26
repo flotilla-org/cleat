@@ -14,6 +14,17 @@ This repository is being split out from the Flotilla monorepo. The first standal
 
 A future Rust VT engine may be added later. Until then, treat Ghostty as the only supported functional engine.
 
+## Attachment cycle safety
+
+Daemons reject direct and indirect output cycles across local daemons, including
+read-only watchers and packet channels. Acyclic nesting remains available with a
+visible containing-session indicator. This requires upgraded clients **and**
+daemons; restart old clients, daemons, and containing sessions before claiming
+protection. Older clients receive an upgrade-required error. SSH/remote output
+subscriptions are admitted untracked, with an acknowledgement warning that cycle
+protection does not cover remote relationships. No graph edge is recorded for
+them. See [output admission and rollout](docs/output-cycle-admission.md).
+
 ## Development
 
 Development builds use Ghostty by default. The explicit `--no-default-features` build is available for work on the Rust-only placeholder path.
@@ -93,6 +104,7 @@ Every daemon exports its coordinates into each session child, following the same
 - `$CLEAT_RUNTIME_DIR` — the daemon's state root, including private roots
 - `$CLEAT_DAEMON` — the daemon name used for ambient command targeting
 - `$CLEAT_SESSION` — the current session ID
+- `$CLEAT_OUTPUT_DAEMON` — the physical daemon generation used for output-cycle admission
 
 This makes bare commands inside a session use that session's daemon and state root. `cleat daemons` discovers daemon directories at the ambient root and the well-known XDG/platform roots. Discovery is intentionally best-effort, not exhaustive: private roots that are not ambient can remain undiscoverable, and each daemon's own Directory remains authoritative for its sessions. Use `cleat daemons --json` for structured `{name, runtime_root, generation, alive, drain_state, build}` entries. `generation` is null for legacy hosts, and `drain_state` is `serving` or `draining`. Build identity is retained for dead generations.
 

@@ -6,7 +6,7 @@ use crate::{
     http_uds,
     keys::encode_send_keys,
     protocol::{AttachmentIdentity, AttachmentKind, WaitCondition, WaitStatus},
-    runtime::{validate_runtime_name, TerminalSize, AMBIENT_DAEMON_ENV, DEFAULT_DAEMON_NAME},
+    runtime::{validate_runtime_name, RuntimeLayout, TerminalSize, AMBIENT_DAEMON_ENV, DEFAULT_DAEMON_NAME},
     server::{AttachOptions, DaemonInstance, EndBound, FallbackReason, SessionService, StartBound},
     vt::VtEngineKind,
 };
@@ -582,8 +582,10 @@ fn check_foreground_nesting(
     };
     let source = format!("{} / {}", ambient.daemon_name(), ambient.session_id());
     if id == Some(ambient.session_id())
-        && daemon.split('@').next() == Some(ambient.daemon_name())
-        && absolute(root)? == absolute(ambient.runtime_root())?
+        && absolute(&RuntimeLayout::new(absolute(root)?).with_daemon(daemon.to_owned())?.daemon_dir())?
+            == absolute(
+                &RuntimeLayout::new(absolute(ambient.runtime_root())?).with_daemon(ambient.output_daemon_name().to_owned())?.daemon_dir(),
+            )?
     {
         return Err(format!("cannot attach to {source} from inside itself: this would create an output loop. Detach with Ctrl-] then d, or use a fresh terminal tab."));
     }
@@ -1622,7 +1624,7 @@ mod nesting_tests {
         let source = RuntimeLayout::new(root.clone()).with_daemon("work".into()).unwrap().session_coordinates("alpha").unwrap();
         let check = |root: &std::path::Path, daemon, id| check_foreground_nesting(root, daemon, id, Some(&source));
         assert!(check(&root, "work", Some("alpha")).unwrap_err().contains("output loop"));
-        assert!(check(&root, "work@2", Some("alpha")).unwrap_err().contains("output loop"));
+        assert!(check(&root, "work@2", Some("alpha")).is_ok(), "another physical daemon is not self-attachment");
         assert!(check(&root, "work@2", Some("beta")).is_ok());
         assert!(check(&root, "work", Some("beta")).is_ok());
         assert!(check(&root, "other", Some("alpha")).is_ok());

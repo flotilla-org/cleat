@@ -667,17 +667,19 @@ impl Drop for DaemonConnection {
 pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]) -> Result<(SessionStream, DirectorySnapshot), String> {
     let socket_path = layout.socket_path();
     let mut stream = try_connect_session_stream(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+    let output_context = crate::output_admission::client_header()?;
     let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms: None })
         .map_err(|err| format!("serialize packet subscribe request: {err}"))?;
     let head = format!(
-        "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\n\r\n",
+        "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {output_context}\r\n\r\n",
         body.len()
     );
     stream.write_all(&[head.as_bytes(), &body].concat()).map_err(|err| format!("write packet upgrade request: {err}"))?;
     let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read packet upgrade response: {err}"))?;
     if response.status != StatusCode::SWITCHING_PROTOCOLS {
-        return Err(format!("unexpected packet response: {}", response.status));
+        return Err(http_uds::upgrade_error(&mut stream, response.status));
     }
+    let _ = response.write_output_warning(&mut std::io::stderr());
 
     let hello = PacketFrame::read(&mut stream).map_err(|err| format!("read packet hello: {err}"))?;
     if hello.channel != CHANNEL_CONTROL || hello.msg_type != MSG_CONTROL_HELLO {
@@ -764,7 +766,7 @@ mod tests {
                 assert!(n > 0);
                 buffer.extend_from_slice(&chunk[..n]);
             }
-            stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n").expect("write 101");
+            stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nx-cleat-output-admission: 1\r\n\r\n").expect("write 101");
             PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_HELLO, &ControlHello::current())
                 .expect("hello frame")
                 .write(&mut stream)

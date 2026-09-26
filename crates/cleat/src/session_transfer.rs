@@ -29,11 +29,9 @@ use crate::{
     protocol::TransferResult,
     runtime::{RuntimeLayout, SessionMetadata},
     session_runtime::{AdoptedSession, SessionRuntime},
-    transfer::{self, AdoptionOffer, HandshakeFailure, SourceDecision, SourceEvent, TargetProtocol},
+    transfer::{self, AdoptionOffer, CommitOutcome, HandshakeFailure, SourceDecision, SourceEvent, TargetProtocol},
     transfer_manifest::{FdManifestEntry, FdRole, FdTransferManifest, MANIFEST_VERSION, MIN_SUPPORTED_VERSION},
 };
-
-type CommitOutcome = (String, Result<Option<Vec<u8>>, String>);
 
 /// Daemon-wide Transfer state, owned by the servicing loop.
 pub(super) struct TransferHub {
@@ -193,23 +191,13 @@ impl TransferHub {
                 }
             }
         }
-        loop {
-            match self.offers_rx.try_recv() {
-                Ok(offer) => {
-                    did_work = true;
-                    self.consider_offer(layout, sessions, offer);
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(offer) = self.offers_rx.try_recv() {
+            did_work = true;
+            self.consider_offer(layout, sessions, offer);
         }
-        loop {
-            match self.commits_rx.try_recv() {
-                Ok((id, outcome)) => {
-                    did_work = true;
-                    self.finish_adoption(layout, sessions, packet_clients, &id, outcome)?;
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok((id, outcome)) = self.commits_rx.try_recv() {
+            did_work = true;
+            self.finish_adoption(layout, sessions, packet_clients, &id, outcome)?;
         }
         self.forwarders.retain_mut(StatusForwarder::poll);
         let now = Instant::now();

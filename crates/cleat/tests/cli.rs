@@ -571,6 +571,7 @@ fn send_keys_execute_reports_missing_session() {
     let cli = Cli {
         runtime_root: None,
         server: Some(cleat::runtime::DEFAULT_DAEMON_NAME.to_string()),
+        hosting_epoch: None,
         command: Command::SendKeys {
             id: "demo".into(),
             literal: false,

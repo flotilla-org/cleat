@@ -288,8 +288,12 @@ pub(crate) fn run_adoption_receiver(mut stream: UnixStream, offers: Sender<Adopt
     }
 }
 
+/// A session id and its source's commit: the output tail, `None` for ABORT,
+/// or why neither arrived.
+pub(crate) type CommitOutcome = (String, Result<Option<Vec<u8>>, String>);
+
 /// Waits for the source's COMMIT or ABORT after READY, on a worker.
-pub(crate) fn run_commit_receiver(mut stream: UnixStream, session_id: String, outcomes: Sender<(String, Result<Option<Vec<u8>>, String>)>) {
+pub(crate) fn run_commit_receiver(mut stream: UnixStream, session_id: String, outcomes: Sender<CommitOutcome>) {
     let _ = stream.set_read_timeout(Some(COMMIT_WAIT));
     let outcome = read_commit(&mut stream);
     let _ = outcomes.send((session_id, outcome));

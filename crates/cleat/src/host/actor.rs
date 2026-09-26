@@ -292,6 +292,7 @@ impl ObservationMirror {
     }
 
     /// The exit code, when the child exited with a known status.
+    #[cfg(test)]
     pub(crate) fn exit_code(&self) -> Option<i32> {
         match self.exit_code.load(AtomicOrdering::SeqCst) {
             EXIT_CODE_UNSET | EXIT_CODE_UNKNOWN => None,
@@ -877,10 +878,11 @@ impl SessionActor {
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = thread::spawn(move || match build_runtime() {
             Ok(runtime) => {
+                let observation = ObservationState::new_with_mirror(rows, Some(actor_observation));
                 #[cfg(unix)]
-                session_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx, command_wake_reader, pty_paused);
+                session_actor_loop(runtime, wake, observation, ready_tx, rx, command_wake_reader, pty_paused);
                 #[cfg(not(unix))]
-                session_actor_loop(runtime, wake, rows, actor_observation, ready_tx, rx, pty_paused);
+                session_actor_loop(runtime, wake, observation, ready_tx, rx, pty_paused);
             }
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
@@ -1250,8 +1252,7 @@ fn sync_terminal_modes_and_wake(runtime: &SessionRuntime, observation: &mut Obse
 fn session_actor_loop(
     mut runtime: SessionRuntime,
     wake: WakeCallback,
-    rows: u16,
-    mirror: Arc<ObservationMirror>,
+    observation: ObservationState,
     ready: mpsc::Sender<Result<ScreenActivityTracker, String>>,
     rx: mpsc::Receiver<SessionCommand>,
     #[cfg(unix)] command_wake: CommandWakeReader,
@@ -1259,7 +1260,7 @@ fn session_actor_loop(
 ) {
     let mut state = SessionActorLoopState {
         images: Default::default(),
-        observation: ObservationState::new_with_mirror(rows, Some(mirror)),
+        observation,
         presentation: PresentationGate::default(),
         exited: false,
         exit: None,

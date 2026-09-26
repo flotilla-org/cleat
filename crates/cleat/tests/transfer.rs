@@ -13,11 +13,15 @@ use cleat::{
     asciicast::EventCode,
     cast_reader::read_all_events_since,
     protocol::{InspectResult, TransferResult},
+    runtime::RuntimeLayout,
+    server::SessionService,
+    vt::VtEngineKind,
 };
 
 struct Root {
     temp: tempfile::TempDir,
     env: Vec<(String, String)>,
+    daemons: std::sync::Mutex<Vec<std::process::Child>>,
 }
 
 impl Root {
@@ -28,7 +32,7 @@ impl Root {
         if !cfg!(feature = "ghostty-vt") {
             env.push(("CLEAT_TEST_VT_ENGINE".to_string(), "replay-probe".to_string()));
         }
-        Self { temp: tempfile::tempdir().unwrap(), env }
+        Self { temp: tempfile::tempdir().unwrap(), env, daemons: Default::default() }
     }
 
     fn path(&self) -> &Path {
@@ -67,12 +71,34 @@ impl Root {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
-    fn launch_shell(&self, id: &str) {
-        let mut args = vec!["launch", id, "--cmd", "sh"];
-        if !cfg!(feature = "ghostty-vt") {
-            args.extend(["--vt", "passthrough"]);
+    /// Start the source daemon (`default`) with extra environment, once.
+    fn start_source(&self, extra_env: &[(&str, &str)]) {
+        let socket = self.path().join("default@1").join("socket");
+        if socket.exists() {
+            return;
         }
-        self.ok(&args);
+        let daemon = self
+            .command(&["--server", "default", "serve"], extra_env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        self.daemons.lock().unwrap().push(daemon);
+        wait_until("the source daemon's socket", Duration::from_secs(15), || std::os::unix::net::UnixStream::connect(&socket).is_ok());
+    }
+
+    /// Launch a recorded shell on the source daemon. The library path works on
+    /// no-VT builds too, where the CLI refuses to launch.
+    fn launch_shell_with(&self, id: &str, extra_env: &[(&str, &str)]) {
+        self.start_source(extra_env);
+        let engine = if cfg!(feature = "ghostty-vt") { VtEngineKind::Ghostty } else { VtEngineKind::Passthrough };
+        let service = SessionService::new(RuntimeLayout::new(self.path().to_path_buf()));
+        service.create(Some(id.into()), Some(engine), None, Some("sh".into()), true).unwrap();
+    }
+
+    fn launch_shell(&self, id: &str) {
+        self.launch_shell_with(id, &[]);
     }
 
     fn inspect(&self, args: &[&str]) -> InspectResult {
@@ -104,13 +130,21 @@ impl Root {
         self.ok(&["--server", daemon, "list"])
     }
 
-    fn daemon_pid(&self, daemon: &str) -> i32 {
-        std::fs::read_to_string(self.path().join(daemon).join("daemon.pid")).unwrap().trim().parse().unwrap()
+    /// SIGKILL the source daemon and reap it.
+    fn kill_source(&self) {
+        let mut daemons = self.daemons.lock().unwrap();
+        let mut daemon = daemons.remove(0);
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
     }
 }
 
 impl Drop for Root {
     fn drop(&mut self) {
+        for mut daemon in self.daemons.lock().unwrap().drain(..) {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
         // Stop every daemon this test started; sessions die with them.
         let Ok(entries) = std::fs::read_dir(self.path()) else { return };
         for entry in entries.flatten() {
@@ -201,8 +235,7 @@ impl Watcher {
     const CHANNEL: u32 = 1;
 
     fn attach(root: &Root, id: &str) -> Self {
-        let service =
-            cleat::server::SessionService::new(cleat::runtime::RuntimeLayout::new(root.path().to_path_buf())).for_session(id).unwrap();
+        let service = SessionService::new(RuntimeLayout::new(root.path().to_path_buf())).for_session(id).unwrap();
         let (mut client, _) = service.connect_packets(id).unwrap();
         client.get_ref().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         client.open_channel(Self::CHANNEL, id, cleat::packet::ChannelRole::Watcher).unwrap();
@@ -258,19 +291,11 @@ fn assert_left_in_place(root: &Root, id: &str, before: &InspectResult, probe: &s
     wait_for_output(&cast, &format!("{probe}-2"));
 }
 
-fn launch_with(root: &Root, id: &str, env: &[(&str, &str)]) {
-    let mut launch = vec!["launch", id, "--cmd", "sh"];
-    if !cfg!(feature = "ghostty-vt") {
-        launch.extend(["--vt", "passthrough"]);
-    }
-    root.ok_with(&launch, env);
-}
-
 #[test]
 fn a_manifest_version_nack_leaves_the_session_and_its_clients_undisturbed() {
     let root = Root::new();
     // The source daemon sends a manifest version outside the target's window.
-    launch_with(&root, "kept", &[("CLEAT_TEST_TRANSFER_MANIFEST_VERSION", "99")]);
+    root.launch_shell_with("kept", &[("CLEAT_TEST_TRANSFER_MANIFEST_VERSION", "99")]);
     let before = root.inspect(&["inspect", "kept"]);
     let mut watcher = Watcher::attach(&root, "kept");
 
@@ -284,7 +309,7 @@ fn a_manifest_version_nack_leaves_the_session_and_its_clients_undisturbed() {
 #[test]
 fn an_adoption_nack_leaves_the_session_and_its_clients_undisturbed() {
     let root = Root::new();
-    launch_with(&root, "kept", &[]);
+    root.launch_shell("kept");
     let before = root.inspect(&["inspect", "kept"]);
     let mut watcher = Watcher::attach(&root, "kept");
 
@@ -460,12 +485,7 @@ fn child_exit_after_the_source_died_records_status_unknown() {
     let root = Root::new();
     root.launch_shell("orphaned");
     root.transfer("orphaned", "other", &[], &[]).unwrap();
-    let source = root.daemon_pid("default@1");
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(source), nix::sys::signal::Signal::SIGKILL).unwrap();
-    wait_until("the source daemon to die", Duration::from_secs(5), || {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(source), None).is_err()
-            || std::fs::read_to_string(format!("/proc/{source}/stat")).is_ok_and(|stat| stat.contains(") Z "))
-    });
+    root.kill_source();
     root.ok(&["send", "orphaned", "exit 7"]);
     let exit = wait_for_exit(&root.cast("other@1", "orphaned"));
     assert_eq!(exit.code, EventCode::Marker);

@@ -113,6 +113,7 @@ impl Route {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RedirectResponse {
     pub error: String,
@@ -533,6 +534,7 @@ pub(crate) fn write_request_with_epoch(
     writer.write_all(body)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn write_transfer_upgrade_request(writer: &mut impl Write) -> std::io::Result<()> {
     write!(
         writer,
@@ -689,6 +691,7 @@ pub(crate) fn write_switching_protocols(writer: &mut impl Write) -> std::io::Res
     write_switching_protocols_for(writer, "cleat-attach/1")
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn write_transfer_switching_protocols(writer: &mut impl Write) -> std::io::Result<()> {
     write_switching_protocols_for(writer, TRANSFER_UPGRADE)
 }

@@ -437,6 +437,18 @@ pub(crate) struct ErrorResponse<'a> {
 pub(crate) struct HttpResponse {
     pub status: StatusCode,
     pub body: Vec<u8>,
+    pub output_warning: Option<String>,
+}
+
+impl HttpResponse {
+    pub(crate) fn write_output_warning(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        if self.status == StatusCode::SWITCHING_PROTOCOLS {
+            if let Some(warning) = &self.output_warning {
+                writeln!(writer, "cleat: warning: {warning}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn looks_like_http_prefix(prefix: &[u8]) -> bool {
@@ -599,7 +611,11 @@ pub(crate) fn read_response(reader: &mut impl Read) -> std::io::Result<HttpRespo
     }
     let mut body = bytes[body_start..].to_vec();
     body.truncate(content_length);
-    Ok(HttpResponse { status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?, body })
+    Ok(HttpResponse {
+        status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?,
+        body,
+        output_warning: None,
+    })
 }
 
 pub(crate) fn upgrade_error(reader: &mut impl Read, status: StatusCode) -> String {
@@ -643,7 +659,16 @@ pub(crate) fn read_response_head(reader: &mut impl Read) -> std::io::Result<Http
     {
         return Err(Error::new(ErrorKind::InvalidData, "daemon lacks output cycle admission; upgrade/restart the daemon"));
     }
-    Ok(HttpResponse { status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?, body: Vec::new() })
+    let output_warning = parsed
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("x-cleat-output-warning"))
+        .map(|header| String::from_utf8_lossy(header.value).chars().filter(|c| !c.is_control()).collect());
+    Ok(HttpResponse {
+        status: StatusCode::from_u16(code).map_err(|err| Error::new(ErrorKind::InvalidData, err))?,
+        body: Vec::new(),
+        output_warning,
+    })
 }
 
 pub(crate) fn route(request: &HttpRequest) -> Route {
@@ -922,6 +947,19 @@ mod tests {
         let mut input = current.as_slice();
         assert_eq!(read_response_head(&mut input).unwrap().status, StatusCode::SWITCHING_PROTOCOLS);
         assert_eq!(input, b"unread packet bytes");
+    }
+
+    #[test]
+    fn remote_upgrade_warning_reaches_client_diagnostics_without_consuming_frames() {
+        let mut bytes = Vec::new();
+        write_packet_switching_protocols(&mut bytes, &crate::output_admission::OutputContext::Remote).unwrap();
+        bytes.extend_from_slice(b"packet bytes");
+        let mut input = bytes.as_slice();
+        let response = read_response_head(&mut input).unwrap();
+        let mut diagnostic = Vec::new();
+        response.write_output_warning(&mut diagnostic).unwrap();
+        assert_eq!(diagnostic, b"cleat: warning: cycle protection does not cover remote relationships\n");
+        assert_eq!(input, b"packet bytes");
     }
 
     #[test]

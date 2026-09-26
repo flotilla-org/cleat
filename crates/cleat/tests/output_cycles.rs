@@ -112,6 +112,41 @@ fn output_admission_accepts_remote_subscriptions_with_warning() {
 }
 
 #[test]
+fn remote_cli_watch_prints_cycle_protection_warning() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let engines = [
+        VtEngineKind::Passthrough,
+        #[cfg(feature = "ghostty-vt")]
+        VtEngineKind::Ghostty,
+    ];
+    for engine in engines {
+        let session = Session::with_engine("remote", engine);
+        let stderr = session._root.path().join("watch.stderr");
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cleat"))
+            .arg("--runtime-root")
+            .arg(session.layout.root())
+            .args(["--server", "remote", "watch", "same"])
+            .env("SSH_CONNECTION", "192.0.2.1 1234 192.0.2.2 22")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let diagnostic = loop {
+            let diagnostic = std::fs::read_to_string(&stderr).unwrap();
+            if diagnostic.contains("cleat: warning:") || Instant::now() >= deadline {
+                break diagnostic;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(diagnostic.contains("cleat: warning: cycle protection does not cover remote relationships"), "{diagnostic}");
+    }
+}
+
+#[test]
 fn output_admission_rejects_old_clients_and_one_row_self_feedback_before_side_effects() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let session = Session::new("default");

@@ -1128,6 +1128,7 @@ fn render_seat_chrome_at_rows(writer: &mut impl Write, state: &SeatState, rows: 
 }
 
 fn render_watcher_message_at_rows(writer: &mut impl Write, rows: u16, message: &str) -> Result<(), String> {
+    let message: String = message.chars().filter(|character| !character.is_control()).collect();
     if rows == 0 {
         return Ok(());
     }
@@ -6249,6 +6250,20 @@ mod tests {
         assert!(output.contains("nested in source/shell"));
         assert!(!output.contains("watching"));
         assert_eq!(output.matches("\x1b[2K").count(), 1);
+    }
+
+    #[test]
+    fn legacy_banner_strips_control_characters_from_nesting_text() {
+        for role in ["watcher", "controller"] {
+            let state = crate::protocol::SeatState { role: role.into(), controller: None };
+            let mut output = Vec::new();
+            super::render_seat_chrome_at_rows(&mut output, &state, 24, Some("nested in source/bad\x1b]2;title\x07\nname")).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("nested in source/bad]2;titlename"));
+            assert!(!output.contains("\x1b]2;title"));
+            assert!(!output.contains('\x07'));
+            assert!(!output.contains('\n'));
+        }
     }
 
     #[test]

@@ -20,6 +20,19 @@ impl ProcessIdentity {
         process_birth(pid).map(|birth| Self { pid, birth })
     }
 
+    fn capture_in_groups(pid: u32, groups: &[u32]) -> Option<Self> {
+        let in_group =
+            || getpgid(Some(Pid::from_raw(pid as i32))).is_ok_and(|pgid| pgid.as_raw() > 0 && groups.contains(&(pgid.as_raw() as u32)));
+        if groups.is_empty() || !in_group() {
+            return None;
+        }
+        let identity = Self::capture(pid)?;
+        // Recheck after capturing identity: the prefilter may have observed a
+        // different process if this PID was recycled. The caller validates the
+        // birth stamp again after enumeration.
+        in_group().then_some(identity)
+    }
+
     fn is_current(self) -> bool {
         process_birth(self.pid) == Some(self.birth)
     }
@@ -48,16 +61,8 @@ impl ProcessTree {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut roots = roots.to_vec();
         for (pid, process) in system.processes() {
-            if !groups.is_empty() {
-                // Capture identity before checking membership, then validate it
-                // below: a PID recycled across the group query is not retained.
-                if let Some(identity) = ProcessIdentity::capture(pid.as_u32()) {
-                    if getpgid(Some(Pid::from_raw(pid.as_u32() as i32)))
-                        .is_ok_and(|pgid| pgid.as_raw() > 0 && groups.contains(&(pgid.as_raw() as u32)))
-                    {
-                        roots.push(identity);
-                    }
-                }
+            if let Some(identity) = ProcessIdentity::capture_in_groups(pid.as_u32(), groups) {
+                roots.push(identity);
             }
             if let Some(parent) = process.parent() {
                 children.entry(parent.as_u32()).or_default().push(pid.as_u32());

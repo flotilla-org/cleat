@@ -25,6 +25,20 @@ If Clippy differs between a crew image and CI, check `rustup show active-toolcha
 and `cargo clippy --version` first. An explicit `+toolchain`, `RUSTUP_TOOLCHAIN`,
 or a rustup directory override can take precedence over the file.
 
+## Crew session environment
+
+When testing from inside a Cleat session, isolate the tests from the enclosing
+session's routing metadata:
+
+```bash
+env -u CLEAT_SESSION -u CLEAT_DAEMON -u CLEAT_RUNTIME_DIR cargo test --workspace --locked
+```
+
+An older enclosing daemon can otherwise cause attach tests to fail with
+`physical source daemon coordinate missing; restart the containing session with an upgraded daemon`.
+This is inherited environment state, separate from the lifecycle failures below;
+the command still runs every test.
+
 ## Container lifecycle tests
 
 The unfiltered `cargo test --workspace --locked` remains the CI gate. In crew

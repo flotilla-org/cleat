@@ -46,7 +46,19 @@ pub(crate) struct ProcessTree {
     processes: Vec<ProcessIdentity>,
 }
 
+/// Capture succeeded and delivery was attempted. A partial delivery error must
+/// not discard the identities needed for subsequent escalation.
+pub(crate) struct TreeTermination {
+    pub(crate) tree: ProcessTree,
+    pub(crate) delivery: Result<(), String>,
+}
+
 impl ProcessTree {
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(pids: &[u32]) -> Self {
+        Self { processes: pids.iter().map(|&pid| ProcessIdentity { pid, birth: 1 }).collect() }
+    }
+
     pub(crate) fn capture(leader: u32, foreground: Option<u32>) -> Self {
         let groups = [leader, foreground.unwrap_or(leader)];
         Self::from_roots(&ProcessIdentity::capture(leader).into_iter().collect::<Vec<_>>(), &groups)
@@ -76,15 +88,29 @@ impl ProcessTree {
     }
 
     pub(crate) fn signal_outside_groups(&self, signal: Signal, groups: &[u32]) -> Result<(), String> {
+        self.signal_with(
+            signal,
+            |pid, birth| {
+                ProcessIdentity { pid, birth }.is_current()
+                    && !getpgid(Some(Pid::from_raw(pid as i32))).is_ok_and(|pgid| groups.contains(&(pgid.as_raw() as u32)))
+            },
+            |pid, signal| kill(Pid::from_raw(pid as i32), signal),
+        )
+    }
+
+    pub(crate) fn signal_with(
+        &self,
+        signal: Signal,
+        mut eligible: impl FnMut(u32, u128) -> bool,
+        mut deliver: impl FnMut(u32, Signal) -> Result<(), Errno>,
+    ) -> Result<(), String> {
         let mut error = None;
-        // Children first, before signaling parents can destroy ancestry.
+        // Children first; continue delivering even after a partial failure.
         for process in self.processes.iter().rev() {
-            if !process.is_current()
-                || getpgid(Some(Pid::from_raw(process.pid as i32))).is_ok_and(|pgid| groups.contains(&(pgid.as_raw() as u32)))
-            {
+            if !eligible(process.pid, process.birth) {
                 continue;
             }
-            if let Err(err) = kill(Pid::from_raw(process.pid as i32), signal) {
+            if let Err(err) = deliver(process.pid, signal) {
                 if err != Errno::ESRCH {
                     error.get_or_insert_with(|| format!("kill {}: {err}", process.pid));
                 }

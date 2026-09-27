@@ -49,3 +49,6 @@ pub mod hosting_epoch;
 mod transfer;
 #[cfg(unix)]
 pub mod transfer_manifest;
+
+#[cfg(unix)]
+mod embedded_transfer;

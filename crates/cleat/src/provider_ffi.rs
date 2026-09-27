@@ -641,6 +641,10 @@ impl OwnedDirectory {
     }
 }
 
+#[path = "provider_transfer.rs"]
+mod session_transfer;
+pub use session_transfer::{cleat_session_adopt, cleat_session_hosting, cleat_session_transfer, cleat_session_transfer_error};
+
 pub struct CleatSession {
     backend: SessionBackend,
     geometry: TerminalGeometry,
@@ -648,6 +652,7 @@ pub struct CleatSession {
     wake: Arc<Mutex<WakeCallback>>,
     last_snapshot: Option<Box<OwnedSnapshot>>,
     last_render_update: Option<Box<OwnedRenderUpdate>>,
+    transfer: session_transfer::TransferState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -675,6 +680,7 @@ struct InProcessSession {
 }
 
 struct DaemonSession {
+    dedicated_connection: bool,
     id: String,
     connection: Arc<DaemonConnection>,
     channel: u32,
@@ -686,6 +692,9 @@ struct DaemonSession {
 impl Drop for DaemonSession {
     fn drop(&mut self) {
         self.connection.close_session_channel(self.channel);
+        if self.dedicated_connection {
+            self.connection.shutdown();
+        }
     }
 }
 
@@ -1243,6 +1252,10 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         wake: provider.wake.clone(),
         last_snapshot: None,
         last_render_update: None,
+        transfer: session_transfer::TransferState::new(
+            provider.runtime_root.clone(),
+            attachment_identity_from_desc(desc).unwrap_or_default(),
+        ),
     }))
 }
 
@@ -1282,6 +1295,10 @@ pub unsafe extern "C" fn cleat_session_attach(provider: *mut CleatProvider, desc
         wake: provider.wake.clone(),
         last_snapshot: None,
         last_render_update: None,
+        transfer: session_transfer::TransferState::new(
+            provider.runtime_root.clone(),
+            attachment_identity_from_desc(desc).unwrap_or_default(),
+        ),
     }))
 }
 
@@ -2259,7 +2276,7 @@ pub unsafe extern "C" fn cleat_session_release_render_update(session: *mut Cleat
 }
 
 fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<InProcessSession, String> {
-    let layout = RuntimeLayout::new(provider.runtime_root.clone());
+    let layout = RuntimeLayout::new(provider.runtime_root.join(".embedded"));
     let vt_engine = vt_engine_from_tag(desc.vt_engine)?;
     vt_engine.ensure_available()?;
     let colors = session_colors_from_desc(desc);
@@ -2269,6 +2286,8 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let id = read_optional_utf8(desc.id, desc.id_len).map_err(|err| format!("id is not valid UTF-8: {err}"))?;
     let mut metadata = layout.create_session(id, vt_engine, cwd, cmd)?;
     metadata.record = desc.record;
+    metadata.colors = colors;
+    metadata.tags = read_selector_strings(desc.tags, desc.tag_count).map_err(|err| err.to_string())?;
     let cols = desc.cols.max(1);
     let rows = desc.rows.max(1);
     metadata.initial_size = TerminalSize { cols, rows };
@@ -2312,7 +2331,15 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         channel_role_from_ffi(desc.role)?,
         attachment_identity_from_desc(desc)?,
     );
-    Ok(DaemonSession { id: metadata.id, connection: Arc::clone(connection), channel, slot, images: Vec::new(), links: Vec::new() })
+    Ok(DaemonSession {
+        dedicated_connection: false,
+        id: metadata.id,
+        connection: Arc::clone(connection),
+        channel,
+        slot,
+        images: Vec::new(),
+        links: Vec::new(),
+    })
 }
 
 fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
@@ -2326,7 +2353,15 @@ fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         channel_role_from_ffi(desc.role)?,
         attachment_identity_from_desc(desc)?,
     );
-    Ok(DaemonSession { id, connection: Arc::clone(connection), channel, slot, images: Vec::new(), links: Vec::new() })
+    Ok(DaemonSession {
+        dedicated_connection: false,
+        id,
+        connection: Arc::clone(connection),
+        channel,
+        slot,
+        images: Vec::new(),
+        links: Vec::new(),
+    })
 }
 
 fn daemon_geometry_from_desc(desc: CleatSessionDesc) -> TerminalResizeEvent {
@@ -2956,6 +2991,7 @@ mod tests {
             wake: Arc::new(Mutex::new(WakeCallback::default())),
             last_snapshot: None,
             last_render_update: None,
+            transfer: Default::default(),
         }));
 
         let session_addr = session as usize;
@@ -2985,6 +3021,7 @@ mod tests {
             wake: Arc::new(Mutex::new(WakeCallback::default())),
             last_snapshot: None,
             last_render_update: None,
+            transfer: Default::default(),
         }));
 
         unsafe {
@@ -3008,6 +3045,7 @@ mod tests {
             wake: Arc::new(Mutex::new(WakeCallback::default())),
             last_snapshot: None,
             last_render_update: None,
+            transfer: Default::default(),
         }));
 
         unsafe {
@@ -3287,6 +3325,7 @@ mod tests {
             wake: Arc::new(Mutex::new(WakeCallback::default())),
             last_snapshot: None,
             last_render_update: None,
+            transfer: Default::default(),
         };
         let worker = std::thread::spawn(move || {
             let mut received = Vec::new();

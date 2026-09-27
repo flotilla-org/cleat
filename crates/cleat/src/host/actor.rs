@@ -1523,7 +1523,13 @@ fn session_actor_handle_command(
         }
         SessionCommand::FlushScreenActivity => {
             // A held batch's damage belongs to the frame published after it.
-            runtime.flush_screen_activity(!state.presentation.is_held());
+            // Output may arrive after the daemon captures a packet but before
+            // this queued flush executes. If screen_grid consumes that newer
+            // damage, publish the retained grid in full instead of losing rows.
+            if runtime.flush_screen_activity(!state.presentation.is_held()) && state.observation.pending_dirty() != DirtyState::Clean {
+                let rows = runtime.inspect(false, 0).terminal.rows;
+                mark_full_and_wake(&mut state.observation, rows, wake);
+            }
         }
         SessionCommand::FlushRecording { reply } => {
             runtime.flush_recording();
@@ -2152,6 +2158,17 @@ mod synchronized_output_tests {
         assert!(text(&completed).contains("MID"), "completed frame lost mid-batch damage: {:?}", text(&completed));
         assert!(completed.render_generation > held.render_generation);
         observe(&actor, &completed);
+    }
+
+    #[test]
+    fn activity_flush_preserves_output_arriving_after_packet_capture() {
+        let (_temp, actor, _wakes) = spawn("activity-render-race", "cat");
+        actor.packet_render(true).unwrap();
+        actor.write_input(b"later-output\n".to_vec()).unwrap();
+        wait_until("new output", Duration::from_secs(5), || actor.capture_text().unwrap().contains("later-output"));
+        actor.enqueue_screen_activity_flush().unwrap();
+        let update = actor.packet_render(false).unwrap().unwrap();
+        assert!(text(&update.packet.update).contains("later-output"), "activity flush consumed unpublished render damage");
     }
 
     #[test]

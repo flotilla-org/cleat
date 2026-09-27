@@ -55,6 +55,8 @@ pub(crate) enum Route {
     SessionWait { id: String },
     SessionTransfer { id: String },
     Transfer,
+    EmbeddedTransfer,
+    SessionAdopt { id: String },
     NotFound,
 }
 
@@ -82,6 +84,7 @@ impl Route {
             | Route::SessionSnapshot { id }
             | Route::SessionTags { id }
             | Route::SessionWait { id }
+            | Route::SessionAdopt { id }
             | Route::SessionTransfer { id } => Some(id),
             Route::Root
             | Route::Health
@@ -90,6 +93,7 @@ impl Route {
             | Route::Sessions
             | Route::SessionCreate
             | Route::Transfer
+            | Route::EmbeddedTransfer
             | Route::NotFound => None,
         }
     }
@@ -113,6 +117,7 @@ impl Route {
                 | Route::SessionResize { .. }
                 | Route::SessionSignal { .. }
                 | Route::SessionTags { .. }
+                | Route::SessionAdopt { .. }
                 | Route::SessionTransfer { .. }
         )
     }
@@ -691,6 +696,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
         (&Method::GET, "/sessions") => Route::Sessions,
         (&Method::POST, "/sessions") => Route::SessionCreate,
         (&Method::POST, "/transfer") => Route::Transfer,
+        (&Method::POST, "/transfer/embedded") => Route::EmbeddedTransfer,
         _ => {
             let Some(rest) = path.strip_prefix("/sessions/") else {
                 return Route::NotFound;
@@ -720,6 +726,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::GET, Some("snapshot"), None) => Route::SessionSnapshot { id: id.to_string() },
                 (&Method::POST, Some("tags"), None) => Route::SessionTags { id: id.to_string() },
                 (&Method::POST, Some("wait"), None) => Route::SessionWait { id: id.to_string() },
+                (&Method::POST, Some("adopt"), None) => Route::SessionAdopt { id: id.to_string() },
                 (&Method::POST, Some("transfer"), None) => Route::SessionTransfer { id: id.to_string() },
                 _ => Route::NotFound,
             }

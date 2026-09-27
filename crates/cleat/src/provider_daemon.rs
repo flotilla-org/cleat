@@ -284,6 +284,23 @@ impl DaemonConnection {
         }
     }
 
+    pub(crate) fn channel_layout(&self, channel: u32) -> RuntimeLayout {
+        match self.route(channel) {
+            Some(route) => route.connection.channel_layout(route.channel),
+            None => {
+                let generation = self.with_directory(|directory| directory.daemon.as_ref().and_then(|daemon| daemon.generation));
+                match generation {
+                    Some(generation) => self
+                        .layout
+                        .clone()
+                        .with_daemon(format!("{}@{generation}", self.layout.logical_name()))
+                        .unwrap_or_else(|_| self.layout.clone()),
+                    None => self.layout.resolved().unwrap_or_else(|_| self.layout.clone()),
+                }
+            }
+        }
+    }
+
     fn route(&self, channel: u32) -> Option<ChannelRoute> {
         recover_lock(&self.routes).get(&channel).cloned()
     }

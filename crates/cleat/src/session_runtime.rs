@@ -137,6 +137,10 @@ impl SessionRuntime {
         // a recording from a prior activation, replay it into the fresh engine so
         // its history returns as scrollback above the freshly-invoked command.
         // Detection is by cast presence — a brand-new session has an empty dir.
+        #[cfg(unix)]
+        if crate::embedded_transfer::held_elsewhere(&session_dir) {
+            return Err("session is hosted-elsewhere".into());
+        }
         crate::runtime::ensure_hosting_epoch(&session_dir)?;
         let cast_path = session_dir.join(crate::recording::CAST_FILE_NAME);
         let recreating = crate::recreate::session_is_recreatable(&session_dir);
@@ -291,7 +295,7 @@ impl SessionRuntime {
             ));
         }
         // No payload means nothing has been drawn yet: the empty screen.
-        let payload = replay_snapshot_payload(&mut *self.vt_engine).unwrap_or_default();
+        let payload = self.vt_engine.transfer_payload()?.unwrap_or_default();
         let (cols, rows) = self.vt_engine.size();
         let pty_master = self.pty_child.duplicate_master()?;
         let recording = self.recorder.as_ref().map(SessionRecorder::append_handle).transpose()?;
@@ -871,12 +875,15 @@ impl SessionRuntime {
 
     /// Record pending screen activity, and unless `consume_damage` is false
     /// also consume the engine's render damage it was derived from.
-    pub(crate) fn flush_screen_activity(&mut self, consume_damage: bool) {
+    pub(crate) fn flush_screen_activity(&mut self, consume_damage: bool) -> bool {
         if self.observe_pending_screen_activity() && consume_damage {
             if let Err(err) = self.vt_engine.screen_grid() {
                 eprintln!("screen activity render flush error: {err}");
+            } else {
+                return true;
             }
         }
+        false
     }
 
     /// Answer ConPTY's startup DA1 query as the VT engine answers a program's,

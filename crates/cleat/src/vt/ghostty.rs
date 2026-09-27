@@ -513,6 +513,75 @@ impl VtEngine for GhosttyVtEngine {
         Ok((!payload.is_empty()).then_some(payload))
     }
 
+    fn transfer_payload(&self) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Write;
+        let mut payload = self.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, true))?.unwrap_or_default();
+        let (resources, placements) = self.terminal.kitty_image_state()?;
+        for resource in resources {
+            let format = match resource.format {
+                0 => 24,
+                1 => 32,
+                2 => 100,
+                _ => return Err("unsupported image format in transfer".into()),
+            };
+            if resource.compression != 0 {
+                return Err("unsupported compressed image in transfer".into());
+            }
+            let mut encoded = Vec::new();
+            let found = self.terminal.with_kitty_image_data(resource.image_id, resource.generation, &mut |bytes| {
+                for (index, chunk) in bytes.chunks(3072).enumerate() {
+                    let more = u8::from((index + 1) * 3072 < bytes.len());
+                    if index == 0 {
+                        let _ = write!(
+                            encoded,
+                            "\x1b_Ga=t,t=d,q=2,i={},f={format},s={},v={},m={more};",
+                            resource.image_id, resource.width_px, resource.height_px
+                        );
+                    } else {
+                        let _ = write!(encoded, "\x1b_Gm={more},q=2;");
+                    }
+                    let _ = write!(encoded, "{}\x1b\\", crate::kitty_output::base64(chunk));
+                }
+                true
+            })?;
+            if !found {
+                return Err("image disappeared while preparing transfer".into());
+            }
+            payload.extend(encoded);
+        }
+        if !placements.is_empty() {
+            payload.extend_from_slice(b"\x1b7\x1b[?6l");
+            for placement in placements {
+                if !placement.is_virtual && (placement.viewport_row < 0 || placement.viewport_col < 0) {
+                    return Err("partially scrolled image cannot be transferred losslessly".into());
+                }
+                if !placement.is_virtual {
+                    write!(payload, "\x1b[{};{}H", placement.viewport_row + 1, placement.viewport_col + 1)
+                        .map_err(|err| err.to_string())?;
+                }
+                write!(
+                    payload,
+                    "\x1b_Ga=p,C=1,q=2,i={},p={},U={},z={},c={},r={},x={},y={},w={},h={},X={},Y={};\x1b\\",
+                    placement.image_id,
+                    placement.placement_id,
+                    u8::from(placement.is_virtual),
+                    placement.z,
+                    placement.grid_cols,
+                    placement.grid_rows,
+                    placement.source_x,
+                    placement.source_y,
+                    placement.source_width,
+                    placement.source_height,
+                    placement.x_offset_px,
+                    placement.y_offset_px
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            payload.extend_from_slice(b"\x1b8");
+        }
+        Ok((!payload.is_empty()).then_some(payload))
+    }
+
     fn screen_text(&self) -> Result<String, String> {
         let mut options = GhosttyFormatterTerminalOptions::init();
         options.emit = GhosttyFormatterFormat::Plain;

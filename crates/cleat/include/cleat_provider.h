@@ -534,6 +534,22 @@ cleat_session *cleat_session_create(cleat_provider *provider, const cleat_sessio
 cleat_session *cleat_session_attach(cleat_provider *provider, const cleat_session_desc *desc);
 void cleat_session_destroy(cleat_session *session);
 
+/* Unix hosting changes on one stable handle. Serialize these blocking calls
+ * with other session operations. The daemon must already be reachable. A false
+ * result preserves the previous hosting; read cleat_session_transfer_error for
+ * unsupported-platform, unreachable-daemon, manifest refusal, or stale-holder
+ * errors. Successful changes invoke the existing wake callback. Release live
+ * render/snapshot borrows before moving; callbacks need no re-registration.
+ * Windows returns false with an unsupported-platform error.
+ * No public struct layout changed; these are additive ABI v9 exports. */
+bool cleat_session_transfer(cleat_session *session, const uint8_t *daemon_name, size_t daemon_name_len);
+bool cleat_session_adopt(cleat_session *session);
+/* Borrowed until the next query/move or destruction: in_process or
+ * daemon:<name@generation>. Redirects also update hosting and wake the host. */
+bool cleat_session_hosting(cleat_session *session, cleat_str *out);
+/* Borrowed until the next move attempt or destruction; empty after success. */
+bool cleat_session_transfer_error(const cleat_session *session, cleat_str *out);
+
 /*
  * Daemon session id for attach-by-id and directory correlation (borrows from
  * the session; valid until destroy). False for non-daemon sessions.

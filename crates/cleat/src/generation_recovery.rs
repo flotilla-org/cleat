@@ -31,13 +31,14 @@ impl GenerationRecovery {
     pub fn save(&self, layout: &RuntimeLayout) -> Result<(), String> {
         let temporary = layout.root().join(format!(".generations-{}", uuid::Uuid::new_v4()));
         let result = (|| -> Result<(), String> {
-            let mut file = fs::File::create(&temporary).map_err(|e| e.to_string())?;
-            file.write_all(&serde_json::to_vec(self).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
+            let mut file = fs::File::create(&temporary).map_err(|e| format!("create temporary journal: {e}"))?;
+            file.write_all(&serde_json::to_vec(self).map_err(|e| format!("encode journal: {e}"))?)
+                .map_err(|e| format!("write temporary journal: {e}"))?;
+            file.sync_all().map_err(|e| format!("sync temporary journal: {e}"))?;
             fs::rename(&temporary, layout.root().join(format!(".{}.generations.json", layout.logical_name())))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("replace journal: {e}"))?;
             #[cfg(unix)]
-            fs::File::open(layout.root()).and_then(|dir| dir.sync_all()).map_err(|e| e.to_string())?;
+            fs::File::open(layout.root()).and_then(|dir| dir.sync_all()).map_err(|e| format!("sync journal directory: {e}"))?;
             Ok(())
         })();
         let _ = fs::remove_file(temporary);
@@ -139,8 +140,15 @@ mod tests {
         fs::remove_dir_all(unpublished.session_dir("explicit")).unwrap();
         fs::write(unpublished.daemon_pid_path(), "0").unwrap();
         fs::write(unpublished.daemon_dir().join("build.json"), "{}").unwrap();
-        recovery.reclaim(&layout).unwrap();
-        assert!(!unpublished.daemon_dir().exists());
+        // Parallel Unix process-spawn tests can briefly inherit our lock until
+        // exec, even after we drop the owning descriptor. Reclamation is
+        // deliberately retryable when a lifetime lock is still held.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while unpublished.daemon_dir().exists() {
+            recovery.reclaim(&layout).unwrap();
+            assert!(std::time::Instant::now() < deadline, "unpublished generation was not reclaimed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(unpublished.prepare_generation().unwrap_err().contains("reclaimed"));
         assert!(crate::session::run_session_daemon(unpublished.root(), unpublished.daemon_name()).unwrap_err().contains("reclaimed"));
         assert!(!unpublished.daemon_dir().exists());

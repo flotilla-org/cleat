@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 9u
+#define CLEAT_PROVIDER_ABI_VERSION 10u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -347,6 +347,9 @@ typedef struct cleat_render_style {
     bool has_hyperlink;
     uint32_t semantic;
     uint64_t hyperlink_id;
+    // Frame-owned bytes; valid until release, the next render pull, or session destruction.
+    // Copy with the cell when retaining a frame. IDs/flags are not URI lookup keys.
+    cleat_str hyperlink_uri;
     uint32_t content_tag;
     bool has_text;
     bool has_styling;

@@ -25,7 +25,7 @@ use crate::{
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 9;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 10;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -353,6 +353,7 @@ pub struct CleatRenderStyle {
     pub has_hyperlink: bool,
     pub semantic: u32,
     pub hyperlink_id: u64,
+    pub hyperlink_uri: CleatStr,
     pub content_tag: u32,
     pub has_text: bool,
     pub has_styling: bool,
@@ -712,6 +713,7 @@ struct OwnedRenderUpdate {
     cells: Vec<CleatRenderCell>,
     image_resources: Vec<CleatImageResource>,
     image_placements: Vec<CleatImagePlacement>,
+    _hyperlinks: Vec<Vec<u8>>,
     _graphemes: Vec<Vec<u32>>,
 }
 
@@ -761,6 +763,7 @@ impl OwnedSnapshot {
 impl OwnedRenderUpdate {
     fn from_update(update: TerminalRenderUpdate) -> Box<Self> {
         let mut graphemes = Vec::new();
+        let mut hyperlinks = Vec::new();
         let mut cells = Vec::new();
         let mut rows = Vec::new();
         let mut ops = Vec::new();
@@ -771,6 +774,7 @@ impl OwnedRenderUpdate {
                 let row_first_cell = cells.len();
                 for cell in row.cells {
                     graphemes.push(cell.graphemes);
+                    hyperlinks.push(cell.style.hyperlink_uri);
                     cells.push(CleatRenderCell {
                         size: std::mem::size_of::<CleatRenderCell>(),
                         graphemes: ptr::null(),
@@ -789,6 +793,7 @@ impl OwnedRenderUpdate {
                             has_hyperlink: cell.style.has_hyperlink,
                             semantic: cell.style.semantic,
                             hyperlink_id: cell.style.hyperlink_id,
+                            hyperlink_uri: CleatStr { ptr: ptr::null(), len: 0 },
                             content_tag: cell.style.content_tag,
                             has_text: cell.style.has_text,
                             has_styling: cell.style.has_styling,
@@ -855,8 +860,12 @@ impl OwnedRenderUpdate {
             cells,
             image_resources,
             image_placements,
+            _hyperlinks: hyperlinks,
             _graphemes: graphemes,
         });
+        for (cell, uri) in owned.cells.iter_mut().zip(owned._hyperlinks.iter()) {
+            cell.style.hyperlink_uri = CleatStr { ptr: uri.as_ptr(), len: uri.len() };
+        }
         for (cell, graphemes) in owned.cells.iter_mut().zip(owned._graphemes.iter()) {
             cell.graphemes = if graphemes.is_empty() { ptr::null() } else { graphemes.as_ptr() };
             cell.grapheme_count = graphemes.len();
@@ -3131,6 +3140,7 @@ mod tests {
                             semantic: 2,
                             has_hyperlink: true,
                             hyperlink_id: 42,
+                            hyperlink_uri: b"https://example.com/destination".to_vec(),
                             content_tag: 1,
                             has_text: true,
                             has_styling: true,
@@ -3181,6 +3191,7 @@ mod tests {
         assert!(style.has_hyperlink);
         assert_eq!(style.semantic, 2);
         assert_eq!(style.hyperlink_id, 42);
+        assert_eq!(unsafe { slice::from_raw_parts(style.hyperlink_uri.ptr, style.hyperlink_uri.len) }, b"https://example.com/destination");
         assert_eq!(style.content_tag, 1);
         assert!(style.has_text);
         assert!(style.has_styling);

@@ -180,6 +180,17 @@ impl GhosttyVtEngine {
                     semantic: resolved_cell.semantic,
                     has_hyperlink: cell.has_hyperlink,
                     hyperlink_id: 0,
+                    hyperlink_uri: if cell.has_hyperlink {
+                        let offset = self.terminal.scrollbar()?.offset;
+                        self.terminal.history_link(
+                            self.terminal.active_screen()?,
+                            col_idx as u16,
+                            u32::try_from(offset + u64::from(row)).map_err(|e| e.to_string())?,
+                            1024 * 1024,
+                        )?
+                    } else {
+                        Vec::new()
+                    },
                     content_tag: content_tag_from_ghostty(cell.content_tag),
                     has_text: cell.has_text,
                     has_styling: cell.has_styling,
@@ -442,6 +453,16 @@ impl VtEngine for GhosttyVtEngine {
         };
         let mut update =
             TerminalRenderUpdate::from_snapshot(crate::provider::TerminalSnapshot::from_screen_grid(frame.grid.clone(), DirtyState::Full));
+        for link in &frame.links {
+            if let Some(cell) = update
+                .ops
+                .first_mut()
+                .and_then(|op| op.rows.get_mut(usize::from(link.row)))
+                .and_then(|row| row.cells.get_mut(usize::from(link.col)))
+            {
+                cell.style.hyperlink_uri = link.uri.clone();
+            }
+        }
         update.viewport_kind = TerminalViewportKind::NormalScrollback;
         update.scrollbar = TerminalScrollbarState::new(update.viewport_kind, frame.total_rows, frame.grid.rows, frame.offset);
         update.scrollback_offset_rows = frame.offset;
@@ -1293,6 +1314,37 @@ mod history_tests {
     }
     fn text(frame: &HistoryFrame) -> String {
         frame.grid.cells.iter().flat_map(|cell| cell.graphemes.iter().copied()).filter_map(char::from_u32).collect()
+    }
+
+    #[test]
+    fn render_links_follow_frames_scrollback_resize_and_wide_cells() {
+        fn uri(update: &TerminalRenderUpdate, row: usize, col: usize) -> &[u8] {
+            &update.ops[0].rows[row].cells[col].style.hyperlink_uri
+        }
+        let mut engine = GhosttyVtEngine::new(8, 2);
+        engine.feed("\x1b]8;;https://one.test\x1b\\界abcde\x1b]8;;https://two.test\x1b\\XY\x1b]8;;\x1b\\".as_bytes()).unwrap();
+        let first = engine.render_update(DirtyState::Full).unwrap();
+        assert_eq!(uri(&first, 0, 0), b"https://one.test");
+        assert_eq!(uri(&first, 0, 1), b"https://one.test");
+        assert_eq!(uri(&first, 0, 7), b"https://two.test");
+        assert_eq!(uri(&first, 1, 0), b"https://two.test");
+        assert!(uri(&first, 1, 1).is_empty());
+        engine.feed(b"\r\nnext\r\nlast").unwrap();
+        engine.render_update(DirtyState::Full).unwrap();
+        engine.scroll_viewport(ViewportCommand::Top).unwrap();
+        let scrolled = engine.render_update(DirtyState::Full).unwrap();
+        assert_eq!(uri(&scrolled, 0, 0), b"https://one.test");
+        engine.scroll_viewport(ViewportCommand::Bottom).unwrap();
+        engine.set_attachment_view(7, ViewportCommand::Top).unwrap();
+        let history = engine.capture_attachment_view(7).unwrap().unwrap();
+        assert_eq!(uri(&history.update, 0, 0), b"https://one.test");
+        engine.resize(10, 2).unwrap();
+        let history = engine.capture_attachment_view(7).unwrap().unwrap();
+        assert_eq!(uri(&history.update, 0, 0), b"https://one.test");
+        engine.feed(b"\x1bcplain").unwrap();
+        let fresh = engine.render_update(DirtyState::Full).unwrap();
+        assert!(uri(&fresh, 0, 0).is_empty());
+        assert_eq!(uri(&first, 0, 0), b"https://one.test"); // retained frame owns its URI
     }
 
     #[test]

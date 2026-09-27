@@ -1717,6 +1717,51 @@ mod tests {
     }
 
     #[test]
+    fn kill_timeout_returns_error_without_purging_live_session_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        let session_dir = create_test_session_dir(temp.path(), "alpha");
+        let cast = session_dir.join(crate::recording::CAST_FILE_NAME);
+        fs::write(&cast, b"retained recording").unwrap();
+        let listener = UnixListener::bind(session_socket_path(temp.path(), "alpha")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (stop, stopped) = mpsc::channel();
+        let daemon = thread::spawn(move || {
+            let live: crate::protocol::InspectResult = serde_json::from_value(serde_json::json!({
+                "session": {"id": "alpha", "state": "detached", "vt_engine": "passthrough"},
+                "terminal": {"rows": 24, "cols": 80},
+                "process": {"leader_pid": 1},
+                "attachments": [],
+                "recording": {"active": true, "bytes_written": 18, "markers": {}}
+            }))
+            .unwrap();
+            while let Err(mpsc::TryRecvError::Empty) = stopped.try_recv() {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(err) => panic!("accept: {err}"),
+                };
+                let request = read_http_request_for_test(&mut stream);
+                if request.starts_with("DELETE ") {
+                    http_uds::write_no_content(&mut stream).unwrap();
+                } else {
+                    assert!(request.starts_with("GET /sessions/alpha HTTP/1.1"), "{request}");
+                    http_uds::write_json(&mut stream, http::StatusCode::OK, &live).unwrap();
+                }
+            }
+        });
+
+        let result = service.kill_with_purge("alpha", true);
+        stop.send(()).unwrap();
+        daemon.join().unwrap();
+        assert_eq!(result.unwrap_err(), "session alpha did not shut down within the termination grace period");
+        assert_eq!(fs::read(cast).unwrap(), b"retained recording", "timeout must not purge a live session");
+    }
+
+    #[test]
     fn kill_purge_preserved_recording_without_socket_returns_promptly() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));

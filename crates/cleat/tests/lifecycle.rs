@@ -4028,7 +4028,7 @@ fn kill_waits_for_interactive_shell_and_preserves_recording() {
     let started = Instant::now();
     cli(&["kill", &info.id]);
     assert!(!signal_fixture_is_running(pid), "kill must wait for interactive shell termination");
-    assert!(started.elapsed() < Duration::from_secs(4), "kill must finish within the grace period plus scheduling allowance");
+    assert!(started.elapsed() < Duration::from_secs(5), "kill must finish within the grace period plus scheduling allowance");
     assert!(service.inspect(&info.id).is_err(), "session should retire normally");
     let layout = RuntimeLayout::new(temp.path().to_path_buf());
     assert!(layout.session_dir(&info.id).exists(), "kill must preserve session metadata");

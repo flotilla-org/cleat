@@ -367,7 +367,11 @@ resolved through the live daemon socket. \n\
     },
     /// Detach from a session
     Detach { id: String },
-    /// Terminate a session
+    /// Terminate a session and wait for it to exit
+    #[command(after_long_help = "On Unix, sends TERM to the session tree, then KILL after a two-second grace period.\n\
+                           Waits up to about three seconds for session exit; reports an error on timeout.\n\
+                           Preserves recorded sessions unless --purge is requested.\n\
+                           Use signal to deliver exactly one signal without escalation.")]
     Kill {
         #[arg(value_name = "ID")]
         id: String,

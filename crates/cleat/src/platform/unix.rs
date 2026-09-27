@@ -245,7 +245,7 @@ impl PtyChild {
     }
 
     pub(crate) fn process_tree(&self) -> crate::platform::signals::ProcessTree {
-        crate::platform::signals::ProcessTree::capture(self.leader_pid())
+        crate::platform::signals::ProcessTree::capture(self.leader_pid(), self.foreground_pgid())
     }
 
     pub(crate) fn signal_tree(&self, tree: &crate::platform::signals::ProcessTree, signal: Signal) -> Result<(), String> {

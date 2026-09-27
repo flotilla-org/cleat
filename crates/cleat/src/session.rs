@@ -2251,7 +2251,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             }
         };
         #[cfg(unix)]
-        let transfers_busy = transfers.busy(draining);
+        let transfers_busy = transfers.busy();
         #[cfg(not(unix))]
         let transfers_busy = false;
         if sessions.is_empty() && !termination_pending && !transfers_busy {
@@ -3116,13 +3116,20 @@ fn handle_http_request(
     match route {
         http_uds::Route::Root | http_uds::Route::Health => {
             let hello = advertised_hello();
+            let build = crate::build_info::BuildInfo::current();
+            // Exercise an installed-binary upgrade with real daemons in integration tests.
+            #[cfg(debug_assertions)]
+            let build = match std::env::var("CLEAT_TEST_DAEMON_BUILD_SHA") {
+                Ok(sha) => crate::build_info::BuildInfo { git_sha: Some(sha), ..build },
+                Err(_) => build,
+            };
             http_uds::write_json(
                 stream,
                 StatusCode::OK,
                 &serde_json::json!({
                     "service": "cleat-session",
                     "generation": state.layout.generation(),
-                    "build": crate::build_info::BuildInfo::current(),
+                    "build": build,
                     "session": state.layout.logical_name(),
                     "packet_protocol": {"version": hello.version, "min_supported_version": hello.min_supported_version},
                     "ok": true,
@@ -3131,6 +3138,24 @@ fn handle_http_request(
                 }),
             )
             .map_err(|err| format!("write HTTP response: {err}"))
+        }
+        http_uds::Route::TransferCheck => {
+            #[cfg(unix)]
+            {
+                let protocol: crate::transfer::TargetProtocol =
+                    serde_json::from_slice(request.body()).map_err(|err| format!("parse transfer preflight: {err}"))?;
+                let mut incompatible = Vec::new();
+                for (id, hosted) in state.sessions.iter().filter(|(_, hosted)| !hosted.actor.observation().exited()) {
+                    for client in transfer_host::incompatible_clients(hosted, protocol, state.packet_clients) {
+                        incompatible.push(format!("{id}: {client}"));
+                    }
+                }
+                incompatible.sort();
+                http_uds::write_json(stream, StatusCode::OK, &incompatible).map_err(|err| format!("write transfer preflight: {err}"))
+            }
+            #[cfg(not(unix))]
+            http_uds::write_error(stream, StatusCode::NOT_IMPLEMENTED, "server handover is only supported on Unix")
+                .map_err(|err| format!("write transfer preflight: {err}"))
         }
         http_uds::Route::Drain => {
             fs::write(state.layout.daemon_dir().join("drain-state"), "draining").map_err(|e| format!("persist drain state: {e}"))?;
@@ -3149,6 +3174,9 @@ fn handle_http_request(
                 StatusCode::OK,
                 &serde_json::json!({
                     "drain_state": "draining", "session_count": state.sessions.len(),
+                    "live_session_ids": state.sessions.iter()
+                        .filter(|(_, hosted)| !hosted.actor.observation().exited())
+                        .map(|(id, _)| id).collect::<Vec<_>>(),
                 }),
             )
             .map_err(|err| format!("write drain response: {err}"))

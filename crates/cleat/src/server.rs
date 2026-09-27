@@ -30,15 +30,48 @@ struct DaemonResponseReader<'a> {
     deadline: Instant,
 }
 
-impl std::io::Read for DaemonResponseReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self
-            .deadline
+impl DaemonResponseReader<'_> {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.deadline
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon response deadline exceeded"))?;
-        set_stream_read_timeout(self.stream, Some(remaining)).map_err(std::io::Error::other)?;
-        self.stream.read(buffer)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon response deadline exceeded"))
+    }
+}
+
+impl std::io::Read for DaemonResponseReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(unix)]
+        loop {
+            use std::os::fd::{AsFd, AsRawFd};
+
+            use nix::{
+                poll::{poll, PollFd, PollFlags, PollTimeout},
+                sys::socket::{recv, MsgFlags},
+            };
+            let remaining = self.remaining()?;
+            // Darwin rejects timeout socket options after the peer closes,
+            // even while its response is buffered. Poll the absolute
+            // deadline and receive nonblocking instead of resetting SO_RCVTIMEO.
+            let mut fds = [PollFd::new(self.stream.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)) {
+                Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+                Err(err) => return Err(err.into()),
+                Ok(_) => {}
+            }
+            match recv(self.stream.as_raw_fd(), buffer, MsgFlags::MSG_DONTWAIT) {
+                Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
+                result => return result.map_err(Into::into),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            set_stream_read_timeout(self.stream, Some(self.remaining()?)).map_err(std::io::Error::other)?;
+            self.stream.read(buffer)
+        }
     }
 }
 
@@ -111,6 +144,28 @@ pub struct DrainReport {
     pub old: DrainGeneration,
     pub current: DrainGeneration,
     pub warning: Option<String>,
+}
+
+#[derive(Default)]
+struct RetirementOutcome {
+    warning: Option<String>,
+    session_count: Option<usize>,
+    live_session_ids: Vec<String>,
+}
+
+/// Per-session outcomes are retained even when only part of a handover succeeds.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HandoverReport {
+    #[serde(flatten)]
+    pub drain: DrainReport,
+    pub moved: Vec<crate::protocol::TransferResult>,
+    pub stayed: Vec<HandoverStayed>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HandoverStayed {
+    pub session_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,17 +353,97 @@ impl SessionService {
         )
     }
 
+    /// Upgrade the logical daemon and transfer every live session (Unix).
+    #[cfg(unix)]
+    pub fn handover(&self, options: TransferOptions) -> Result<HandoverReport, String> {
+        let mut moved = Vec::new();
+        let mut stayed = Vec::new();
+        let mut drain = self.roll_using(
+            |layout| crate::platform::daemon::spawn_daemon_process(layout.root(), layout.daemon_name()),
+            Duration::from_secs(10),
+            |old, new| {
+                let protocol = crate::transfer::probe_target(&new.layout.socket_path(), Instant::now() + Duration::from_secs(2))?;
+                let body = serde_json::to_vec(&protocol).map_err(|err| format!("serialize protocol: {err}"))?;
+                let response = old.daemon_request_body(Method::POST, "/transfer-check", &body)?;
+                if response.status == StatusCode::NOT_FOUND || response.status == StatusCode::METHOD_NOT_ALLOWED {
+                    return Err("source daemon does not support handover; use server drain; alias unchanged".into());
+                }
+                if response.status != StatusCode::OK {
+                    return Err(format!("handover preflight failed; alias unchanged: {}", http_error_message(response)));
+                }
+                let incompatible: Vec<String> =
+                    serde_json::from_slice(&response.body).map_err(|err| format!("parse handover preflight: {err}"))?;
+                if !options.drop_incompatible && !incompatible.is_empty() {
+                    return Err(format!(
+                        "handover refused; alias unchanged: attached clients cannot follow:\n{}\nrerun with --drop-incompatible",
+                        incompatible.join("\n")
+                    ));
+                }
+                Ok(())
+            },
+            |old, new, mut ids| {
+                ids.sort();
+                // Bound worker count while allowing the daemon's asynchronous
+                // transfer machinery to service several handshakes together.
+                for batch in ids.chunks(16) {
+                    thread::scope(|scope| {
+                        let workers: Vec<_> = batch
+                            .iter()
+                            .map(|id| {
+                                let options = options.clone();
+                                (
+                                    id,
+                                    thread::Builder::new()
+                                        .name(format!("handover:{id}"))
+                                        .spawn_scoped(scope, move || old.transfer(id, new, options)),
+                                )
+                            })
+                            .collect();
+                        for (id, worker) in workers {
+                            let outcome = match worker {
+                                Ok(worker) => worker
+                                    .join()
+                                    .unwrap_or_else(|_| Err("transfer worker panicked; inspect the session's current holder".into())),
+                                Err(err) => Err(format!("start transfer worker: {err}")),
+                            };
+                            match outcome {
+                                Ok(result) => moved.push(result),
+                                Err(reason) => stayed.push(HandoverStayed { session_id: id.clone(), reason }),
+                            }
+                        }
+                    });
+                }
+                Ok(())
+            },
+        )?;
+        if drain.changed {
+            drain.old.session_count = drain.old.session_count.saturating_sub(moved.len());
+            drain.current.session_count += moved.len();
+        }
+        Ok(HandoverReport { drain, moved, stayed })
+    }
+
     fn drain_using(
         &self,
         start: impl FnOnce(&RuntimeLayout) -> Result<(), String>,
         health_deadline: Duration,
     ) -> Result<DrainReport, String> {
+        self.roll_using(start, health_deadline, |_, _| Ok(()), |_, _, _| Ok(()))
+    }
+
+    fn roll_using(
+        &self,
+        start: impl FnOnce(&RuntimeLayout) -> Result<(), String>,
+        health_deadline: Duration,
+        preflight: impl FnOnce(&Self, &Self) -> Result<(), String>,
+        transfer: impl FnOnce(&Self, &Self, Vec<String>) -> Result<(), String>,
+    ) -> Result<DrainReport, String> {
         if self.layout.daemon_name().contains('@') {
-            return Err("server drain requires a logical name; use --server without @generation".into());
+            return Err("server upgrade requires a logical name; use --server without @generation".into());
         }
-        let _lock = self.layout.lock_generations()?;
+        let generation_lock = self.layout.lock_generations()?;
         let mut recovery = crate::generation_recovery::GenerationRecovery::load(&self.layout)?;
-        let (recovery_warning, _) = self.resume_retirement(&mut recovery)?;
+        let recovered = self.resume_retirement(&mut recovery)?;
         recovery.reclaim(&self.layout)?;
         let old_service = Self::new(self.layout.resolved()?);
         let old_status = old_service.daemon_build_status()?;
@@ -327,7 +462,7 @@ impl SessionService {
             .as_ref()
             .is_some_and(|build| build.git_sha == installed.git_sha && build.protocol_version == installed.protocol_version)
         {
-            return Ok(DrainReport { changed: false, installed, current: old.clone(), old, warning: recovery_warning });
+            return Ok(DrainReport { changed: false, installed, current: old.clone(), old, warning: recovered.warning });
         }
         // Query the count separately: pre-drain daemons don't include it in status.
         let response = old_service.daemon_request(Method::GET, "/sessions")?;
@@ -361,6 +496,7 @@ impl SessionService {
             {
                 return Err("successor build does not match installed client; alias unchanged".into());
             }
+            preflight(&old_service, &new_service)?;
             Ok(status)
         })();
         let status = match startup {
@@ -385,11 +521,15 @@ impl SessionService {
         self.layout.set_current_generation(generation)?;
         recovery.unpublished.remove(&generation);
         recovery.save(&self.layout)?;
-        let (warning, session_count) = self.resume_retirement(&mut recovery)?;
-        if let Some(session_count) = session_count {
+        let retirement = self.resume_retirement(&mut recovery)?;
+        if let Some(session_count) = retirement.session_count {
             old.session_count = session_count;
         }
-        let warning = warning.or(recovery_warning);
+        let warning = retirement.warning.or(recovered.warning);
+        // Relocation takes this same logical-name lock in the source daemon.
+        // The alias and retirement are settled; release it before any transfer.
+        drop(generation_lock);
+        transfer(&old_service, &new_service, retirement.live_session_ids)?;
         let current = DrainGeneration {
             name: successor.daemon_name().to_string(),
             generation: successor.generation(),
@@ -399,27 +539,32 @@ impl SessionService {
         Ok(DrainReport { changed: true, installed, old, current, warning })
     }
 
-    fn resume_retirement(
-        &self,
-        recovery: &mut crate::generation_recovery::GenerationRecovery,
-    ) -> Result<(Option<String>, Option<usize>), String> {
-        let Some(retirement) = &recovery.retirement else { return Ok((None, None)) };
+    fn resume_retirement(&self, recovery: &mut crate::generation_recovery::GenerationRecovery) -> Result<RetirementOutcome, String> {
+        let Some(retirement) = &recovery.retirement else { return Ok(RetirementOutcome::default()) };
         if self.layout.generation().is_none_or(|current| current < retirement.successor) {
             // Publication did not happen. Never drain the still-current host.
             recovery.retirement = None;
-            return recovery.save(&self.layout).map(|()| (None, None));
+            return recovery.save(&self.layout).map(|()| RetirementOutcome::default());
         }
         let old_layout = self.layout.clone().with_daemon(retirement.old.clone())?;
         if old_layout.logical_name() != self.layout.logical_name() || old_layout.generation() >= Some(retirement.successor) {
             return Err("invalid pending daemon retirement".into());
         }
         let old_service = Self::new(old_layout);
-        let mut session_count = None;
-        let warning = match old_service.daemon_request(Method::POST, "/drain") {
+        let mut outcome = RetirementOutcome::default();
+        outcome.warning = match old_service.daemon_request(Method::POST, "/drain") {
             Ok(response) if response.status == StatusCode::OK => {
-                let status = serde_json::from_slice::<crate::build_info::DaemonBuildStatus>(&response.body)
-                    .map_err(|e| format!("alias moved, but invalid drain response: {e}"))?;
-                session_count = Some(status.session_count);
+                #[derive(serde::Deserialize)]
+                struct RetiringSessions {
+                    #[serde(flatten)]
+                    status: crate::build_info::DaemonBuildStatus,
+                    #[serde(default)]
+                    live_session_ids: Vec<String>,
+                }
+                let retiring: RetiringSessions =
+                    serde_json::from_slice(&response.body).map_err(|e| format!("alias moved, but invalid drain response: {e}"))?;
+                outcome.session_count = Some(retiring.status.session_count);
+                outcome.live_session_ids = retiring.live_session_ids;
                 None
             }
             Ok(response) if response.status == StatusCode::NOT_FOUND || response.status == StatusCode::METHOD_NOT_ALLOWED => Some(format!(
@@ -442,14 +587,18 @@ impl SessionService {
         recovery.unpublished.remove(&retirement.successor);
         recovery.retirement = None;
         recovery.save(&self.layout)?;
-        Ok((warning, session_count))
+        Ok(outcome)
     }
 
     fn daemon_request(&self, method: Method, path: &str) -> Result<http_uds::HttpResponse, String> {
+        self.daemon_request_body(method, path, &[])
+    }
+
+    fn daemon_request_body(&self, method: Method, path: &str, body: &[u8]) -> Result<http_uds::HttpResponse, String> {
         let mut stream = try_connect_session_stream(&self.layout.socket_path()).map_err(|err| format!("connect daemon: {err}"))?;
         set_stream_read_timeout(&stream, Some(Duration::from_secs(2)))?;
         crate::platform::ipc::set_stream_write_timeout(&stream, Some(Duration::from_secs(2)))?;
-        http_uds::write_request(&mut stream, method, path, &[]).map_err(|err| format!("write daemon request: {err}"))?;
+        http_uds::write_request(&mut stream, method, path, body).map_err(|err| format!("write daemon request: {err}"))?;
         let mut reader = DaemonResponseReader { stream: &mut stream, deadline: Instant::now() + Duration::from_secs(2) };
         http_uds::read_response(&mut reader).map_err(|err| format!("read daemon response: {err}"))
     }

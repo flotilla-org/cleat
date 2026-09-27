@@ -292,6 +292,21 @@ fn auto_start_cannot_resurrect_a_retired_generation_during_or_after_cleanup() {
 
 #[test]
 fn later_drain_retries_failed_retirement_without_another_successor() {
+    assert_failed_retirement_is_retried(|service| assert!(!service.drain().unwrap().changed));
+}
+
+#[cfg(unix)]
+#[test]
+fn later_handover_retries_failed_retirement_without_another_successor() {
+    assert_failed_retirement_is_retried(|service| {
+        let report = service.handover(Default::default()).unwrap();
+        assert!(!report.drain.changed);
+        assert!(report.moved.is_empty());
+        assert!(report.stayed.is_empty());
+    });
+}
+
+fn assert_failed_retirement_is_retried(recover: impl FnOnce(&SessionService)) {
     let temp = tempfile::tempdir().unwrap();
     let layout = RuntimeLayout::new(temp.path().to_path_buf());
     let old = layout.prepare_generation().unwrap();
@@ -304,7 +319,7 @@ fn later_drain_retries_failed_retirement_without_another_successor() {
     // Recovery is retried even though the successor already matches our build.
     assert!(service.drain().unwrap_err().contains("injected drain failure"));
     host.fail_drain.store(false, Ordering::SeqCst);
-    assert!(!service.drain().unwrap().changed);
+    recover(&service);
     assert_eq!(host.drain_requests.load(Ordering::SeqCst), 3);
     assert_eq!(layout.generation(), Some(2));
     assert!(!temp.path().join("default@3").exists());
@@ -370,4 +385,54 @@ fn pending_retirement_completes_when_the_old_host_already_exited() {
     assert!(crate::generation_recovery::GenerationRecovery::load(&layout).unwrap().retirement.is_none());
     assert!(successor.daemon_dir().exists());
     assert_eq!(layout.generation(), Some(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn handover_from_a_pre_handover_daemon_keeps_the_alias_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let old = layout.prepare_generation().unwrap();
+    let _host = OldDaemon::start(&old, true);
+    let error = SessionService::new(layout.clone()).handover(Default::default()).unwrap_err();
+    assert!(error.contains("use server drain") && error.contains("alias unchanged"), "{error}");
+    assert_eq!(layout.generation(), Some(1));
+    SessionService::new(layout.with_daemon("default@2".into()).unwrap()).daemon_request(Method::POST, "/drain").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn response_deadline_reader_consumes_a_response_after_peer_close() {
+    let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    http_uds::write_json(&mut writer, StatusCode::OK, &serde_json::json!({"ok": true})).unwrap();
+    drop(writer);
+    let response =
+        http_uds::read_response(&mut DaemonResponseReader { stream: &mut reader, deadline: Instant::now() + Duration::from_secs(1) })
+            .unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(), serde_json::json!({"ok": true}));
+}
+
+#[cfg(unix)]
+#[test]
+fn response_deadline_is_not_extended_by_trickling_bytes() {
+    use std::io::Read;
+    let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        for _ in 0..100 {
+            if writer.write_all(b"x").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let start = Instant::now();
+    let mut bytes = Vec::new();
+    let error =
+        DaemonResponseReader { stream: &mut reader, deadline: start + Duration::from_millis(60) }.read_to_end(&mut bytes).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(!bytes.is_empty());
+    assert!(start.elapsed() < Duration::from_millis(500));
+    drop(reader);
+    worker.join().unwrap();
 }

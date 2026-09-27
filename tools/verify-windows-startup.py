@@ -1,7 +1,6 @@
 """Temporary #289 runner experiment; removed after collecting evidence."""
 
 from pathlib import Path
-import json
 import subprocess
 import time
 
@@ -17,7 +16,6 @@ def run(args, *, expected_failure=False):
         assert "os error 121" in result.stdout, "different Win32 error"
     else:
         assert result.returncode == 0, "validation failed; no retry"
-    return result.stdout
 
 
 def stop_experiment_daemons():
@@ -64,18 +62,10 @@ try:
     stop_experiment_daemons()
     daemon.write_text(originals[daemon])
     run(["cargo", "build", "-p", "cleat", "--locked", "--features", "ghostty-vt"])
-    artifacts = run(test[:test.index("--")] + ["--no-run", "--message-format=json"])
-    executables = []
-    for line in artifacts.splitlines():
-        if not line.startswith("{"):
-            continue
-        artifact = json.loads(line)
-        if artifact.get("reason") == "compiler-artifact" and artifact.get("target", {}).get("name") == "generations" and artifact.get("executable"):
-            executables.append(artifact["executable"])
-    assert len(executables) == 1, f"expected one generations test executable: {executables}"
     for iteration in range(1, 21):
         print(f"[startup-289] normal generations run {iteration}/20", flush=True)
-        run([executables[0], "--nocapture"])
+        run(test)
+        stop_experiment_daemons()
 finally:
     for path, contents in originals.items():
         path.write_text(contents)

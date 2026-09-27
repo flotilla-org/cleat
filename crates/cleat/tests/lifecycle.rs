@@ -3993,6 +3993,51 @@ fn signal_term_to_leader_terminates_session() {
 }
 
 #[test]
+fn kill_waits_for_interactive_shell_and_preserves_recording() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    // Exercise zsh when installed, with bash as the CI fallback.
+    let shell = if Command::new("zsh").arg("--version").output().is_ok() { "zsh -f -i" } else { "bash --noprofile --norc -i" };
+    let info = service
+        .create(Some("interactive".into()), Some(VtEngineKind::Passthrough), None, Some(format!("exec {shell}")), true)
+        .expect("create interactive shell");
+    let ready = temp.path().join("ready");
+    service.send_keys(&info.id, format!("echo $$ > {}\n", ready.display()).as_bytes()).unwrap();
+    wait_until("interactive shell ready", || std::fs::read_to_string(&ready).is_ok_and(|s| s.trim().parse::<i32>().is_ok()));
+    let pid = std::fs::read_to_string(&ready).unwrap().trim().parse::<i32>().unwrap();
+    let _pids = SignalFixturePids(vec![pid]);
+    let cli = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cleat"))
+            .arg("--runtime-root")
+            .arg(temp.path())
+            .env_remove("CLEAT_DAEMON")
+            .env_remove("CLEAT_SESSION")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    };
+    for target in ["foreground", "leader", "tree"] {
+        cli(&["signal", &info.id, "TERM", "--target", target]);
+    }
+    std::thread::sleep(Duration::from_millis(2200));
+    assert!(signal_fixture_is_running(pid), "explicit TERM must not escalate");
+    service.inspect(&info.id).expect("shell still hosted after TERM");
+
+    let started = Instant::now();
+    cli(&["kill", &info.id]);
+    assert!(!signal_fixture_is_running(pid), "kill must wait for interactive shell termination");
+    assert!(started.elapsed() < Duration::from_secs(5), "kill must finish within the grace period plus scheduling allowance");
+    assert!(service.inspect(&info.id).is_err(), "session should retire normally");
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    assert!(layout.session_dir(&info.id).exists(), "kill must preserve session metadata");
+    let cast = layout.session_dir(&info.id).join(CAST_FILE_NAME);
+    let events = cleat::cast_reader::read_all_events_since(&cast, 0).expect("read retained recording");
+    assert!(events.iter().any(|event| event.code == cleat::asciicast::EventCode::Exit), "recording must include the exit event");
+}
+
+#[test]
 fn kill_terminates_background_children_in_leader_process_group() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");

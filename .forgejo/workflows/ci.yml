@@ -41,6 +41,14 @@ jobs:
           test -z "${FORGEJO_ADMIN_TOKEN:-}"
           ! git --no-pager config --local --get-regexp 'http\..*\.extraheader'
 
+      - name: Install pinned Rust toolchain
+        # The rustup proxy installs the toolchain and components from rust-toolchain.toml.
+        shell: bash
+        run: |
+          expected=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustc --version
+          test "$(rustc --version | cut -d ' ' -f 2)" = "$expected"
+
       - name: Prepare Ghostty VT
         run: |
           ./tools/prepare-ghostty-vt.sh

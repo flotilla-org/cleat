@@ -853,6 +853,9 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                         for session in &report.stayed {
                             output.push_str(&format!("\n{}: stayed: {}", session.session_id, session.reason));
                         }
+                        if let Some(warning) = &report.drain.warning {
+                            output.push_str(&format!("\nwarning: {warning}"));
+                        }
                         output
                     };
                     if report.stayed.is_empty() {

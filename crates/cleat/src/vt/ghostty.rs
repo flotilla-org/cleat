@@ -191,12 +191,15 @@ impl GhosttyVtEngine {
                     has_hyperlink: cell.has_hyperlink,
                     hyperlink_id: 0,
                     hyperlink_uri: if cell.has_hyperlink {
-                        let uri = self.terminal.history_link(
-                            links.screen,
-                            col_idx as u16,
-                            u32::try_from(links.offset + u64::from(row)).map_err(|e| e.to_string())?,
-                            links.remaining_bytes,
-                        )?;
+                        let uri = self
+                            .terminal
+                            .bounded_history_link(
+                                links.screen,
+                                col_idx as u16,
+                                u32::try_from(links.offset + u64::from(row)).map_err(|e| e.to_string())?,
+                                links.remaining_bytes,
+                            )?
+                            .unwrap_or_default();
                         links.remaining_bytes -= uri.len();
                         uri
                     } else {
@@ -1333,14 +1336,20 @@ mod history_tests {
     }
 
     #[test]
-    fn live_render_hyperlink_budget_is_shared_across_rows_and_recovers() {
+    fn live_render_hyperlink_budget_preserves_text_even_on_repeated_full_frames() {
         let mut engine = GhosttyVtEngine::new(80, 20);
         let uri = format!("https://example.test/{}", "a".repeat(1000));
         engine.feed(format!("\x1b]8;;{uri}\x1b\\{}\x1b]8;;\x1b\\", "x".repeat(1600)).as_bytes()).unwrap();
-        let error = engine.render_update(DirtyState::Full).unwrap_err();
-        assert!(error.contains("resource budget"), "{error}");
-        // A failed capture must not publish a partially stripped frame. A later
-        // valid frame can still be captured, despite rows visited before failure.
+        for _ in 0..2 {
+            let update = engine.render_update(DirtyState::Full).unwrap();
+            let cells: Vec<_> = update.ops.iter().flat_map(|op| &op.rows).flat_map(|row| &row.cells).collect();
+            assert_eq!(cells.len(), 1600);
+            assert!(cells.iter().all(|cell| cell.graphemes == [u32::from('x')]));
+            let bytes: usize = cells.iter().map(|cell| cell.style.hyperlink_uri.len()).sum();
+            assert!(bytes > 0 && bytes <= MAX_RENDER_HYPERLINK_BYTES);
+            assert!(cells.last().unwrap().style.hyperlink_uri.is_empty());
+        }
+        // Later output can expose its smaller link without needing a new session.
         engine.feed(b"\x1bc\x1b]8;;https://small.test\x1b\\ok\x1b]8;;\x1b\\").unwrap();
         let update = engine.render_update(DirtyState::Partial).unwrap();
         assert_eq!(update.ops[0].rows[0].cells[0].style.hyperlink_uri, b"https://small.test");

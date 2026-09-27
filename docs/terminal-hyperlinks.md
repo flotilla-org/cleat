@@ -11,8 +11,10 @@ captures populate the same field as well as their existing per-cell `links` list
 Row replacement and scroll copy apply to URI data together with cell content.
 A retained update never resolves a URI from a newer engine state.
 Live render updates share a cumulative 1 MiB URI budget across all included rows,
-matching the tracked-history resource limit. An over-budget update is rejected
-rather than publishing a partially stripped frame; later valid output can recover. Snapshot-only
+matching the tracked-history resource limit. Destinations exceeding the remaining budget are omitted before allocation;
+their text still renders and their empty URI cannot activate an unrelated link.
+Repeated full captures of the same dense screen remain usable. Tracked-history
+captures retain their existing all-resource budget/error behavior. Snapshot-only
 feeds do not expose URI destinations; use render updates for hyperlinks.
 
 This changes the C layout (provider ABI **10**) and the postcard render payload

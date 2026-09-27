@@ -11,4 +11,4 @@ pub use unsupported::*;
 #[cfg(unix)]
 mod tree;
 #[cfg(unix)]
-pub(crate) use tree::{ProcessTree, TreeTermination};
+pub(crate) use tree::{ProcessTree, SignalDelivery, TreeTermination};

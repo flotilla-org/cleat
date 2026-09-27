@@ -53,3 +53,6 @@ pub mod transfer_manifest;
 
 #[cfg(unix)]
 mod embedded_transfer;
+
+#[cfg(unix)]
+mod termination_diagnostics;

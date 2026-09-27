@@ -1707,6 +1707,7 @@ pub(crate) const SESSION_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 struct PendingTermination {
+    session_id: String,
     deadline: Instant,
     tree: crate::platform::signals::ProcessTree,
 }
@@ -1716,14 +1717,15 @@ impl PendingTermination {
     fn service(
         &self,
         now: Instant,
-        kill: impl FnOnce(&crate::platform::signals::ProcessTree) -> Result<(), String>,
-    ) -> Option<Result<(), String>> {
+        kill: impl FnOnce(&crate::platform::signals::ProcessTree) -> crate::platform::signals::SignalDelivery,
+    ) -> Option<crate::platform::signals::SignalDelivery> {
         (now >= self.deadline).then(|| kill(&self.tree))
     }
 }
 
 #[cfg(unix)]
 fn begin_termination(
+    session_id: &str,
     started: &mut Option<Result<(), String>>,
     pending: &mut Vec<PendingTermination>,
     now: impl FnOnce() -> Instant,
@@ -1734,7 +1736,11 @@ fn begin_termination(
     }
     let termination = terminate()?;
     // Retain the snapshot before propagating any partial delivery error.
-    pending.push(PendingTermination { deadline: now() + SESSION_TERMINATION_GRACE, tree: termination.tree });
+    pending.push(PendingTermination {
+        session_id: session_id.to_owned(),
+        deadline: now() + SESSION_TERMINATION_GRACE,
+        tree: termination.tree,
+    });
     let delivery = termination.delivery.map_err(|err| format!("TERM delivery incomplete; KILL escalation scheduled: {err}"));
     *started = Some(delivery.clone());
     delivery
@@ -2100,6 +2106,8 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     )
     .map_err(|e| format!("write daemon build identity: {e}"))?;
 
+    #[cfg(unix)]
+    let termination_diagnostics = crate::termination_diagnostics::TerminationDiagnostics::open(&layout.daemon_dir())?;
     let mut draining = false;
     let mut sessions: HashMap<String, HostedSession> = HashMap::new();
     #[cfg(unix)]
@@ -2151,10 +2159,8 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
         #[cfg(unix)]
         pending_terminations.retain(|pending| match pending.service(Instant::now(), |tree| tree.kill_survivors()) {
             None => true,
-            Some(result) => {
-                if let Err(err) = result {
-                    eprintln!("cleat: session termination escalation failed: {err}");
-                }
+            Some(delivery) => {
+                termination_diagnostics.record(&pending.session_id, delivery);
                 false
             }
         });
@@ -3442,7 +3448,9 @@ fn handle_http_request(
                 return write_http_not_found(stream);
             };
             #[cfg(unix)]
-            begin_termination(&mut hosted.termination_started, state.pending_terminations, Instant::now, || hosted.actor.terminate_tree())?;
+            begin_termination(&id, &mut hosted.termination_started, state.pending_terminations, Instant::now, || {
+                hosted.actor.terminate_tree()
+            })?;
             #[cfg(not(unix))]
             hosted.actor.dispatch_signal(TERMINATE_SIGNAL, crate::protocol::SignalTarget::Tree)?;
             http_uds::write_no_content(stream).map_err(|err| format!("write HTTP delete response: {err}"))
@@ -5375,6 +5383,7 @@ mod tests {
         let mut started = None;
         let mut pending = Vec::new();
         let result = super::begin_termination(
+            "test-session",
             &mut started,
             &mut pending,
             || now,
@@ -5390,7 +5399,13 @@ mod tests {
         assert_eq!(pending.len(), 1, "partial TERM must retain escalation");
         assert_eq!(started, Some(result.clone()));
         assert_eq!(
-            super::begin_termination(&mut started, &mut pending, || now + Duration::from_secs(1), || panic!("retry must not recapture")),
+            super::begin_termination(
+                "test-session",
+                &mut started,
+                &mut pending,
+                || now + Duration::from_secs(1),
+                || panic!("retry must not recapture")
+            ),
             result,
             "retry must not silently claim complete delivery"
         );
@@ -5402,10 +5417,13 @@ mod tests {
         // and deadline are needed to kill the permitted survivor.
         let kill = escalation
             .service(now + super::SESSION_TERMINATION_GRACE, |tree| {
-                tree.signal_with(Signal::SIGKILL, |pid, _| live.borrow().contains(&pid), &deliver)
+                tree.deliver_with(Signal::SIGKILL, |pid, _| live.borrow().contains(&pid), &deliver)
             })
             .unwrap();
-        assert!(kill.unwrap_err().contains("EPERM"));
+        assert_eq!(kill.delivered, vec![2]);
+        assert_eq!(kill.errors.len(), 1);
+        assert!(kill.errors[0].contains("EPERM"));
+        assert_eq!(escalation.session_id, "test-session");
         assert_eq!(*live.borrow(), vec![3], "inaccessible process is not reported dead");
         assert!(deliveries.borrow().contains(&(2, Signal::SIGKILL)));
         assert!(!deliveries.borrow().contains(&(1, Signal::SIGKILL)));
@@ -5422,6 +5440,7 @@ mod tests {
         let mut started = None;
         let mut pending = Vec::new();
         super::begin_termination(
+            "test-session",
             &mut started,
             &mut pending,
             || now,
@@ -5442,12 +5461,12 @@ mod tests {
             },
         )
         .unwrap();
-        super::begin_termination(&mut started, &mut pending, || now, || panic!("already started")).unwrap();
+        super::begin_termination("test-session", &mut started, &mut pending, || now, || panic!("already started")).unwrap();
         assert_eq!(pending.len(), 1);
         let mut killed = Vec::new();
         pending[0]
             .service(now + super::SESSION_TERMINATION_GRACE, |tree| {
-                tree.signal_with(
+                tree.deliver_with(
                     Signal::SIGKILL,
                     |pid, _| pid == 1,
                     |pid, _| {
@@ -5456,7 +5475,6 @@ mod tests {
                     },
                 )
             })
-            .unwrap()
             .unwrap();
         assert_eq!(killed, vec![1]);
     }
@@ -5466,7 +5484,7 @@ mod tests {
     fn termination_refusal_does_not_schedule_or_latch() {
         let mut started = None;
         let mut pending = Vec::new();
-        let result = super::begin_termination(&mut started, &mut pending, Instant::now, || Err("ownership refused".into()));
+        let result = super::begin_termination("test-session", &mut started, &mut pending, Instant::now, || Err("ownership refused".into()));
         assert_eq!(result, Err("ownership refused".into()));
         assert!(started.is_none());
         assert!(pending.is_empty());

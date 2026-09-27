@@ -524,7 +524,7 @@ pub(crate) enum SessionCommand {
     },
     #[cfg(unix)]
     TerminateTree {
-        reply: mpsc::Sender<Result<crate::platform::signals::ProcessTree, String>>,
+        reply: mpsc::Sender<Result<crate::platform::signals::TreeTermination, String>>,
     },
     DispatchSignal {
         signal: i32,
@@ -1091,7 +1091,7 @@ impl SessionActor {
     }
 
     #[cfg(unix)]
-    pub(crate) fn terminate_tree(&self) -> Result<crate::platform::signals::ProcessTree, String> {
+    pub(crate) fn terminate_tree(&self) -> Result<crate::platform::signals::TreeTermination, String> {
         self.request_result(|reply| SessionCommand::TerminateTree { reply })
     }
 

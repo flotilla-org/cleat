@@ -248,6 +248,15 @@ impl PtyChild {
         crate::platform::signals::ProcessTree::capture(self.leader_pid(), self.foreground_pgid())
     }
 
+    pub(crate) fn terminate_tree(&self) -> Result<crate::platform::signals::TreeTermination, String> {
+        // An ownership refusal is not partial delivery: never retain escalation
+        // authority for a child transferred to another host.
+        self.ensure_may_signal()?;
+        let tree = self.process_tree();
+        let delivery = self.signal_tree(&tree, Signal::SIGTERM);
+        Ok(crate::platform::signals::TreeTermination { tree, delivery })
+    }
+
     pub(crate) fn signal_tree(&self, tree: &crate::platform::signals::ProcessTree, signal: Signal) -> Result<(), String> {
         self.ensure_may_signal()?;
         // Capture the foreground group before signaling anything: terminating

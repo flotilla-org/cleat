@@ -669,11 +669,12 @@ impl SessionRuntime {
     }
 
     #[cfg(unix)]
-    pub(crate) fn terminate_tree(&mut self) -> Result<crate::platform::signals::ProcessTree, String> {
-        let tree = self.pty_child.process_tree();
-        self.pty_child.signal_tree(&tree, nix::sys::signal::Signal::SIGTERM)?;
-        self.record_custom_event('s', &serde_json::json!({"signal": libc::SIGTERM, "target": "tree"}).to_string());
-        Ok(tree)
+    pub(crate) fn terminate_tree(&mut self) -> Result<crate::platform::signals::TreeTermination, String> {
+        let termination = self.pty_child.terminate_tree()?;
+        if termination.delivery.is_ok() {
+            self.record_custom_event('s', &serde_json::json!({"signal": libc::SIGTERM, "target": "tree"}).to_string());
+        }
+        Ok(termination)
     }
 
     pub(crate) fn dispatch_signal(&mut self, signal: i32, target: SignalTarget) -> Result<(), String> {

@@ -41,6 +41,9 @@ jobs:
           test -z "${FORGEJO_ADMIN_TOKEN:-}"
           ! git --no-pager config --local --get-regexp 'http\..*\.extraheader'
 
+      - name: Install pinned Rust toolchain
+        run: rustc --version
+
       - name: Prepare Ghostty VT
         run: |
           ./tools/prepare-ghostty-vt.sh

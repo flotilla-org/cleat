@@ -1230,6 +1230,10 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         attachment_name_len: 0,
         attachment_kind: CLEAT_ATTACHMENT_TOOL,
     });
+    let identity = match attachment_identity_from_desc(desc) {
+        Ok(identity) => identity,
+        Err(_) => return ptr::null_mut(),
+    };
     let geometry = TerminalGeometry::from_cell_size(desc.cols.max(1), desc.rows.max(1), desc.cell_width_px, desc.cell_height_px);
     let backend = match provider.backend {
         ProviderBackend::Mock => {
@@ -1252,10 +1256,7 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         wake: provider.wake.clone(),
         last_snapshot: None,
         last_render_update: None,
-        transfer: session_transfer::TransferState::new(
-            provider.runtime_root.clone(),
-            attachment_identity_from_desc(desc).unwrap_or_default(),
-        ),
+        transfer: session_transfer::TransferState::new(provider.runtime_root.clone(), identity),
     }))
 }
 
@@ -1283,6 +1284,10 @@ pub unsafe extern "C" fn cleat_session_attach(provider: *mut CleatProvider, desc
         Some(desc) => *desc,
         None => return ptr::null_mut(),
     };
+    let identity = match attachment_identity_from_desc(desc) {
+        Ok(identity) => identity,
+        Err(_) => return ptr::null_mut(),
+    };
     let geometry = TerminalGeometry::from_cell_size(desc.cols.max(1), desc.rows.max(1), desc.cell_width_px, desc.cell_height_px);
     let backend = match attach_daemon_session(provider, desc) {
         Ok(session) => SessionBackend::Daemon(session),
@@ -1295,10 +1300,7 @@ pub unsafe extern "C" fn cleat_session_attach(provider: *mut CleatProvider, desc
         wake: provider.wake.clone(),
         last_snapshot: None,
         last_render_update: None,
-        transfer: session_transfer::TransferState::new(
-            provider.runtime_root.clone(),
-            attachment_identity_from_desc(desc).unwrap_or_default(),
-        ),
+        transfer: session_transfer::TransferState::new(provider.runtime_root.clone(), identity),
     }))
 }
 
@@ -2790,6 +2792,21 @@ mod tests {
         let converted = session_colors_from_desc(CleatSessionDesc { colors: &colors, ..CleatSessionDesc::default() });
 
         assert_eq!(converted, TerminalColors::default());
+    }
+
+    #[test]
+    fn session_creation_rejects_invalid_attachment_identity() {
+        unsafe {
+            let provider = cleat_provider_open(&CleatProviderDesc {
+                abi_version: CLEAT_PROVIDER_ABI_VERSION,
+                requested_features: ProviderFeatures::CELL_SNAPSHOTS.bits(),
+                ..CleatProviderDesc::default()
+            });
+            assert!(!provider.is_null());
+            let session = cleat_session_create(provider, &CleatSessionDesc { attachment_kind: u32::MAX, ..CleatSessionDesc::default() });
+            assert!(session.is_null());
+            cleat_provider_close(provider);
+        }
     }
 
     #[test]

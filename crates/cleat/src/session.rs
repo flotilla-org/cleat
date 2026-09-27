@@ -3204,8 +3204,11 @@ fn handle_http_request(
                 Ok(())
             }
             #[cfg(not(unix))]
-            http_uds::write_error(stream, StatusCode::NOT_IMPLEMENTED, "session transfer is only supported on Unix")
-                .map_err(|err| err.to_string())
+            {
+                let _ = id;
+                http_uds::write_error(stream, StatusCode::NOT_IMPLEMENTED, "session transfer is only supported on Unix")
+                    .map_err(|err| err.to_string())
+            }
         }
         http_uds::Route::SessionTransfer { id } => 'transfer: {
             let Some(hosted) = state.sessions.get_mut(&id) else {
@@ -3277,13 +3280,9 @@ fn handle_http_request(
             crate::runtime::validate_environment(&session.environment)?;
             session.vt_engine.ensure_available()?;
             #[cfg(unix)]
-            if state.transfers.adoption_pending(&session.id) {
-                return http_uds::write_error(
-                    stream,
-                    StatusCode::CONFLICT,
-                    &format!("session {} is being transferred to this daemon", session.id),
-                )
-                .map_err(|err| format!("write HTTP error response: {err}"));
+            if state.transfers.transfer_pending(&session.id) {
+                return http_uds::write_error(stream, StatusCode::CONFLICT, &format!("session {} is being transferred", session.id))
+                    .map_err(|err| format!("write HTTP error response: {err}"));
             }
             let mut created = false;
             if !state.sessions.contains_key(&session.id) {

@@ -123,6 +123,8 @@ pub(crate) fn held_elsewhere(dir: &std::path::Path) -> bool {
 /// An embedded holder may return to a different daemon. The target has a
 /// private, paused snapshot directory at READY. Park it while moving the
 /// retained directory into place; until the epoch commits, Drop rolls back.
+/// Both paths belong to the same runtime root. Refuse EXDEV rather than copy:
+/// the live append descriptor and kernel lease must keep naming the same inode.
 pub(crate) struct RelocatedDirectory {
     source: PathBuf,
     target: PathBuf,

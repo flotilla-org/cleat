@@ -238,6 +238,9 @@ fn killed_embedded_process_releases_lease_and_leaves_recreatable_recording() {
     wait(|| fixture.temp.path().join("holder-ready").exists());
     let dir = fixture.temp.path().join("default@1/sessions/moving");
     assert!(!cleat::recreate::session_is_recreatable(&dir));
+    // Observe publication before killing the adopter: COMMITTED reaches the
+    // process before the source daemon publishes its hosted-elsewhere entry.
+    wait(|| fixture.service().inspect("moving").is_ok_and(|inspect| inspect.session.state == "hosted-elsewhere"));
     child.kill().unwrap();
     child.wait().unwrap();
     wait(|| cleat::recreate::session_is_recreatable(&dir));
@@ -245,7 +248,7 @@ fn killed_embedded_process_releases_lease_and_leaves_recreatable_recording() {
     // Recreation uses the same directory and seeds the replacement VT from the
     // recording, exactly as attach's create-if-missing path does.
     fixture.service().create(Some("moving".into()), Some(cleat::vt::VtEngineKind::Ghostty), None, Some("cat".into()), true).unwrap();
-    assert!(fixture.service().inspect("moving").is_ok());
+    fixture.service().inspect("moving").expect("inspect recreated session");
     assert!(std::fs::read_to_string(dir.join("session.cast")).unwrap().contains("survives_holder_death"));
 }
 

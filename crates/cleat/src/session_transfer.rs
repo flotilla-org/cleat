@@ -132,8 +132,8 @@ impl TransferHub {
         !self.outgoing.is_empty() || !self.pending_adoptions.is_empty() || (!draining && !self.forwarders.is_empty())
     }
 
-    pub(super) fn adoption_pending(&self, id: &str) -> bool {
-        self.pending_adoptions.contains_key(id)
+    pub(super) fn transfer_pending(&self, id: &str) -> bool {
+        self.pending_adoptions.contains_key(id) || self.outgoing.iter().any(|transfer| transfer.session_id == id)
     }
 
     /// The redirect a request for a released session receives during the

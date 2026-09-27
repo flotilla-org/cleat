@@ -18,6 +18,21 @@ def run(args, *, expected_failure=False):
         assert result.returncode == 0, "validation failed; no retry"
 
 
+def stop_experiment_daemons():
+    # This dedicated runner's test binary spawns detached daemons. Release
+    # their loaded DLLs before rebuilding a different variant; scope by the
+    # exact executable path, not by image name or unrelated runner processes.
+    run(["powershell", "-NoProfile", "-Command", """
+        $ErrorActionPreference = 'Stop'
+        $exe = (Resolve-Path 'target/debug/cleat.exe').Path
+        $owned = @(Get-Process cleat -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe })
+        foreach ($process in $owned) {
+            Stop-Process -InputObject $process -Force -ErrorAction SilentlyContinue
+            if (!$process.WaitForExit(15000)) { throw 'test daemon did not exit' }
+        }
+    """])
+
+
 ipc = Path("crates/cleat/src/platform/ipc/windows.rs")
 daemon = Path("crates/cleat/src/session.rs")
 generations = Path("crates/cleat/tests/generations.rs")
@@ -39,10 +54,12 @@ try:
     print("[startup-289] OLD listener, delayed first accept: expect exact reported failure", flush=True)
     run(["cargo", "build", "-p", "cleat", "--locked", "--features", "ghostty-vt"])
     run(test, expected_failure=True)
+    stop_experiment_daemons()
     ipc.write_text(originals[ipc])
     print("[startup-289] FIXED listener, same delayed first accept: require pass", flush=True)
     run(["cargo", "build", "-p", "cleat", "--locked", "--features", "ghostty-vt"])
     run(test)
+    stop_experiment_daemons()
     daemon.write_text(originals[daemon])
     run(["cargo", "build", "-p", "cleat", "--locked", "--features", "ghostty-vt"])
     for iteration in range(1, 21):

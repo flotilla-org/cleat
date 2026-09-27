@@ -25,6 +25,9 @@ claims that every failure is `default@2` and all three occurred September 27.
 The other daemon-launching tests finish within 0.89 s in the PR #281 job and
 0.41 s in the PR #279 job. These are suite-relative completion times, not measured
 daemon initialization times; the old logs do not contain startup-stage timings.
+The source at all three failing heads (`c1b46ca`, `536b661`, `ad97bfc`)
+contains the old `ERROR_NO_DATA | ERROR_PIPE_LISTING_ALIAS => return Ok(false)`
+branch, without the disconnect correction.
 
 ## Mechanism under test
 

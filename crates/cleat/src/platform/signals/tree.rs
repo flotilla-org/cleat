@@ -1,4 +1,4 @@
-//! Best-effort Unix descendant signaling. Capture before signaling: a dying
+//! Best-effort Unix descendant and process-group member signaling. Capture before signaling: a dying
 //! parent can immediately reparent its children, losing the ancestry link.
 use std::collections::{HashMap, HashSet};
 
@@ -28,24 +28,37 @@ impl ProcessIdentity {
 /// Retained independently of the session actor so escalation survives leader
 /// exit and reparenting. Birth stamps guard against signaling a reused PID.
 /// This is a snapshot, not a containment primitive: a process which reparents
-/// before capture cannot be discovered by ancestry walking.
+/// before capture can only be discovered if it remains in a captured group.
 pub(crate) struct ProcessTree {
     processes: Vec<ProcessIdentity>,
 }
 
 impl ProcessTree {
-    pub(crate) fn capture(leader: u32) -> Self {
-        Self::from_roots(&ProcessIdentity::capture(leader).into_iter().collect::<Vec<_>>())
+    pub(crate) fn capture(leader: u32, foreground: Option<u32>) -> Self {
+        let groups = [leader, foreground.unwrap_or(leader)];
+        Self::from_roots(&ProcessIdentity::capture(leader).into_iter().collect::<Vec<_>>(), &groups)
     }
 
-    fn from_roots(roots: &[ProcessIdentity]) -> Self {
-        if roots.is_empty() {
+    fn from_roots(roots: &[ProcessIdentity], groups: &[u32]) -> Self {
+        if roots.is_empty() && groups.is_empty() {
             return Self { processes: Vec::new() };
         }
         let mut system = System::new();
         system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut roots = roots.to_vec();
         for (pid, process) in system.processes() {
+            if !groups.is_empty() {
+                // Capture identity before checking membership, then validate it
+                // below: a PID recycled across the group query is not retained.
+                if let Some(identity) = ProcessIdentity::capture(pid.as_u32()) {
+                    if getpgid(Some(Pid::from_raw(pid.as_u32() as i32)))
+                        .is_ok_and(|pgid| pgid.as_raw() > 0 && groups.contains(&(pgid.as_raw() as u32)))
+                    {
+                        roots.push(identity);
+                    }
+                }
+            }
             if let Some(parent) = process.parent() {
                 children.entry(parent.as_u32()).or_default().push(pid.as_u32());
             }
@@ -78,7 +91,9 @@ impl ProcessTree {
     pub(crate) fn kill_survivors(&self) -> Result<(), String> {
         // Include descendants born during grace, including those of surviving
         // escaped children after the original leader has been reaped.
-        Self::from_roots(&self.processes).signal_outside_groups(Signal::SIGKILL, &[])
+        // Never rediscover members by a retained group ID: it may have been
+        // recycled during grace. Only validated identities become new roots.
+        Self::from_roots(&self.processes, &[]).signal_outside_groups(Signal::SIGKILL, &[])
     }
 }
 
@@ -137,6 +152,15 @@ mod tests {
         let mut actual = descendants(&[1, 2], &children);
         actual.sort_unstable();
         assert_eq!(actual, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn captures_group_members_without_a_live_ancestry_root() {
+        let identity = ProcessIdentity::capture(std::process::id()).unwrap();
+        let pgid = getpgid(None).unwrap().as_raw() as u32;
+        let tree = ProcessTree::capture(u32::MAX, Some(pgid));
+        assert!(tree.processes.contains(&identity));
+        assert_eq!(tree.processes.iter().filter(|process| **process == identity).count(), 1);
     }
 
     #[test]

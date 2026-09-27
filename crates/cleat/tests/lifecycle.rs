@@ -4070,6 +4070,27 @@ if mode == 'late':
             while True:
                 time.sleep(1)
     signal.signal(signal.SIGTERM, on_term)
+if mode == 'reparented-foreground':
+    pid = os.fork()
+    if pid == 0:
+        os.setpgid(0, 0)
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        os.tcsetpgrp(0, os.getpgrp())
+        parent = os.getpid()
+        if os.fork() != 0:
+            os._exit(0)
+        while os.getppid() == parent:
+            time.sleep(0.01)
+        with open(ready + '.pgid', 'w') as f:
+            f.write(str(os.getpgrp()))
+        with open(ready, 'w') as f:
+            f.write(str(os.getpid()))
+        while True:
+            time.sleep(1)
+    os.waitpid(pid, 0)
+    while True:
+        time.sleep(1)
 pid = os.fork()
 if pid == 0:
     if mode == 'foreground':
@@ -4106,6 +4127,17 @@ if mode == 'late':
         assert_eq!(service.inspect(&info.id).unwrap().process.foreground_pgid, Some(pids.0[0] as u32));
         assert_ne!(pids.0[0], leader);
     }
+    let unrelated = if mode == "reparented-foreground" {
+        let pgid: u32 = std::fs::read_to_string(ready.with_extension("pgid")).unwrap().parse().unwrap();
+        assert_eq!(service.inspect(&info.id).unwrap().process.foreground_pgid, Some(pgid));
+        assert_ne!(pgid, pids.0[0] as u32, "the foreground group leader has exited");
+        let other =
+            service.create(Some("unrelated".into()), Some(VtEngineKind::Passthrough), None, Some("exec sleep 30".into()), true).unwrap();
+        let pid = service.inspect(&other.id).unwrap().process.leader_pid as i32;
+        Some((other.id, SignalFixturePids(vec![pid])))
+    } else {
+        None
+    };
     if delete {
         let started = Instant::now();
         let response = http_session_request(
@@ -4134,6 +4166,11 @@ if mode == 'late':
     }
     assert!(pids.0.iter().all(|pid| !signal_fixture_is_running(*pid)), "tree processes survived {mode}");
     wait_until("session retirement", || service.inspect(&info.id).is_err());
+    if let Some((id, pids)) = unrelated {
+        assert!(signal_fixture_is_running(pids.0[0]), "unrelated session must survive escalation");
+        service.inspect(&id).expect("unrelated session remains serviceable");
+        service.kill(&id).expect("clean up unrelated session");
+    }
 }
 
 #[test]
@@ -4154,6 +4191,11 @@ fn delete_escalates_term_ignoring_tree() {
 #[test]
 fn delete_escalates_escaped_child_after_leader_exits() {
     run_tree_signal_fixture("orphan", true);
+}
+
+#[test]
+fn delete_escalates_reparented_foreground_members() {
+    run_tree_signal_fixture("reparented-foreground", true);
 }
 
 #[test]

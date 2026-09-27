@@ -30,15 +30,48 @@ struct DaemonResponseReader<'a> {
     deadline: Instant,
 }
 
-impl std::io::Read for DaemonResponseReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self
-            .deadline
+impl DaemonResponseReader<'_> {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.deadline
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon response deadline exceeded"))?;
-        set_stream_read_timeout(self.stream, Some(remaining)).map_err(std::io::Error::other)?;
-        self.stream.read(buffer)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon response deadline exceeded"))
+    }
+}
+
+impl std::io::Read for DaemonResponseReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(unix)]
+        loop {
+            use std::os::fd::{AsFd, AsRawFd};
+
+            use nix::{
+                poll::{poll, PollFd, PollFlags, PollTimeout},
+                sys::socket::{recv, MsgFlags},
+            };
+            let remaining = self.remaining()?;
+            // Darwin rejects timeout socket options after the peer closes,
+            // even while its response is buffered. Poll the absolute
+            // deadline and receive nonblocking instead of resetting SO_RCVTIMEO.
+            let mut fds = [PollFd::new(self.stream.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)) {
+                Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+                Err(err) => return Err(err.into()),
+                Ok(_) => {}
+            }
+            match recv(self.stream.as_raw_fd(), buffer, MsgFlags::MSG_DONTWAIT) {
+                Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
+                result => return result.map_err(Into::into),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            set_stream_read_timeout(self.stream, Some(self.remaining()?)).map_err(std::io::Error::other)?;
+            self.stream.read(buffer)
+        }
     }
 }
 

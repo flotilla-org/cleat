@@ -287,3 +287,40 @@ fn handover_from_a_pre_handover_daemon_keeps_the_alias_unchanged() {
     assert_eq!(layout.generation(), Some(1));
     SessionService::new(layout.with_daemon("default@2".into()).unwrap()).daemon_request(Method::POST, "/drain").unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn response_deadline_reader_consumes_a_response_after_peer_close() {
+    let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    http_uds::write_json(&mut writer, StatusCode::OK, &serde_json::json!({"ok": true})).unwrap();
+    drop(writer);
+    let response =
+        http_uds::read_response(&mut DaemonResponseReader { stream: &mut reader, deadline: Instant::now() + Duration::from_secs(1) })
+            .unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(), serde_json::json!({"ok": true}));
+}
+
+#[cfg(unix)]
+#[test]
+fn response_deadline_is_not_extended_by_trickling_bytes() {
+    use std::io::Read;
+    let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        for _ in 0..100 {
+            if writer.write_all(b"x").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let start = Instant::now();
+    let mut bytes = Vec::new();
+    let error =
+        DaemonResponseReader { stream: &mut reader, deadline: start + Duration::from_millis(60) }.read_to_end(&mut bytes).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(!bytes.is_empty());
+    assert!(start.elapsed() < Duration::from_millis(500));
+    drop(reader);
+    worker.join().unwrap();
+}

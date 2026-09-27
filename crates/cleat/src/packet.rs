@@ -8,8 +8,8 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 10 adds daemon build and drain metadata to Directory snapshots and deltas.
-pub const PROTOCOL_VERSION: u16 = 10;
+/// Version 11 adds frame-owned OSC 8 URI bytes to render cell styles.
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -521,9 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn daemon_directory_metadata_requires_protocol_version_ten() {
-        assert_eq!(PROTOCOL_VERSION, 10);
-        assert!(!ControlHello::current().accepts(9));
+    fn frame_owned_hyperlinks_require_protocol_version_eleven() {
+        assert_eq!(PROTOCOL_VERSION, 11);
+        assert!(!ControlHello::current().accepts(10));
     }
 
     #[test]

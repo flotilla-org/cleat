@@ -25,6 +25,15 @@ use crate::provider::{
 };
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
+const MAX_RENDER_HYPERLINK_BYTES: usize = 1024 * 1024;
+
+// One budget and coordinate mapping for every row included in an update.
+struct RenderLinkCapture {
+    screen: GhosttyTerminalScreen,
+    offset: u64,
+    remaining_bytes: usize,
+}
+
 // Match libghostty-vt's own default (320 MB). A lower limit silently evicts the
 // oldest images (placements included) once the decoded RGBA footprint exceeds
 // it. For example, three 2269x2620 images are ~22.7 MB each = ~68 MB, which a
@@ -148,12 +157,13 @@ impl GhosttyVtEngine {
     fn read_render_row(
         &mut self,
         row: u16,
-        cols: u16,
         raw_row: ghostty_ffi::GhosttyRow,
         colors: &GhosttyRenderStateColors,
         dirty: bool,
         cached_cells: &mut [ResolvedCell],
+        links: &mut RenderLinkCapture,
     ) -> Result<TerminalRenderRow, String> {
+        let cols = u16::try_from(cached_cells.len()).map_err(|e| e.to_string())?;
         self.row_iter.populate_cells(&mut self.row_cells)?;
 
         let mut render_cells = Vec::with_capacity(cols as usize);
@@ -180,6 +190,21 @@ impl GhosttyVtEngine {
                     semantic: resolved_cell.semantic,
                     has_hyperlink: cell.has_hyperlink,
                     hyperlink_id: 0,
+                    hyperlink_uri: if cell.has_hyperlink {
+                        let uri = self
+                            .terminal
+                            .bounded_history_link(
+                                links.screen,
+                                col_idx as u16,
+                                u32::try_from(links.offset + u64::from(row)).map_err(|e| e.to_string())?,
+                                links.remaining_bytes,
+                            )?
+                            .unwrap_or_default();
+                        links.remaining_bytes -= uri.len();
+                        uri
+                    } else {
+                        Vec::new()
+                    },
                     content_tag: content_tag_from_ghostty(cell.content_tag),
                     has_text: cell.has_text,
                     has_styling: cell.has_styling,
@@ -442,6 +467,16 @@ impl VtEngine for GhosttyVtEngine {
         };
         let mut update =
             TerminalRenderUpdate::from_snapshot(crate::provider::TerminalSnapshot::from_screen_grid(frame.grid.clone(), DirtyState::Full));
+        for link in &frame.links {
+            if let Some(cell) = update
+                .ops
+                .first_mut()
+                .and_then(|op| op.rows.get_mut(usize::from(link.row)))
+                .and_then(|row| row.cells.get_mut(usize::from(link.col)))
+            {
+                cell.style.hyperlink_uri = link.uri.clone();
+            }
+        }
         update.viewport_kind = TerminalViewportKind::NormalScrollback;
         update.scrollbar = TerminalScrollbarState::new(update.viewport_kind, frame.total_rows, frame.grid.rows, frame.offset);
         update.scrollback_offset_rows = frame.offset;
@@ -616,6 +651,11 @@ impl VtEngine for GhosttyVtEngine {
 
         let mut update_rows = Vec::new();
         let mut dirty_rows = Vec::new();
+        let mut links = RenderLinkCapture {
+            screen: self.terminal.active_screen()?,
+            offset: self.terminal.scrollbar()?.offset,
+            remaining_bytes: MAX_RENDER_HYPERLINK_BYTES,
+        };
         if effective_dirty != DirtyState::Clean {
             self.render_state.populate_row_iterator(&mut self.row_iter)?;
             let mut row_idx: usize = 0;
@@ -634,7 +674,7 @@ impl VtEngine for GhosttyVtEngine {
                     let cached_row = cached_cells
                         .get_mut(row_start..row_end)
                         .ok_or_else(|| format!("render row {row} was outside the {cols}x{rows} cell cache"))?;
-                    let render_row = self.read_render_row(row, cols, raw_row, &colors, row_dirty, cached_row)?;
+                    let render_row = self.read_render_row(row, raw_row, &colors, row_dirty, cached_row, &mut links)?;
                     if effective_dirty == DirtyState::Partial {
                         dirty_rows.push(row);
                     }
@@ -1293,6 +1333,57 @@ mod history_tests {
     }
     fn text(frame: &HistoryFrame) -> String {
         frame.grid.cells.iter().flat_map(|cell| cell.graphemes.iter().copied()).filter_map(char::from_u32).collect()
+    }
+
+    #[test]
+    fn live_render_hyperlink_budget_preserves_text_even_on_repeated_full_frames() {
+        let mut engine = GhosttyVtEngine::new(80, 20);
+        let uri = format!("https://example.test/{}", "a".repeat(1000));
+        engine.feed(format!("\x1b]8;;{uri}\x1b\\{}\x1b]8;;\x1b\\", "x".repeat(1600)).as_bytes()).unwrap();
+        for _ in 0..2 {
+            let update = engine.render_update(DirtyState::Full).unwrap();
+            let cells: Vec<_> = update.ops.iter().flat_map(|op| &op.rows).flat_map(|row| &row.cells).collect();
+            assert_eq!(cells.len(), 1600);
+            assert!(cells.iter().all(|cell| cell.graphemes == [u32::from('x')]));
+            let bytes: usize = cells.iter().map(|cell| cell.style.hyperlink_uri.len()).sum();
+            assert!(bytes > 0 && bytes <= MAX_RENDER_HYPERLINK_BYTES);
+            assert!(cells.last().unwrap().style.hyperlink_uri.is_empty());
+        }
+        // Later output can expose its smaller link without needing a new session.
+        engine.feed(b"\x1bc\x1b]8;;https://small.test\x1b\\ok\x1b]8;;\x1b\\").unwrap();
+        let update = engine.render_update(DirtyState::Partial).unwrap();
+        assert_eq!(update.ops[0].rows[0].cells[0].style.hyperlink_uri, b"https://small.test");
+    }
+
+    #[test]
+    fn render_links_follow_frames_scrollback_resize_and_wide_cells() {
+        fn uri(update: &TerminalRenderUpdate, row: usize, col: usize) -> &[u8] {
+            &update.ops[0].rows[row].cells[col].style.hyperlink_uri
+        }
+        let mut engine = GhosttyVtEngine::new(8, 2);
+        engine.feed("\x1b]8;;https://one.test\x1b\\界abcde\x1b]8;;https://two.test\x1b\\XY\x1b]8;;\x1b\\".as_bytes()).unwrap();
+        let first = engine.render_update(DirtyState::Full).unwrap();
+        assert_eq!(uri(&first, 0, 0), b"https://one.test");
+        assert_eq!(uri(&first, 0, 1), b"https://one.test");
+        assert_eq!(uri(&first, 0, 7), b"https://two.test");
+        assert_eq!(uri(&first, 1, 0), b"https://two.test");
+        assert!(uri(&first, 1, 1).is_empty());
+        engine.feed(b"\r\nnext\r\nlast").unwrap();
+        engine.render_update(DirtyState::Full).unwrap();
+        engine.scroll_viewport(ViewportCommand::Top).unwrap();
+        let scrolled = engine.render_update(DirtyState::Full).unwrap();
+        assert_eq!(uri(&scrolled, 0, 0), b"https://one.test");
+        engine.scroll_viewport(ViewportCommand::Bottom).unwrap();
+        engine.set_attachment_view(7, ViewportCommand::Top).unwrap();
+        let history = engine.capture_attachment_view(7).unwrap().unwrap();
+        assert_eq!(uri(&history.update, 0, 0), b"https://one.test");
+        engine.resize(10, 2).unwrap();
+        let history = engine.capture_attachment_view(7).unwrap().unwrap();
+        assert_eq!(uri(&history.update, 0, 0), b"https://one.test");
+        engine.feed(b"\x1bcplain").unwrap();
+        let fresh = engine.render_update(DirtyState::Full).unwrap();
+        assert!(uri(&fresh, 0, 0).is_empty());
+        assert_eq!(uri(&first, 0, 0), b"https://one.test"); // retained frame owns its URI
     }
 
     #[test]

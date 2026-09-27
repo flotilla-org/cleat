@@ -234,7 +234,11 @@ impl RuntimeLayout {
         crate::platform::ipc::validate_session_socket_path(&self.socket_path())?;
         self.ensure_root()?;
         if self.daemon_name.contains('@') {
-            self.ensure_daemon_dirs()?;
+            let lease = self.try_lock_daemon_lifetime()?;
+            crate::generation_recovery::GenerationRecovery::load(self)?.check_start(self)?;
+            if lease.is_some() {
+                self.ensure_daemon_dirs()?;
+            }
             return Ok(self.clone());
         }
         let _lock = self.lock_generations()?;
@@ -291,15 +295,30 @@ impl RuntimeLayout {
 
     /// Reserve the next directory without publishing it. Caller holds the layout lock.
     pub(crate) fn allocate_generation(&self) -> Result<Self, String> {
+        self.allocate_generation_using(false)
+    }
+
+    pub(crate) fn allocate_unpublished_generation(&self) -> Result<Self, String> {
+        self.allocate_generation_using(true)
+    }
+
+    fn allocate_generation_using(&self, unpublished: bool) -> Result<Self, String> {
+        let mut recovery = crate::generation_recovery::GenerationRecovery::load(self)?;
         let next = self
             .generation_names()?
             .iter()
             .filter_map(|n| n.rsplit_once('@')?.1.parse::<u64>().ok())
             .chain(self.generation())
+            .chain(Some(recovery.high_water))
             .max()
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("daemon generation exhausted")?;
+        recovery.high_water = next;
+        if unpublished {
+            recovery.unpublished.insert(next);
+        }
+        recovery.save(self)?;
         let next_layout = self.clone().with_daemon(format!("{}@{next}", self.logical_name()))?;
         next_layout.ensure_daemon_dirs()?;
         Ok(next_layout)
@@ -337,7 +356,12 @@ impl RuntimeLayout {
         if result.is_err() {
             let _ = fs::remove_file(temporary);
         }
-        result
+        result?;
+        // Retirement may be acknowledged immediately after this returns. Make
+        // publication durable before its recovery intent can be cleared.
+        #[cfg(unix)]
+        fs::File::open(&self.root).and_then(|dir| dir.sync_all()).map_err(|e| format!("sync daemon alias: {e}"))?;
+        Ok(())
     }
 
     pub fn sessions_dir(&self) -> PathBuf {

@@ -260,8 +260,8 @@ fn probe_target(socket: &PathBuf, deadline: Instant) -> Result<TargetProtocol, S
 fn handshake(socket: &PathBuf, deadline: Instant, manifest: &FdTransferManifest, fds: &[OwnedFd]) -> Result<UnixStream, HandshakeFailure> {
     let mut stream = connect(socket, deadline).map_err(HandshakeFailure::Failed)?;
     http_uds::write_transfer_upgrade_request(&mut stream).map_err(|err| HandshakeFailure::Failed(format!("request transfer: {err}")))?;
-    let response =
-        http_uds::read_response_head(&mut stream).map_err(|err| HandshakeFailure::Failed(format!("read transfer upgrade: {err}")))?;
+    let response = http_uds::read_transfer_response_head(&mut stream)
+        .map_err(|err| HandshakeFailure::Failed(format!("read transfer upgrade: {err}")))?;
     if response.status != StatusCode::SWITCHING_PROTOCOLS {
         return Err(HandshakeFailure::Failed(format!("target daemon refused the transfer upgrade: HTTP {}", response.status)));
     }

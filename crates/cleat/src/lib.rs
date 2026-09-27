@@ -33,6 +33,7 @@ mod session_runtime;
 pub mod vt;
 
 mod mouse;
+mod output_admission;
 
 mod attach_mouse;
 

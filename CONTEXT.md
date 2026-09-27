@@ -84,6 +84,13 @@ plus the ambient root) is best-effort convenience, never exhaustive: private
 daemons (e.g. temp-dir state in a test suite) legitimately exist outside it, and
 each daemon's Directory remains the only authority on its sessions.
 
+**Output source daemon** (`CLEAT_OUTPUT_DAEMON`):
+The physical daemon generation hosting the containing session, exported by the
+daemon for output-cycle admission. Unlike logical `CLEAT_DAEMON` command
+targeting, this coordinate stays pinned across a generation switch (including
+`name@legacy` for legacy directories). Together with `CLEAT_RUNTIME_DIR` and
+`CLEAT_SESSION`, it identifies the source of a local output relationship.
+
 **Sibling session**:
 A session launched into the same daemon as an existing source session, thereby
 sharing that daemon's **initial** execution context — container, namespace,

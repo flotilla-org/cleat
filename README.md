@@ -145,6 +145,20 @@ Runtime layout v2 is daemon-scoped:
 
 **Unix termination.** `cleat kill <id>` (HTTP `DELETE /sessions/{id}`) sends TERM to the session tree, then KILL to surviving processes after a two-second grace period. The CLI waits for session exit and preserves the session metadata and recording as on normal exit (`--purge` explicitly removes them). DELETE acknowledges the request with 204 before the grace period ends; other sessions remain serviceable. Tree signals include the leader group, the foreground job-control group, and discoverable descendants, including children that called `setsid`. Cleanup snapshots identities of descendants and members of the leader and foreground groups, retains them across leader exit, and includes descendants born during grace. Escalation validates process birth stamps and signals individual processes, never a retained group ID that could have been recycled. Discovery is best-effort: children already reparented before the initial snapshot are recoverable only if they remain in one of those groups. `cleat signal <id> TERM` (or `cleat signal <id> TERM --target tree`) delivers exactly the requested signal without escalation. Interactive shells such as sh/zsh can ignore TERM and remain running; use `kill` to terminate them.
 
+**Termination diagnostics (Unix).** Each daemon generation appends to
+`<root>/<name>@<generation>/termination.jsonl`, independently of session recordings.
+Every DELETE grace deadline emits a `termination_escalation` JSON object with
+`unix_ms` (UTC epoch milliseconds), `session_id`, `signal: "KILL"`, `delivered`
+(PIDs for which the KILL syscall succeeded), and `errors` (non-ESRCH failures).
+An empty `delivered` array means no successful deliveries, not a missing event;
+syscall success does not prove process exit. The log survives actor retirement,
+recording pause, and daemon exit. It is retained with the daemon generation and
+has no automatic rotation. A separate writer syncs each line to disk; servicing
+never waits for disk I/O. Orderly shutdown drains the queue. Abrupt daemon death
+can lose queued events, and storage failures can prevent persistence. Startup
+fails if the log cannot be opened; later write failures are reported to stderr.
+No session recording descriptor is retained for diagnostics.
+
 **Recording and recreation.** CLI-created sessions record by default. Use `--no-record` to opt out, and `cleat record <id>` to enable recording on a running session. Recording is the persistence floor: a daemon crash or host reboot loses the PTY and process state, but a preserved recording can seed scrollback when the session is recreated.
 
 ## Behavioral Model

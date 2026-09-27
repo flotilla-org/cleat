@@ -53,6 +53,18 @@ pub(crate) struct TreeTermination {
     pub(crate) delivery: Result<(), String>,
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct SignalDelivery {
+    pub delivered: Vec<u32>,
+    pub errors: Vec<String>,
+}
+
+impl SignalDelivery {
+    fn into_result(self) -> Result<(), String> {
+        self.errors.into_iter().next().map_or(Ok(()), Err)
+    }
+}
+
 impl ProcessTree {
     #[cfg(test)]
     pub(crate) fn test_snapshot(pids: &[u32]) -> Self {
@@ -88,7 +100,11 @@ impl ProcessTree {
     }
 
     pub(crate) fn signal_outside_groups(&self, signal: Signal, groups: &[u32]) -> Result<(), String> {
-        self.signal_with(
+        self.deliver(signal, groups).into_result()
+    }
+
+    fn deliver(&self, signal: Signal, groups: &[u32]) -> SignalDelivery {
+        self.deliver_with(
             signal,
             |pid, birth| {
                 ProcessIdentity { pid, birth }.is_current()
@@ -98,33 +114,43 @@ impl ProcessTree {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn signal_with(
+        &self,
+        signal: Signal,
+        eligible: impl FnMut(u32, u128) -> bool,
+        deliver: impl FnMut(u32, Signal) -> Result<(), Errno>,
+    ) -> Result<(), String> {
+        self.deliver_with(signal, eligible, deliver).into_result()
+    }
+
+    pub(crate) fn deliver_with(
         &self,
         signal: Signal,
         mut eligible: impl FnMut(u32, u128) -> bool,
         mut deliver: impl FnMut(u32, Signal) -> Result<(), Errno>,
-    ) -> Result<(), String> {
-        let mut error = None;
+    ) -> SignalDelivery {
+        let mut report = SignalDelivery::default();
         // Children first; continue delivering even after a partial failure.
         for process in self.processes.iter().rev() {
             if !eligible(process.pid, process.birth) {
                 continue;
             }
-            if let Err(err) = deliver(process.pid, signal) {
-                if err != Errno::ESRCH {
-                    error.get_or_insert_with(|| format!("kill {}: {err}", process.pid));
-                }
+            match deliver(process.pid, signal) {
+                Ok(()) => report.delivered.push(process.pid),
+                Err(Errno::ESRCH) => {}
+                Err(err) => report.errors.push(format!("kill {}: {err}", process.pid)),
             }
         }
-        error.map_or(Ok(()), Err)
+        report
     }
 
-    pub(crate) fn kill_survivors(&self) -> Result<(), String> {
+    pub(crate) fn kill_survivors(&self) -> SignalDelivery {
         // Include descendants born during grace, including those of surviving
         // escaped children after the original leader has been reaped.
         // Never rediscover members by a retained group ID: it may have been
         // recycled during grace. Only validated identities become new roots.
-        Self::from_roots(&self.processes, &[]).signal_outside_groups(Signal::SIGKILL, &[])
+        Self::from_roots(&self.processes, &[]).deliver(Signal::SIGKILL, &[])
     }
 }
 
@@ -201,6 +227,6 @@ mod tests {
         // Would kill the test runner if identity validation were omitted.
         let tree = ProcessTree { processes: vec![identity] };
         tree.signal_outside_groups(Signal::SIGKILL, &[]).unwrap();
-        tree.kill_survivors().unwrap();
+        assert!(tree.kill_survivors().delivered.is_empty());
     }
 }

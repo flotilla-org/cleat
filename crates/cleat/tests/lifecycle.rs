@@ -4183,7 +4183,10 @@ if mode == 'late':
     } else {
         None
     };
+    let diagnostic_path = daemon_pid_path(temp.path(), &info.id).with_file_name("termination.jsonl");
     if delete {
+        // Escalation diagnostics must bypass recording pause.
+        service.record(&info.id, false).expect("pause recording");
         let started = Instant::now();
         let response = http_session_request(
             temp.path(),
@@ -4196,6 +4199,21 @@ if mode == 'late':
         service.list().expect("list during grace");
     } else {
         service.signal(&info.id, libc::SIGTERM, cleat::protocol::SignalTarget::Tree).expect("tree signal");
+    }
+    if delete && mode == "orphan" {
+        wait_until("original actor retired before escalation", || service.inspect(&info.id).is_err());
+        assert!(signal_fixture_is_running(pids.0[0]), "escaped child must outlive actor");
+        #[cfg(target_os = "linux")]
+        {
+            let daemon_pid = std::fs::read_to_string(daemon_pid_path(temp.path(), &info.id)).unwrap();
+            let cast = service.session_dir(&info.id).join(CAST_FILE_NAME);
+            let retains_cast = std::fs::read_dir(format!("/proc/{}/fd", daemon_pid.trim()))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+                .any(|path| path == cast);
+            assert!(!retains_cast, "retired actor must release recording before escalation");
+        }
     }
     if mode == "late" {
         wait_until("child forked during grace", || {
@@ -4215,6 +4233,23 @@ if mode == 'late':
         assert!(signal_fixture_is_running(pids.0[0]), "unrelated session must survive escalation");
         service.inspect(&id).expect("unrelated session remains serviceable");
         service.kill(&id).expect("clean up unrelated session");
+    }
+    if delete {
+        wait_until("durable escalation diagnostic", || {
+            std::fs::read_to_string(&diagnostic_path).ok().is_some_and(|text| text.ends_with('\n'))
+        });
+        let text = std::fs::read_to_string(&diagnostic_path).unwrap();
+        let records: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records.len(), 1, "one escalation per DELETE");
+        let record = &records[0];
+        assert_eq!(record["session_id"], info.id);
+        assert_eq!(record["signal"], "KILL");
+        assert_eq!(record["errors"], serde_json::json!([]));
+        let delivered = record["delivered"].as_array().unwrap();
+        assert!(delivered.contains(&serde_json::json!(pids.0[0])), "escaped child KILL recorded");
+        if mode == "ignore" {
+            assert!(delivered.contains(&serde_json::json!(leader)), "resistant leader KILL recorded");
+        }
     }
 }
 

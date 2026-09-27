@@ -19,7 +19,10 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX},
     System::{
-        Pipes::{ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT},
+        Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+            PIPE_WAIT,
+        },
         Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent, WaitForSingleObject},
         IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
     },
@@ -193,7 +196,8 @@ impl PendingPipeInstance {
                     self.connect = Some(connect);
                     return Ok(false);
                 }
-                ERROR_NO_DATA | ERROR_PIPE_LISTING_ALIAS => return Ok(false),
+                ERROR_NO_DATA => return self.disconnect_closed_client(),
+                ERROR_PIPE_LISTING_ALIAS => return Ok(false),
                 err => return Err(io_error_from_code(err)),
             }
         }
@@ -209,6 +213,8 @@ impl PendingPipeInstance {
                     if err == ERROR_PIPE_CONNECTED {
                         self.connect = None;
                         Ok(true)
+                    } else if err == ERROR_NO_DATA {
+                        self.disconnect_closed_client()
                     } else {
                         Err(io_error_from_code(err))
                     }
@@ -218,6 +224,18 @@ impl PendingPipeInstance {
                 }
             }
             status => Err(io::Error::other(format!("WaitForSingleObject connect returned {status}"))),
+        }
+    }
+
+    fn disconnect_closed_client(&mut self) -> io::Result<bool> {
+        // A startup probe can connect and close before our first accept poll.
+        // ERROR_NO_DATA leaves the instance connected to that closed client;
+        // retrying ConnectNamedPipe alone would keep it busy forever.
+        self.connect = None;
+        if unsafe { DisconnectNamedPipe(self.handle) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(false)
         }
     }
 
@@ -529,6 +547,37 @@ mod tests {
     use std::{io::Read, thread};
 
     use super::*;
+
+    #[test]
+    fn listener_recovers_when_probe_disconnects_before_first_accept() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("socket");
+        let listener = bind_session_listener(&socket_path).unwrap();
+        // Deterministically exercise the startup probe race: no accept has
+        // called ConnectNamedPipe when the client's handle is closed.
+        drop(connect_session_stream(&socket_path).unwrap());
+        assert_eq!(listener.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        let client = thread::spawn(move || {
+            let mut stream = connect_session_stream(&socket_path).unwrap();
+            set_stream_read_timeout(&stream, Some(Duration::from_secs(5))).unwrap();
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [42]);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "listener stayed busy after the probe disconnected");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => panic!("accept: {err}"),
+            }
+        };
+        stream.write_all(&[42]).unwrap();
+        client.join().unwrap();
+    }
 
     #[test]
     fn read_timeout_cancels_pending_io_and_stream_remains_usable() {

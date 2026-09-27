@@ -30,6 +30,7 @@ pub(crate) enum Route {
     Root,
     Health,
     Drain,
+    TransferCheck,
     PacketConnect,
     Sessions,
     SessionCreate,
@@ -88,6 +89,7 @@ impl Route {
             | Route::SessionTransfer { id } => Some(id),
             Route::Root
             | Route::Health
+            | Route::TransferCheck
             | Route::Drain
             | Route::PacketConnect
             | Route::Sessions
@@ -692,6 +694,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
         (&Method::GET, "/") => Route::Root,
         (&Method::GET, "/healthz") => Route::Health,
         (&Method::POST, "/drain") => Route::Drain,
+        (&Method::POST, "/transfer-check") => Route::TransferCheck,
         (&Method::POST, "/connect") => Route::PacketConnect,
         (&Method::GET, "/sessions") => Route::Sessions,
         (&Method::POST, "/sessions") => Route::SessionCreate,

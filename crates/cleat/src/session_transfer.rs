@@ -125,11 +125,9 @@ impl TransferHub {
         *seen = (*seen).max(epoch);
     }
 
-    /// True while a transfer is in flight either way, or (unless draining)
-    /// while this daemon still forwards a released child's exit status: the
-    /// daemon must not linger-exit under either.
-    pub(super) fn busy(&self, draining: bool) -> bool {
-        !self.outgoing.is_empty() || !self.pending_adoptions.is_empty() || (!draining && !self.forwarders.is_empty())
+    /// Keep the reaper and redirects alive even after the generation drains.
+    pub(super) fn busy(&self) -> bool {
+        !self.outgoing.is_empty() || !self.pending_adoptions.is_empty() || !self.forwarders.is_empty() || !self.moved.is_empty()
     }
 
     pub(super) fn transfer_pending(&self, id: &str) -> bool {
@@ -551,7 +549,7 @@ impl TransferHub {
         manifest: &FdTransferManifest,
         returning: bool,
     ) -> Result<(), String> {
-        maybe_refuse_adoption_for_test()?;
+        maybe_refuse_adoption_for_test(&manifest.session.id)?;
         let id = &manifest.session.id;
         crate::runtime::validate_runtime_name(id)?;
         if (sessions.contains_key(id) && !returning) || self.pending_adoptions.contains_key(id) {
@@ -647,6 +645,26 @@ impl OutgoingTransfer {
     }
 }
 
+/// Shared by the generation preflight and the per-session commit gate.
+pub(super) fn incompatible_clients(hosted: &HostedSession, protocol: TargetProtocol, packet_clients: &[PacketClient]) -> Vec<String> {
+    let packet_compatible = protocol.accepts(PROTOCOL_VERSION);
+    let mut incompatible = Vec::new();
+    if !packet_compatible {
+        for client in packet_clients.iter().filter(|client| !client.dead) {
+            for channel in client.channels.values().filter(|channel| channel.session_id == hosted.metadata.id) {
+                incompatible.push(describe_client(&channel.identity, channel.role));
+            }
+        }
+    }
+    if let Some(client) = &hosted.active_client {
+        incompatible.push(describe_client(&client.identity, ChannelRole::Controller));
+    }
+    for client in &hosted.watchers {
+        incompatible.push(describe_client(&client.identity, ChannelRole::Watcher));
+    }
+    incompatible
+}
+
 /// The compatibility gate (ruling 9), then the manifest. Everything a client
 /// negotiated was this daemon's own protocol version, so a target that
 /// refuses it strands every packet attachment; stream attachments can never
@@ -658,21 +676,7 @@ fn prepare_outgoing(
     packet_clients: &[PacketClient],
 ) -> Result<(), (StatusCode, String)> {
     let id = hosted.metadata.id.clone();
-    let packet_compatible = protocol.accepts(PROTOCOL_VERSION);
-    let mut incompatible = Vec::new();
-    if !packet_compatible {
-        for client in packet_clients.iter().filter(|client| !client.dead) {
-            for channel in client.channels.values().filter(|channel| channel.session_id == id) {
-                incompatible.push(describe_client(&channel.identity, channel.role));
-            }
-        }
-    }
-    if let Some(client) = &hosted.active_client {
-        incompatible.push(describe_client(&client.identity, ChannelRole::Controller));
-    }
-    for client in &hosted.watchers {
-        incompatible.push(describe_client(&client.identity, ChannelRole::Watcher));
-    }
+    let incompatible = incompatible_clients(hosted, protocol, packet_clients);
     if !incompatible.is_empty() && !transfer.drop_incompatible {
         return Err((
             StatusCode::CONFLICT,
@@ -937,9 +941,12 @@ impl StatusForwarder {
     }
 }
 
-/// Test hook: a target that refuses every adoption (debug builds only).
+/// Test hook: a target that refuses all adoptions, or one selected ID (debug builds only).
 #[cfg(debug_assertions)]
-fn maybe_refuse_adoption_for_test() -> Result<(), String> {
+fn maybe_refuse_adoption_for_test(id: &str) -> Result<(), String> {
+    if std::env::var("CLEAT_TEST_TRANSFER_REFUSE_ID").is_ok_and(|refused| refused != id) {
+        return Ok(());
+    }
     match std::env::var("CLEAT_TEST_TRANSFER_REFUSE_ADOPTION") {
         Ok(reason) if !reason.is_empty() => Err(reason),
         _ => Ok(()),
@@ -947,7 +954,7 @@ fn maybe_refuse_adoption_for_test() -> Result<(), String> {
 }
 
 #[cfg(not(debug_assertions))]
-fn maybe_refuse_adoption_for_test() -> Result<(), String> {
+fn maybe_refuse_adoption_for_test(_id: &str) -> Result<(), String> {
     Ok(())
 }
 

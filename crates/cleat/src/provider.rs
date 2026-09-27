@@ -112,6 +112,9 @@ pub struct TerminalRenderStyle {
     pub semantic: u32,
     pub has_hyperlink: bool,
     pub hyperlink_id: u64,
+    /// Owned OSC 8 destination for this cell in this render frame. Empty means no link.
+    #[serde(default)]
+    pub hyperlink_uri: Vec<u8>,
     pub content_tag: u32,
     pub has_text: bool,
     pub has_styling: bool,
@@ -329,6 +332,7 @@ impl TerminalRenderCell {
                 semantic: cell.semantic,
                 has_hyperlink: cell.has_hyperlink,
                 hyperlink_id: 0,
+                hyperlink_uri: Vec::new(),
                 content_tag: 0,
                 has_text: true,
                 has_styling: !cell.flags.is_empty(),
@@ -959,6 +963,7 @@ mod tests {
                             semantic: 4,
                             has_hyperlink: true,
                             hyperlink_id: 99,
+                            hyperlink_uri: b"https://example.com/destination".to_vec(),
                             content_tag: 5,
                             has_text: true,
                             has_styling: true,

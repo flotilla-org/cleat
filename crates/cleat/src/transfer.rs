@@ -64,7 +64,7 @@ const MAX_REASON_BYTES: usize = 64 * 1024;
 const MAX_TAIL_BYTES: usize = 32 * 1024 * 1024;
 
 /// What the target advertises before anything is released.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TargetProtocol {
     pub version: u16,
     pub min_supported_version: u16,
@@ -262,7 +262,7 @@ fn connect(socket: &PathBuf, deadline: Instant) -> Result<UnixStream, String> {
     Ok(stream)
 }
 
-fn probe_target(socket: &PathBuf, deadline: Instant) -> Result<TargetProtocol, String> {
+pub(crate) fn probe_target(socket: &PathBuf, deadline: Instant) -> Result<TargetProtocol, String> {
     #[derive(Deserialize)]
     struct Health {
         packet_protocol: Option<ProtocolRange>,

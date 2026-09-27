@@ -3993,6 +3993,51 @@ fn signal_term_to_leader_terminates_session() {
 }
 
 #[test]
+fn kill_waits_for_interactive_shell_and_preserves_recording() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    // Exercise zsh when installed, with bash as the CI fallback.
+    let shell = if Command::new("zsh").arg("--version").output().is_ok() { "zsh -f -i" } else { "bash --noprofile --norc -i" };
+    let info = service
+        .create(Some("interactive".into()), Some(VtEngineKind::Passthrough), None, Some(format!("exec {shell}")), true)
+        .expect("create interactive shell");
+    let ready = temp.path().join("ready");
+    service.send_keys(&info.id, format!("echo $$ > {}\n", ready.display()).as_bytes()).unwrap();
+    wait_until("interactive shell ready", || std::fs::read_to_string(&ready).is_ok_and(|s| s.trim().parse::<i32>().is_ok()));
+    let pid = std::fs::read_to_string(&ready).unwrap().trim().parse::<i32>().unwrap();
+    let _pids = SignalFixturePids(vec![pid]);
+    let cli = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cleat"))
+            .arg("--runtime-root")
+            .arg(temp.path())
+            .env_remove("CLEAT_DAEMON")
+            .env_remove("CLEAT_SESSION")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    };
+    for target in ["foreground", "leader", "tree"] {
+        cli(&["signal", &info.id, "TERM", "--target", target]);
+    }
+    std::thread::sleep(Duration::from_millis(2200));
+    assert!(signal_fixture_is_running(pid), "explicit TERM must not escalate");
+    service.inspect(&info.id).expect("shell still hosted after TERM");
+
+    let started = Instant::now();
+    cli(&["kill", &info.id]);
+    assert!(!signal_fixture_is_running(pid), "kill must wait for interactive shell termination");
+    assert!(started.elapsed() < Duration::from_secs(5), "kill must finish within the grace period plus scheduling allowance");
+    assert!(service.inspect(&info.id).is_err(), "session should retire normally");
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    assert!(layout.session_dir(&info.id).exists(), "kill must preserve session metadata");
+    let cast = layout.session_dir(&info.id).join(CAST_FILE_NAME);
+    let events = cleat::cast_reader::read_all_events_since(&cast, 0).expect("read retained recording");
+    assert!(events.iter().any(|event| event.code == cleat::asciicast::EventCode::Exit), "recording must include the exit event");
+}
+
+#[test]
 fn kill_terminates_background_children_in_leader_process_group() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
@@ -4070,6 +4115,27 @@ if mode == 'late':
             while True:
                 time.sleep(1)
     signal.signal(signal.SIGTERM, on_term)
+if mode == 'reparented-foreground':
+    pid = os.fork()
+    if pid == 0:
+        os.setpgid(0, 0)
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        os.tcsetpgrp(0, os.getpgrp())
+        parent = os.getpid()
+        if os.fork() != 0:
+            os._exit(0)
+        while os.getppid() == parent:
+            time.sleep(0.01)
+        with open(ready + '.pgid', 'w') as f:
+            f.write(str(os.getpgrp()))
+        with open(ready, 'w') as f:
+            f.write(str(os.getpid()))
+        while True:
+            time.sleep(1)
+    os.waitpid(pid, 0)
+    while True:
+        time.sleep(1)
 pid = os.fork()
 if pid == 0:
     if mode == 'foreground':
@@ -4106,6 +4172,17 @@ if mode == 'late':
         assert_eq!(service.inspect(&info.id).unwrap().process.foreground_pgid, Some(pids.0[0] as u32));
         assert_ne!(pids.0[0], leader);
     }
+    let unrelated = if mode == "reparented-foreground" {
+        let pgid: u32 = std::fs::read_to_string(ready.with_extension("pgid")).unwrap().parse().unwrap();
+        assert_eq!(service.inspect(&info.id).unwrap().process.foreground_pgid, Some(pgid));
+        assert_ne!(pgid, pids.0[0] as u32, "the foreground group leader has exited");
+        let other =
+            service.create(Some("unrelated".into()), Some(VtEngineKind::Passthrough), None, Some("exec sleep 30".into()), true).unwrap();
+        let pid = service.inspect(&other.id).unwrap().process.leader_pid as i32;
+        Some((other.id, SignalFixturePids(vec![pid])))
+    } else {
+        None
+    };
     if delete {
         let started = Instant::now();
         let response = http_session_request(
@@ -4134,6 +4211,11 @@ if mode == 'late':
     }
     assert!(pids.0.iter().all(|pid| !signal_fixture_is_running(*pid)), "tree processes survived {mode}");
     wait_until("session retirement", || service.inspect(&info.id).is_err());
+    if let Some((id, pids)) = unrelated {
+        assert!(signal_fixture_is_running(pids.0[0]), "unrelated session must survive escalation");
+        service.inspect(&id).expect("unrelated session remains serviceable");
+        service.kill(&id).expect("clean up unrelated session");
+    }
 }
 
 #[test]
@@ -4154,6 +4236,11 @@ fn delete_escalates_term_ignoring_tree() {
 #[test]
 fn delete_escalates_escaped_child_after_leader_exits() {
     run_tree_signal_fixture("orphan", true);
+}
+
+#[test]
+fn delete_escalates_reparented_foreground_members() {
+    run_tree_signal_fixture("reparented-foreground", true);
 }
 
 #[test]

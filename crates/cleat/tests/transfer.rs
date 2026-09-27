@@ -541,8 +541,22 @@ fn the_compatibility_gate_refuses_then_drops_incompatible_clients() {
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn cleat_attach_and_watch_follow_the_move_with_a_notice() {
+    assert_cli_clients_follow(false);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn cleat_attach_and_watch_follow_handover_with_a_notice() {
+    assert_cli_clients_follow(true);
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn assert_cli_clients_follow(handover: bool) {
     use std::io::Write;
     let root = Root::new();
+    if handover {
+        root.start_source(&[("CLEAT_TEST_DAEMON_BUILD_SHA", "previous-build")]);
+    }
     root.launch_shell("followed");
     let spawn = |verb: &str, output: &std::fs::File| {
         root.command(&[verb, "followed"], &[])
@@ -559,23 +573,29 @@ fn cleat_attach_and_watch_follow_the_move_with_a_notice() {
     let rendered = |file: &tempfile::NamedTempFile| std::fs::metadata(file.path()).unwrap().len() > 0;
     wait_until("the initial renders", Duration::from_secs(10), || rendered(&attach_output) && rendered(&watch_output));
 
-    root.transfer("followed", "other", &[], &[]).unwrap();
+    let target = if handover {
+        root.ok(&["server", "handover"]);
+        "default@2"
+    } else {
+        root.transfer("followed", "other", &[], &[]).unwrap();
+        "other@1"
+    };
     let noticed = |file: &tempfile::NamedTempFile| {
-        String::from_utf8_lossy(&std::fs::read(file.path()).unwrap()).contains("session moved to daemon:other@1")
+        String::from_utf8_lossy(&std::fs::read(file.path()).unwrap()).contains(&format!("session moved to daemon:{target}"))
     };
     wait_until("the move notices", Duration::from_secs(10), || noticed(&attach_output) && noticed(&watch_output));
 
     // The attachment kept its controller role on the new host.
     let mut stdin = attach.stdin.take().unwrap();
     stdin.write_all(b"echo typed-$((6*7))\r").unwrap();
-    wait_for_output(&root.cast("other@1", "followed"), "typed-42");
+    wait_for_output(&root.cast(target, "followed"), "typed-42");
     let roles: Vec<_> =
-        root.inspect(&["--server", "other", "inspect", "followed"]).attachments.into_iter().map(|attachment| attachment.role).collect();
+        root.inspect(&["--server", target, "inspect", "followed"]).attachments.into_iter().map(|attachment| attachment.role).collect();
     assert!(roles.contains(&"controller".to_string()) && roles.contains(&"watcher".to_string()), "{roles:?}");
     assert!(attach.try_wait().unwrap().is_none() && watch.try_wait().unwrap().is_none(), "both clients stay attached");
 
     // A followed channel still closes cleanly when the session ends.
-    root.ok(&["send", "followed", "exit"]);
+    root.ok(&["kill", "followed"]);
     drop(stdin);
     for child in [&mut attach, &mut watch] {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -603,4 +623,154 @@ fn a_second_transfer_keeps_the_forked_hosts_status_forwarding() {
     root.ok(&["send", "hopping", "exit 9"]);
     let exit = wait_for_exit(&cast);
     assert_eq!((exit.code, exit.data.as_str()), (EventCode::Exit, "9"));
+}
+
+#[test]
+fn handover_moves_three_sessions_and_keeps_the_draining_reaper_alive() {
+    let root = Root::new();
+    root.start_source(&[("CLEAT_TEST_DAEMON_BUILD_SHA", "previous-build")]);
+    let mut before = Vec::new();
+    for id in ["one", "two", "three"] {
+        root.launch_shell(id);
+        root.ok(&["send", id, "echo before-$((40+2))"]);
+        wait_for_output(&root.cast("default@1", id), "before-42");
+        before.push(root.inspect(&["inspect", id]));
+    }
+    let mut watcher = Watcher::attach(&root, "one");
+    let report: serde_json::Value = serde_json::from_str(&root.ok(&["server", "handover", "--json"])).unwrap();
+    assert_eq!(report["moved"].as_array().unwrap().len(), 3);
+    assert!(report["stayed"].as_array().unwrap().is_empty());
+    assert_eq!(report["old"]["generation"], 1);
+    assert_eq!(report["current"]["generation"], 2);
+    assert_eq!(watcher.redirected().address, "daemon:default@2");
+    let daemons: serde_json::Value = serde_json::from_str(&root.ok(&["daemons", "--json"])).unwrap();
+    for (generation, state) in [(1, "draining"), (2, "serving")] {
+        assert!(daemons
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["generation"] == generation && d["drain_state"] == state && d["alive"] == true));
+    }
+    for original in before {
+        let id = &original.session.id;
+        let after = root.inspect(&["inspect", id]);
+        assert_eq!(after.process.leader_pid, original.process.leader_pid);
+        assert_eq!(after.hosting_epoch, original.hosting_epoch + 1);
+        assert_eq!(after.generation, Some(2));
+        root.ok(&["send", id, "echo after-$((50+5))"]);
+        let cast = root.cast("default@2", id);
+        wait_for_output(&cast, "after-55");
+        assert!(recorded_output(&cast).contains("before-42"));
+        assert_eq!(std::fs::read_to_string(&cast).unwrap().lines().filter(|line| line.starts_with('{')).count(), 1);
+        assert!(!root.session_dir("default@1", id).exists());
+    }
+    assert!(root.ok(&["server", "handover"]).contains("nothing to hand over"));
+    // Outlive the redirect grace: only the live child forwarders now keep @1 alive.
+    std::thread::sleep(Duration::from_secs(31));
+    assert!(root.daemons.lock().unwrap()[0].try_wait().unwrap().is_none());
+    for id in ["one", "two", "three"] {
+        root.ok(&["send", id, "exit 7"]);
+        let exit = wait_for_exit(&root.cast("default@2", id));
+        assert_eq!((exit.code, exit.data.as_str()), (EventCode::Exit, "7"));
+    }
+    wait_until("the draining reaper to exit", Duration::from_secs(10), || root.daemons.lock().unwrap()[0].try_wait().unwrap().is_some());
+}
+
+#[test]
+fn handover_checks_all_attachments_before_moving_any_session() {
+    let root = Root::new();
+    root.start_source(&[("CLEAT_TEST_DAEMON_BUILD_SHA", "previous-build")]);
+    for id in ["free", "blocked-one", "blocked-two"] {
+        root.launch_shell(id);
+    }
+    let mut first = Watcher::attach(&root, "blocked-one");
+    let mut second = Watcher::attach(&root, "blocked-two");
+    let newer = [("CLEAT_TEST_PACKET_PROTOCOL_VERSION", "99")];
+    let error = root.err_with(&["server", "handover"], &newer);
+    assert!(
+        error.contains("blocked-one:")
+            && error.contains("blocked-two:")
+            && error.contains("watcher")
+            && error.contains("--drop-incompatible"),
+        "{error}"
+    );
+    assert_eq!(RuntimeLayout::new(root.path().into()).generation(), Some(1));
+    for id in ["free", "blocked-one", "blocked-two"] {
+        assert_eq!(root.inspect(&["inspect", id]).hosting_epoch, 1);
+        assert!(markers(&root.cast("default@1", id)).is_empty());
+    }
+    let report: serde_json::Value =
+        serde_json::from_str(&root.ok_with(&["server", "handover", "--drop-incompatible", "--json"], &newer)).unwrap();
+    let moved = report["moved"].as_array().unwrap();
+    assert_eq!(moved.len(), 3);
+    assert_eq!(moved.iter().map(|session| session["dropped_clients"].as_array().unwrap().len()).sum::<usize>(), 2);
+    assert_eq!(first.redirected().address, "daemon:default@3");
+    assert_eq!(second.redirected().address, "daemon:default@3");
+}
+
+#[test]
+fn handover_reports_a_nack_without_rolling_back_other_sessions() {
+    let root = Root::new();
+    root.start_source(&[("CLEAT_TEST_DAEMON_BUILD_SHA", "previous-build")]);
+    for id in ["one", "kept", "three"] {
+        root.launch_shell(id);
+    }
+    let output = root.run_with(&["server", "handover", "--json"], &[
+        ("CLEAT_TEST_TRANSFER_REFUSE_ADOPTION", "not today"),
+        ("CLEAT_TEST_TRANSFER_REFUSE_ID", "kept"),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["moved"].as_array().unwrap().len(), 2);
+    assert_eq!(report["stayed"].as_array().unwrap().len(), 1);
+    assert_eq!(report["stayed"][0]["session_id"], "kept");
+    assert!(report["stayed"][0]["reason"].as_str().unwrap().contains("not today"));
+    for (id, epoch, generation) in [("one", 2, 2), ("kept", 1, 1), ("three", 2, 2)] {
+        let inspect = root.inspect(&["inspect", id]);
+        assert_eq!(inspect.hosting_epoch, epoch);
+        assert_eq!(inspect.generation, Some(generation));
+        root.ok(&["send", id, "echo still-$((1+1))"]);
+        wait_for_output(&root.cast(&format!("default@{generation}"), id), "still-2");
+    }
+    assert!(root.ok(&["server", "handover"]).contains("nothing to hand over"));
+}
+
+#[test]
+fn handover_refuses_legacy_stream_clients_until_drop_is_requested() {
+    let root = Root::new();
+    root.start_source(&[("CLEAT_TEST_DAEMON_BUILD_SHA", "previous-build")]);
+    root.launch_shell("legacy");
+    let _watcher =
+        cleat::session::watch_foreground(&RuntimeLayout::new(root.path().into()), "legacy", cleat::protocol::AttachmentIdentity {
+            name: "legacy-watcher".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let error = root.err_with(&["server", "handover"], &[]);
+    assert!(error.contains("legacy-watcher"), "{error}");
+    assert_eq!(RuntimeLayout::new(root.path().into()).generation(), Some(1));
+    let report: serde_json::Value = serde_json::from_str(&root.ok(&["server", "handover", "--drop-incompatible", "--json"])).unwrap();
+    assert_eq!(report["moved"][0]["dropped_clients"].as_array().unwrap().len(), 1);
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn handover_of_a_recreated_session_leaves_no_husk_blocking_a_return_transfer() {
+    let root = Root::new();
+    root.start_source(&[("CLEAT_TEST_DAEMON_BUILD_SHA", "previous-build")]);
+    root.launch_shell("recreated");
+    root.ok(&["send", "recreated", "exit 0"]);
+    wait_for_exit(&root.cast("default@1", "recreated"));
+    let service = SessionService::new(RuntimeLayout::new(root.path().into()));
+    wait_until("session retirement", Duration::from_secs(5), || service.inspect("recreated").is_err());
+    let (_, attachment) =
+        service.attach(Some("recreated".into()), Some(VtEngineKind::Ghostty), None, None, false, Default::default()).unwrap();
+    drop(attachment);
+    wait_until("legacy attachment disconnect", Duration::from_secs(5), || service.inspect("recreated").unwrap().attachments.is_empty());
+    root.ok(&["server", "handover"]);
+    assert!(!root.session_dir("default@1", "recreated").exists());
+    root.transfer("recreated", "other", &[], &[]).unwrap();
+    assert!(!root.session_dir("default@2", "recreated").exists());
+    root.transfer("recreated", "default", &[], &[]).unwrap();
+    assert_eq!(root.inspect(&["inspect", "recreated"]).generation, Some(2));
 }

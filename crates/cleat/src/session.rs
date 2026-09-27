@@ -1058,6 +1058,11 @@ fn render_packet_cell(writer: &mut impl Write, cell: &crate::provider::TerminalR
     if cell.style.bg_color.tag != crate::provider::TerminalStyleColorTag::None || matches!(cell.style.content_tag, 2 | 3) {
         write!(writer, "\x1b[48;2;{};{};{}m", bg.r, bg.g, bg.b).map_err(|err| format!("write packet cell background: {err}"))?;
     }
+    // Never allow untrusted URI bytes to terminate OSC or inject terminal controls.
+    let uri = std::str::from_utf8(&cell.style.hyperlink_uri).ok().filter(|uri| !uri.is_empty() && !uri.chars().any(char::is_control));
+    if let Some(uri) = uri {
+        write!(writer, "\x1b]8;;{uri}\x1b\\").map_err(|err| format!("open packet hyperlink: {err}"))?;
+    }
     if cell.graphemes.is_empty() || cell.graphemes.contains(&0x10eeee) {
         writer.write_all(b" ").map_err(|err| format!("write packet blank cell: {err}"))?;
     } else {
@@ -1066,6 +1071,9 @@ fn render_packet_cell(writer: &mut impl Write, cell: &crate::provider::TerminalR
                 write!(writer, "{character}").map_err(|err| format!("write packet grapheme: {err}"))?;
             }
         }
+    }
+    if uri.is_some() {
+        writer.write_all(b"\x1b]8;;\x1b\\").map_err(|err| format!("close packet hyperlink: {err}"))?;
     }
     Ok(())
 }
@@ -1695,8 +1703,7 @@ impl PacketChannelRef {
     }
 }
 
-#[cfg(unix)]
-const SESSION_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const SESSION_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 struct PendingTermination {
@@ -2034,6 +2041,8 @@ fn flush_watchers(watchers: &mut Vec<ActiveClient>) {
 #[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> {
     let layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(daemon_name.to_string())?.prepare_generation()?;
+    let Some(_lifetime) = layout.try_lock_daemon_lifetime()? else { return Ok(()) };
+    crate::generation_recovery::GenerationRecovery::load(&layout)?.check_start(&layout)?;
     let daemon_name = layout.daemon_name();
     let socket_path = layout.socket_path();
     validate_session_socket_path(&socket_path)?;
@@ -2254,7 +2263,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             }
         };
         #[cfg(unix)]
-        let transfers_busy = transfers.busy(draining);
+        let transfers_busy = transfers.busy();
         #[cfg(not(unix))]
         let transfers_busy = false;
         if sessions.is_empty() && !termination_pending && !transfers_busy {
@@ -3126,13 +3135,20 @@ fn handle_http_request(
     match route {
         http_uds::Route::Root | http_uds::Route::Health => {
             let hello = advertised_hello();
+            let build = crate::build_info::BuildInfo::current();
+            // Exercise an installed-binary upgrade with real daemons in integration tests.
+            #[cfg(debug_assertions)]
+            let build = match std::env::var("CLEAT_TEST_DAEMON_BUILD_SHA") {
+                Ok(sha) => crate::build_info::BuildInfo { git_sha: Some(sha), ..build },
+                Err(_) => build,
+            };
             http_uds::write_json(
                 stream,
                 StatusCode::OK,
                 &serde_json::json!({
                     "service": "cleat-session",
                     "generation": state.layout.generation(),
-                    "build": crate::build_info::BuildInfo::current(),
+                    "build": build,
                     "session": state.layout.logical_name(),
                     "packet_protocol": {"version": hello.version, "min_supported_version": hello.min_supported_version},
                     "ok": true,
@@ -3141,6 +3157,24 @@ fn handle_http_request(
                 }),
             )
             .map_err(|err| format!("write HTTP response: {err}"))
+        }
+        http_uds::Route::TransferCheck => {
+            #[cfg(unix)]
+            {
+                let protocol: crate::transfer::TargetProtocol =
+                    serde_json::from_slice(request.body()).map_err(|err| format!("parse transfer preflight: {err}"))?;
+                let mut incompatible = Vec::new();
+                for (id, hosted) in state.sessions.iter().filter(|(_, hosted)| !hosted.actor.observation().exited()) {
+                    for client in transfer_host::incompatible_clients(hosted, protocol, state.packet_clients) {
+                        incompatible.push(format!("{id}: {client}"));
+                    }
+                }
+                incompatible.sort();
+                http_uds::write_json(stream, StatusCode::OK, &incompatible).map_err(|err| format!("write transfer preflight: {err}"))
+            }
+            #[cfg(not(unix))]
+            http_uds::write_error(stream, StatusCode::NOT_IMPLEMENTED, "server handover is only supported on Unix")
+                .map_err(|err| format!("write transfer preflight: {err}"))
         }
         http_uds::Route::Drain => {
             fs::write(state.layout.daemon_dir().join("drain-state"), "draining").map_err(|e| format!("persist drain state: {e}"))?;
@@ -3159,6 +3193,9 @@ fn handle_http_request(
                 StatusCode::OK,
                 &serde_json::json!({
                     "drain_state": "draining", "session_count": state.sessions.len(),
+                    "live_session_ids": state.sessions.iter()
+                        .filter(|(_, hosted)| !hosted.actor.observation().exited())
+                        .map(|(id, _)| id).collect::<Vec<_>>(),
                 }),
             )
             .map_err(|err| format!("write drain response: {err}"))
@@ -5252,7 +5289,6 @@ pub(crate) fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String
         }
     }
 
-    layout.ensure_daemon_dirs()?;
     spawn_daemon_process(layout.root(), layout.daemon_name())?;
     wait_for_socket(&layout.socket_path())
 }
@@ -5987,6 +6023,48 @@ mod tests {
         for col in [2, 3, 6, 9, 11, 13] {
             assert!(!output.contains(&format!("\x1b[1;{col}H")), "unnecessary position at {col}: {output:?}");
         }
+    }
+
+    #[test]
+    fn packet_renderer_relays_links_without_leaking_or_injecting_controls() {
+        use super::render_packet_cell;
+        let mut cell = crate::provider::TerminalRenderCell { graphemes: vec!['L' as u32], ..Default::default() };
+        cell.style.hyperlink_uri = b"https://example.com/actual".to_vec();
+        let mut output = Vec::new();
+        render_packet_cell(&mut output, &cell).unwrap();
+        assert!(output.ends_with(b"\x1b]8;;https://example.com/actual\x1b\\L\x1b]8;;\x1b\\"));
+        for uri in [b"https://bad/\x1b]52;;evil".as_slice(), b"https://bad/\x07", b"https://bad/\n", b"\xff"] {
+            cell.style.hyperlink_uri = uri.to_vec();
+            output.clear();
+            render_packet_cell(&mut output, &cell).unwrap();
+            assert!(!output.windows(4).any(|bytes| bytes == b"\x1b]8;"));
+            assert!(output.ends_with(b"L"));
+        }
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn packet_renderer_round_trips_link_frames_through_nested_terminal() {
+        use crate::{
+            provider::DirtyState,
+            vt::{ghostty::GhosttyVtEngine, VtEngine},
+        };
+        let mut inner = GhosttyVtEngine::new(8, 2);
+        inner.feed(b"\x1b]8;;https://actual.test\x1b\\label\x1b]8;;\x1b\\").unwrap();
+        let mut renderer = PacketTerminalRenderer::new(8, 2);
+        let mut output = Vec::new();
+        renderer.apply_and_render(&mut output, &inner.render_update(DirtyState::Full).unwrap()).unwrap();
+        let mut outer = GhosttyVtEngine::new(8, 2);
+        outer.feed(&output).unwrap();
+        let update = outer.render_update(DirtyState::Full).unwrap();
+        assert_eq!(update.ops[0].rows[0].cells[0].style.hyperlink_uri, b"https://actual.test");
+        assert!(update.ops[0].rows[0].cells[5].style.hyperlink_uri.is_empty());
+        inner.feed(b"\r\x1b[2Kplain").unwrap();
+        output.clear();
+        renderer.apply_and_render(&mut output, &inner.render_update(DirtyState::Partial).unwrap()).unwrap();
+        outer.feed(&output).unwrap();
+        let update = outer.render_update(DirtyState::Full).unwrap();
+        assert!(update.ops[0].rows[0].cells[0].style.hyperlink_uri.is_empty());
     }
 
     #[test]

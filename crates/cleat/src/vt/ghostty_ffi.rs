@@ -2530,6 +2530,11 @@ impl TerminalHandle {
         Ok(Some(out))
     }
     pub fn history_link(&self, screen: GhosttyTerminalScreen, x: u16, y: u32, max_bytes: usize) -> Result<Vec<u8>, String> {
+        self.bounded_history_link(screen, x, y, max_bytes)?.ok_or_else(|| "history capture exceeds resource budget".into())
+    }
+    /// None means the destination would exceed the caller's remaining budget;
+    /// the size query rejects it before allocating. Other lookup errors remain errors.
+    pub fn bounded_history_link(&self, screen: GhosttyTerminalScreen, x: u16, y: u32, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
         let mut reference = GridRef { size: std::mem::size_of::<GridRef>(), node: ptr::null_mut(), x: 0, y: 0 };
         check_result(
             unsafe { ghostty_terminal_grid_ref_on_screen(self.raw, screen, GridPoint::screen(x, y), &mut reference) },
@@ -2541,7 +2546,7 @@ impl TerminalHandle {
             check_result(result, "ghostty_grid_ref_hyperlink_uri(size)")?;
         }
         if len > max_bytes {
-            return Err("history capture exceeds resource budget".into());
+            return Ok(None);
         }
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(len).map_err(|e| e.to_string())?;
@@ -2550,7 +2555,7 @@ impl TerminalHandle {
             unsafe { ghostty_grid_ref_hyperlink_uri(&reference, bytes.as_mut_ptr(), len, &mut len) },
             "ghostty_grid_ref_hyperlink_uri",
         )?;
-        Ok(bytes)
+        Ok(Some(bytes))
     }
     fn kitty_graphics_for_anchor(&self, anchor: Option<&HistoryAnchor>) -> Result<Option<GhosttyKittyGraphics>, String> {
         let Some(anchor) = anchor else {

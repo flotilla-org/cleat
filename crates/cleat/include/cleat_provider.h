@@ -544,7 +544,7 @@ void cleat_session_destroy(cleat_session *session);
  * errors. Successful changes invoke the existing wake callback. Release live
  * render/snapshot borrows before moving; callbacks need no re-registration.
  * Windows returns false with an unsupported-platform error.
- * No public struct layout changed; these are additive ABI v9 exports. */
+ * No public struct layout changed; these exports are additive to the current ABI. */
 bool cleat_session_transfer(cleat_session *session, const uint8_t *daemon_name, size_t daemon_name_len);
 bool cleat_session_adopt(cleat_session *session);
 /* Borrowed until the next query/move or destruction: in_process or

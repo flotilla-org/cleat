@@ -25,6 +25,12 @@ subscriptions are admitted untracked, with an acknowledgement warning that cycle
 protection does not cover remote relationships. No graph edge is recorded for
 them. See [output admission and rollout](docs/output-cycle-admission.md).
 
+## Terminal hyperlinks
+
+Render feeds carry frame-owned OSC 8 destinations, and packet attachment relays
+those destinations to the outer terminal. See [terminal hyperlinks](docs/terminal-hyperlinks.md)
+for ownership, resource limits and the provider ABI / packet protocol rollout.
+
 ## Development
 
 Development builds use Ghostty by default. The explicit `--no-default-features` build is available for work on the Rust-only placeholder path.

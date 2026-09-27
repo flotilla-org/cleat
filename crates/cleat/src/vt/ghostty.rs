@@ -25,6 +25,15 @@ use crate::provider::{
 };
 
 const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
+const MAX_RENDER_HYPERLINK_BYTES: usize = 1024 * 1024;
+
+// One budget and coordinate mapping for every row included in an update.
+struct RenderLinkCapture {
+    screen: GhosttyTerminalScreen,
+    offset: u64,
+    remaining_bytes: usize,
+}
+
 // Match libghostty-vt's own default (320 MB). A lower limit silently evicts the
 // oldest images (placements included) once the decoded RGBA footprint exceeds
 // it. For example, three 2269x2620 images are ~22.7 MB each = ~68 MB, which a
@@ -148,12 +157,13 @@ impl GhosttyVtEngine {
     fn read_render_row(
         &mut self,
         row: u16,
-        cols: u16,
         raw_row: ghostty_ffi::GhosttyRow,
         colors: &GhosttyRenderStateColors,
         dirty: bool,
         cached_cells: &mut [ResolvedCell],
+        links: &mut RenderLinkCapture,
     ) -> Result<TerminalRenderRow, String> {
+        let cols = u16::try_from(cached_cells.len()).map_err(|e| e.to_string())?;
         self.row_iter.populate_cells(&mut self.row_cells)?;
 
         let mut render_cells = Vec::with_capacity(cols as usize);
@@ -181,13 +191,14 @@ impl GhosttyVtEngine {
                     has_hyperlink: cell.has_hyperlink,
                     hyperlink_id: 0,
                     hyperlink_uri: if cell.has_hyperlink {
-                        let offset = self.terminal.scrollbar()?.offset;
-                        self.terminal.history_link(
-                            self.terminal.active_screen()?,
+                        let uri = self.terminal.history_link(
+                            links.screen,
                             col_idx as u16,
-                            u32::try_from(offset + u64::from(row)).map_err(|e| e.to_string())?,
-                            1024 * 1024,
-                        )?
+                            u32::try_from(links.offset + u64::from(row)).map_err(|e| e.to_string())?,
+                            links.remaining_bytes,
+                        )?;
+                        links.remaining_bytes -= uri.len();
+                        uri
                     } else {
                         Vec::new()
                     },
@@ -637,6 +648,11 @@ impl VtEngine for GhosttyVtEngine {
 
         let mut update_rows = Vec::new();
         let mut dirty_rows = Vec::new();
+        let mut links = RenderLinkCapture {
+            screen: self.terminal.active_screen()?,
+            offset: self.terminal.scrollbar()?.offset,
+            remaining_bytes: MAX_RENDER_HYPERLINK_BYTES,
+        };
         if effective_dirty != DirtyState::Clean {
             self.render_state.populate_row_iterator(&mut self.row_iter)?;
             let mut row_idx: usize = 0;
@@ -655,7 +671,7 @@ impl VtEngine for GhosttyVtEngine {
                     let cached_row = cached_cells
                         .get_mut(row_start..row_end)
                         .ok_or_else(|| format!("render row {row} was outside the {cols}x{rows} cell cache"))?;
-                    let render_row = self.read_render_row(row, cols, raw_row, &colors, row_dirty, cached_row)?;
+                    let render_row = self.read_render_row(row, raw_row, &colors, row_dirty, cached_row, &mut links)?;
                     if effective_dirty == DirtyState::Partial {
                         dirty_rows.push(row);
                     }
@@ -1314,6 +1330,20 @@ mod history_tests {
     }
     fn text(frame: &HistoryFrame) -> String {
         frame.grid.cells.iter().flat_map(|cell| cell.graphemes.iter().copied()).filter_map(char::from_u32).collect()
+    }
+
+    #[test]
+    fn live_render_hyperlink_budget_is_shared_across_rows_and_recovers() {
+        let mut engine = GhosttyVtEngine::new(80, 20);
+        let uri = format!("https://example.test/{}", "a".repeat(1000));
+        engine.feed(format!("\x1b]8;;{uri}\x1b\\{}\x1b]8;;\x1b\\", "x".repeat(1600)).as_bytes()).unwrap();
+        let error = engine.render_update(DirtyState::Full).unwrap_err();
+        assert!(error.contains("resource budget"), "{error}");
+        // A failed capture must not publish a partially stripped frame. A later
+        // valid frame can still be captured, despite rows visited before failure.
+        engine.feed(b"\x1bc\x1b]8;;https://small.test\x1b\\ok\x1b]8;;\x1b\\").unwrap();
+        let update = engine.render_update(DirtyState::Partial).unwrap();
+        assert_eq!(update.ops[0].rows[0].cells[0].style.hyperlink_uri, b"https://small.test");
     }
 
     #[test]

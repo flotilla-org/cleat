@@ -826,8 +826,10 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         if self.layout.socket_path().exists() && self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &()).is_ok() {
-            self.wait_for_session_shutdown(id);
-            if !self.layout.session_dir(id).exists() {
+            self.wait_for_session_shutdown(id)?;
+            // The daemon owns normal exit cleanup. Never remove metadata or
+            // recordings merely because termination was requested.
+            if !purge || !self.layout.session_dir(id).exists() {
                 return Ok(());
             }
         }
@@ -846,13 +848,19 @@ impl SessionService {
         }
     }
 
-    fn wait_for_session_shutdown(&self, id: &str) {
-        for _ in 0..50 {
+    fn wait_for_session_shutdown(&self, id: &str) -> Result<(), String> {
+        // Allow the shared TERM→KILL path to finish before reporting success or
+        // purging files that the live session may still be writing.
+        let deadline = Instant::now() + crate::session::SESSION_TERMINATION_GRACE + Duration::from_secs(1);
+        loop {
             // Shutdown polling must never auto-start the daemon it is waiting on.
             if !self.layout.session_dir(id).exists()
                 || self.http_json::<_, crate::protocol::InspectResult>(id, Method::GET, &format!("/sessions/{id}"), &()).is_err()
             {
-                break;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("session {id} did not shut down within the termination grace period"));
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -1683,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_deletes_session_over_http_when_socket_is_available() {
+    fn kill_requests_termination_over_http_without_removing_session_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
         let session_dir = create_test_session_dir(temp.path(), "alpha");
@@ -1705,7 +1713,7 @@ mod tests {
 
         reader.join().expect("join reader");
         assert!(request.starts_with("DELETE /sessions/alpha HTTP/1.1\r\n"), "{request}");
-        assert!(!session_dir.exists(), "kill should remove the local session directory");
+        assert!(session_dir.exists(), "kill should leave normal exit cleanup to the daemon");
     }
 
     #[test]

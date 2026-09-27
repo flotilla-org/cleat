@@ -1695,8 +1695,7 @@ impl PacketChannelRef {
     }
 }
 
-#[cfg(unix)]
-const SESSION_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const SESSION_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 struct PendingTermination {

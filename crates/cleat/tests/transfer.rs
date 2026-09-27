@@ -595,7 +595,7 @@ fn assert_cli_clients_follow(handover: bool) {
     assert!(attach.try_wait().unwrap().is_none() && watch.try_wait().unwrap().is_none(), "both clients stay attached");
 
     // A followed channel still closes cleanly when the session ends.
-    root.ok(&["send", "followed", "exit"]);
+    root.ok(&["kill", "followed"]);
     drop(stdin);
     for child in [&mut attach, &mut watch] {
         let deadline = Instant::now() + Duration::from_secs(5);

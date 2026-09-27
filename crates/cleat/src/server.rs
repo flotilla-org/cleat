@@ -525,7 +525,10 @@ impl SessionService {
         if let Some(session_count) = retirement.session_count {
             old.session_count = session_count;
         }
-        let warning = retirement.warning.or(recovered.warning);
+        let warning = match (recovered.warning, retirement.warning) {
+            (Some(recovered), Some(retirement)) => Some(format!("{recovered}; {retirement}")),
+            (recovered, retirement) => retirement.or(recovered),
+        };
         // Relocation takes this same logical-name lock in the source daemon.
         // The alias and retirement are settled; release it before any transfer.
         drop(generation_lock);

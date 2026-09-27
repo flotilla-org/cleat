@@ -436,3 +436,25 @@ fn response_deadline_is_not_extended_by_trickling_bytes() {
     drop(reader);
     worker.join().unwrap();
 }
+
+#[test]
+fn recovery_and_new_retirement_both_report_unsupported_old_daemons() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let first = layout.prepare_generation().unwrap();
+    let _first_host = OldDaemon::start(&first, false);
+    let second = layout.allocate_generation().unwrap();
+    let _second_host = OldDaemon::start(&second, false);
+    layout.set_current_generation(2).unwrap();
+    let mut recovery = crate::generation_recovery::GenerationRecovery::load(&layout).unwrap();
+    recovery.retirement = Some(crate::generation_recovery::Retirement { old: first.daemon_name().into(), successor: 2 });
+    recovery.save(&layout).unwrap();
+    let service = SessionService::new(layout.clone());
+    let report = service.drain().unwrap();
+    assert!(report.changed);
+    let warning = report.warning.unwrap();
+    assert!(warning.contains("default@1 cannot be told to drain"), "{warning}");
+    assert!(warning.contains("default@2 cannot be told to drain"), "{warning}");
+    assert_eq!(layout.generation(), Some(3));
+    service.daemon_request(Method::POST, "/drain").unwrap();
+}

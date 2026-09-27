@@ -47,6 +47,21 @@ runner: an exited process can remain a zombie if PID 1 does not reap it, and
 `kill(pid, 0)` still reports that PID as present. Allocating a PTY alone does not
 provide an init process that reaps orphans.
 
+For Linux containers whose PID 1 does not reap orphans, install
+[Tini](https://github.com/krallin/tini#subreaping) (Debian/Ubuntu package `tini`)
+and wrap the entire Cargo invocation:
+
+```bash
+tini -s -- env -u CLEAT_SESSION -u CLEAT_DAEMON -u CLEAT_RUNTIME_DIR cargo test --workspace --locked
+```
+
+`-s` registers Tini with `PR_SET_CHILD_SUBREAPER` even when it is not PID 1.
+It adopts orphaned descendants and reaps them while Cargo runs, forwards signals,
+and returns Cargo's exit status. This requires Linux 3.4 or later and applies only
+to descendants of this invocation; it cannot reap zombies already owned by PID 1
+or supply a missing PTY. Use this wrapper instead of excluding tests when orphan
+reaping is the problem. The crew image should ultimately provide a reaping init.
+
 PR #248 reproduced these `crates/cleat/tests/lifecycle.rs` failures on its
 unchanged base while the unfiltered CI suites passed:
 

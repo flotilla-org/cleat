@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread,
@@ -14,17 +14,25 @@ use crate::{
 };
 
 struct OldDaemon {
+    _lifetime: std::fs::File,
+    fail_drain: Arc<AtomicBool>,
+    drain_requests: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl OldDaemon {
     fn start(layout: &RuntimeLayout, supports_drain: bool) -> Self {
+        let lifetime = layout.try_lock_daemon_lifetime().unwrap().unwrap();
         layout.ensure_daemon_dirs().unwrap();
         let listener = bind_session_listener(&layout.socket_path()).unwrap();
         set_listener_nonblocking(&listener, true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let fail_drain = Arc::new(AtomicBool::new(false));
+        let drain_requests = Arc::new(AtomicUsize::new(0));
+        let fail = fail_drain.clone();
+        let requests = drain_requests.clone();
         let generation = layout.generation();
         let worker = thread::spawn(move || {
             while !thread_stop.load(Ordering::SeqCst) {
@@ -39,7 +47,12 @@ impl OldDaemon {
                         } else if request.starts_with("GET /sessions HTTP") {
                             (StatusCode::OK, serde_json::json!({"sessions": []}))
                         } else if request.starts_with("POST /drain HTTP") && supports_drain {
-                            (StatusCode::OK, serde_json::json!({"drain_state": "draining", "session_count": 0}))
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            if fail.load(Ordering::SeqCst) {
+                                (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({"error": "injected drain failure"}))
+                            } else {
+                                (StatusCode::OK, serde_json::json!({"drain_state": "draining", "session_count": 0}))
+                            }
                         } else {
                             (StatusCode::NOT_FOUND, serde_json::json!({"error": "not found"}))
                         };
@@ -50,7 +63,7 @@ impl OldDaemon {
                 }
             }
         });
-        Self { stop, worker: Some(worker) }
+        Self { _lifetime: lifetime, stop, worker: Some(worker), fail_drain, drain_requests }
     }
 }
 
@@ -138,6 +151,8 @@ fn failed_start_or_health_check_never_publishes_successor() {
         assert!(err.contains(if fail_start { "test startup failure" } else { "failed health check" }), "{err}");
         assert_eq!(layout.generation(), Some(1));
         assert!(service.daemon_build_status().is_ok());
+        assert!(!temp.path().join("default@2").exists());
+        assert_eq!(layout.allocate_generation().unwrap().generation(), Some(3));
     }
 }
 
@@ -273,4 +288,86 @@ fn auto_start_cannot_resurrect_a_retired_generation_during_or_after_cleanup() {
         assert_eq!(old.daemon_dir().exists(), registration_remains);
         assert_eq!(layout.generation(), Some(2));
     }
+}
+
+#[test]
+fn later_drain_retries_failed_retirement_without_another_successor() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let old = layout.prepare_generation().unwrap();
+    let host = OldDaemon::start(&old, true);
+    host.fail_drain.store(true, Ordering::SeqCst);
+    let service = SessionService::new(layout.clone());
+    assert!(service.drain().unwrap_err().contains("injected drain failure"));
+    assert_eq!(layout.generation(), Some(2));
+    assert_eq!(service.daemon_build_status().unwrap().build, Some(crate::build_info::BuildInfo::current()));
+    // Recovery is retried even though the successor already matches our build.
+    assert!(service.drain().unwrap_err().contains("injected drain failure"));
+    host.fail_drain.store(false, Ordering::SeqCst);
+    assert!(!service.drain().unwrap().changed);
+    assert_eq!(host.drain_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(layout.generation(), Some(2));
+    assert!(!temp.path().join("default@3").exists());
+    assert!(crate::generation_recovery::GenerationRecovery::load(&layout).unwrap().retirement.is_none());
+    assert!(!service.drain().unwrap().changed);
+    assert_eq!(host.drain_requests.load(Ordering::SeqCst), 3);
+    service.daemon_request(Method::POST, "/drain").unwrap();
+}
+
+#[test]
+fn recovery_before_publication_preserves_the_old_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let old = layout.prepare_generation().unwrap();
+    let host = OldDaemon::start(&old, true);
+    let reserved = layout.allocate_unpublished_generation().unwrap();
+    let mut recovery = crate::generation_recovery::GenerationRecovery::load(&layout).unwrap();
+    recovery.retirement = Some(crate::generation_recovery::Retirement { old: old.daemon_name().into(), successor: 2 });
+    recovery.save(&layout).unwrap();
+    let service = SessionService::new(layout.clone());
+    service.resume_retirement(&mut recovery).unwrap();
+    recovery.reclaim(&layout).unwrap();
+    assert_eq!(host.drain_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(layout.generation(), Some(1));
+    assert!(!reserved.daemon_dir().exists());
+    assert_eq!(layout.allocate_generation().unwrap().generation(), Some(3));
+}
+
+#[test]
+fn recovery_after_publication_retries_retirement_and_preserves_successor() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let old = layout.prepare_generation().unwrap();
+    let host = OldDaemon::start(&old, true);
+    let successor = layout.allocate_unpublished_generation().unwrap();
+    let mut recovery = crate::generation_recovery::GenerationRecovery::load(&layout).unwrap();
+    recovery.retirement = Some(crate::generation_recovery::Retirement { old: old.daemon_name().into(), successor: 2 });
+    recovery.save(&layout).unwrap();
+    layout.set_current_generation(2).unwrap();
+    // Crash before clearing the unpublished reservation from the journal.
+    let mut recovery = crate::generation_recovery::GenerationRecovery::load(&layout).unwrap();
+    SessionService::new(layout.clone()).resume_retirement(&mut recovery).unwrap();
+    recovery.reclaim(&layout).unwrap();
+    assert_eq!(host.drain_requests.load(Ordering::SeqCst), 1);
+    assert!(successor.daemon_dir().exists());
+    assert!(recovery.unpublished.is_empty());
+}
+
+#[test]
+fn pending_retirement_completes_when_the_old_host_already_exited() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let old = layout.prepare_generation().unwrap();
+    let successor = layout.allocate_unpublished_generation().unwrap();
+    let mut recovery = crate::generation_recovery::GenerationRecovery::load(&layout).unwrap();
+    recovery.retirement = Some(crate::generation_recovery::Retirement { old: old.daemon_name().into(), successor: 2 });
+    recovery.save(&layout).unwrap();
+    layout.set_current_generation(2).unwrap();
+    // A draining daemon may exit before its acknowledgment reaches the caller.
+    std::fs::remove_dir_all(old.daemon_dir()).unwrap();
+    SessionService::new(layout.clone()).resume_retirement(&mut recovery).unwrap();
+    assert!(recovery.retirement.is_none());
+    assert!(crate::generation_recovery::GenerationRecovery::load(&layout).unwrap().retirement.is_none());
+    assert!(successor.daemon_dir().exists());
+    assert_eq!(layout.generation(), Some(2));
 }

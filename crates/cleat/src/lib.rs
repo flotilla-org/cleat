@@ -9,6 +9,7 @@ pub mod cli;
 mod conpty_startup;
 pub mod da;
 pub mod duration_parser;
+mod generation_recovery;
 mod host;
 mod http_uds;
 mod image_backing;

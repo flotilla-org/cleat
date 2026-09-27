@@ -307,6 +307,9 @@ impl SessionService {
             return Err("server drain requires a logical name; use --server without @generation".into());
         }
         let _lock = self.layout.lock_generations()?;
+        let mut recovery = crate::generation_recovery::GenerationRecovery::load(&self.layout)?;
+        let (recovery_warning, _) = self.resume_retirement(&mut recovery)?;
+        recovery.reclaim(&self.layout)?;
         let old_service = Self::new(self.layout.resolved()?);
         let old_status = old_service.daemon_build_status()?;
         let installed = crate::build_info::BuildInfo::current();
@@ -324,7 +327,7 @@ impl SessionService {
             .as_ref()
             .is_some_and(|build| build.git_sha == installed.git_sha && build.protocol_version == installed.protocol_version)
         {
-            return Ok(DrainReport { changed: false, installed, current: old.clone(), old, warning: None });
+            return Ok(DrainReport { changed: false, installed, current: old.clone(), old, warning: recovery_warning });
         }
         // Query the count separately: pre-drain daemons don't include it in status.
         let response = old_service.daemon_request(Method::GET, "/sessions")?;
@@ -337,40 +340,56 @@ impl SessionService {
         }
         let sessions: SessionCount = serde_json::from_slice(&response.body).map_err(|e| format!("read old sessions: {e}"))?;
         let mut old = DrainGeneration { session_count: sessions.sessions.len(), ..old };
-        let successor = self.layout.allocate_generation()?;
+        let successor = self.layout.allocate_unpublished_generation()?;
         let new_service = Self::new(successor.clone());
-        start(&successor)?;
-        let deadline = Instant::now() + health_deadline;
-        let status = loop {
-            match new_service.daemon_status_at("/healthz") {
-                Ok(status) => break status,
-                Err(err) if Instant::now() >= deadline => {
-                    return Err(format!("successor {} failed health check; alias unchanged: {err}", successor.daemon_name()));
+        let startup = (|| {
+            start(&successor)?;
+            let deadline = Instant::now() + health_deadline;
+            let status = loop {
+                match new_service.daemon_status_at("/healthz") {
+                    Ok(status) => break status,
+                    Err(err) if Instant::now() >= deadline => {
+                        return Err(format!("successor {} failed health check; alias unchanged: {err}", successor.daemon_name()));
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(20)),
                 }
-                Err(_) => thread::sleep(Duration::from_millis(20)),
+            };
+            if status
+                .build
+                .as_ref()
+                .is_none_or(|build| build.git_sha != installed.git_sha || build.protocol_version != installed.protocol_version)
+            {
+                return Err("successor build does not match installed client; alias unchanged".into());
+            }
+            Ok(status)
+        })();
+        let status = match startup {
+            Ok(status) => status,
+            Err(error) => {
+                // A started daemon owns its lifetime lock; leave it to idle exit.
+                // Reclamation is retried by the next drain if it is still alive.
+                let cleanup = crate::generation_recovery::GenerationRecovery::load(&self.layout)
+                    .and_then(|mut recovery| recovery.reclaim(&self.layout));
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => format!("{error}; cleanup deferred: {cleanup}"),
+                });
             }
         };
-        if status
-            .build
-            .as_ref()
-            .is_none_or(|build| build.git_sha != installed.git_sha || build.protocol_version != installed.protocol_version)
-        {
-            return Err("successor build does not match installed client; alias unchanged".into());
+        let generation = successor.generation().ok_or("missing successor generation")?;
+        let mut recovery = crate::generation_recovery::GenerationRecovery::load(&self.layout)?;
+        // Write intent before publishing. Recovery distinguishes the two sides of
+        // publication by the alias, including a crash before the next write.
+        recovery.retirement = Some(crate::generation_recovery::Retirement { old: old.name.clone(), successor: generation });
+        recovery.save(&self.layout)?;
+        self.layout.set_current_generation(generation)?;
+        recovery.unpublished.remove(&generation);
+        recovery.save(&self.layout)?;
+        let (warning, session_count) = self.resume_retirement(&mut recovery)?;
+        if let Some(session_count) = session_count {
+            old.session_count = session_count;
         }
-        self.layout.set_current_generation(successor.generation().ok_or("missing successor generation")?)?;
-        let warning = match old_service.daemon_request(Method::POST, "/drain") {
-            Ok(response) if response.status == StatusCode::OK => {
-                let status: crate::build_info::DaemonBuildStatus =
-                    serde_json::from_slice(&response.body).map_err(|e| format!("alias moved, but invalid drain response: {e}"))?;
-                old.session_count = status.session_count;
-                None
-            }
-            Ok(response) if response.status == StatusCode::NOT_FOUND || response.status == StatusCode::METHOD_NOT_ALLOWED => {
-                Some(format!("{} cannot be told to drain; left serving. New sessions use {}", old.name, successor.daemon_name()))
-            }
-            Ok(response) => return Err(format!("alias moved, but old daemon drain failed: {}", http_error_message(response))),
-            Err(err) => return Err(format!("alias moved, but old daemon drain failed: {err}")),
-        };
+        let warning = warning.or(recovery_warning);
         let current = DrainGeneration {
             name: successor.daemon_name().to_string(),
             generation: successor.generation(),
@@ -378,6 +397,52 @@ impl SessionService {
             session_count: status.session_count,
         };
         Ok(DrainReport { changed: true, installed, old, current, warning })
+    }
+
+    fn resume_retirement(
+        &self,
+        recovery: &mut crate::generation_recovery::GenerationRecovery,
+    ) -> Result<(Option<String>, Option<usize>), String> {
+        let Some(retirement) = &recovery.retirement else { return Ok((None, None)) };
+        if self.layout.generation().is_none_or(|current| current < retirement.successor) {
+            // Publication did not happen. Never drain the still-current host.
+            recovery.retirement = None;
+            return recovery.save(&self.layout).map(|()| (None, None));
+        }
+        let old_layout = self.layout.clone().with_daemon(retirement.old.clone())?;
+        if old_layout.logical_name() != self.layout.logical_name() || old_layout.generation() >= Some(retirement.successor) {
+            return Err("invalid pending daemon retirement".into());
+        }
+        let old_service = Self::new(old_layout);
+        let mut session_count = None;
+        let warning = match old_service.daemon_request(Method::POST, "/drain") {
+            Ok(response) if response.status == StatusCode::OK => {
+                let status = serde_json::from_slice::<crate::build_info::DaemonBuildStatus>(&response.body)
+                    .map_err(|e| format!("alias moved, but invalid drain response: {e}"))?;
+                session_count = Some(status.session_count);
+                None
+            }
+            Ok(response) if response.status == StatusCode::NOT_FOUND || response.status == StatusCode::METHOD_NOT_ALLOWED => Some(format!(
+                "{} cannot be told to drain; left serving. New sessions use {}@{}",
+                retirement.old,
+                self.layout.logical_name(),
+                retirement.successor
+            )),
+            Ok(response) => {
+                return Err(format!("alias moved, but old daemon drain failed (retry server drain): {}", http_error_message(response)))
+            }
+            Err(_)
+                if !old_service.layout.daemon_dir().exists()
+                    || !is_session_daemon_alive(old_service.layout.root(), old_service.layout.daemon_name()) =>
+            {
+                None
+            }
+            Err(err) => return Err(format!("alias moved, but old daemon drain failed (retry server drain): {err}")),
+        };
+        recovery.unpublished.remove(&retirement.successor);
+        recovery.retirement = None;
+        recovery.save(&self.layout)?;
+        Ok((warning, session_count))
     }
 
     fn daemon_request(&self, method: Method, path: &str) -> Result<http_uds::HttpResponse, String> {

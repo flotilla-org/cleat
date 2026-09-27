@@ -2032,6 +2032,8 @@ fn flush_watchers(watchers: &mut Vec<ActiveClient>) {
 #[cfg(any(unix, windows))]
 pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> {
     let layout = RuntimeLayout::new(root.to_path_buf()).with_daemon(daemon_name.to_string())?.prepare_generation()?;
+    let Some(_lifetime) = layout.try_lock_daemon_lifetime()? else { return Ok(()) };
+    crate::generation_recovery::GenerationRecovery::load(&layout)?.check_start(&layout)?;
     let daemon_name = layout.daemon_name();
     let socket_path = layout.socket_path();
     validate_session_socket_path(&socket_path)?;
@@ -5215,7 +5217,6 @@ pub(crate) fn ensure_daemon_started(layout: &RuntimeLayout) -> Result<(), String
         }
     }
 
-    layout.ensure_daemon_dirs()?;
     spawn_daemon_process(layout.root(), layout.daemon_name())?;
     wait_for_socket(&layout.socket_path())
 }

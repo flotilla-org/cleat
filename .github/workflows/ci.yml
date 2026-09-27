@@ -216,3 +216,5 @@ jobs:
           }
       - name: Test workspace with Ghostty VT
         run: cargo test --workspace --locked --features cleat/ghostty-vt
+      - name: Temporary Windows startup evidence for issue 289
+        run: python tools/verify-windows-startup.py

@@ -28,6 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
+        # The rustup proxy installs the toolchain and components from rust-toolchain.toml.
         run: rustc --version
       - uses: mlugg/setup-zig@v2
         with:
@@ -55,6 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
+        # The rustup proxy installs the toolchain and components from rust-toolchain.toml.
         run: rustc --version
       - uses: mlugg/setup-zig@v2
         with:
@@ -80,6 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
+        # The rustup proxy installs the toolchain and components from rust-toolchain.toml.
         run: rustc --version
       - uses: actions/cache@v4
         with:
@@ -101,6 +104,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
+        # The rustup proxy installs the toolchain and components from rust-toolchain.toml.
         run: rustc --version
       - run: cargo clippy -p cleat --all-targets --locked --no-default-features -- -D warnings
       - run: cargo test -p cleat --locked --no-default-features --test fd_transfer --test transfer_state --test child_observation --test transfer
@@ -115,6 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
+        # The rustup proxy installs the toolchain and components from rust-toolchain.toml.
         run: rustc --version
       # Compile the application and exercise named-pipe/provider behavior
       # without making this portability gate depend on a Ghostty build.
@@ -136,6 +141,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
+        # The rustup proxy installs the toolchain and components from rust-toolchain.toml.
         run: rustc --version
       # The prepared Ghostty install and bundled ConPTY depend only on the pins
       # and the scripts that realise them, so an exact-key hit skips Zig and the

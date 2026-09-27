@@ -42,6 +42,7 @@ jobs:
           ! git --no-pager config --local --get-regexp 'http\..*\.extraheader'
 
       - name: Install pinned Rust toolchain
+        # The rustup proxy installs the toolchain and components from rust-toolchain.toml.
         run: rustc --version
 
       - name: Prepare Ghostty VT

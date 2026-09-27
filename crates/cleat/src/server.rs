@@ -113,6 +113,21 @@ pub struct DrainReport {
     pub warning: Option<String>,
 }
 
+/// Per-session outcomes are retained even when only part of a handover succeeds.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HandoverReport {
+    #[serde(flatten)]
+    pub drain: DrainReport,
+    pub moved: Vec<crate::protocol::TransferResult>,
+    pub stayed: Vec<HandoverStayed>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HandoverStayed {
+    pub session_id: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonInstance {
     name: String,
@@ -298,15 +313,95 @@ impl SessionService {
         )
     }
 
+    /// Upgrade the logical daemon and transfer every live session (Unix).
+    #[cfg(unix)]
+    pub fn handover(&self, options: TransferOptions) -> Result<HandoverReport, String> {
+        let mut moved = Vec::new();
+        let mut stayed = Vec::new();
+        let mut drain = self.roll_using(
+            |layout| crate::platform::daemon::spawn_daemon_process(layout.root(), layout.daemon_name()),
+            Duration::from_secs(10),
+            |old, new| {
+                let protocol = crate::transfer::probe_target(&new.layout.socket_path(), Instant::now() + Duration::from_secs(2))?;
+                let body = serde_json::to_vec(&protocol).map_err(|err| format!("serialize protocol: {err}"))?;
+                let response = old.daemon_request_body(Method::POST, "/transfer-check", &body)?;
+                if response.status == StatusCode::NOT_FOUND || response.status == StatusCode::METHOD_NOT_ALLOWED {
+                    return Err("source daemon does not support handover; use server drain; alias unchanged".into());
+                }
+                if response.status != StatusCode::OK {
+                    return Err(format!("handover preflight failed; alias unchanged: {}", http_error_message(response)));
+                }
+                let incompatible: Vec<String> =
+                    serde_json::from_slice(&response.body).map_err(|err| format!("parse handover preflight: {err}"))?;
+                if !options.drop_incompatible && !incompatible.is_empty() {
+                    return Err(format!(
+                        "handover refused; alias unchanged: attached clients cannot follow:\n{}\nrerun with --drop-incompatible",
+                        incompatible.join("\n")
+                    ));
+                }
+                Ok(())
+            },
+            |old, new, mut ids| {
+                ids.sort();
+                // Bound worker count while allowing the daemon's asynchronous
+                // transfer machinery to service several handshakes together.
+                for batch in ids.chunks(16) {
+                    thread::scope(|scope| {
+                        let workers: Vec<_> = batch
+                            .iter()
+                            .map(|id| {
+                                let options = options.clone();
+                                (
+                                    id,
+                                    thread::Builder::new()
+                                        .name(format!("handover:{id}"))
+                                        .spawn_scoped(scope, move || old.transfer(id, new, options)),
+                                )
+                            })
+                            .collect();
+                        for (id, worker) in workers {
+                            let outcome = match worker {
+                                Ok(worker) => worker
+                                    .join()
+                                    .unwrap_or_else(|_| Err("transfer worker panicked; inspect the session's current holder".into())),
+                                Err(err) => Err(format!("start transfer worker: {err}")),
+                            };
+                            match outcome {
+                                Ok(result) => moved.push(result),
+                                Err(reason) => stayed.push(HandoverStayed { session_id: id.clone(), reason }),
+                            }
+                        }
+                    });
+                }
+                Ok(())
+            },
+        )?;
+        if drain.changed {
+            drain.old.session_count = drain.old.session_count.saturating_sub(moved.len());
+            drain.current.session_count += moved.len();
+        }
+        Ok(HandoverReport { drain, moved, stayed })
+    }
+
     fn drain_using(
         &self,
         start: impl FnOnce(&RuntimeLayout) -> Result<(), String>,
         health_deadline: Duration,
     ) -> Result<DrainReport, String> {
+        self.roll_using(start, health_deadline, |_, _| Ok(()), |_, _, _| Ok(()))
+    }
+
+    fn roll_using(
+        &self,
+        start: impl FnOnce(&RuntimeLayout) -> Result<(), String>,
+        health_deadline: Duration,
+        preflight: impl FnOnce(&Self, &Self) -> Result<(), String>,
+        transfer: impl FnOnce(&Self, &Self, Vec<String>) -> Result<(), String>,
+    ) -> Result<DrainReport, String> {
         if self.layout.daemon_name().contains('@') {
-            return Err("server drain requires a logical name; use --server without @generation".into());
+            return Err("server upgrade requires a logical name; use --server without @generation".into());
         }
-        let _lock = self.layout.lock_generations()?;
+        let generation_lock = self.layout.lock_generations()?;
         let old_service = Self::new(self.layout.resolved()?);
         let old_status = old_service.daemon_build_status()?;
         let installed = crate::build_info::BuildInfo::current();
@@ -357,12 +452,22 @@ impl SessionService {
         {
             return Err("successor build does not match installed client; alias unchanged".into());
         }
+        preflight(&old_service, &new_service)?;
         self.layout.set_current_generation(successor.generation().ok_or("missing successor generation")?)?;
+        let mut live_session_ids = Vec::new();
         let warning = match old_service.daemon_request(Method::POST, "/drain") {
             Ok(response) if response.status == StatusCode::OK => {
                 let status: crate::build_info::DaemonBuildStatus =
                     serde_json::from_slice(&response.body).map_err(|e| format!("alias moved, but invalid drain response: {e}"))?;
                 old.session_count = status.session_count;
+                #[derive(serde::Deserialize)]
+                struct RetiringSessions {
+                    #[serde(default)]
+                    live_session_ids: Vec<String>,
+                }
+                let retiring: RetiringSessions =
+                    serde_json::from_slice(&response.body).map_err(|err| format!("parse retiring sessions: {err}"))?;
+                live_session_ids = retiring.live_session_ids;
                 None
             }
             Ok(response) if response.status == StatusCode::NOT_FOUND || response.status == StatusCode::METHOD_NOT_ALLOWED => {
@@ -371,6 +476,10 @@ impl SessionService {
             Ok(response) => return Err(format!("alias moved, but old daemon drain failed: {}", http_error_message(response))),
             Err(err) => return Err(format!("alias moved, but old daemon drain failed: {err}")),
         };
+        // Relocation takes this same logical-name lock in the source daemon.
+        // The alias and retirement are settled; release it before any transfer.
+        drop(generation_lock);
+        transfer(&old_service, &new_service, live_session_ids)?;
         let current = DrainGeneration {
             name: successor.daemon_name().to_string(),
             generation: successor.generation(),
@@ -381,10 +490,14 @@ impl SessionService {
     }
 
     fn daemon_request(&self, method: Method, path: &str) -> Result<http_uds::HttpResponse, String> {
+        self.daemon_request_body(method, path, &[])
+    }
+
+    fn daemon_request_body(&self, method: Method, path: &str, body: &[u8]) -> Result<http_uds::HttpResponse, String> {
         let mut stream = try_connect_session_stream(&self.layout.socket_path()).map_err(|err| format!("connect daemon: {err}"))?;
         set_stream_read_timeout(&stream, Some(Duration::from_secs(2)))?;
         crate::platform::ipc::set_stream_write_timeout(&stream, Some(Duration::from_secs(2)))?;
-        http_uds::write_request(&mut stream, method, path, &[]).map_err(|err| format!("write daemon request: {err}"))?;
+        http_uds::write_request(&mut stream, method, path, body).map_err(|err| format!("write daemon request: {err}"))?;
         let mut reader = DaemonResponseReader { stream: &mut stream, deadline: Instant::now() + Duration::from_secs(2) };
         http_uds::read_response(&mut reader).map_err(|err| format!("read daemon response: {err}"))
     }

@@ -144,6 +144,16 @@ fn parse_boolish(value: &str) -> Option<bool> {
 
 #[derive(Debug, Subcommand, PartialEq)]
 pub enum ServerCommand {
+    /// Upgrade the daemon and move every live session to the successor (Unix)
+    Handover {
+        #[arg(long)]
+        drop_incompatible: bool,
+        /// Per-session transfer deadline (default 10s)
+        #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
+        timeout: Option<Duration>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Start this binary's generation and let the old daemon's sessions finish
     Drain {
         #[arg(long)]
@@ -808,6 +818,53 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 ExecResult::Ok(Some(sessions.iter().map(format_session_human).collect::<Vec<_>>().join("\n")))
             }
         }
+        #[cfg(unix)]
+        Command::Server { command: ServerCommand::Handover { drop_incompatible, timeout, json } } => {
+            let options = crate::server::TransferOptions { drop_incompatible, timeout };
+            match service.handover(options) {
+                Err(err) => ExecResult::Err(err),
+                Ok(report) => {
+                    let output = if json {
+                        match serde_json::to_string(&report) {
+                            Ok(output) => output,
+                            Err(err) => return ExecResult::Err(format!("serialize handover report: {err}")),
+                        }
+                    } else if !report.drain.changed {
+                        "nothing to hand over".into()
+                    } else {
+                        let dropped: usize = report.moved.iter().map(|session| session.dropped_clients.len()).sum();
+                        let mut output = format!(
+                            "{} -> {}: {} sessions moved, {} stayed, {} clients dropped",
+                            report.drain.old.name,
+                            report.drain.current.name,
+                            report.moved.len(),
+                            report.stayed.len(),
+                            dropped
+                        );
+                        for session in &report.moved {
+                            output.push_str(&format!("\n{}: moved (hosting epoch {})", session.session_id, session.hosting_epoch));
+                            for client in &session.dropped_clients {
+                                output.push_str(&format!("\n  dropped: {client}"));
+                            }
+                            if let Some(warning) = &session.warning {
+                                output.push_str(&format!("\n  warning: {warning}"));
+                            }
+                        }
+                        for session in &report.stayed {
+                            output.push_str(&format!("\n{}: stayed: {}", session.session_id, session.reason));
+                        }
+                        output
+                    };
+                    if report.stayed.is_empty() {
+                        ExecResult::Ok(Some(output))
+                    } else {
+                        ExecResult::Exit { code: 1, message: None, output: Some(output) }
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        Command::Server { command: ServerCommand::Handover { .. } } => ExecResult::Err("server handover is only supported on Unix".into()),
         Command::Server { command: ServerCommand::Drain { json } } => match service.drain() {
             Ok(report) if json => match serde_json::to_string(&report) {
                 Ok(output) => ExecResult::Ok(Some(output)),

@@ -274,3 +274,16 @@ fn auto_start_cannot_resurrect_a_retired_generation_during_or_after_cleanup() {
         assert_eq!(layout.generation(), Some(2));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn handover_from_a_pre_handover_daemon_keeps_the_alias_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf());
+    let old = layout.prepare_generation().unwrap();
+    let _host = OldDaemon::start(&old, true);
+    let error = SessionService::new(layout.clone()).handover(Default::default()).unwrap_err();
+    assert!(error.contains("use server drain") && error.contains("alias unchanged"), "{error}");
+    assert_eq!(layout.generation(), Some(1));
+    SessionService::new(layout.with_daemon("default@2".into()).unwrap()).daemon_request(Method::POST, "/drain").unwrap();
+}

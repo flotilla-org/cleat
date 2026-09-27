@@ -875,15 +875,12 @@ impl SessionRuntime {
 
     /// Record pending screen activity, and unless `consume_damage` is false
     /// also consume the engine's render damage it was derived from.
-    pub(crate) fn flush_screen_activity(&mut self, consume_damage: bool) -> bool {
+    pub(crate) fn flush_screen_activity(&mut self, consume_damage: bool) {
         if self.observe_pending_screen_activity() && consume_damage {
             if let Err(err) = self.vt_engine.screen_grid() {
                 eprintln!("screen activity render flush error: {err}");
-            } else {
-                return true;
             }
         }
-        false
     }
 
     /// Answer ConPTY's startup DA1 query as the VT engine answers a program's,

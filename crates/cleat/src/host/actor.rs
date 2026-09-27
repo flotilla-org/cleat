@@ -1524,12 +1524,9 @@ fn session_actor_handle_command(
         SessionCommand::FlushScreenActivity => {
             // A held batch's damage belongs to the frame published after it.
             // Output may arrive after the daemon captures a packet but before
-            // this queued flush executes. If screen_grid consumes that newer
-            // damage, publish the retained grid in full instead of losing rows.
-            if runtime.flush_screen_activity(!state.presentation.is_held()) && state.observation.pending_dirty() != DirtyState::Clean {
-                let rows = runtime.inspect(false, 0).terminal.rows;
-                mark_full_and_wake(&mut state.observation, rows, wake);
-            }
+            // this queued flush executes. Keep deferred VT damage until that
+            // newer generation has actually been observed by the renderer.
+            runtime.flush_screen_activity(!state.presentation.is_held() && state.observation.pending_dirty() == DirtyState::Clean);
         }
         SessionCommand::FlushRecording { reply } => {
             runtime.flush_recording();

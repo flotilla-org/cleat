@@ -16,6 +16,10 @@ use crate::vt::VtEngine;
 /// prior output as scrollback. This is the same signal `SessionRuntime::spawn`
 /// uses to decide whether to seed the engine.
 pub fn session_is_recreatable(session_dir: &Path) -> bool {
+    #[cfg(unix)]
+    if crate::embedded_transfer::held_elsewhere(session_dir) {
+        return false;
+    }
     let cast_path = session_dir.join(crate::recording::CAST_FILE_NAME);
     std::fs::metadata(&cast_path).map(|meta| meta.is_file() && meta.len() > 0).unwrap_or(false)
 }

@@ -107,7 +107,7 @@ impl HandshakeFailure {
 /// Servicing loop → source worker.
 pub(crate) enum SourceDecision {
     Proceed { manifest: Box<FdTransferManifest>, fds: Vec<OwnedFd> },
-    Commit { tail: Vec<u8>, relocation: Relocation },
+    Commit { tail: Vec<u8>, relocation: Option<Relocation> },
     Abort,
 }
 
@@ -175,7 +175,29 @@ fn copy_dir(source: &std::path::Path, destination: &std::path::Path) -> Result<(
 /// timeout; the servicing loop enforces the overall deadline independently
 /// and simply stops listening when it passes.
 pub(crate) fn run_source_worker(socket: PathBuf, deadline: Instant, events: Sender<SourceEvent>, decisions: Receiver<SourceDecision>) {
-    let probed = probe_target(&socket, deadline);
+    run_source_exchange(Some(socket), None, deadline, events, decisions);
+}
+
+pub(crate) fn run_embedded_source_worker(
+    stream: UnixStream,
+    deadline: Instant,
+    events: Sender<SourceEvent>,
+    decisions: Receiver<SourceDecision>,
+) {
+    run_source_exchange(None, Some(stream), deadline, events, decisions);
+}
+
+fn run_source_exchange(
+    socket: Option<PathBuf>,
+    stream: Option<UnixStream>,
+    deadline: Instant,
+    events: Sender<SourceEvent>,
+    decisions: Receiver<SourceDecision>,
+) {
+    let probed = match &socket {
+        Some(socket) => probe_target(socket, deadline),
+        None => Ok(TargetProtocol { version: crate::packet::PROTOCOL_VERSION, min_supported_version: crate::packet::PROTOCOL_VERSION }),
+    };
     let failed = probed.is_err();
     if events.send(SourceEvent::Probed(probed)).is_err() || failed {
         return;
@@ -184,7 +206,11 @@ pub(crate) fn run_source_worker(socket: PathBuf, deadline: Instant, events: Send
         Ok(SourceDecision::Proceed { manifest, fds }) => (manifest, fds),
         _ => return,
     };
-    let mut stream = match handshake(&socket, deadline, &manifest, &fds) {
+    let handshake = match stream {
+        Some(stream) => handshake_stream(stream, &manifest, &fds),
+        None => handshake(socket.as_ref().expect("source socket"), deadline, &manifest, &fds),
+    };
+    let mut stream = match handshake {
         Ok(stream) => {
             // The target owns duplicates now; ours close here.
             drop(fds);
@@ -202,7 +228,7 @@ pub(crate) fn run_source_worker(socket: PathBuf, deadline: Instant, events: Send
         Ok(SourceDecision::Commit { tail, relocation }) => {
             // Off the servicing loop: a copy across roots scales with the
             // recording. Committed either way; a failure is reported.
-            let moved = relocation.apply();
+            let moved = relocation.map_or(Ok(()), |relocation| relocation.apply());
             let confirmed = (|| {
                 stream.set_write_timeout(Some(COMMITTED_WAIT)).map_err(|err| format!("set transfer write timeout: {err}"))?;
                 stream.set_read_timeout(Some(COMMITTED_WAIT)).map_err(|err| format!("set transfer read timeout: {err}"))?;
@@ -265,6 +291,14 @@ fn handshake(socket: &PathBuf, deadline: Instant, manifest: &FdTransferManifest,
     if response.status != StatusCode::SWITCHING_PROTOCOLS {
         return Err(HandshakeFailure::Failed(format!("target daemon refused the transfer upgrade: HTTP {}", response.status)));
     }
+    handshake_stream(stream, manifest, fds)
+}
+
+pub(crate) fn handshake_stream(
+    mut stream: UnixStream,
+    manifest: &FdTransferManifest,
+    fds: &[OwnedFd],
+) -> Result<UnixStream, HandshakeFailure> {
     let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(AsFd::as_fd).collect();
     fd_transfer::send(&mut stream, manifest, &borrowed).map_err(|err| {
         if err.starts_with("FD transfer rejected") {
@@ -331,7 +365,7 @@ pub(crate) fn write_committed(stream: &mut impl Write) -> std::io::Result<()> {
     write_frame(stream, COMMITTED, &[])
 }
 
-fn read_committed(stream: &mut impl Read) -> Result<(), String> {
+pub(crate) fn read_committed(stream: &mut impl Read) -> Result<(), String> {
     match read_frame(stream, MAX_REASON_BYTES)? {
         (COMMITTED, _) => Ok(()),
         (code, _) => Err(format!("invalid transfer acknowledgement {code}")),
@@ -341,18 +375,19 @@ fn read_committed(stream: &mut impl Read) -> Result<(), String> {
 /// A validated transport offer waiting for the servicing loop's adoption
 /// decision.
 pub(crate) struct AdoptionOffer {
+    pub embedded: bool,
     pub received: ReceivedTransfer,
     pub stream: UnixStream,
 }
 
 /// The adopting side's receive, on a worker. Transport-level rejections are
 /// answered by `fd_transfer::receive` itself.
-pub(crate) fn run_adoption_receiver(mut stream: UnixStream, offers: Sender<AdoptionOffer>) {
+pub(crate) fn run_adoption_receiver_from(mut stream: UnixStream, offers: Sender<AdoptionOffer>, embedded: bool) {
     let _ = stream.set_read_timeout(Some(DEFAULT_HANDSHAKE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(DEFAULT_HANDSHAKE_TIMEOUT));
     match fd_transfer::receive(&mut stream) {
         Ok(received) => {
-            let _ = offers.send(AdoptionOffer { received, stream });
+            let _ = offers.send(AdoptionOffer { received, stream, embedded });
         }
         Err(err) => eprintln!("transfer receive failed: {err}"),
     }
@@ -423,6 +458,10 @@ pub(crate) fn classify_descriptors(manifest: &FdTransferManifest, fds: Vec<Owned
         })
         .transpose()?;
     Ok(AdoptionDescriptors { pty_master, recording, pidfd, child_status })
+}
+
+pub(crate) fn write_commit(stream: &mut impl Write, tail: &[u8]) -> std::io::Result<()> {
+    write_frame(stream, COMMIT, tail)
 }
 
 #[cfg(test)]

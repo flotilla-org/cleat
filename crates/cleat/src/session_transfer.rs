@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     os::{fd::OwnedFd, unix::net::UnixStream},
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
@@ -45,6 +45,7 @@ pub(super) struct TransferHub {
     /// Highest hosting epoch this daemon has seen per session id. An adoption
     /// must exceed it, so a stale or replayed manifest can never win.
     seen_epochs: HashMap<String, u64>,
+    holders: HashMap<String, UnixStream>,
 }
 
 struct OutgoingTransfer {
@@ -57,6 +58,7 @@ struct OutgoingTransfer {
     decisions: Option<Sender<SourceDecision>>,
     phase: OutgoingPhase,
     dropped_clients: Vec<String>,
+    embedded: bool,
 }
 
 enum OutgoingPhase {
@@ -85,6 +87,7 @@ struct PendingAdoption {
     hosted: HostedSession,
     stream: UnixStream,
     epoch: u64,
+    created_dir: bool,
 }
 
 struct MovedSession {
@@ -113,6 +116,7 @@ impl TransferHub {
             moved: HashMap::new(),
             forwarders: Vec::new(),
             seen_epochs: HashMap::new(),
+            holders: HashMap::new(),
         }
     }
 
@@ -126,8 +130,8 @@ impl TransferHub {
         !self.outgoing.is_empty() || !self.pending_adoptions.is_empty() || !self.forwarders.is_empty() || !self.moved.is_empty()
     }
 
-    pub(super) fn adoption_pending(&self, id: &str) -> bool {
-        self.pending_adoptions.contains_key(id)
+    pub(super) fn transfer_pending(&self, id: &str) -> bool {
+        self.pending_adoptions.contains_key(id) || self.outgoing.iter().any(|transfer| transfer.session_id == id)
     }
 
     /// The redirect a request for a released session receives during the
@@ -138,10 +142,11 @@ impl TransferHub {
 
     /// Accept a `cleat-transfer/1` connection: the transport receive runs on a
     /// worker; the servicing loop sees only its validated result.
-    pub(super) fn accept_incoming(&self, stream: UnixStream) {
+    pub(super) fn accept_incoming(&self, stream: UnixStream, embedded: bool) {
         let offers = self.offers_tx.clone();
-        let spawned =
-            thread::Builder::new().name("cleat-transfer-in".into()).spawn(move || transfer::run_adoption_receiver(stream, offers));
+        let spawned = thread::Builder::new()
+            .name("cleat-transfer-in".into())
+            .spawn(move || transfer::run_adoption_receiver_from(stream, offers, embedded));
         if let Err(err) = spawned {
             eprintln!("cleat: failed to spawn transfer receiver: {err}");
         }
@@ -174,6 +179,7 @@ impl TransferHub {
             decisions: Some(decisions),
             phase: OutgoingPhase::Probing,
             dropped_clients: Vec::new(),
+            embedded: false,
         };
         if let Err(err) = spawned {
             transfer.respond_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("start transfer worker: {err}"));
@@ -181,6 +187,38 @@ impl TransferHub {
         }
         hosted.transferring = true;
         self.outgoing.push(transfer);
+    }
+
+    pub(super) fn start_embedded(&mut self, hosted: &mut HostedSession, response: SessionStream, target: RuntimeLayout) {
+        let (events_tx, events) = mpsc::channel();
+        let (decisions, decisions_rx) = mpsc::channel();
+        let deadline = Instant::now() + transfer::DEFAULT_HANDSHAKE_TIMEOUT;
+        let worker = match response.try_clone() {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        if thread::Builder::new()
+            .name("cleat-release-embedded".into())
+            .spawn(move || {
+                transfer::run_embedded_source_worker(worker, deadline, events_tx, decisions_rx);
+            })
+            .is_err()
+        {
+            return;
+        }
+        hosted.transferring = true;
+        self.outgoing.push(OutgoingTransfer {
+            session_id: hosted.metadata.id.clone(),
+            response,
+            target,
+            drop_incompatible: true,
+            deadline,
+            events,
+            decisions: Some(decisions),
+            phase: OutgoingPhase::Probing,
+            dropped_clients: Vec::new(),
+            embedded: true,
+        });
     }
 
     /// One servicing pass: outgoing transfers, incoming adoptions, status
@@ -192,6 +230,26 @@ impl TransferHub {
         packet_clients: &mut Vec<PacketClient>,
     ) -> Result<bool, String> {
         let mut did_work = false;
+        let ended: Vec<_> = self
+            .holders
+            .iter_mut()
+            .filter_map(|(id, stream)| {
+                let mut byte = [0];
+                match stream.read(&mut byte) {
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => None,
+                    _ => Some(id.clone()),
+                }
+            })
+            .collect();
+        for id in ended {
+            self.holders.remove(&id);
+            if sessions.get(&id).is_some_and(|hosted| hosted.hosted_elsewhere) {
+                sessions.remove(&id);
+                super::cleanup_exited_session(layout, &id, true);
+                broadcast_directory_remove(&id, packet_clients)?;
+            }
+            did_work = true;
+        }
         let mut index = 0;
         while index < self.outgoing.len() {
             match self.service_outgoing(index, layout, sessions, packet_clients)? {
@@ -265,8 +323,19 @@ impl TransferHub {
             let Committed { result, mut released, redirect, .. } = *committed;
             // The target now hosts the session: send attachments there.
             release_transferred_session(&mut released, &redirect, packet_clients)?;
-            drop(released);
-            transfer.respond(StatusCode::OK, &result);
+            if transfer.embedded {
+                released.hosted_elsewhere = true;
+                released.hosting_epoch = result.hosting_epoch;
+                let holder = transfer.response.try_clone().map_err(|err| err.to_string())?;
+                holder.set_nonblocking(true).map_err(|err| err.to_string())?;
+                self.holders.insert(id.clone(), holder);
+                let entry = directory_entry_for_session(layout, &released, packet_clients)?;
+                sessions.insert(id, released);
+                broadcast_directory_upsert(entry, packet_clients)?;
+            } else {
+                drop(released);
+                transfer.respond(StatusCode::OK, &result);
+            }
             return Ok(None);
         }
         let Some(hosted) = sessions.get_mut(&id) else {
@@ -365,7 +434,7 @@ impl TransferHub {
         if epoch != expected {
             eprintln!("transfer of {id}: hosting epoch advanced to {epoch}, expected {expected}");
         }
-        let address = format!("daemon:{}", transfer.target.daemon_name());
+        let address = if transfer.embedded { "embedded".into() } else { format!("daemon:{}", transfer.target.daemon_name()) };
         let OutgoingPhase::Handshaking { status_writer, forked_pid, .. } = std::mem::replace(&mut transfer.phase, OutgoingPhase::Probing)
         else {
             unreachable!("phase checked above");
@@ -406,9 +475,11 @@ impl TransferHub {
         if let Some(decisions) = &transfer.decisions {
             let relocation =
                 transfer::Relocation { source: layout.session_dir(&id), target: transfer.target.clone(), session_id: id.clone() };
-            let _ = decisions.send(SourceDecision::Commit { tail, relocation });
+            let _ = decisions.send(SourceDecision::Commit { tail, relocation: (!transfer.embedded).then_some(relocation) });
         }
-        self.moved.insert(id.clone(), MovedSession { redirect, until: Instant::now() + transfer::REDIRECT_GRACE });
+        if !transfer.embedded {
+            self.moved.insert(id.clone(), MovedSession { redirect, until: Instant::now() + transfer::REDIRECT_GRACE });
+        }
         self.note_epoch(&id, epoch);
         Ok(Some(true))
     }
@@ -416,28 +487,43 @@ impl TransferHub {
     /// Validate an offer and build its runtime (not yet reading the PTY), then
     /// reply READY; or refuse it. The transport already checked the envelope.
     fn consider_offer(&mut self, layout: &RuntimeLayout, sessions: &HashMap<String, HostedSession>, offer: AdoptionOffer) {
-        let AdoptionOffer { received, mut stream } = offer;
+        let AdoptionOffer { received, mut stream, embedded } = offer;
         let id = received.manifest.session.id.clone();
         let epoch = received.manifest.hosting_epoch;
-        let adopted = self.validate_offer(layout, sessions, &received.manifest).and_then(|()| {
+        let returning = embedded && sessions.get(&id).is_some_and(|hosted| hosted.hosted_elsewhere);
+        let mut created_dir = false;
+        let adopted = self.validate_offer(layout, sessions, &received.manifest, returning).and_then(|()| {
+            if embedded && !returning {
+                fs::create_dir(layout.session_dir(&id)).map_err(|err| err.to_string())?;
+                created_dir = true;
+            }
             let (manifest, fds) = received.commit();
-            adopt_session(layout, manifest, fds)
+            adopt_session(layout, manifest, fds, created_dir)
         });
         let hosted = match adopted {
             Ok(hosted) => hosted,
             Err(reason) => {
+                if created_dir {
+                    let _ = fs::remove_dir_all(layout.session_dir(&id));
+                }
                 let _ = transfer::write_refusal(&mut stream, &reason);
                 return;
             }
         };
         if let Err(err) = transfer::write_ready(&mut stream) {
             eprintln!("transfer of {id}: could not reply ready: {err}");
+            if created_dir {
+                let _ = fs::remove_dir_all(layout.session_dir(&id));
+            }
             return;
         }
         let commit_stream = match stream.try_clone() {
             Ok(commit_stream) => commit_stream,
             Err(err) => {
                 eprintln!("transfer of {id}: {err}");
+                if created_dir {
+                    let _ = fs::remove_dir_all(layout.session_dir(&id));
+                }
                 return;
             }
         };
@@ -448,9 +534,12 @@ impl TransferHub {
             .spawn(move || transfer::run_commit_receiver(commit_stream, session_id, outcomes))
         {
             eprintln!("transfer of {id}: failed to spawn commit receiver: {err}");
+            if created_dir {
+                let _ = fs::remove_dir_all(layout.session_dir(&id));
+            }
             return;
         }
-        self.pending_adoptions.insert(id, PendingAdoption { hosted, stream, epoch });
+        self.pending_adoptions.insert(id, PendingAdoption { hosted, stream, epoch, created_dir });
     }
 
     fn validate_offer(
@@ -458,17 +547,18 @@ impl TransferHub {
         layout: &RuntimeLayout,
         sessions: &HashMap<String, HostedSession>,
         manifest: &FdTransferManifest,
+        returning: bool,
     ) -> Result<(), String> {
         maybe_refuse_adoption_for_test(&manifest.session.id)?;
         let id = &manifest.session.id;
         crate::runtime::validate_runtime_name(id)?;
-        if sessions.contains_key(id) || self.pending_adoptions.contains_key(id) {
+        if (sessions.contains_key(id) && !returning) || self.pending_adoptions.contains_key(id) {
             return Err(format!("session {id} is already live on this daemon"));
         }
         if std::fs::read_to_string(layout.daemon_dir().join("drain-state")).is_ok_and(|state| state.trim() == "draining") {
             return Err(format!("daemon:{} is draining and accepts no new sessions", layout.daemon_name()));
         }
-        if layout.session_dir(id).exists() {
+        if layout.session_dir(id).exists() && !returning {
             return Err(format!("this daemon retains state for session {id}; purge it (cleat kill --purge) before transferring here"));
         }
         if let Some(seen) = self.seen_epochs.get(id) {
@@ -507,6 +597,9 @@ impl TransferHub {
                 // adopt without the tail rather than strand the session.
                 let committed = session_dir.is_dir() && crate::hosting_epoch::read(&session_dir).ok() == Some(pending.epoch);
                 if !committed {
+                    if pending.created_dir {
+                        let _ = fs::remove_dir_all(&session_dir);
+                    }
                     if let Err(err) = outcome {
                         eprintln!("transfer of {id} abandoned before commit: {err}");
                     }
@@ -516,6 +609,9 @@ impl TransferHub {
                 Vec::new()
             }
         };
+        if let Err(err) = fs::write(session_dir.join(crate::hosting_epoch::EPOCH_FILE_NAME), format!("{}\n", pending.epoch)) {
+            eprintln!("persist adopted epoch for {id}: {err}");
+        }
         if let Err(err) = pending.hosted.actor.resume_adopted(tail) {
             eprintln!("transfer of {id}: adoption failed at commit: {err}");
             return Ok(());
@@ -526,6 +622,7 @@ impl TransferHub {
             let _ = fs::create_dir_all(&session_dir);
             let _ = fs::write(session_dir.join(crate::hosting_epoch::EPOCH_FILE_NAME), format!("{}\n", pending.epoch));
         }
+        self.holders.remove(id);
         self.note_epoch(id, pending.epoch);
         let _ = transfer::write_committed(&mut pending.stream);
         let entry = directory_entry_for_session(layout, &pending.hosted, packet_clients)?;
@@ -540,7 +637,11 @@ impl OutgoingTransfer {
     }
 
     fn respond_error(&mut self, status: StatusCode, message: &str) {
-        let _ = http_uds::write_error(&mut self.response, status, message);
+        if self.embedded {
+            let _ = transfer::write_refusal(&mut self.response, message);
+        } else {
+            let _ = http_uds::write_error(&mut self.response, status, message);
+        }
     }
 }
 
@@ -754,8 +855,13 @@ pub(super) fn write_stale_holder(stream: &mut SessionStream, id: &str, current: 
 
 /// Build the paused runtime for an offer. Everything here is local and
 /// bounded; the PTY is not read until the source commits.
-fn adopt_session(layout: &RuntimeLayout, manifest: FdTransferManifest, fds: Vec<OwnedFd>) -> Result<HostedSession, String> {
-    let descriptors = transfer::classify_descriptors(&manifest, fds)?;
+fn adopt_session(
+    layout: &RuntimeLayout,
+    mut manifest: FdTransferManifest,
+    fds: Vec<OwnedFd>,
+    created_dir: bool,
+) -> Result<HostedSession, String> {
+    let mut descriptors = transfer::classify_descriptors(&manifest, fds)?;
     #[cfg(target_os = "linux")]
     let observer = match descriptors.pidfd {
         Some(pidfd) => Some(ChildObserver::from_pidfd(pidfd)),
@@ -769,6 +875,25 @@ fn adopt_session(layout: &RuntimeLayout, manifest: FdTransferManifest, fds: Vec<
     let pty_child = PtyChild::adopt(descriptors.pty_master, manifest.child_pid, observer, descriptors.child_status)?;
     let id = manifest.session.id.clone();
     let session_dir = layout.session_dir(&id);
+    if created_dir {
+        let mut recorder = crate::recording::SessionRecorder::new(
+            &session_dir,
+            manifest.size.cols,
+            manifest.size.rows,
+            manifest.session.vt_engine.as_str(),
+        )?;
+        recorder.write_snapshot(
+            &manifest.replay_snapshot.state,
+            &manifest.replay_snapshot.engine,
+            manifest.size.cols,
+            manifest.size.rows,
+            Duration::ZERO,
+        );
+        recorder.output(manifest.replay_snapshot.state.as_bytes(), Duration::ZERO);
+        recorder.flush();
+        descriptors.recording = Some(recorder.append_handle()?);
+        manifest.session.record = true;
+    }
     let size = manifest.size;
     let cell_pixel_size = manifest.cell_pixel_size;
     let hosting_epoch = manifest.hosting_epoch;

@@ -233,4 +233,10 @@ Moving a running session's PTY between hostings via FD transfer, preserving the
 running process (e.g. promoting an embedded session to a daemon before the client
 exits). Lossless. Daemon-to-daemon transfer (`cleat transfer`) exists on Unix: the
 source releases, the target adopts, attachments follow a redirect, and the hosting
-epoch fences stale holders. Embedded hostings follow in a later slice.
+epoch fences stale holders. On Unix, the C provider's `cleat_session_transfer`
+and `cleat_session_adopt` switch one stable handle between in-process and daemon
+hosting. An embedded target holds a kernel lease on the daemon-owned directory;
+the daemon lists it as `hosted-elsewhere` and refuses recreation until the holder
+exits. A fresh embedded source starts the daemon recording at its transfer
+snapshot. In-process provider recordings live beneath the runtime root's
+`.embedded/` namespace so they cannot collide with daemon-owned sessions.

@@ -893,6 +893,10 @@ impl SessionService {
     }
 
     pub fn kill_with_purge(&self, id: &str, purge: bool) -> Result<(), String> {
+        #[cfg(unix)]
+        if crate::embedded_transfer::held_elsewhere(&self.layout.session_dir(id)) {
+            return Err(format!("session {id} is hosted-elsewhere; its holder owns its lifetime"));
+        }
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
@@ -1464,6 +1468,10 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
         let Some(id) = path.file_name().and_then(|name| name.to_str()).map(str::to_string) else {
             continue;
         };
+        #[cfg(unix)]
+        if crate::embedded_transfer::held_elsewhere(&path) {
+            continue;
+        }
         if !crate::recreate::session_is_recreatable(&path) {
             layout.remove_session(&id)?;
             continue;

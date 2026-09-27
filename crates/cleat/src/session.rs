@@ -1767,6 +1767,7 @@ struct HostedSession {
     /// Frozen for an outgoing transfer: role changes, resize, tags and
     /// control operations wait; PTY input and output keep flowing.
     transferring: bool,
+    hosted_elsewhere: bool,
 }
 
 impl HostedSession {
@@ -1809,6 +1810,7 @@ impl HostedSession {
             should_keep_session_dir,
             hosting_epoch,
             transferring: false,
+            hosted_elsewhere: false,
         })
     }
 
@@ -2229,6 +2231,9 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             let Some(hosted) = sessions.get_mut(&session_id) else {
                 continue;
             };
+            if hosted.hosted_elsewhere {
+                continue;
+            }
             let service_result = contain_session_unwind(&session_id, || -> Result<(bool, Option<bool>), String> {
                 maybe_panic_for_containment_test(&session_id);
                 let session_did_work = service_hosted_session(&layout, &session_id, hosted, &mut packet_clients)?;
@@ -2391,7 +2396,7 @@ fn controller_identity(hosted: &HostedSession, packet_clients: &[PacketClient]) 
 
 fn sync_packet_geometry(hosted: &mut HostedSession) -> Result<(), String> {
     // Geometry and focus changes wait for an outgoing transfer to settle.
-    if hosted.transferring {
+    if hosted.transferring || hosted.hosted_elsewhere {
         return Ok(());
     }
     let focused = hosted.active_client.is_some() || hosted.packet_control.focused();
@@ -2520,6 +2525,9 @@ fn announce_seat_state_except(
 
 fn inspect_hosted_session(hosted: &HostedSession, packet_clients: &[PacketClient]) -> Result<crate::protocol::InspectResult, String> {
     let mut result = hosted.actor.inspect(false, 0)?;
+    if hosted.hosted_elsewhere {
+        result.session.state = "hosted-elsewhere".into();
+    }
     if let Some(client) = hosted.active_client.as_ref() {
         result.attachments.push(crate::protocol::AttachmentInspect {
             role: "controller".to_string(),
@@ -2562,7 +2570,7 @@ fn directory_entry_for_session(
         controller_count: (if hosted.active_client.is_some() { 1 } else { 0 }) + packet_controllers,
         watcher_count: u32::try_from(hosted.watchers.len()).unwrap_or(u32::MAX).saturating_add(packet_watchers),
         controller: controller_identity(hosted, packet_clients),
-        recreatable: crate::recreate::session_is_recreatable(&layout.session_dir(&inspect.session.id)),
+        recreatable: !hosted.hosted_elsewhere && crate::recreate::session_is_recreatable(&layout.session_dir(&inspect.session.id)),
         cols: inspect.terminal.cols,
         rows: inspect.terminal.rows,
     })
@@ -3127,6 +3135,10 @@ fn handle_http_request(
                 }
             }
             Some(hosted) => {
+                if hosted.hosted_elsewhere && !matches!(route, http_uds::Route::SessionInspect { .. }) {
+                    return http_uds::write_error(stream, StatusCode::CONFLICT, "session is hosted-elsewhere")
+                        .map_err(|err| err.to_string());
+                }
                 if let Some(held) = holder_epoch.filter(|held| route.mutates_session() && *held != hosted.hosting_epoch) {
                     #[cfg(unix)]
                     return transfer_host::write_stale_holder(stream, id, hosted.hosting_epoch, held)
@@ -3217,7 +3229,9 @@ fn handle_http_request(
             )
             .map_err(|err| format!("write drain response: {err}"))
         }
-        http_uds::Route::Transfer => {
+        http_uds::Route::Transfer | http_uds::Route::EmbeddedTransfer => {
+            #[cfg(unix)]
+            let embedded = matches!(route, http_uds::Route::EmbeddedTransfer);
             if !http_uds::request_has_upgrade_token(&request, http_uds::TRANSFER_UPGRADE) {
                 return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "missing Upgrade: cleat-transfer/1")
                     .map_err(|err| format!("write HTTP transfer upgrade error: {err}"));
@@ -3228,12 +3242,39 @@ fn handle_http_request(
                 *response_committed = true;
                 http_uds::write_transfer_switching_protocols(stream)
                     .map_err(|err| format!("write HTTP transfer upgrade response: {err}"))?;
-                state.transfers.accept_incoming(transfer_stream);
+                state.transfers.accept_incoming(transfer_stream, embedded);
                 Ok(())
             }
             #[cfg(not(unix))]
             http_uds::write_error(stream, StatusCode::NOT_IMPLEMENTED, "session transfer is only supported on Unix")
                 .map_err(|err| format!("write HTTP transfer error: {err}"))
+        }
+        http_uds::Route::SessionAdopt { id } => {
+            #[cfg(unix)]
+            {
+                let Some(hosted) = state.sessions.get_mut(&id) else {
+                    return write_http_not_found(stream);
+                };
+                if hosted.transferring || hosted.actor.observation().exited() || http_uds::request_hosting_epoch(&request)?.is_none() {
+                    return http_uds::write_error(
+                        stream,
+                        StatusCode::CONFLICT,
+                        "adoption requires a live session and current holder epoch",
+                    )
+                    .map_err(|err| err.to_string());
+                }
+                let response = stream.try_clone().map_err(|err| err.to_string())?;
+                http_uds::write_transfer_switching_protocols(stream).map_err(|err| err.to_string())?;
+                *response_committed = true;
+                state.transfers.start_embedded(hosted, response, state.layout.clone());
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = id;
+                http_uds::write_error(stream, StatusCode::NOT_IMPLEMENTED, "session transfer is only supported on Unix")
+                    .map_err(|err| err.to_string())
+            }
         }
         http_uds::Route::SessionTransfer { id } => 'transfer: {
             let Some(hosted) = state.sessions.get_mut(&id) else {
@@ -3305,13 +3346,9 @@ fn handle_http_request(
             crate::runtime::validate_environment(&session.environment)?;
             session.vt_engine.ensure_available()?;
             #[cfg(unix)]
-            if state.transfers.adoption_pending(&session.id) {
-                return http_uds::write_error(
-                    stream,
-                    StatusCode::CONFLICT,
-                    &format!("session {} is being transferred to this daemon", session.id),
-                )
-                .map_err(|err| format!("write HTTP error response: {err}"));
+            if state.transfers.transfer_pending(&session.id) {
+                return http_uds::write_error(stream, StatusCode::CONFLICT, &format!("session {} is being transferred", session.id))
+                    .map_err(|err| format!("write HTTP error response: {err}"));
             }
             let mut created = false;
             if !state.sessions.contains_key(&session.id) {
@@ -3643,7 +3680,7 @@ fn handle_http_request(
                     hosted.actor.write_input(bytes)?;
                 }
                 http_uds::InputRequest::Resize { cols, rows } => {
-                    if hosted.transferring {
+                    if hosted.transferring || hosted.hosted_elsewhere {
                         return http_uds::write_error(stream, StatusCode::CONFLICT, &transferring_message(&id))
                             .map_err(|err| format!("write HTTP transferring response: {err}"));
                     }
@@ -4632,7 +4669,7 @@ fn apply_packet_role_request(
         return Ok(());
     };
     // Role changes wait for an outgoing transfer; the client keeps its role.
-    if hosted.transferring {
+    if hosted.transferring || hosted.hosted_elsewhere {
         return Ok(());
     }
     let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
@@ -4695,7 +4732,7 @@ fn open_packet_channel(
         })?;
         return Ok(());
     };
-    if hosted.transferring {
+    if hosted.transferring || hosted.hosted_elsewhere {
         packet_clients[index]
             .enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message: transferring_message(&open.session_id) })?;
         return Ok(());

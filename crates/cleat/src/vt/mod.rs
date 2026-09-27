@@ -367,6 +367,11 @@ pub trait VtEngine {
     }
     fn supports_replay(&self) -> bool;
     fn replay_payload(&self, capabilities: &ClientCapabilities) -> Result<Option<Vec<u8>>, String>;
+    /// Same-engine snapshot for a hosting change, including protocol state
+    /// that a conservative external terminal replay cannot reproduce.
+    fn transfer_payload(&self) -> Result<Option<Vec<u8>>, String> {
+        self.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, true))
+    }
     fn screen_text(&self) -> Result<String, String>;
     fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
     fn render_update(&mut self, dirty: DirtyState) -> Result<TerminalRenderUpdate, String> {

@@ -888,6 +888,13 @@ impl SessionService {
         }
     }
 
+    /// Request termination through the daemon without waiting or local cleanup.
+    pub(crate) fn request_end(&self, id: &str) -> Result<(), String> {
+        // For daemon-attached handles: let DELETE reject sessions no longer
+        // hosted here, rather than consulting local holder files as CLI kill does.
+        self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &())
+    }
+
     pub fn kill(&self, id: &str) -> Result<(), String> {
         self.kill_with_purge(id, false)
     }

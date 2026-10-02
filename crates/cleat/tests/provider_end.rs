@@ -95,7 +95,7 @@ fn wait(ready: impl FnMut() -> bool) {
 fn wait_for(timeout: Duration, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while !ready() {
-        assert!(Instant::now() < deadline, "timed out");
+        assert!(Instant::now() < deadline, "timed out after {timeout:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
 }

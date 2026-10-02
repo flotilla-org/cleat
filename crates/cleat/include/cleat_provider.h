@@ -543,7 +543,9 @@ void cleat_session_destroy(cleat_session *session);
  * request after initiating termination, without waiting for escalation/exit.
  * The recording is kept and the handle stays valid: observe SESSION_CLOSED
  * through cleat_session_connection_state, then call cleat_session_destroy.
- * Serialize this blocking request with other session operations. In-process
+ * Serialize this blocking request with other session operations. There is no
+ * HTTP response timeout: an unresponsive daemon can block this call indefinitely.
+ * In-process
  * and mock sessions return false with an unsupported reason.
  * Additive exports; no public struct layout or ABI version change. */
 bool cleat_session_end(cleat_session *session);

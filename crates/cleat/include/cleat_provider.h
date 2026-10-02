@@ -404,6 +404,16 @@ typedef struct cleat_image_resource {
     size_t data_len;
 } cleat_image_resource;
 
+enum { CLEAT_IMAGE_BACKING_FILE = 1, CLEAT_IMAGE_BACKING_SHM = 2 };
+typedef struct cleat_image_backing {
+    size_t size;
+    uint32_t kind;
+    const uint8_t *name;
+    size_t name_len;
+    uint32_t width_px, height_px, format, compression;
+    size_t data_len;
+} cleat_image_backing;
+
 typedef struct cleat_image_placement {
     size_t size;
     uint32_t image_id;
@@ -659,6 +669,22 @@ bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
  * exposes scroll/copy damage.
  */
 bool cleat_session_render_update(cleat_session *session, cleat_render_update *out);
+/* Acquire backing for a committed daemon generation. FILE borrows the existing
+ * private path and retains it until release/session destruction and at least
+ * while the generation remains in the committed view. FILE fails for byte
+ * backing. SHM (Unix only) copies once into a fresh caller-owned POSIX shm name;
+ * the receiver or caller must unlink it. Release never unlinks returned SHM.
+ * Names are not NUL-terminated and remain valid until release/session destruction.
+ * size reports sizeof(cleat_image_backing), as with other output structs.
+ * Release each success exactly once, on the originating session, before close.
+ * Do not release multiple copies of a result. Failure leaves out unchanged.
+ */
+bool cleat_session_image_resource_backing(cleat_session *session,
+    uint32_t image_id, uint64_t generation, uint32_t kind, cleat_image_backing *out);
+void cleat_session_release_image_resource_backing(cleat_session *session, cleat_image_backing *backing);
+/* Borrowed error text, valid until next backing request or session destruction. */
+bool cleat_session_image_resource_backing_error(const cleat_session *session, cleat_str *out);
+
 /*
  * Borrows image bytes for an image resource reported by
  * cleat_session_render_update. The callback is invoked synchronously and the

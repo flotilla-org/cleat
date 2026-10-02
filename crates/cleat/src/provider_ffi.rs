@@ -416,6 +416,28 @@ pub struct CleatImageResource {
     pub data_len: usize,
 }
 
+pub const CLEAT_IMAGE_BACKING_FILE: u32 = 1;
+pub const CLEAT_IMAGE_BACKING_SHM: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CleatImageBacking {
+    pub size: usize,
+    pub kind: u32,
+    pub name: *const u8,
+    pub name_len: usize,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub format: u32,
+    pub compression: u32,
+    pub data_len: usize,
+}
+
+struct OwnedImageBacking {
+    name: Vec<u8>,
+    _image: Option<crate::image_delivery::Image>,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CleatImagePlacement {
@@ -655,6 +677,8 @@ pub struct CleatSession {
     last_render_update: Option<Box<OwnedRenderUpdate>>,
     transfer: session_transfer::TransferState,
     end_error: String,
+    backing_error: String,
+    image_backings: std::collections::HashMap<usize, OwnedImageBacking>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -688,6 +712,7 @@ struct DaemonSession {
     channel: u32,
     slot: Arc<Mutex<ChannelSlot>>,
     images: Vec<crate::image_delivery::Image>,
+    image_resources: Vec<TerminalImageResource>,
     links: Vec<crate::provider::TerminalViewLink>,
 }
 
@@ -1268,6 +1293,8 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         last_render_update: None,
         transfer: session_transfer::TransferState::new(provider.runtime_root.clone(), identity),
         end_error: String::new(),
+        backing_error: String::new(),
+        image_backings: Default::default(),
     }))
 }
 
@@ -1313,6 +1340,8 @@ pub unsafe extern "C" fn cleat_session_attach(provider: *mut CleatProvider, desc
         last_render_update: None,
         transfer: session_transfer::TransferState::new(provider.runtime_root.clone(), identity),
         end_error: String::new(),
+        backing_error: String::new(),
+        image_backings: Default::default(),
     }))
 }
 
@@ -2129,6 +2158,7 @@ pub unsafe extern "C" fn cleat_session_render_update(session: *mut CleatSession,
                 match slot.pending.take() {
                     Some(update) => {
                         daemon.images = std::mem::take(&mut slot.pending_images);
+                        daemon.image_resources = update.image_resources.clone();
                         daemon.links = std::mem::take(&mut slot.pending_links);
                         slot.last.absorb(&update);
                         Some(update)
@@ -2200,6 +2230,91 @@ pub unsafe extern "C" fn cleat_session_with_image_resource_data(
                 .unwrap_or(false)
         }
     }
+}
+
+/// Acquire a client-chosen backing for a generation in the committed daemon view.
+/// # Safety
+/// `session` must be valid and `out` writable. Release each successful result
+/// once on this session; its name is borrowed until release/session destruction.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_image_resource_backing(
+    session: *mut CleatSession,
+    image_id: u32,
+    generation: u64,
+    kind: u32,
+    out: *mut CleatImageBacking,
+) -> bool {
+    let (Some(session), Some(out)) = (unsafe { session.as_mut() }, unsafe { out.as_mut() }) else { return false };
+    session.backing_error.clear();
+    let result = (|| {
+        if !matches!(kind, CLEAT_IMAGE_BACKING_FILE | CLEAT_IMAGE_BACKING_SHM) {
+            return Err("unsupported image backing kind".to_string());
+        }
+        let SessionBackend::Daemon(daemon) = &session.backend else {
+            return Err("unsupported image backing backend".to_string());
+        };
+        let image = daemon
+            .images
+            .iter()
+            .find(|image| image.image_id == image_id && image.generation == generation)
+            .ok_or("image generation unavailable")?
+            .clone();
+        let resource = daemon
+            .image_resources
+            .iter()
+            .find(|resource| resource.image_id == image_id && resource.generation == generation)
+            .ok_or("image descriptor unavailable")?;
+        let owned = match kind {
+            CLEAT_IMAGE_BACKING_FILE => {
+                let path = image.backing.path().ok_or("image generation has byte backing")?;
+                OwnedImageBacking { name: path.as_os_str().as_encoded_bytes().to_vec(), _image: Some(image.clone()) }
+            }
+            _ => OwnedImageBacking { name: crate::image_backing::create_shm(image.bytes())?, _image: None },
+        };
+        let value = CleatImageBacking {
+            size: std::mem::size_of::<CleatImageBacking>(),
+            kind,
+            name: owned.name.as_ptr(),
+            name_len: owned.name.len(),
+            width_px: resource.width_px,
+            height_px: resource.height_px,
+            format: resource.format,
+            compression: resource.compression,
+            data_len: resource.data_len,
+        };
+        session.image_backings.insert(value.name as usize, owned);
+        Ok(value)
+    })();
+    match result {
+        Ok(value) => {
+            *out = value;
+            true
+        }
+        Err(error) => {
+            session.backing_error = error;
+            false
+        }
+    }
+}
+
+/// # Safety
+/// `session` must be valid; `backing` must be a successful, unreleased result
+/// from this session (or a cleared result). SHM ownership stays with the caller.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_release_image_resource_backing(session: *mut CleatSession, backing: *mut CleatImageBacking) {
+    let (Some(session), Some(backing)) = (unsafe { session.as_mut() }, unsafe { backing.as_mut() }) else { return };
+    session.image_backings.remove(&(backing.name as usize));
+    *backing = CleatImageBacking::default();
+}
+
+/// # Safety
+/// `session` must be valid and `out` writable. The error is borrowed until the
+/// next backing request or session destruction.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_image_resource_backing_error(session: *const CleatSession, out: *mut CleatStr) -> bool {
+    let (Some(session), Some(out)) = (unsafe { session.as_ref() }, unsafe { out.as_mut() }) else { return false };
+    *out = CleatStr { ptr: session.backing_error.as_ptr(), len: session.backing_error.len() };
+    true
 }
 
 /// # Safety
@@ -2400,6 +2515,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         channel,
         slot,
         images: Vec::new(),
+        image_resources: Vec::new(),
         links: Vec::new(),
     })
 }
@@ -2422,6 +2538,7 @@ fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         channel,
         slot,
         images: Vec::new(),
+        image_resources: Vec::new(),
         links: Vec::new(),
     })
 }
@@ -3070,6 +3187,8 @@ mod tests {
             last_render_update: None,
             transfer: Default::default(),
             end_error: String::new(),
+            backing_error: String::new(),
+            image_backings: Default::default(),
         }));
 
         let session_addr = session as usize;
@@ -3101,6 +3220,8 @@ mod tests {
             last_render_update: None,
             transfer: Default::default(),
             end_error: String::new(),
+            backing_error: String::new(),
+            image_backings: Default::default(),
         }));
 
         unsafe {
@@ -3126,6 +3247,8 @@ mod tests {
             last_render_update: None,
             transfer: Default::default(),
             end_error: String::new(),
+            backing_error: String::new(),
+            image_backings: Default::default(),
         }));
 
         unsafe {
@@ -3409,6 +3532,8 @@ mod tests {
             last_render_update: None,
             transfer: Default::default(),
             end_error: String::new(),
+            backing_error: String::new(),
+            image_backings: Default::default(),
         };
         let worker = std::thread::spawn(move || {
             let mut received = Vec::new();

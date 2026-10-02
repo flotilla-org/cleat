@@ -9,7 +9,7 @@ use cleat::{provider_ffi::*, runtime::RuntimeLayout, server::SessionService};
 
 struct Fixture {
     temp: tempfile::TempDir,
-    daemon: Child,
+    daemon: Option<Child>,
     provider: *mut CleatProvider,
     controller: *mut CleatSession,
     watcher: *mut CleatSession,
@@ -19,16 +19,21 @@ impl Fixture {
     fn new(backend: u32) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_str().unwrap();
-        let daemon = Command::new(env!("CARGO_BIN_EXE_cleat"))
-            .args(["--runtime-root", root, "--server", "default", "serve"])
-            .env_remove("CLEAT_DAEMON")
-            .env_remove("CLEAT_SESSION")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        wait(|| temp.path().join("default@1/socket").exists());
+        let daemon = if backend == CLEAT_PROVIDER_BACKEND_DAEMON {
+            let daemon = Command::new(env!("CARGO_BIN_EXE_cleat"))
+                .args(["--runtime-root", root, "--server", "default", "serve"])
+                .env_remove("CLEAT_DAEMON")
+                .env_remove("CLEAT_SESSION")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            wait(|| temp.path().join("default@1/socket").exists());
+            Some(daemon)
+        } else {
+            None
+        };
         unsafe {
             let provider = cleat_provider_open(&CleatProviderDesc {
                 abi_version: CLEAT_PROVIDER_ABI_VERSION,
@@ -69,12 +74,19 @@ impl Drop for Fixture {
             cleat_session_destroy(self.controller);
             cleat_provider_close(self.provider);
         }
-        let _ = self.daemon.kill();
-        let _ = self.daemon.wait();
+        if let Some(daemon) = &mut self.daemon {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
     }
 }
-fn wait(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+#[track_caller]
+fn wait(ready: impl FnMut() -> bool) {
+    wait_for(Duration::from_secs(10), ready);
+}
+#[track_caller]
+fn wait_for(timeout: Duration, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
     while !ready() {
         assert!(Instant::now() < deadline, "timed out");
         std::thread::sleep(Duration::from_millis(10));
@@ -114,8 +126,8 @@ fn controller_ends_term_resistant_session_watcher_cannot() {
         wait(|| cleat_session_role(fixture.watcher) == CLEAT_ROLE_CONTROLLER);
         assert!(cleat_session_end(fixture.watcher), "{}", fixture.error(fixture.watcher));
         assert!(fixture.error(fixture.watcher).is_empty());
-        wait(|| cleat_session_connection_state(fixture.controller) == CLEAT_SESSION_CLOSED);
-        wait(|| cleat_session_connection_state(fixture.watcher) == CLEAT_SESSION_CLOSED);
+        wait_for(Duration::from_secs(30), || cleat_session_connection_state(fixture.controller) == CLEAT_SESSION_CLOSED);
+        wait_for(Duration::from_secs(30), || cleat_session_connection_state(fixture.watcher) == CLEAT_SESSION_CLOSED);
         assert!(cast.exists());
         // A failed retry keeps the handle usable and reports the HTTP error.
         assert!(!cleat_session_end(fixture.controller));
@@ -143,7 +155,17 @@ fn end_null_arguments_are_rejected() {
     unsafe {
         assert!(!cleat_session_end(std::ptr::null_mut()));
         assert!(!cleat_session_end_error(std::ptr::null(), &mut CleatStr::default()));
-        let fixture = Fixture::new(CLEAT_PROVIDER_BACKEND_IN_PROCESS);
-        assert!(!cleat_session_end_error(fixture.controller, std::ptr::null_mut()));
+        // A mock handle is enough to exercise pointer validation; no processes.
+        let provider = cleat_provider_open(&CleatProviderDesc {
+            abi_version: CLEAT_PROVIDER_ABI_VERSION,
+            backend: CLEAT_PROVIDER_BACKEND_MOCK,
+            ..Default::default()
+        });
+        assert!(!provider.is_null());
+        let session = cleat_session_create(provider, &CleatSessionDesc::default());
+        assert!(!session.is_null());
+        assert!(!cleat_session_end_error(session, std::ptr::null_mut()));
+        cleat_session_destroy(session);
+        cleat_provider_close(provider);
     }
 }

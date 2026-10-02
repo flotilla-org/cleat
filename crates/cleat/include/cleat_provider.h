@@ -538,6 +538,9 @@ cleat_session *cleat_session_attach(cleat_provider *provider, const cleat_sessio
 void cleat_session_destroy(cleat_session *session);
 /* Request daemon TERM-to-KILL escalation for the whole child tree. Only a
  * granted CONTROLLER may end a session; WATCHER and UNKNOWN return false.
+ * This library checks the latest locally observed role grant; the daemon's
+ * same-user HTTP authorization is unchanged. The daemon acknowledges the
+ * request after initiating termination, without waiting for escalation/exit.
  * The recording is kept and the handle stays valid: observe SESSION_CLOSED
  * through cleat_session_connection_state, then call cleat_session_destroy.
  * Serialize this blocking request with other session operations. In-process

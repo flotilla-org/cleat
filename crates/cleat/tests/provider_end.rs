@@ -44,7 +44,8 @@ impl Fixture {
             });
             assert!(!provider.is_null());
             // The readiness marker proves the TERM trap is installed before ending.
-            let command = b"sh -c 'trap \"\" TERM; echo ready; sleep 600'";
+            let command: &[u8] =
+                if backend == CLEAT_PROVIDER_BACKEND_DAEMON { b"sh -c 'trap \"\" TERM; echo ready; sleep 600'" } else { b"cat" };
             let controller = cleat_session_create(provider, &CleatSessionDesc {
                 cols: 80,
                 rows: 24,
@@ -69,6 +70,12 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if self.daemon.is_some() {
+            // Even a failed assertion must let the daemon finish tree escalation
+            // before we stop it. CLI cleanup is independent of the FFI role guard.
+            let service = SessionService::new(RuntimeLayout::new(self.temp.path().into()));
+            let _ = service.kill("ending");
+        }
         unsafe {
             cleat_session_destroy(self.watcher);
             cleat_session_destroy(self.controller);

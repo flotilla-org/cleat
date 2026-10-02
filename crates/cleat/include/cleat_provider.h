@@ -536,6 +536,17 @@ cleat_session *cleat_session_create(cleat_provider *provider, const cleat_sessio
  */
 cleat_session *cleat_session_attach(cleat_provider *provider, const cleat_session_desc *desc);
 void cleat_session_destroy(cleat_session *session);
+/* Request daemon TERM-to-KILL escalation for the whole child tree. Only a
+ * granted CONTROLLER may end a session; WATCHER and UNKNOWN return false.
+ * The recording is kept and the handle stays valid: observe SESSION_CLOSED
+ * through cleat_session_connection_state, then call cleat_session_destroy.
+ * Serialize this blocking request with other session operations. In-process
+ * and mock sessions return false with an unsupported reason.
+ * Additive exports; no public struct layout or ABI version change. */
+bool cleat_session_end(cleat_session *session);
+/* Error from the last end attempt; empty after success. Borrowed until the
+ * next end attempt or destruction. False for invalid session/out pointers. */
+bool cleat_session_end_error(const cleat_session *session, cleat_str *out);
 
 /* Unix hosting changes on one stable handle. Serialize these blocking calls
  * with other session operations. The daemon must already be reachable. A false
@@ -647,8 +658,9 @@ bool cleat_session_render_update(cleat_session *session, cleat_render_update *ou
 /*
  * Borrows image bytes for an image resource reported by
  * cleat_session_render_update. The callback is invoked synchronously and the
- * data pointer is valid only for the duration of that callback. This currently
- * succeeds only for in-process sessions. The callback must not call back into
+ * data pointer is valid only for the duration of that callback. In-process and
+ * daemon sessions serve bytes for the requested image id and generation;
+ * unavailable resources return false. The callback must not call back into
  * this session.
  */
 bool cleat_session_with_image_resource_data(cleat_session *session,

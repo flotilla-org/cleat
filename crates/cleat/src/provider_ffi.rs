@@ -654,6 +654,7 @@ pub struct CleatSession {
     last_snapshot: Option<Box<OwnedSnapshot>>,
     last_render_update: Option<Box<OwnedRenderUpdate>>,
     transfer: session_transfer::TransferState,
+    end_error: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1266,6 +1267,7 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         last_snapshot: None,
         last_render_update: None,
         transfer: session_transfer::TransferState::new(provider.runtime_root.clone(), identity),
+        end_error: String::new(),
     }))
 }
 
@@ -1310,6 +1312,7 @@ pub unsafe extern "C" fn cleat_session_attach(provider: *mut CleatProvider, desc
         last_snapshot: None,
         last_render_update: None,
         transfer: session_transfer::TransferState::new(provider.runtime_root.clone(), identity),
+        end_error: String::new(),
     }))
 }
 
@@ -1363,6 +1366,54 @@ pub unsafe extern "C" fn cleat_session_role(session: *const CleatSession) -> u32
             None => CLEAT_ROLE_UNKNOWN,
         },
     }
+}
+
+/// Request whole-tree termination without destroying the handle or recording.
+/// Only controller handles may end sessions. In-process and mock backends are
+/// unsupported; errors are available through `cleat_session_end_error`.
+/// # Safety
+/// `session` must be live and exclusively owned for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_end(session: *mut CleatSession) -> bool {
+    let role = unsafe { cleat_session_role(session) };
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return false;
+    };
+    let result = if role != CLEAT_ROLE_CONTROLLER {
+        let role_name = if role == CLEAT_ROLE_WATCHER { "watcher" } else { "unknown" };
+        Err(format!("session role {role_name} cannot end a session; controller role required"))
+    } else {
+        match &session.backend {
+            SessionBackend::Daemon(daemon) => {
+                crate::server::SessionService::new(daemon.connection.channel_layout(daemon.channel)).request_end(&daemon.id)
+            }
+            SessionBackend::InProcess(_) => Err("ending in-process sessions is unsupported".into()),
+            SessionBackend::Mock(_) => Err("ending mock sessions is unsupported".into()),
+        }
+    };
+    match result {
+        Ok(()) => {
+            session.end_error.clear();
+            true
+        }
+        Err(error) => {
+            session.end_error = error;
+            false
+        }
+    }
+}
+
+/// Error from the last end attempt, empty after success.
+/// # Safety
+/// `session` and `out` must be valid. The string is borrowed until the next end
+/// attempt or session destruction.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_end_error(session: *const CleatSession, out: *mut CleatStr) -> bool {
+    let (Some(session), Some(out)) = (unsafe { session.as_ref() }, unsafe { out.as_mut() }) else {
+        return false;
+    };
+    *out = CleatStr { ptr: session.end_error.as_ptr(), len: session.end_error.len() };
+    true
 }
 
 /// Request exclusive control, demoting other driving attachments to watchers. The
@@ -3018,6 +3069,7 @@ mod tests {
             last_snapshot: None,
             last_render_update: None,
             transfer: Default::default(),
+            end_error: String::new(),
         }));
 
         let session_addr = session as usize;
@@ -3048,6 +3100,7 @@ mod tests {
             last_snapshot: None,
             last_render_update: None,
             transfer: Default::default(),
+            end_error: String::new(),
         }));
 
         unsafe {
@@ -3072,6 +3125,7 @@ mod tests {
             last_snapshot: None,
             last_render_update: None,
             transfer: Default::default(),
+            end_error: String::new(),
         }));
 
         unsafe {
@@ -3354,6 +3408,7 @@ mod tests {
             last_snapshot: None,
             last_render_update: None,
             transfer: Default::default(),
+            end_error: String::new(),
         };
         let worker = std::thread::spawn(move || {
             let mut received = Vec::new();

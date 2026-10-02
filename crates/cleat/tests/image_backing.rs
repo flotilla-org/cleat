@@ -105,12 +105,19 @@ fn name(out: &CleatImageBacking) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(out.name, out.name_len).to_vec() }
 }
 fn shm_bytes(out: &CleatImageBacking) -> Vec<u8> {
-    use std::io::Read;
+    use std::os::fd::AsRawFd;
     let name = CString::new(name(out)).unwrap();
     let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
     assert!(fd >= 0);
-    let mut bytes: Vec<u8> = Vec::new();
-    unsafe { std::fs::File::from_raw_fd(fd) }.read_to_end(&mut bytes).unwrap();
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    assert_eq!(file.metadata().unwrap().len(), out.data_len as u64);
+    if out.data_len == 0 {
+        return Vec::new();
+    }
+    let mapping = unsafe { libc::mmap(std::ptr::null_mut(), out.data_len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let bytes = unsafe { std::slice::from_raw_parts(mapping.cast::<u8>(), out.data_len).to_vec() };
+    assert_eq!(unsafe { libc::munmap(mapping, out.data_len) }, 0);
     bytes
 }
 unsafe extern "C" fn copy(user: *mut std::ffi::c_void, data: *const u8, len: usize) -> bool {
@@ -180,6 +187,7 @@ fn daemon_backing_lifecycle() {
     exercise(false);
 }
 // A process boundary isolates forced filesystem refusal from parallel tests.
+#[cfg(feature = "test-image-link-refusal")]
 #[test]
 fn hard_link_refusal_falls_back_to_shm() {
     let status = Command::new(std::env::current_exe().unwrap())
@@ -190,9 +198,41 @@ fn hard_link_refusal_falls_back_to_shm() {
     assert!(status.success());
 }
 // Issue #294: byte-delivered generations refuse FILE but still support SHM.
+// Only the parent refusal test sets the environment; direct runs skip the scenario.
+#[cfg(feature = "test-image-link-refusal")]
 #[test]
 fn refused_child() {
     if std::env::var_os("CLEAT_TEST_IMAGE_LINK_REFUSE").is_some() {
         exercise(true);
+    }
+}
+
+// Unsupported backends refuse both kinds; release tolerates null/cleared outputs.
+#[test]
+fn unsupported_backend_and_empty_release() {
+    unsafe {
+        let provider = cleat_provider_open(&CleatProviderDesc {
+            abi_version: CLEAT_PROVIDER_ABI_VERSION,
+            backend: CLEAT_PROVIDER_BACKEND_MOCK,
+            ..Default::default()
+        });
+        assert!(!provider.is_null());
+        let session = cleat_session_create(provider, &CleatSessionDesc::default());
+        assert!(!session.is_null());
+        for kind in [CLEAT_IMAGE_BACKING_FILE, CLEAT_IMAGE_BACKING_SHM] {
+            let mut out = CleatImageBacking { data_len: 123, ..Default::default() };
+            assert!(!cleat_session_image_resource_backing(session, 1, 1, kind, &mut out));
+            assert_eq!(out.data_len, 123);
+            let mut error = CleatStr::default();
+            assert!(cleat_session_image_resource_backing_error(session, &mut error));
+            assert_eq!(std::slice::from_raw_parts(error.ptr, error.len), b"unsupported image backing backend");
+        }
+        cleat_session_release_image_resource_backing(session, std::ptr::null_mut());
+        let mut cleared = CleatImageBacking::default();
+        cleat_session_release_image_resource_backing(session, &mut cleared);
+        cleat_session_release_image_resource_backing(session, &mut cleared);
+        assert!(cleared.name.is_null());
+        cleat_session_destroy(session);
+        cleat_provider_close(provider);
     }
 }

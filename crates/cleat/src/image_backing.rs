@@ -86,8 +86,8 @@ impl LocalImage {
         result
     }
     pub fn acquire(path: &Path, len: usize) -> io::Result<Self> {
-        // Debug-only fault injection at the filesystem boundary for ABI tests.
-        #[cfg(debug_assertions)]
+        // Opt-in test-only fault injection at the filesystem boundary for ABI tests.
+        #[cfg(feature = "test-image-link-refusal")]
         if std::env::var_os("CLEAT_TEST_IMAGE_LINK_REFUSE").is_some() {
             return Err(io::Error::other("forced hard-link refusal"));
         }
@@ -157,31 +157,6 @@ impl Drop for LocalImage {
         }
         let _ = fs::remove_file(&self.path);
     }
-}
-
-/// A successful return transfers unlink responsibility to the caller.
-#[cfg(unix)]
-pub(crate) fn create_shm(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    use std::os::fd::FromRawFd;
-    // Short enough for platforms with a 31-character POSIX shm name limit.
-    let name = std::ffi::CString::new(format!("/cl-{}", &uuid::Uuid::new_v4().simple().to_string()[..24])).unwrap();
-    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    if let Err(error) = file.write_all(bytes) {
-        unsafe {
-            libc::shm_unlink(name.as_ptr());
-        }
-        return Err(error.to_string());
-    }
-    Ok(name.as_bytes().to_vec())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn create_shm(_: &[u8]) -> Result<Vec<u8>, String> {
-    Err("unsupported image backing: POSIX shm requires Unix".into())
 }
 
 #[cfg(test)]

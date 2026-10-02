@@ -2269,7 +2269,7 @@ pub unsafe extern "C" fn cleat_session_image_resource_backing(
                 let path = image.backing.path().ok_or("image generation has byte backing")?;
                 OwnedImageBacking { name: path.as_os_str().as_encoded_bytes().to_vec(), _image: Some(image.clone()) }
             }
-            _ => OwnedImageBacking { name: crate::image_backing::create_shm(image.bytes())?, _image: None },
+            _ => OwnedImageBacking { name: crate::image_shm::create_shm(image.bytes())?, _image: None },
         };
         let value = CleatImageBacking {
             size: std::mem::size_of::<CleatImageBacking>(),
@@ -2303,7 +2303,10 @@ pub unsafe extern "C" fn cleat_session_image_resource_backing(
 #[no_mangle]
 pub unsafe extern "C" fn cleat_session_release_image_resource_backing(session: *mut CleatSession, backing: *mut CleatImageBacking) {
     let (Some(session), Some(backing)) = (unsafe { session.as_mut() }, unsafe { backing.as_mut() }) else { return };
-    session.image_backings.remove(&(backing.name as usize));
+    if !backing.name.is_null() {
+        let removed = session.image_backings.remove(&(backing.name as usize));
+        debug_assert!(removed.is_some(), "backing must be released once on its originating session");
+    }
     *backing = CleatImageBacking::default();
 }
 

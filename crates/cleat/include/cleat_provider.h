@@ -676,6 +676,9 @@ bool cleat_session_render_update(cleat_session *session, cleat_render_update *ou
  * the receiver or caller must unlink it. Release never unlinks returned SHM.
  * Names are not NUL-terminated and remain valid until release/session destruction.
  * size reports sizeof(cleat_image_backing), as with other output structs.
+ * Callers need not pre-set size; it is output metadata, not buffer negotiation.
+ * Use a matching header and library ABI. SHM copies synchronously on the caller
+ * thread, once per request, for the entire payload (up to the 320 MiB view budget).
  * Release each success exactly once, on the originating session, before close.
  * Do not release multiple copies of a result. Failure leaves out unchanged.
  */

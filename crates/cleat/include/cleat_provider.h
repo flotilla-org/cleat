@@ -545,8 +545,7 @@ void cleat_session_destroy(cleat_session *session);
  * through cleat_session_connection_state, then call cleat_session_destroy.
  * Serialize this blocking request with other session operations. There is no
  * HTTP response timeout: an unresponsive daemon can block this call indefinitely.
- * In-process
- * and mock sessions return false with an unsupported reason.
+ * In-process and mock sessions return false with an unsupported reason.
  * Additive exports; no public struct layout or ABI version change. */
 bool cleat_session_end(cleat_session *session);
 /* Error from the last end attempt; empty after success. Borrowed until the

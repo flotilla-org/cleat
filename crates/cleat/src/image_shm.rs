@@ -72,7 +72,9 @@ mod tests {
             let fd = unsafe { libc::shm_open(name.0.as_ptr(), libc::O_RDONLY, 0) };
             assert!(fd >= 0);
             let file = unsafe { File::from_raw_fd(fd) };
-            assert_eq!(file.metadata().unwrap().len(), len as u64);
+            // macOS reports page-rounded shm allocation size; the payload is
+            // the exact prefix identified by data_len, not the physical size.
+            assert!(file.metadata().unwrap().len() >= len as u64);
             if len > 0 {
                 let mapping = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
                 assert_ne!(mapping, libc::MAP_FAILED);

@@ -674,6 +674,7 @@ bool cleat_session_render_update(cleat_session *session, cleat_render_update *ou
  * while the generation remains in the committed view. FILE fails for byte
  * backing. SHM (Unix only) copies once into a fresh caller-owned POSIX shm name;
  * the receiver or caller must unlink it. Release never unlinks returned SHM.
+ * data_len bounds the payload prefix; shm allocation may be page-rounded.
  * Names are not NUL-terminated and remain valid until release/session destruction.
  * size reports sizeof(cleat_image_backing), as with other output structs.
  * Callers need not pre-set size; it is output metadata, not buffer negotiation.

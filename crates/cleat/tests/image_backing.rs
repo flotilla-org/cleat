@@ -110,7 +110,8 @@ fn shm_bytes(out: &CleatImageBacking) -> Vec<u8> {
     let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
     assert!(fd >= 0);
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    assert_eq!(file.metadata().unwrap().len(), out.data_len as u64);
+    // POSIX shm allocation may be page-rounded (macOS); data_len bounds pixels.
+    assert!(file.metadata().unwrap().len() >= out.data_len as u64);
     if out.data_len == 0 {
         return Vec::new();
     }

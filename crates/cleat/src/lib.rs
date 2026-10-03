@@ -14,6 +14,7 @@ mod host;
 mod http_uds;
 mod image_backing;
 mod image_delivery;
+mod image_shm;
 mod keyboard;
 pub mod keys;
 mod kitty_output;

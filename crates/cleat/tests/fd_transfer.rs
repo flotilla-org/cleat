@@ -1,4 +1,9 @@
 #![cfg(unix)]
+// Exercise the actual POSIX shm implementation in the existing Unix resource
+// test target, which macOS CI runs without a Ghostty dependency.
+#[path = "../src/image_shm.rs"]
+mod image_shm;
+
 // Adapted from ceda0b99, crates/cleat/tests/fd_transfer.rs (PR #166).
 use std::{
     fs::File,

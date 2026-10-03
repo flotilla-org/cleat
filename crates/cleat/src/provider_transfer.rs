@@ -218,7 +218,16 @@ fn transfer_session(session: &mut CleatSession, name: String) -> Result<(), Stri
             crate::packet::ChannelRole::Controller,
             session.transfer.identity.clone(),
         );
-        Ok(DaemonSession { dedicated_connection: true, id, connection, channel, slot, images: Vec::new(), links: Vec::new() })
+        Ok(DaemonSession {
+            dedicated_connection: true,
+            id,
+            connection,
+            channel,
+            slot,
+            images: Vec::new(),
+            image_resources: Vec::new(),
+            links: Vec::new(),
+        })
     })();
     match result {
         Ok(daemon) => {

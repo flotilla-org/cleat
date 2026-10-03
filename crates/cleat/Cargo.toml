@@ -11,6 +11,8 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = ["ghostty-vt"]
 ghostty-vt = ["dep:png"]
+# Internal fault injection for daemon C ABI integration tests; never enable in consumers.
+test-image-link-refusal = []
 
 [dependencies]
 bitflags = { version = "2", features = ["serde"] }

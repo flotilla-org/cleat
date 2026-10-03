@@ -86,6 +86,11 @@ impl LocalImage {
         result
     }
     pub fn acquire(path: &Path, len: usize) -> io::Result<Self> {
+        // Opt-in test-only fault injection at the filesystem boundary for ABI tests.
+        #[cfg(feature = "test-image-link-refusal")]
+        if std::env::var_os("CLEAT_TEST_IMAGE_LINK_REFUSE").is_some() {
+            return Err(io::Error::other("forced hard-link refusal"));
+        }
         let retained = Self::name();
         fs::hard_link(path, &retained)?;
         let result = Self::open(retained.clone(), len);

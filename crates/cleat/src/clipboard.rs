@@ -104,17 +104,27 @@ impl Default for ClipboardRouter {
     }
 }
 impl ClipboardRouter {
+    fn advance_connection_epoch(&mut self) {
+        if let Some(epoch) = self.connection_epoch.checked_add(1) {
+            self.connection_epoch = epoch;
+        } else {
+            // Rotate the identity namespace instead of reusing an old epoch.
+            self.epoch = uuid::Uuid::new_v4().into_bytes();
+            self.connection_epoch = 0;
+            self.sequence = 0;
+        }
+    }
     pub(crate) fn set_target(&mut self, target: Option<u128>) {
         if target != self.target {
             self.queue.clear();
-            self.connection_epoch += 1;
+            self.advance_connection_epoch();
             self.target = target;
         }
     }
     #[cfg(unix)]
     pub(crate) fn suspend(&mut self) {
         self.queue.clear();
-        self.connection_epoch += 1;
+        self.advance_connection_epoch();
         self.suspended = true;
     }
     #[cfg(unix)]
@@ -149,6 +159,28 @@ mod tests {
     use super::*;
     fn event(text: Option<String>) -> ClipboardEvent {
         ClipboardEvent { session_epoch: [0; 16], connection_epoch: 0, sequence: 0, destination: 0, text }
+    }
+    #[test]
+    fn exhausted_connection_epoch_rotates_identity_and_discards_pending() {
+        let mut router = ClipboardRouter::default();
+        router.set_target(Some(1));
+        router.connection_epoch = u64::MAX;
+        assert!(router.accept(event(None)));
+        let old_epoch = router.epoch;
+        router.set_target(Some(2));
+        assert!(router.drain(2).is_empty());
+        assert!(router.accept(event(None)));
+        let next = router.drain(2).pop().unwrap();
+        assert_ne!(next.session_epoch, old_epoch);
+        assert_eq!(next.connection_epoch, 0);
+        assert_eq!(next.sequence, 1);
+        #[cfg(unix)]
+        {
+            router.connection_epoch = u64::MAX;
+            router.suspend();
+            assert_ne!(router.epoch, next.session_epoch);
+            assert_eq!(router.connection_epoch, 0);
+        }
     }
     #[test]
     fn exhausted_sequence_drops_without_reusing_identity() {

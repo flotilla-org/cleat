@@ -6,7 +6,8 @@ OSC 52 is parsed by that VT, never by a separate Cleat OSC parser. Its synchrono
 callback validates and copies one UTF-8 `text/plain` (or
 `text/plain;charset=utf-8`) representation, or an explicit clear with zero
 representations. NUL-containing, invalid UTF-8, unsupported MIME/multiple
-representations and oversized content are rejected before host exposure.
+representations and oversized content are rejected before host exposure and
+counted as drops.
 Zero-length representations are distinct from clear and are unsupported by this
 OSC 52 relay; Ghostty reports empty OSC 52 requests as explicit clears.
 

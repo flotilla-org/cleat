@@ -52,6 +52,25 @@ fn unavailable_socket_never_spawns_or_creates_runtime() {
     }
 }
 
+// Invalid IDs have the same client-side error for both socket commands,
+// before any attempt to connect to the supplied endpoint.
+#[test]
+fn socket_verbs_reject_invalid_session_ids_consistently() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("missing.sock");
+    for id in ["", ".", "..", "invalid/name", "invalid\\name"] {
+        let mut errors = Vec::new();
+        for verb in ["attach", "packets"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_cleat")).args([verb, "--socket"]).arg(&socket).arg(id).output().unwrap();
+            assert!(!output.status.success());
+            let diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(!diagnostic.contains("missing.sock"), "validate before socket I/O: {diagnostic}");
+            errors.push(diagnostic);
+        }
+        assert_eq!(errors[0], errors[1], "consistent ID validation for {id:?}");
+    }
+}
+
 #[cfg(feature = "ghostty-vt")]
 mod live {
     use std::{
@@ -226,15 +245,28 @@ mod live {
     #[test]
     fn socket_attach_deliberate_detach_succeeds() {
         let daemon = Daemon::new();
-        let directory = tempfile::tempdir().unwrap();
-        let socket = daemon.expose(directory.path());
-        let mut child = Client(
-            client("attach", &socket, directory.path()).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap(),
-        );
-        eventually("controller opened", || !daemon.service.inspect("remote").unwrap().attachments.is_empty());
-        child.0.stdin.as_mut().unwrap().write_all(b"\x1dd").unwrap();
-        assert!(child.wait().success());
-        no_local_state(directory.path());
+        // Cover detach already queued at relay start, and detach after the
+        // controller grant. Both can interleave with ACK/resize writes.
+        for queued in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = daemon.expose(directory.path());
+            let stderr = directory.path().join("stderr");
+            let mut child = Client(
+                client("attach", &socket, directory.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(fs::File::create(&stderr).unwrap())
+                    .spawn()
+                    .unwrap(),
+            );
+            if !queued {
+                eventually("controller opened", || !daemon.service.inspect("remote").unwrap().attachments.is_empty());
+            }
+            child.0.stdin.as_mut().unwrap().write_all(b"\x1dd").unwrap();
+            let status = child.wait();
+            assert!(status.success(), "detach (queued={queued}): {}", fs::read_to_string(stderr).unwrap());
+            no_local_state(directory.path());
+        }
     }
 
     // Transfer closes a socket-only attachment. It cannot follow a redirect

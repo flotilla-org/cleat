@@ -659,7 +659,7 @@ fn check_foreground_nesting(
 
 /// Execute socket commands before constructing or discovering a local service.
 /// `None` means this command uses the ordinary local runtime.
-pub fn execute_socket(cli: &Cli) -> Option<ExecResult> {
+fn execute_socket(cli: &Cli) -> Option<ExecResult> {
     match &cli.command {
         Command::Attach { socket: Some(socket), id, attachment, strict, take, .. } => Some(
             (|| {
@@ -672,6 +672,7 @@ pub fn execute_socket(cli: &Cli) -> Option<ExecResult> {
         ),
         Command::Packets { socket: Some(socket), id, count } => Some(
             (|| {
+                validate_runtime_name(id)?;
                 let (client, directory) = crate::socket_client::connect_packets(socket)?;
                 render_packet_summaries(client, directory, id, *count)
                     .map_err(|err| format!("socket packets: {err}; recovery requires a fresh connect"))
@@ -682,10 +683,31 @@ pub fn execute_socket(cli: &Cli) -> Option<ExecResult> {
     }
 }
 
+/// Execute a CLI command, discovering local state only if its route needs it.
+pub fn execute_discovered(cli: Cli) -> ExecResult {
+    let root = cli.runtime_root.clone();
+    execute_with_service(cli, || match root {
+        Some(root) => Ok(SessionService::new(RuntimeLayout::new(root))),
+        None => SessionService::discover(),
+    })
+}
+
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
+    execute_with_service(cli, || Ok(service.clone()))
+}
+
+fn execute_with_service(cli: Cli, service: impl FnOnce() -> Result<SessionService, String>) -> ExecResult {
     if let Some(result) = execute_socket(&cli) {
         return result;
     }
+    let service = match service() {
+        Ok(service) => service,
+        Err(err) => return ExecResult::Err(err),
+    };
+    execute_local(cli, &service)
+}
+
+fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
     if cli.has_conflicting_daemon_targets() {
         return ExecResult::Err("--server cannot be used with --from".to_string());
     }
@@ -1826,5 +1848,21 @@ mod nesting_tests {
         std::os::unix::fs::symlink(&root, &alias).unwrap();
         let source = RuntimeLayout::new(root).session_coordinates("alpha").unwrap();
         assert!(check_foreground_nesting(&alias, "default", Some("alpha"), Some(&source)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    // Glue: every entry point uses this route. A socket command must never
+    // invoke the factory that discovers or constructs the local service.
+    #[test]
+    fn socket_route_never_constructs_local_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("absent.sock");
+        let cli = Cli::try_parse_from(["cleat", "packets", "--socket", socket.to_str().unwrap(), "session"]).unwrap();
+        let result = execute_with_service(cli, || panic!("socket mode requested a local service"));
+        assert!(matches!(result, ExecResult::Err(_)));
     }
 }

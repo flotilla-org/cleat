@@ -6,7 +6,7 @@ use crate::{
     packet::{ChannelRole, DirectorySnapshot, PacketClient},
     platform::ipc::SessionStream,
     protocol::AttachmentIdentity,
-    session::ForegroundAttach,
+    session::{ForegroundAttach, PacketAttachOptions},
 };
 
 pub fn connect_packets(socket: &Path) -> Result<(PacketClient<SessionStream>, DirectorySnapshot), String> {
@@ -17,7 +17,13 @@ pub fn connect_packets(socket: &Path) -> Result<(PacketClient<SessionStream>, Di
 pub fn attach(socket: &Path, id: &str, identity: AttachmentIdentity, strict: bool, take: bool) -> Result<ForegroundAttach, String> {
     crate::runtime::validate_runtime_name(id)?;
     let (stream, directory) = connect(socket)?;
-    crate::session::attach_packet_stream((stream, directory), id, identity, ChannelRole::Controller, strict, take, true)
+    crate::session::attach_packet_stream((stream, directory), id, PacketAttachOptions {
+        identity,
+        role: ChannelRole::Controller,
+        strict,
+        take,
+        connect_only: true,
+    })
 }
 
 pub(crate) fn ensure_supported() -> Result<(), String> {

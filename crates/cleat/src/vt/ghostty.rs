@@ -311,6 +311,14 @@ impl VtEngine for GhosttyVtEngine {
         self.capture_activity_damage().map(Some)
     }
 
+    fn clipboard_supported(&self) -> bool {
+        true
+    }
+
+    fn drain_clipboard(&mut self) -> (Vec<crate::clipboard::ClipboardEvent>, u64) {
+        self.terminal.drain_clipboard()
+    }
+
     fn drain_replies(&mut self) -> Vec<u8> {
         self.terminal.drain_replies()
     }
@@ -1585,5 +1593,142 @@ mod history_tests {
         let mut fresh = engine.history_view(HistoryScreen::Primary, 0).unwrap();
         engine.feed(b"\x1bc").unwrap();
         assert!(matches!(engine.capture_history(&mut fresh, limits()).unwrap(), HistoryCapture::ReturnToLive));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_regression {
+    use super::*;
+    #[test]
+    fn osc52_survives_vt_and_attach_serialization() {
+        // A write without screen damage must survive real VT -> owned effect ->
+        // attach OSC 52 -> real enclosing VT, exactly once.
+        let mut inner = GhosttyVtEngine::new(80, 24);
+        inner.feed(b"\x1b]52;c;aGVsbG8=\x07").unwrap();
+        let (events, _) = inner.drain_clipboard();
+        assert_eq!(events.len(), 1);
+        let mut output = Vec::new();
+        events[0].write_osc52(&mut output).unwrap();
+        let mut enclosing = GhosttyVtEngine::new(80, 24);
+        enclosing.feed(&output).unwrap();
+        assert_eq!(enclosing.drain_clipboard().0, events);
+        assert!(inner.drain_clipboard().0.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod clipboard_contract {
+    use super::*;
+    use crate::{clipboard::*, packet::*};
+    fn engine() -> GhosttyVtEngine {
+        GhosttyVtEngine::new(80, 24)
+    }
+    #[test]
+    fn split_unicode_destinations_and_clear_survive_packets_and_real_outer_vt() {
+        // The generator spans every two-chunk boundary, BEL and ST terminators,
+        // normalized destinations, UTF-8 and explicit clear. Each accepted event
+        // must round-trip through the real packet codec and attach serialization.
+        for (payload, expected) in [(b"8J+MjSBoZWxsbw==".as_slice(), Some("🌍 hello")), (b"".as_slice(), None)] {
+            for (dest, location) in [("c", 0), ("s", 1), ("p", 2), ("", 0)] {
+                for terminator in ["\x07", "\x1b\\"] {
+                    let mut input = format!("\x1b]52;{dest};").into_bytes();
+                    input.extend(payload);
+                    input.extend(terminator.as_bytes());
+                    for split in 0..=input.len() {
+                        let mut inner = engine();
+                        let before = inner.screen_grid().unwrap();
+                        inner.feed(&input[..split]).unwrap();
+                        inner.feed(&input[split..]).unwrap();
+                        let events = inner.drain_clipboard().0;
+                        assert_eq!(events.len(), 1, "split {split}, {dest}");
+                        assert_eq!(events[0].text.as_deref(), expected);
+                        assert_eq!(events[0].destination, location);
+                        assert_eq!(inner.screen_grid().unwrap().cells, before.cells);
+                        let packet = PacketFrame::new(1, MSG_SESSION_CLIPBOARD, &events[0]).unwrap();
+                        let mut wire = Vec::new();
+                        packet.write(&mut wire).unwrap();
+                        let decoded: ClipboardEvent = PacketFrame::read(&mut wire.as_slice()).unwrap().decode().unwrap();
+                        let mut output = Vec::new();
+                        decoded.write_osc52(&mut output).unwrap();
+                        let mut outer = engine();
+                        for byte in output {
+                            outer.feed(&[byte]).unwrap();
+                        }
+                        assert_eq!(outer.drain_clipboard().0, events);
+                        assert!(inner.drain_clipboard().0.is_empty());
+                        inner.resize(81, 25).unwrap();
+                        inner.render_update(crate::provider::DirtyState::Full).unwrap();
+                        inner.screen_text().unwrap();
+                        assert!(inner.drain_clipboard().0.is_empty());
+                        let replay = inner.replay_payload(&ClientCapabilities::conservative_fallback()).unwrap().unwrap();
+                        outer.feed(&replay).unwrap();
+                        assert!(outer.drain_clipboard().0.is_empty());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn serializer_round_trips_base64_padding_and_unicode_byte_lengths() {
+        // Generate byte lengths in all three base64 padding classes using
+        // ASCII and multibyte scalars; zero-length input is an explicit clear.
+        for scalar in ["a", "é", "🌍"] {
+            for count in 0..9 {
+                let event = ClipboardEvent {
+                    session_epoch: [0; 16],
+                    connection_epoch: 0,
+                    sequence: 0,
+                    destination: 0,
+                    text: if count == 0 { None } else { Some(scalar.repeat(count)) },
+                };
+                let mut bytes = Vec::new();
+                event.write_osc52(&mut bytes).unwrap();
+                let mut vt = engine();
+                vt.feed(&bytes).unwrap();
+                assert_eq!(vt.drain_clipboard().0, vec![event]);
+            }
+        }
+    }
+
+    #[test]
+    fn queries_invalid_binary_and_acknowledged_writes_never_escape() {
+        // Reads are separate, invalid base64 is parser-rejected, and decoded
+        // binary/oversized/acknowledged content is rejected before host exposure.
+        let mut vt = engine();
+        for request in ["\x1b]52;c;?\x07", "\x1b]52;c;!invalid\x07", "\x1b]52;c;AA==\x07", "\x1b]52;c;/w==\x07"] {
+            vt.feed(request.as_bytes()).unwrap();
+            assert!(vt.drain_clipboard().0.is_empty());
+        }
+        vt.feed(b"\x1b]5522;type=write:id=one\x1b\\\x1b]5522;type=wdata:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1b\\\x1b]5522;type=wdata\x1b\\")
+            .unwrap();
+        assert!(vt.drain_clipboard().0.is_empty());
+        assert!(String::from_utf8(vt.drain_replies()).unwrap().contains("status=ENOSYS"));
+        let event = ClipboardEvent {
+            session_epoch: [0; 16],
+            connection_epoch: 0,
+            sequence: 0,
+            destination: 0,
+            text: Some("x".repeat(MAX_CLIPBOARD_PAYLOAD)),
+        };
+        let mut bytes = Vec::new();
+        event.write_osc52(&mut bytes).unwrap();
+        vt.feed(&bytes).unwrap();
+        assert_eq!(vt.drain_clipboard().0[0], event);
+        let mut too_large = b"\x1b]52;c;".to_vec();
+        // Base64 for 65538 bytes (two bytes past the payload bound).
+        too_large.extend(b"eHh4".repeat((MAX_CLIPBOARD_PAYLOAD / 3) + 1));
+        too_large.push(7);
+        vt.feed(&too_large).unwrap();
+        let (events, dropped) = vt.drain_clipboard();
+        assert!(events.is_empty());
+        assert!(dropped > 0);
+        for _ in 0..MAX_CLIPBOARD_EVENTS + 2 {
+            vt.feed(b"\x1b]52;c;\x07").unwrap();
+        }
+        vt.feed(b"terminal still progresses").unwrap();
+        let (events, dropped) = vt.drain_clipboard();
+        assert_eq!(events.len(), MAX_CLIPBOARD_EVENTS);
+        assert_eq!(dropped, 2);
+        assert!(vt.screen_text().unwrap().contains("terminal still progresses"));
     }
 }

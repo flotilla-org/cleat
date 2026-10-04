@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    ffi::{c_char, c_void},
+    ffi::{c_char, c_int, c_void},
     io::Cursor,
     ptr, slice,
     sync::OnceLock,
@@ -548,6 +548,7 @@ pub enum GhosttyTerminalOption {
     KittyImageMediumFile = 16,
     KittyImageMediumTempFile = 17,
     KittyImageMediumSharedMem = 18,
+    ClipboardWrite = 26,
     ScrollbackMaxBytes = 27,
     ModeDefault = 33,
     Mode = 34,
@@ -1124,6 +1125,7 @@ pub struct TerminalHandle {
 
 struct TerminalEffects {
     reply_buf: Vec<u8>,
+    clipboard: crate::clipboard::ClipboardQueue,
     cols: u16,
     rows: u16,
     cell_width_px: u32,
@@ -1138,6 +1140,99 @@ const DA_CONFORMANCE_VT220: u16 = 62;
 const DA_DEVICE_TYPE_VT220: u16 = 1;
 /// DA2 firmware version. Matches cleat's pre-existing synthetic reply.
 const DA_FIRMWARE_VERSION: u16 = 10;
+
+#[repr(C)]
+struct ClipboardContent {
+    mime: GhosttyString,
+    data: GhosttyString,
+}
+#[repr(C)]
+struct ClipboardWriteReply {
+    size: usize,
+    result: c_int,
+    remember: bool,
+}
+#[repr(C)]
+struct ClipboardWrite {
+    size: usize,
+    location: c_int,
+    contents: *const ClipboardContent,
+    contents_len: usize,
+    name: GhosttyString,
+    granted: bool,
+    can_remember: bool,
+    ctx: *const c_void,
+    reply: unsafe extern "C" fn(*const ClipboardWrite, *const ClipboardWriteReply),
+    requires_completion: bool,
+}
+unsafe extern "C" fn clipboard_write_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void, request: *const ClipboardWrite) {
+    if userdata.is_null() || request.is_null() {
+        return;
+    }
+    // Only the size word may be read until the sized request is validated.
+    let size = unsafe { (*request).size };
+    if size < std::mem::offset_of!(ClipboardWrite, requires_completion) + std::mem::size_of::<bool>() {
+        return;
+    }
+    // All borrowed content is copied here; neither the request nor reply is retained.
+    let write = unsafe { &*request };
+    let effects = unsafe { &mut *(userdata as *mut TerminalEffects) };
+    let result = (|| {
+        if write.requires_completion || !(0..=2).contains(&write.location) || write.contents_len > 1 {
+            return 2;
+        }
+        let text = if write.contents_len == 0 {
+            None
+        } else {
+            if write.contents.is_null() {
+                return 4;
+            }
+            let content = unsafe { &*write.contents };
+            if content.mime.ptr.is_null()
+                || content.mime.len > 64
+                || content.data.ptr.is_null()
+                || content.data.len > crate::clipboard::MAX_CLIPBOARD_PAYLOAD
+            {
+                return 4;
+            }
+            let mime = unsafe { slice::from_raw_parts(content.mime.ptr, content.mime.len) };
+            if mime != b"text/plain" && mime != b"text/plain;charset=utf-8" {
+                return 2;
+            }
+            // Empty representations are distinct from clear and cannot be expressed
+            // faithfully by this OSC 52 relay. The parser emits clears with no contents.
+            if content.data.len == 0 {
+                return 2;
+            }
+            let bytes = unsafe { slice::from_raw_parts(content.data.ptr, content.data.len) };
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                return 4;
+            };
+            if text.contains('\0') {
+                return 4;
+            }
+            Some(text.to_owned())
+        };
+        let event = crate::clipboard::ClipboardEvent {
+            session_epoch: [0; 16],
+            connection_epoch: 0,
+            sequence: 0,
+            destination: write.location as u32,
+            text,
+        };
+        if effects.clipboard.push(event) {
+            0
+        } else {
+            3
+        }
+    })();
+    if result != 0 && result != 3 {
+        effects.clipboard.dropped = effects.clipboard.dropped.saturating_add(1);
+    }
+    let reply = ClipboardWriteReply { size: std::mem::size_of::<ClipboardWriteReply>(), result, remember: false };
+    // Synchronous reply only: success is queue admission for fire-and-forget writes.
+    unsafe { (write.reply)(request, &reply) };
+}
 
 unsafe extern "C" fn device_attributes_trampoline(
     _terminal: GhosttyTerminal,
@@ -1301,7 +1396,14 @@ impl TerminalHandle {
             return Err(err);
         }
 
-        let mut effects = Box::new(TerminalEffects { reply_buf: Vec::new(), cols, rows, cell_width_px: 1, cell_height_px: 1 });
+        let mut effects = Box::new(TerminalEffects {
+            reply_buf: Vec::new(),
+            clipboard: Default::default(),
+            cols,
+            rows,
+            cell_width_px: 1,
+            cell_height_px: 1,
+        });
         let userdata_ptr: *mut c_void = (&mut *effects as *mut TerminalEffects).cast();
 
         let set_user = unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::Userdata, userdata_ptr as *const c_void) };
@@ -1335,6 +1437,12 @@ impl TerminalHandle {
             return Err(err);
         }
 
+        let result =
+            unsafe { ghostty_terminal_set(raw, GhosttyTerminalOption::ClipboardWrite, clipboard_write_trampoline as *const c_void) };
+        if let Err(err) = check_result(result, "ghostty_terminal_set(ClipboardWrite)") {
+            unsafe { ghostty_terminal_free(raw) };
+            return Err(err);
+        }
         Ok(Self { raw, effects })
     }
 
@@ -1350,6 +1458,11 @@ impl TerminalHandle {
         Ok(())
     }
 
+    pub fn drain_clipboard(&mut self) -> (Vec<crate::clipboard::ClipboardEvent>, u64) {
+        let events = std::iter::from_fn(|| self.effects.clipboard.pop()).collect();
+        let dropped = std::mem::take(&mut self.effects.clipboard.dropped);
+        (events, dropped)
+    }
     pub fn feed(&mut self, bytes: &[u8]) {
         unsafe { ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len()) };
     }

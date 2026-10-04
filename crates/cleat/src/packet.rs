@@ -8,8 +8,8 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 11 adds frame-owned OSC 8 URI bytes to render cell styles.
-pub const PROTOCOL_VERSION: u16 = 11;
+/// Version 12 adds live clipboard effects independent of render credit.
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -35,6 +35,13 @@ pub const MSG_SESSION_SIZE_POLICY: u8 = 23;
 pub const MSG_SESSION_IMAGE: u8 = 24;
 pub const MSG_SESSION_IMAGE_FILE: u8 = 25;
 pub const MSG_SESSION_IMAGE_FILE_RESULT: u8 = 26;
+pub const MSG_SESSION_CLIPBOARD: u8 = 27;
+pub const MSG_SESSION_CLIPBOARD_LOSS: u8 = 28;
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ClipboardLoss {
+    /// Cumulative observed drops for the current host actor; a new/restarted actor resets the total.
+    pub dropped: u64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageFile {
@@ -186,6 +193,8 @@ pub struct RoleRequest {
 /// any later change (e.g. demotion because another client took control).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleState {
+    /// Functional VT supports the live write channel; never implies reads.
+    pub clipboard_writes: bool,
     pub role: ChannelRole,
     #[serde(default)]
     pub controller: Option<AttachmentIdentity>,
@@ -521,9 +530,9 @@ mod tests {
     }
 
     #[test]
-    fn frame_owned_hyperlinks_require_protocol_version_eleven() {
-        assert_eq!(PROTOCOL_VERSION, 11);
-        assert!(!ControlHello::current().accepts(10));
+    fn clipboard_effects_require_protocol_version_twelve() {
+        assert_eq!(PROTOCOL_VERSION, 12);
+        assert!(!ControlHello::current().accepts(11));
     }
 
     #[test]

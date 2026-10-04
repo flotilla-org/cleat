@@ -367,6 +367,24 @@ pub(crate) struct SessionMouseEvent {
 }
 
 pub(crate) enum SessionCommand {
+    SetClipboardTarget {
+        target: Option<u128>,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    DrainClipboard {
+        target: u128,
+        reply: mpsc::Sender<Result<Vec<crate::clipboard::ClipboardEvent>, String>>,
+    },
+    PopClipboard {
+        target: u128,
+        reply: mpsc::Sender<Result<Option<crate::clipboard::ClipboardEvent>, String>>,
+    },
+    ClipboardSupported {
+        reply: mpsc::Sender<Result<bool, String>>,
+    },
+    ClipboardLoss {
+        reply: mpsc::Sender<Result<u64, String>>,
+    },
     RetainInputSources {
         sources: Vec<u128>,
         reply: mpsc::Sender<Result<(), String>>,
@@ -956,6 +974,21 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::SetQueryPassthrough { enabled, reply })
     }
 
+    pub(crate) fn set_clipboard_target(&self, target: Option<u128>) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::SetClipboardTarget { target, reply })
+    }
+    pub(crate) fn drain_clipboard(&self, target: u128) -> Result<Vec<crate::clipboard::ClipboardEvent>, String> {
+        self.request_result(|reply| SessionCommand::DrainClipboard { target, reply })
+    }
+    pub(crate) fn pop_clipboard(&self, target: u128) -> Result<Option<crate::clipboard::ClipboardEvent>, String> {
+        self.request_result(|reply| SessionCommand::PopClipboard { target, reply })
+    }
+    pub(crate) fn clipboard_supported(&self) -> Result<bool, String> {
+        self.request_result(|reply| SessionCommand::ClipboardSupported { reply })
+    }
+    pub(crate) fn clipboard_loss(&self) -> Result<u64, String> {
+        self.request_result(|reply| SessionCommand::ClipboardLoss { reply })
+    }
     pub(crate) fn subscribe_raw_output(&self) -> Result<RawOutputTap, String> {
         let (reply, recv) = mpsc::channel();
         self.tx.send(SessionCommand::SubscribeRawOutput { reply }).map_err(|_| "session actor is not running".to_string())?;
@@ -1188,6 +1221,7 @@ struct SessionActorLoopState {
     queries_forwarded_to_client: bool,
     raw_output_taps: Vec<SyncSender<RawOutputChunk>>,
     last_raw_output_sequence: u64,
+    clipboard: crate::clipboard::ClipboardRouter,
 }
 
 fn pump_session_runtime(
@@ -1277,7 +1311,10 @@ fn session_actor_loop(
         queries_forwarded_to_client: false,
         raw_output_taps: Vec::new(),
         last_raw_output_sequence: 0,
+        clipboard: Default::default(),
     };
+    // Initialization/reconstructed history is never a live effect source.
+    let _ = runtime.drain_clipboard();
     let _ = ready.send(Ok(runtime.screen_activity_tracker()));
     loop {
         // Exit has been reaped and final output drained. EOF remains readable
@@ -1366,6 +1403,25 @@ fn session_actor_handle_command(
 ) -> bool {
     let mut stop = false;
     match command {
+        SessionCommand::SetClipboardTarget { target, reply } => {
+            // Discard parser effects created by initialization or an adoption tail.
+            let _ = runtime.drain_clipboard();
+            state.clipboard.set_target(target);
+            let _ = reply.send(Ok(()));
+        }
+        SessionCommand::DrainClipboard { target, reply } => {
+            let _ = reply.send(Ok(state.clipboard.drain(target)));
+        }
+        SessionCommand::PopClipboard { target, reply } => {
+            let event = if state.clipboard.target == Some(target) { state.clipboard.queue.pop() } else { None };
+            let _ = reply.send(Ok(event));
+        }
+        SessionCommand::ClipboardSupported { reply } => {
+            let _ = reply.send(Ok(runtime.clipboard_supported()));
+        }
+        SessionCommand::ClipboardLoss { reply } => {
+            let _ = reply.send(Ok(state.clipboard.queue.dropped));
+        }
         SessionCommand::Resize { cols, rows, reply } => {
             let cols = cols.max(1);
             let rows = rows.max(1);
@@ -1615,6 +1671,9 @@ fn session_actor_handle_command(
         SessionCommand::PrepareTransfer { reply } => {
             let result =
                 if state.exited { Err(format!("session {} has exited", runtime.session_id())) } else { runtime.prepare_transfer() };
+            if result.is_ok() {
+                state.clipboard.suspend();
+            }
             let _ = reply.send(result);
         }
         #[cfg(unix)]
@@ -1634,6 +1693,7 @@ fn session_actor_handle_command(
         #[cfg(unix)]
         SessionCommand::AbortTransfer { reply } => {
             runtime.abort_transfer();
+            state.clipboard.resume();
             state.pty_paused = false;
             let _ = reply.send(Ok(()));
         }
@@ -1644,6 +1704,8 @@ fn session_actor_handle_command(
         #[cfg(unix)]
         SessionCommand::ResumeAdopted { tail, reply } => {
             let result = runtime.resume_adopted(&tail);
+            let _ = runtime.drain_clipboard();
+            state.clipboard.queue.clear();
             if result.is_ok() {
                 state.pty_paused = false;
                 let rows = runtime.inspect(false, 0).terminal.rows;
@@ -1728,6 +1790,16 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
         if let Some(code) = state.exit {
             state.observation.record_exit(code, wake);
         }
+    }
+    let previous_loss = state.clipboard.queue.dropped;
+    let (events, dropped) = runtime.drain_clipboard();
+    state.clipboard.queue.dropped = state.clipboard.queue.dropped.saturating_add(dropped);
+    let mut accepted = false;
+    for event in events {
+        accepted |= state.clipboard.accept(event);
+    }
+    if accepted || state.clipboard.queue.dropped != previous_loss {
+        wake();
     }
     sync_terminal_modes_and_wake(runtime, &mut state.observation, wake);
 }

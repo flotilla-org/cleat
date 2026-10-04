@@ -282,6 +282,7 @@ fn adopt_session(session: &mut CleatSession) -> Result<(), String> {
     crate::transfer::write_ready(&mut stream).map_err(|err| err.to_string())?;
     let tail = crate::transfer::read_commit(&mut stream)?.ok_or("daemon aborted adoption")?;
     actor.resume_adopted(tail)?;
+    actor.set_clipboard_target(Some(0))?;
     let _ = crate::transfer::write_committed(&mut stream);
     session.backend = SessionBackend::InProcess(Box::new(InProcessSession { actor }));
     session.transfer.identity = identity;

@@ -25,7 +25,7 @@ use crate::{
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 10;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 11;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -2485,6 +2485,7 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     })
     .map_err(|err| err.replace("session actor", "in-process session actor"))?;
     actor.set_query_passthrough(false)?;
+    actor.set_clipboard_target(Some(0))?;
     Ok(InProcessSession { actor })
 }
 
@@ -2865,6 +2866,109 @@ fn cell_width_tag(width: TerminalCellWidth) -> u32 {
         TerminalCellWidth::Wide => CLEAT_CELL_WIDTH_WIDE,
         TerminalCellWidth::SpacerTail => CLEAT_CELL_WIDTH_SPACER_TAIL,
         TerminalCellWidth::SpacerHead => CLEAT_CELL_WIDTH_SPACER_HEAD,
+    }
+}
+
+/// One owned live event. Text is UTF-8 and borrowed from this acquisition until
+/// release. It remains valid after session destruction or hosting changes.
+#[repr(C)]
+pub struct CleatClipboardEvent {
+    pub session_epoch: [u8; 16],
+    pub connection_epoch: u64,
+    pub sequence: u64,
+    pub destination: u32,
+    /// 1 = text write, 2 = explicit clear.
+    pub kind: u32,
+    pub text: *const u8,
+    pub text_len: usize,
+    owner: *mut c_void,
+}
+struct OwnedClipboardEvent {
+    public: CleatClipboardEvent,
+    _text: Option<String>,
+}
+
+/// Whether this session's actual VT supports live writes. Reads are never enabled.
+/// # Safety
+/// `session` must be null or a live session handle.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_clipboard_supported(session: *const CleatSession) -> bool {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return false;
+    };
+    match &session.backend {
+        SessionBackend::Mock(_) => false,
+        SessionBackend::InProcess(s) => s.actor.clipboard_supported().unwrap_or(false),
+        SessionBackend::Daemon(s) => s
+            .slot
+            .lock()
+            .ok()
+            .is_some_and(|slot| slot.closed.is_none() && slot.role_state.as_ref().is_some_and(|role| role.clipboard_writes)),
+    }
+}
+/// Acquire and remove one event; null means no pending event. Does not consume
+/// render updates or credit. Each non-null acquisition must be released once.
+/// # Safety
+/// `session` must be null or a live session handle, accessed on its owner thread.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_acquire_clipboard_event(session: *mut CleatSession) -> *const CleatClipboardEvent {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return ptr::null();
+    };
+    let event = match &session.backend {
+        SessionBackend::Mock(_) => None,
+        SessionBackend::InProcess(s) => s.actor.pop_clipboard(0).ok().flatten(),
+        SessionBackend::Daemon(s) => s.slot.lock().ok().and_then(|mut slot| {
+            if slot.closed.is_none() && slot.granted_role == Some(crate::packet::ChannelRole::Controller) {
+                slot.clipboard.pop()
+            } else {
+                None
+            }
+        }),
+    };
+    let Some(event) = event else {
+        return ptr::null();
+    };
+    let owned = Box::new(OwnedClipboardEvent {
+        public: CleatClipboardEvent {
+            session_epoch: event.session_epoch,
+            connection_epoch: event.connection_epoch,
+            sequence: event.sequence,
+            destination: event.destination,
+            kind: if event.text.is_some() { 1 } else { 2 },
+            text: event.text.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+            text_len: event.text.as_ref().map_or(0, String::len),
+            owner: ptr::null_mut(),
+        },
+        _text: event.text,
+    });
+    let owned = Box::into_raw(owned);
+    unsafe {
+        (*owned).public.owner = owned.cast();
+        ptr::addr_of!((*owned).public)
+    }
+}
+/// # Safety
+/// `event` must be null or an unreleased pointer returned by acquisition.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_clipboard_event_release(event: *const CleatClipboardEvent) {
+    if let Some(event) = unsafe { event.as_ref() } {
+        unsafe { drop(Box::from_raw(event.owner.cast::<OwnedClipboardEvent>())) };
+    }
+}
+/// Cumulative locally observed drops (invalid/overflow/no controller/epoch reset).
+/// Transport disconnect may also lose already attempted writes without an ack.
+/// # Safety
+/// `session` must be null or a live session handle.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_clipboard_dropped(session: *const CleatSession) -> u64 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return 0;
+    };
+    match &session.backend {
+        SessionBackend::Mock(_) => 0,
+        SessionBackend::InProcess(s) => s.actor.clipboard_loss().unwrap_or(0),
+        SessionBackend::Daemon(s) => s.slot.lock().map_or(0, |slot| slot.clipboard.dropped.saturating_add(slot.clipboard_upstream_dropped)),
     }
 }
 

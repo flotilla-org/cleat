@@ -40,6 +40,7 @@ fn channel(id: u32, image: Image) -> PacketSessionChannel {
         view_changed: false,
         view_state: Default::default(),
         next_capture: Instant::now(),
+        clipboard_loss: 0,
         local_images: false,
         image_resident: resident,
         image_transfer: Some(transfer),

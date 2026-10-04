@@ -131,6 +131,8 @@ pub(crate) struct ChannelSlot {
     /// Latest un-consumed render packet. The ack-gated protocol guarantees at
     /// most one arrives before we ack, and we ack on consumption.
     pub pending: Option<TerminalRenderUpdate>,
+    pub clipboard: crate::clipboard::ClipboardQueue,
+    pub clipboard_upstream_dropped: u64,
     images: crate::image_delivery::ImageReceiver,
     pub pending_images: Vec<crate::image_delivery::Image>,
     pub pending_links: Vec<crate::provider::TerminalViewLink>,
@@ -323,6 +325,8 @@ impl DaemonConnection {
         let slot = Arc::new(Mutex::new(ChannelSlot {
             session_id: session_id.clone(),
             pending: None,
+            clipboard: Default::default(),
+            clipboard_upstream_dropped: 0,
             images: Default::default(),
             pending_images: Vec::new(),
             pending_links: Vec::new(),
@@ -384,6 +388,7 @@ impl DaemonConnection {
                 slot.desired_role = role;
             }
             slot.pending = None;
+            slot.clipboard.clear();
             slot.pending_images.clear();
             slot.images = Default::default();
             slot.pending_links.clear();
@@ -589,6 +594,7 @@ impl DaemonConnection {
                     // the old grant died with the connection
                     slot.granted_role = None;
                     slot.pending = None;
+                    slot.clipboard.clear();
                     slot.pending_images.clear();
                     slot.images = Default::default();
                     slot.pending_links.clear();
@@ -623,6 +629,7 @@ impl DaemonConnection {
             let mut slot = recover_lock(&slot);
             slot.closed = Some(message.clone());
             slot.pending = None;
+            slot.clipboard.clear();
             slot.pending_images.clear();
             slot.pending_links.clear();
             slot.images = Default::default();
@@ -667,7 +674,11 @@ impl DaemonConnection {
                     if let Some(slot) = slot {
                         match redirect {
                             Some(redirect) => self.follow_redirect(error.channel, slot, redirect),
-                            None => recover_lock(&slot).closed = Some(error.message),
+                            None => {
+                                let mut slot = recover_lock(&slot);
+                                slot.clipboard.clear();
+                                slot.closed = Some(error.message);
+                            }
                         }
                         (self.wake)();
                     }
@@ -706,6 +717,28 @@ impl DaemonConnection {
                 })();
                 if let Err(error) = result {
                     self.fail_image_channel(channel, error);
+                }
+            }
+            (channel, crate::packet::MSG_SESSION_CLIPBOARD_LOSS) if channel != CHANNEL_CONTROL => {
+                if let Ok(loss) = frame.decode::<crate::packet::ClipboardLoss>() {
+                    let slot = recover_lock(&self.state).channels.get(&channel).cloned();
+                    if let Some(slot) = slot {
+                        recover_lock(&slot).clipboard_upstream_dropped = loss.dropped;
+                        (self.wake)();
+                    }
+                }
+            }
+            (channel, crate::packet::MSG_SESSION_CLIPBOARD) if channel != CHANNEL_CONTROL => {
+                if let Ok(event) = frame.decode::<crate::clipboard::ClipboardEvent>() {
+                    let slot = recover_lock(&self.state).channels.get(&channel).cloned();
+                    if let Some(slot) = slot {
+                        let mut slot = recover_lock(&slot);
+                        if slot.closed.is_none() && slot.granted_role == Some(ChannelRole::Controller) {
+                            slot.clipboard.push(event);
+                            drop(slot);
+                            (self.wake)();
+                        }
+                    }
                 }
             }
             (channel, MSG_SESSION_RENDER) if channel != CHANNEL_CONTROL => {
@@ -752,6 +785,9 @@ impl DaemonConnection {
                     };
                     if let Some(slot) = slot {
                         let mut slot = recover_lock(&slot);
+                        if role_state.role != ChannelRole::Controller {
+                            slot.clipboard.clear();
+                        }
                         slot.granted_role = Some(role_state.role);
                         slot.desired_role = role_state.role;
                         slot.role_state = Some(role_state);
@@ -772,6 +808,11 @@ impl DaemonConnection {
         {
             let mut state = recover_lock(&self.state);
             state.connected = false;
+            for slot in state.channels.values() {
+                let mut slot = recover_lock(slot);
+                slot.clipboard.clear();
+                slot.granted_role = None;
+            }
         }
         (self.wake)();
     }
@@ -1161,6 +1202,7 @@ mod tests {
             TerminalInputEvent::Resize(TerminalResizeEvent { cell_width_px: 12.0, cell_height_px: 24.0, ..geometry(120, 50) })
         );
         PacketFrame::new(channel, MSG_SESSION_ROLE, &crate::packet::RoleState {
+            clipboard_writes: false,
             role: ChannelRole::Controller,
             controller: None,
             denial_reason: None,
@@ -1182,6 +1224,7 @@ mod tests {
 
     fn role_state(role: ChannelRole) -> crate::packet::RoleState {
         crate::packet::RoleState {
+            clipboard_writes: false,
             role,
             controller: None,
             denial_reason: None,

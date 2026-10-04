@@ -58,3 +58,5 @@ mod embedded_transfer;
 
 #[cfg(unix)]
 mod termination_diagnostics;
+
+pub mod clipboard;

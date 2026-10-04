@@ -1855,6 +1855,18 @@ mod nesting_tests {
 mod routing_tests {
     use super::*;
 
+    // On platforms without Unix sockets both verbs must reject the endpoint
+    // before constructing local state or attempting another transport.
+    #[cfg(not(unix))]
+    #[test]
+    fn socket_commands_report_unsupported_platform() {
+        for verb in ["attach", "packets"] {
+            let cli = Cli::try_parse_from(["cleat", verb, "--socket", "unused.sock", "session"]).unwrap();
+            let result = execute_with_service(cli, || panic!("unsupported endpoint requested local state"));
+            assert!(matches!(result, ExecResult::Err(error) if error.contains("unsupported on this platform")));
+        }
+    }
+
     // Glue: every entry point uses this route. A socket command must never
     // invoke the factory that discovers or constructs the local service.
     #[test]

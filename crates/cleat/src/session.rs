@@ -356,6 +356,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let read_handle = packet.stream.lock().map_err(|_| "packet stream poisoned")?.try_clone().map_err(|e| e.to_string())?;
     let alive = Arc::new(AtomicBool::new(true));
     let controller = Arc::new(AtomicBool::new(packet.initial_role.role == ChannelRole::Controller));
+    let detach_requested = Arc::new(AtomicBool::new(false));
     let mut renderer = PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows);
     renderer.keyboard = keyboard.clone();
     let nested_in = if packet.connect_only {
@@ -383,6 +384,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let mut images = packet.images;
     let identity = packet.identity.clone();
     let connect_only = packet.connect_only;
+    let detach_out = Arc::clone(&detach_requested);
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut read_stream = read_handle;
         // A transferred session announces its new address before closing the
@@ -402,7 +404,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             }
             stdout.flush().map_err(|e| e.to_string())?;
         }
-        write_packet_frame(
+        write_packet_relay_frame(
+            &detach_out,
             &write_stream,
             PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: initial_update.render_generation }),
         )?;
@@ -424,7 +427,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 (id, crate::packet::MSG_SESSION_IMAGE_FILE) if id == channel => {
                     let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| e.to_string())?;
                     let acquired = !connect_only && images.file(&file);
-                    write_packet_frame(
+                    write_packet_relay_frame(
+                        &detach_out,
                         &write_stream,
                         PacketFrame::new(channel, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT, &crate::packet::ImageFileResult {
                             image_id: file.image_id,
@@ -448,7 +452,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     chrome.view = packet.view;
                     chrome.renderer.images.set_assets(images.commit(&packet.update.image_resources)?);
                     chrome.paint(&mut stdout, Some(&packet.update))?;
-                    write_packet_frame(
+                    write_packet_relay_frame(
+                        &detach_out,
                         &write_stream,
                         PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: packet.update.render_generation }),
                     )?;
@@ -509,7 +514,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                         chrome.renderer.images.set_assets(images.commit(&opened.update.image_resources)?);
                         chrome.paint(&mut stdout, Some(&opened.update))?;
                         drop(chrome);
-                        write_packet_frame(
+                        write_packet_relay_frame(
+                            &detach_out,
                             &write_stream,
                             PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: opened.update.render_generation }),
                         )?;
@@ -523,6 +529,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let resize_stream = Arc::clone(&packet.stream);
     let alive_resize = Arc::clone(&alive);
     let chrome_resize = Arc::clone(&chrome);
+    let detach_resize = Arc::clone(&detach_requested);
     let resize_loop = thread::spawn(move || -> Result<(), String> {
         let mut last = None;
         let mut cell_query = Instant::now();
@@ -534,8 +541,13 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     chrome_resize.lock().map_err(|_| "chrome poisoned")?.paint(&mut stdout, None)?;
                     stdout.flush().map_err(|e| e.to_string())?;
                 }
-                write_packet_frame(&resize_stream, PacketFrame::new(channel, MSG_SESSION_RESIZE, &Resize { cols: next.0, rows: next.1 }))?;
-                write_packet_frame(
+                write_packet_relay_frame(
+                    &detach_resize,
+                    &resize_stream,
+                    PacketFrame::new(channel, MSG_SESSION_RESIZE, &Resize { cols: next.0, rows: next.1 }),
+                )?;
+                write_packet_relay_frame(
+                    &detach_resize,
                     &resize_stream,
                     PacketFrame::new(channel, MSG_SESSION_VIEWPORT, &crate::packet::Viewport {
                         command: crate::provider::ViewportCommand::DeltaRows(0),
@@ -567,7 +579,6 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
         &std::env::var("TERM_PROGRAM").unwrap_or_default(),
     ));
     let mut buf = [0u8; 4096];
-    let mut detached = false;
     let stdin_result = 'input: loop {
         if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
             break Ok(());
@@ -670,7 +681,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 }
                 Action::Hint(text) => hint = Some(text.to_string()),
                 Action::Command(Command::Detach) => {
-                    detached = true;
+                    detach_requested.store(true, Ordering::SeqCst);
                     break 'input Ok(());
                 }
                 Action::Command(Command::AutoSize) => {
@@ -760,10 +771,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let out_result = relay_out.join().map_err(|_| "packet stdout relay panicked")?;
     let resize_result = resize_loop.join().map_err(|_| "packet resize relay panicked")?;
     cleanup.emit()?;
-    // A deliberate detach shuts down the stream while ACK/resize writes may
-    // still be in flight. Their resulting errors are cleanup, not a failure
-    // of the requested detach. Unexpected transport loss still propagates.
-    if signal_exit || detached {
+    if signal_exit {
         return Ok(());
     }
     stdin_result?;
@@ -772,9 +780,54 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
 }
 
 fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
+    write_packet_frame_with_detach(stream, frame, None)
+}
+
+fn write_packet_relay_frame(
+    detach_requested: &AtomicBool,
+    stream: &Arc<Mutex<SessionStream>>,
+    frame: std::io::Result<PacketFrame>,
+) -> Result<(), String> {
+    write_packet_frame_with_detach(stream, frame, Some(detach_requested))
+}
+
+fn write_packet_frame_with_detach(
+    stream: &Arc<Mutex<SessionStream>>,
+    frame: std::io::Result<PacketFrame>,
+    detach_requested: Option<&AtomicBool>,
+) -> Result<(), String> {
     let frame = frame.map_err(|err| format!("encode packet attach frame: {err}"))?;
     let mut stream = stream.lock().map_err(|_| "packet attach stream lock poisoned".to_string())?;
-    frame.write(&mut *stream).map_err(|err| format!("write packet attach frame: {err}"))
+    match frame.write(&mut *stream) {
+        // Deliberate detach may close the socket while background ACK/resize
+        // writes are in flight. Suppress only shutdown errors observed after
+        // that request; earlier errors and non-socket failures still propagate.
+        Err(err) if detach_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) && is_graceful_socket_shutdown(&err) => Ok(()),
+        result => result.map_err(|err| format!("write packet attach frame: {err}")),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod packet_detach_tests {
+    use super::*;
+
+    // A prior transport error is retained; only shutdown writes after an
+    // explicit detach are cleanup. Encoding errors are never suppressed.
+    #[test]
+    fn detach_suppresses_only_subsequent_socket_shutdown_errors() {
+        let (stream, peer) = SessionStream::pair().unwrap();
+        drop(peer);
+        let stream = Arc::new(Mutex::new(stream));
+        let detach = AtomicBool::new(false);
+        let frame = || PacketFrame::new(1, MSG_SESSION_ACK, &Ack { generation: 1 });
+        let prior_error = write_packet_relay_frame(&detach, &stream, frame());
+        assert!(prior_error.is_err());
+        detach.store(true, Ordering::SeqCst);
+        assert!(prior_error.is_err(), "detach cannot reinterpret a prior failure");
+        assert!(write_packet_relay_frame(&detach, &stream, frame()).is_ok());
+        let invalid = Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid packet"));
+        assert!(write_packet_relay_frame(&detach, &stream, invalid).unwrap_err().contains("encode packet attach frame"));
+    }
 }
 
 #[derive(Debug)]

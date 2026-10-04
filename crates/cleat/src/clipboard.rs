@@ -122,7 +122,11 @@ impl ClipboardRouter {
         self.suspended = false;
     }
     pub(crate) fn accept(&mut self, mut event: ClipboardEvent) -> bool {
-        self.sequence += 1;
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            self.queue.dropped = self.queue.dropped.saturating_add(1);
+            return false;
+        };
+        self.sequence = sequence;
         if self.target.is_none() || self.suspended {
             self.queue.dropped = self.queue.dropped.saturating_add(1);
             return false;
@@ -145,6 +149,18 @@ mod tests {
     use super::*;
     fn event(text: Option<String>) -> ClipboardEvent {
         ClipboardEvent { session_epoch: [0; 16], connection_epoch: 0, sequence: 0, destination: 0, text }
+    }
+    #[test]
+    fn exhausted_sequence_drops_without_reusing_identity() {
+        let mut router = ClipboardRouter::default();
+        router.set_target(Some(1));
+        router.sequence = u64::MAX - 1;
+        assert!(router.accept(event(None)));
+        assert_eq!(router.drain(1)[0].sequence, u64::MAX);
+        assert!(!router.accept(event(None)));
+        assert!(!router.accept(event(None)));
+        assert!(router.drain(1).is_empty());
+        assert_eq!(router.queue.dropped, 2);
     }
     #[test]
     fn controller_epoch_fences_pending_effects_and_transfer() {

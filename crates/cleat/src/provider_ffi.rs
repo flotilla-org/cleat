@@ -2929,7 +2929,7 @@ pub unsafe extern "C" fn cleat_session_acquire_clipboard_event(session: *mut Cle
     let Some(event) = event else {
         return ptr::null();
     };
-    let mut owned = Box::new(OwnedClipboardEvent {
+    let owned = Box::new(OwnedClipboardEvent {
         public: CleatClipboardEvent {
             session_epoch: event.session_epoch,
             connection_epoch: event.connection_epoch,
@@ -2942,10 +2942,11 @@ pub unsafe extern "C" fn cleat_session_acquire_clipboard_event(session: *mut Cle
         },
         _text: event.text,
     });
-    owned.public.owner = (&mut *owned as *mut OwnedClipboardEvent).cast();
-    let result = &owned.public as *const CleatClipboardEvent;
-    let _ = Box::into_raw(owned);
-    result
+    let owned = Box::into_raw(owned);
+    unsafe {
+        (*owned).public.owner = owned.cast();
+        ptr::addr_of!((*owned).public)
+    }
 }
 /// # Safety
 /// `event` must be null or an unreleased pointer returned by acquisition.

@@ -97,7 +97,14 @@ and cross-host relationships are outside the shared graph.
 Remote output forwarding is admitted untracked: `{"version":1,"context":{"kind":"remote"}}`
 is accepted without local peer corroboration or any graph edge. The supplied
 clients send that declaration when `SSH_CONNECTION` or `SSH_CLIENT` is present,
-so SSH attach/watch and packet subscriptions remain available. The HTTP 101
+so SSH attach/watch and packet subscriptions remain available. The supported
+socket-only entry points, `cleat attach --socket PATH ID` and
+`cleat packets --socket PATH ID`, always declare `remote`, independent of SSH
+or local session environment. They do not discover or verify local source
+coordinates. The daemon still validates the declaration schema and admission
+version; the client checks packet protocol compatibility. The daemon does not read the
+forwarder's `/proc/<pid>/environ`, verify the ultimate remote source identity,
+or add graph edges. Local declarations retain their existing verification. The HTTP 101
 acknowledgement includes `x-cleat-output-admission: 1` and the warning field
 `x-cleat-output-warning: cycle protection does not cover remote relationships`.
 Supplied clients print this warning to stderr when opening the connection.

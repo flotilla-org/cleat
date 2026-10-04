@@ -32,6 +32,7 @@ mod screen_activity;
 pub mod server;
 pub mod session;
 mod session_runtime;
+pub mod socket_client;
 pub mod vt;
 
 mod mouse;

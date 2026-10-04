@@ -59,6 +59,13 @@ impl Cli {
     }
 
     fn validate_daemon_target(self) -> Result<Self, clap::Error> {
+        if self.socket().is_some() && (self.runtime_root.is_some() || self.server.is_some() || self.hosting_epoch.is_some()) {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--socket cannot be used with --runtime-root, --server, or --hosting-epoch",
+            )
+            .with_cmd(&Self::command()));
+        }
         if self.has_conflicting_daemon_targets() {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
@@ -67,6 +74,13 @@ impl Cli {
             .with_cmd(&Self::command()));
         }
         Ok(self)
+    }
+
+    fn socket(&self) -> Option<&std::path::Path> {
+        match &self.command {
+            Command::Attach { socket, .. } | Command::Packets { socket, .. } => socket.as_deref(),
+            _ => None,
+        }
     }
 
     fn has_conflicting_daemon_targets(&self) -> bool {
@@ -179,6 +193,9 @@ pub enum Command {
     Attach {
         #[arg(value_name = "ID")]
         id: Option<String>,
+        /// Connect only to this Unix socket (forwarded or remote daemon)
+        #[arg(long, value_name = "PATH", requires = "id", conflicts_with_all = ["server", "hosting_epoch", "vt", "cwd", "cmd", "record", "no_record"])]
+        socket: Option<PathBuf>,
         #[arg(long, help = "Fail if the session does not exist")]
         no_create: bool,
         #[arg(long, value_enum, help = crate::vt::VT_ENGINE_HELP)]
@@ -209,6 +226,9 @@ pub enum Command {
     Packets {
         #[arg(value_name = "ID")]
         id: String,
+        /// Connect only to this Unix socket (forwarded or remote daemon)
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["server", "hosting_epoch"])]
+        socket: Option<PathBuf>,
         #[arg(long, default_value_t = 1, value_parser = parse_positive_usize, help = "Number of render packets to print")]
         count: usize,
     },
@@ -637,7 +657,35 @@ fn check_foreground_nesting(
     Ok(())
 }
 
+/// Execute socket commands before constructing or discovering a local service.
+/// `None` means this command uses the ordinary local runtime.
+pub fn execute_socket(cli: &Cli) -> Option<ExecResult> {
+    match &cli.command {
+        Command::Attach { socket: Some(socket), id, attachment, strict, take, .. } => Some(
+            (|| {
+                let id = id.as_deref().ok_or("--socket requires a session ID")?;
+                crate::socket_client::ensure_supported()?;
+                let handlers = crate::platform::terminal::AttachSignalHandlers::install()?;
+                crate::socket_client::attach(socket, id, attachment.clone().resolve(), *strict, *take)?.relay_stdio_with_handlers(handlers)
+            })()
+            .map_or_else(ExecResult::Err, |_| ExecResult::Ok(None)),
+        ),
+        Command::Packets { socket: Some(socket), id, count } => Some(
+            (|| {
+                let (client, directory) = crate::socket_client::connect_packets(socket)?;
+                render_packet_summaries(client, directory, id, *count)
+                    .map_err(|err| format!("socket packets: {err}; recovery requires a fresh connect"))
+            })()
+            .map_or_else(ExecResult::Err, |lines| ExecResult::Ok(Some(lines.join("\n")))),
+        ),
+        _ => None,
+    }
+}
+
 pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
+    if let Some(result) = execute_socket(&cli) {
+        return result;
+    }
     if cli.has_conflicting_daemon_targets() {
         return ExecResult::Err("--server cannot be used with --from".to_string());
     }
@@ -714,7 +762,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
         }
     }
     match cli.command {
-        Command::Attach { id, no_create, vt, cwd, cmd, strict, take, attachment, record } => {
+        Command::Attach { id, socket: _, no_create, vt, cwd, cmd, strict, take, attachment, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -756,7 +804,7 @@ pub fn execute(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Packets { id, count } => match run_packets_command(service, &id, count) {
+        Command::Packets { id, count, socket: _ } => match run_packets_command(service, &id, count) {
             Ok(lines) if lines.is_empty() => ExecResult::Ok(None),
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
@@ -1537,7 +1585,16 @@ fn format_directory_entry(entry: &crate::packet::DirectoryEntry) -> String {
 }
 
 fn run_packets_command(service: &SessionService, id: &str, count: usize) -> Result<Vec<String>, String> {
-    let (mut client, directory) = service.connect_packets(id)?;
+    let (client, directory) = service.connect_packets(id)?;
+    render_packet_summaries(client, directory, id, count)
+}
+
+fn render_packet_summaries(
+    mut client: crate::packet::PacketClient<crate::platform::ipc::SessionStream>,
+    directory: crate::packet::DirectorySnapshot,
+    id: &str,
+    count: usize,
+) -> Result<Vec<String>, String> {
     if !directory.sessions.iter().any(|entry| entry.session_id == id) {
         return Err(format!("session {id} was not present in packet directory"));
     }

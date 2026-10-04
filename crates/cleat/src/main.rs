@@ -2,6 +2,10 @@ use cleat::{cli, server::SessionService};
 
 fn main() {
     let cli = cli::parse();
+    if let Some(result) = cli::execute_socket(&cli) {
+        finish(result);
+        return;
+    }
     let service = if let Some(root) = cli.runtime_root.clone() {
         Ok(SessionService::new(cleat::runtime::RuntimeLayout::new(root)))
     } else {
@@ -14,7 +18,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    match cli::execute(cli, &service) {
+    finish(cli::execute(cli, &service));
+}
+
+fn finish(result: cli::ExecResult) {
+    match result {
         cli::ExecResult::Ok(Some(output)) => println!("{output}"),
         cli::ExecResult::Ok(None) => {}
         cli::ExecResult::Err(err) => {

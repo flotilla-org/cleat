@@ -798,9 +798,16 @@ impl Drop for DaemonConnection {
 /// Client half of the daemon-scoped `/connect` upgrade: HTTP upgrade dance,
 /// protocol hello, initial directory snapshot.
 pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]) -> Result<(SessionStream, DirectorySnapshot), String> {
-    let socket_path = layout.socket_path();
-    let mut stream = try_connect_session_stream(&socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
-    let output_context = crate::output_admission::client_header()?;
+    connect_packet_endpoint(&layout.socket_path(), selectors, &crate::output_admission::client_header()?)
+}
+
+/// Connect without runtime discovery, session metadata, startup, or recovery.
+pub(crate) fn connect_packet_endpoint(
+    socket_path: &std::path::Path,
+    selectors: &[String],
+    output_context: &str,
+) -> Result<(SessionStream, DirectorySnapshot), String> {
+    let mut stream = try_connect_session_stream(socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
     let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms: None })
         .map_err(|err| format!("serialize packet subscribe request: {err}"))?;
     let head = format!(

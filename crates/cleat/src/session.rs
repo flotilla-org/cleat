@@ -71,6 +71,7 @@ enum ForegroundTransport {
 
 #[derive(Debug)]
 struct PacketForegroundAttach {
+    connect_only: bool,
     session_name: String,
     stream: Arc<Mutex<SessionStream>>,
     channel: u32,
@@ -357,8 +358,11 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let controller = Arc::new(AtomicBool::new(packet.initial_role.role == ChannelRole::Controller));
     let mut renderer = PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows);
     renderer.keyboard = keyboard.clone();
-    let nested_in =
-        crate::runtime::ambient_session_coordinates()?.map(|source| format!("{}/{}", source.daemon_name(), source.session_id()));
+    let nested_in = if packet.connect_only {
+        None
+    } else {
+        crate::runtime::ambient_session_coordinates()?.map(|source| format!("{}/{}", source.daemon_name(), source.session_id()))
+    };
     let chrome = Arc::new(Mutex::new(AttachChrome {
         session_name: packet.session_name,
         renderer,
@@ -378,6 +382,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let initial_update = packet.initial_update;
     let mut images = packet.images;
     let identity = packet.identity.clone();
+    let connect_only = packet.connect_only;
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut read_stream = read_handle;
         // A transferred session announces its new address before closing the
@@ -405,7 +410,10 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             let frame = match PacketFrame::read(&mut read_stream) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    alive_out.store(false, Ordering::SeqCst);
+                    let was_alive = alive_out.swap(false, Ordering::SeqCst);
+                    if connect_only && was_alive {
+                        return Err(format!("socket disconnected: {err}; recovery requires a fresh connect"));
+                    }
                     return if is_graceful_socket_shutdown(&err) { Ok(()) } else { Err(err.to_string()) };
                 }
             };
@@ -413,7 +421,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             match (frame.channel, frame.msg_type) {
                 (id, crate::packet::MSG_SESSION_IMAGE_FILE) if id == channel => {
                     let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| e.to_string())?;
-                    let acquired = images.file(&file);
+                    let acquired = !connect_only && images.file(&file);
                     write_packet_frame(
                         &write_stream,
                         PacketFrame::new(channel, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT, &crate::packet::ImageFileResult {
@@ -471,6 +479,10 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
                     let error = frame.decode::<ControlError>().map_err(|e| e.to_string())?;
                     if error.channel == channel {
+                        if connect_only {
+                            alive_out.store(false, Ordering::SeqCst);
+                            return Err(format!("socket channel closed: {}; recovery requires a fresh connect", error.message));
+                        }
                         let Some(moved) = redirect.take().filter(|_| !followed) else {
                             alive_out.store(false, Ordering::SeqCst);
                             return Ok(());
@@ -1334,11 +1346,24 @@ pub fn attach_packet_foreground(
     strict: bool,
     take: bool,
 ) -> Result<ForegroundAttach, String> {
-    let (mut stream, directory) = crate::provider_daemon::connect_packet_stream(layout, &[])?;
+    let (stream, directory) = crate::provider_daemon::connect_packet_stream(layout, &[])?;
+    attach_packet_stream((stream, directory), id, identity, role, strict, take, false)
+}
+
+pub(crate) fn attach_packet_stream(
+    connection: (SessionStream, crate::packet::DirectorySnapshot),
+    id: &str,
+    identity: AttachmentIdentity,
+    role: ChannelRole,
+    strict: bool,
+    take: bool,
+    connect_only: bool,
+) -> Result<ForegroundAttach, String> {
+    let (mut stream, directory) = connection;
     if !directory.sessions.iter().any(|entry| entry.session_id == id) {
         return Err(format!("session {id} was not present in packet directory"));
     }
-    let opened = open_foreground_channel(&mut stream, id, identity.clone(), role, take)?;
+    let opened = open_foreground_channel(&mut stream, id, identity.clone(), role, take, connect_only)?;
     if strict && opened.role.role != ChannelRole::Controller {
         let holder = opened
             .role
@@ -1350,6 +1375,7 @@ pub fn attach_packet_foreground(
     }
     Ok(ForegroundAttach {
         transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
+            connect_only,
             session_name: id.to_owned(),
             stream: Arc::new(Mutex::new(stream)),
             channel: FOREGROUND_CHANNEL,
@@ -1370,6 +1396,7 @@ fn open_foreground_channel(
     identity: AttachmentIdentity,
     role: ChannelRole,
     take: bool,
+    connect_only: bool,
 ) -> Result<ForegroundChannel, String> {
     let (cols, rows) = current_terminal_size();
     PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
@@ -1398,7 +1425,7 @@ fn open_foreground_channel(
             }
             (FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE_FILE) => {
                 let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| e.to_string())?;
-                let acquired = images.file(&file);
+                let acquired = !connect_only && images.file(&file);
                 PacketFrame::new(FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT, &crate::packet::ImageFileResult {
                     image_id: file.image_id,
                     generation: file.generation,
@@ -1439,7 +1466,7 @@ fn follow_foreground_redirect(
     let layout = RuntimeLayout::new(PathBuf::from(&redirect.runtime_root)).with_daemon(redirect.daemon.clone())?;
     let (mut stream, _) = crate::provider_daemon::connect_packet_stream(&layout, &[])
         .map_err(|err| format!("session {} moved to {}, but reconnecting failed: {err}", redirect.session_id, redirect.address))?;
-    let opened = open_foreground_channel(&mut stream, &redirect.session_id, identity, role, false)?;
+    let opened = open_foreground_channel(&mut stream, &redirect.session_id, identity, role, false, false)?;
     Ok((stream, opened))
 }
 

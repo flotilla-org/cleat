@@ -64,6 +64,16 @@ struct Declaration {
     context: OutputContext,
 }
 
+/// Socket-only clients explicitly declare a remote sink even without SSH
+/// environment variables. The daemon validates the declaration schema and
+/// version, but cannot corroborate the ultimate peer through a forwarding
+/// process's /proc environment. Remote edges are untracked: no local cycle
+/// protection or source identity verification. Socket access remains the trust
+/// boundary; local External/Session declarations retain peer corroboration.
+pub(crate) fn remote_client_header() -> Result<String, String> {
+    serde_json::to_string(&Declaration { version: 1, context: OutputContext::Remote }).map_err(|e| e.to_string())
+}
+
 pub(crate) fn client_header() -> Result<String, String> {
     let context = if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_CLIENT").is_some() {
         OutputContext::Remote

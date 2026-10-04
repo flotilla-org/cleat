@@ -69,6 +69,6 @@ Live testing: launch a fresh session, inspect `TERM`, `TERM_PROGRAM` and
 `COLORTERM`, then try Katzensteg's mouse targeting and a terminfo-based TUI.
 Existing sessions retain their original environment.
 
-Sources: [pinned Ghostty terminfo](https://github.com/rjwittams/ghostty/blob/c3dbb925e6cbcfceafba5749f81a486dd2275099/src/terminfo/ghostty.zig),
+Sources: [pinned Ghostty terminfo](https://github.com/rjwittams/ghostty/blob/c361de9691f006f65c400be73896d1e48a8ec56c/src/terminfo/ghostty.zig),
 [Ghostty's terminfo guidance](https://ghostty.org/docs/help/terminfo), and
 [ncurses infocmp lookup](https://invisible-island.net/ncurses/man/infocmp.1m.html).

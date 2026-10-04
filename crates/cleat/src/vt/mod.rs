@@ -326,6 +326,13 @@ pub struct MouseModifiers {
 // NOTE: VtEngine is intentionally not Send. Engines may wrap foreign terminal-state
 // handles that are only accessed from the single session daemon event loop.
 pub trait VtEngine {
+    fn clipboard_supported(&self) -> bool {
+        false
+    }
+    /// Consume live writes and loss counts independently of rendering.
+    fn drain_clipboard(&mut self) -> (Vec<crate::clipboard::ClipboardEvent>, u64) {
+        (Vec::new(), 0)
+    }
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String>;
     /// Report whether output fed since the engine's render state was last
     /// consumed caused screen damage. `None` means activity is unobservable.

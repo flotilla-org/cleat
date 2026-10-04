@@ -785,6 +785,14 @@ impl SessionRuntime {
         self.recorder.is_some()
     }
 
+    pub(crate) fn clipboard_supported(&self) -> bool {
+        self.vt_engine.clipboard_supported()
+    }
+
+    pub(crate) fn drain_clipboard(&mut self) -> (Vec<crate::clipboard::ClipboardEvent>, u64) {
+        self.vt_engine.drain_clipboard()
+    }
+
     pub(crate) fn session_id(&self) -> &str {
         &self.session.id
     }

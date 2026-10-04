@@ -138,3 +138,26 @@ fn replay_parse_full_flag_surface() {
         other => panic!("expected Replay, got {other:?}"),
     }
 }
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn recorded_split_clipboard_effects_are_not_forwarded() {
+    use cleat::vt::{ghostty::GhosttyVtEngine, VtEngine};
+    // Replay reconstructs screen state once escape sequences appear. Every
+    // split boundary must retain visible text without exposing recorded writes.
+    let sequence = "\x1b]52;c;aGVsbG8=\x1b\\";
+    for split in 0..=sequence.len() {
+        let temp = tempfile::tempdir().unwrap();
+        let events = [
+            Event { time: Duration::ZERO, code: EventCode::Output, data: "visible".into() },
+            Event { time: Duration::ZERO, code: EventCode::Output, data: sequence[..split].into() },
+            Event { time: Duration::ZERO, code: EventCode::Output, data: sequence[split..].into() },
+        ];
+        let path = write_fixture_cast(temp.path(), &events);
+        let bytes = replay_path_to_bytes(&path, StartBound::Offset(0), EndBound::EndOfRecording);
+        let mut enclosing = GhosttyVtEngine::new(80, 24);
+        enclosing.feed(&bytes).unwrap();
+        assert!(enclosing.drain_clipboard().0.is_empty());
+        assert!(enclosing.screen_text().unwrap().contains("visible"));
+    }
+}

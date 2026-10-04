@@ -2,6 +2,7 @@
 
 This change implements [ADR 0005](adr/0005-retained-image-delivery.md) on cleat base `c5eaa36`, using pinned Ghostty `c3dbb925e6cbcfceafba5749f81a486dd2275099`. Validation ran on arm64 macOS. The public C ABI remains version 8; the daemon packet protocol changes from 7 to 8, requiring matching daemon/client cleat builds.
 
+This is a historical validation record. The current Ghostty pin is `c361de9691f006f65c400be73896d1e48a8ec56c`; see [live clipboard writes](clipboard-effects.md).
 ## Automated checks
 
 - `./tools/prepare-ghostty-vt.sh`: passed.

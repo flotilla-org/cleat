@@ -443,6 +443,14 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                         PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: packet.update.render_generation }),
                     )?;
                 }
+                (id, crate::packet::MSG_SESSION_CLIPBOARD) if id == channel => {
+                    let event = frame.decode::<crate::clipboard::ClipboardEvent>().map_err(|e| e.to_string())?;
+                    if controller_out.load(Ordering::SeqCst) {
+                        let _chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
+                        event.write_osc52(&mut stdout).map_err(|e| e.to_string())?;
+                        stdout.flush().map_err(|e| e.to_string())?;
+                    }
+                }
                 (id, MSG_SESSION_ROLE) if id == channel => {
                     let state = frame.decode::<RoleState>().map_err(|e| e.to_string())?;
                     controller_out.store(state.role == ChannelRole::Controller, Ordering::SeqCst);
@@ -757,7 +765,7 @@ fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result
 }
 
 #[derive(Debug)]
-struct PacketTerminalRenderer {
+pub(crate) struct PacketTerminalRenderer {
     keyboard: Option<Arc<Mutex<crate::attach_keyboard::KeyboardMode>>>,
     mouse_cell_size: (u16, u16),
     images: crate::kitty_output::KittyOutput,
@@ -773,7 +781,7 @@ struct PacketTerminalRenderer {
 }
 
 impl PacketTerminalRenderer {
-    fn new(cols: u16, rows: u16) -> Self {
+    pub(crate) fn new(cols: u16, rows: u16) -> Self {
         Self {
             keyboard: None,
             mouse_cell_size: (1, 1),
@@ -815,7 +823,7 @@ impl PacketTerminalRenderer {
         }
     }
 
-    fn apply_and_render(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
+    pub(crate) fn apply_and_render(&mut self, writer: &mut impl Write, update: &TerminalRenderUpdate) -> Result<(), String> {
         // Packet rendering reconstructs terminal rows from retained grid
         // state. Keep the synthesized cursor moves invisible just as the
         // source application did with synchronized output: terminals that
@@ -2427,6 +2435,11 @@ fn sync_packet_geometry(hosted: &mut HostedSession) -> Result<(), String> {
 }
 
 fn sync_packet_controller_presence(layout: &RuntimeLayout, hosted: &HostedSession, previously_had_controller: bool) -> Result<(), String> {
+    hosted.actor.set_clipboard_target(if hosted.active_client.is_none() {
+        hosted.packet_control.controllers().next().map(PacketChannelRef::view_id)
+    } else {
+        None
+    })?;
     hosted.actor.retain_input_sources(hosted.packet_control.controllers().map(PacketChannelRef::view_id).collect())?;
     let has_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
     // Query authority follows the transport, not the number of drivers.
@@ -2515,6 +2528,7 @@ fn announce_seat_state_except(
             }
             client.enqueue_frame(
                 &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState {
+                    clipboard_writes: hosted.actor.clipboard_supported()?,
                     role,
                     controller: controller.clone(),
                     denial_reason,
@@ -4040,6 +4054,7 @@ struct PacketSessionChannel {
     view_changed: bool,
     view_state: crate::provider::ViewState,
     next_capture: Instant,
+    clipboard_loss: u64,
     local_images: bool,
     image_resident: HashSet<crate::image_delivery::ImageKey>,
     image_transfer: Option<ImageTransfer>,
@@ -4693,6 +4708,7 @@ fn apply_packet_role_request(
     let (participants, exclusive) = packet_presence(hosted, packet_clients);
     packet_clients[index].enqueue_frame(
         &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState {
+            clipboard_writes: hosted.actor.clipboard_supported()?,
             role: granted,
             controller,
             denial_reason,
@@ -4802,6 +4818,7 @@ fn open_packet_channel(
         view_changed: false,
         view_state: Default::default(),
         next_capture: Instant::now(),
+        clipboard_loss: 0,
         local_images: true,
         image_resident: HashSet::new(),
         image_transfer: None,
@@ -4810,6 +4827,7 @@ fn open_packet_channel(
     let client = &mut packet_clients[index];
     client.enqueue_frame(
         &PacketFrame::new(open.channel, MSG_SESSION_ROLE, &RoleState {
+            clipboard_writes: hosted.actor.clipboard_supported()?,
             role: granted,
             controller,
             denial_reason,
@@ -4842,6 +4860,30 @@ fn push_due_packet_renders(
         return Ok(());
     }
 
+    // Transient clipboard effects drain even with clean cells or render credit held.
+    for client in packet_clients.iter_mut() {
+        let channels: Vec<_> = client
+            .channels
+            .iter()
+            .filter(|(_, c)| c.session_id == session_id && c.role == ChannelRole::Controller)
+            .map(|(id, _)| *id)
+            .collect();
+        for channel in channels {
+            let loss = actor.clipboard_loss()?;
+            if client.channels[&channel].clipboard_loss != loss {
+                client.channels.get_mut(&channel).expect("channel exists").clipboard_loss = loss;
+                client.enqueue_frame(
+                    &PacketFrame::new(channel, crate::packet::MSG_SESSION_CLIPBOARD_LOSS, &crate::packet::ClipboardLoss { dropped: loss })
+                        .map_err(|e| e.to_string())?,
+                )?;
+            }
+            let target = PacketChannelRef { client_id: client.id, channel }.view_id();
+            for event in actor.drain_clipboard(target)? {
+                client
+                    .enqueue_frame(&PacketFrame::new(channel, crate::packet::MSG_SESSION_CLIPBOARD, &event).map_err(|e| e.to_string())?)?;
+            }
+        }
+    }
     if actor.observation().dirty() != DirtyState::Clean {
         let result = actor.packet_render(false);
         match result {
@@ -5946,6 +5988,7 @@ mod tests {
             visible: false,
             hidden: false,
             role: RoleState {
+                clipboard_writes: false,
                 role: ChannelRole::Controller,
                 controller: None,
                 denial_reason: None,

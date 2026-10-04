@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 10u
+#define CLEAT_PROVIDER_ABI_VERSION 11u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -709,6 +709,26 @@ bool cleat_session_with_image_resource_data(cleat_session *session,
 bool cleat_session_viewport_snapshot(cleat_session *session, const cleat_viewport_request *request, cleat_snapshot *out);
 void cleat_session_release_snapshot(cleat_session *session, cleat_snapshot *snapshot);
 void cleat_session_release_render_update(cleat_session *session, cleat_render_update *update);
+
+/* Live writes only; clipboard reads remain unsupported. Acquire removes one
+ * event and is independent of render credit. Returned text is owned by the
+ * acquisition, valid until release even after session destruction. Release
+ * exactly once; NULL release is harmless. destination: standard=0, selection=1,
+ * primary=2. kind: text=1, clear=2. Clears have NULL text and zero length. */
+typedef struct {
+    uint8_t session_epoch[16];
+    uint64_t connection_epoch;
+    uint64_t sequence;
+    uint32_t destination;
+    uint32_t kind;
+    const uint8_t *text;
+    size_t text_len;
+    void *owner; /* opaque; do not access */
+} cleat_clipboard_event;
+bool cleat_session_clipboard_supported(const cleat_session *session);
+const cleat_clipboard_event *cleat_session_acquire_clipboard_event(cleat_session *session);
+void cleat_clipboard_event_release(const cleat_clipboard_event *event);
+uint64_t cleat_session_clipboard_dropped(const cleat_session *session);
 
 #ifdef __cplusplus
 }

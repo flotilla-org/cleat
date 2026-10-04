@@ -1,8 +1,8 @@
 # Scoped history capture
 
-Cleat pins Ghostty `c3dbb925e6cbcfceafba5749f81a486dd2275099`, published on
-`rjwittams/ghostty` branch `patches/libvt-scoped-capture`. This adds the capture
-foundation for independent attachment views. The first attachment host,
+Cleat pins Ghostty `c361de9691f006f65c400be73896d1e48a8ec56c`, published on
+`rjwittams/ghostty` branch `patches/libvt-clipboard-write-completion`. It retains the capture
+foundation for independent attachment views and adds clipboard completion metadata. The first attachment host,
 transport, roles and CLI command mode are described in
 [multiplayer attachments](multiplayer-attachments.md).
 

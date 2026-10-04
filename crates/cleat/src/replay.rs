@@ -47,19 +47,69 @@ pub fn sleep_for_gap(gap: Duration, opts: &ReplayOptions) -> Duration {
 ///
 /// `sleeper` is injected so unit tests can assert the requested sleep
 /// durations without actually blocking.
-pub fn play<W, S, I>(events: I, opts: &ReplayOptions, writer: &mut W, mut sleeper: S) -> Result<(), String>
+pub fn play<W, S, I>(events: I, opts: &ReplayOptions, writer: &mut W, sleeper: S) -> Result<(), String>
 where
     W: Write,
     S: FnMut(Duration),
     I: Iterator<Item = Result<Event, String>>,
 {
+    play_at_size(events, opts, writer, sleeper, (80, 24))
+}
+
+fn play_at_size<W: Write, S: FnMut(Duration), I: Iterator<Item = Result<Event, String>>>(
+    events: I,
+    opts: &ReplayOptions,
+    writer: &mut W,
+    mut sleeper: S,
+    size: (u16, u16),
+) -> Result<(), String> {
+    #[cfg(feature = "ghostty-vt")]
+    let mut presentation = {
+        use crate::vt::VtEngine;
+        let mut engine = crate::vt::ghostty::GhosttyVtEngine::new(size.0, size.1);
+        // Replay uses the existing parser, and discards all transient effects.
+        let _ = engine.drain_clipboard();
+        (engine, crate::session::PacketTerminalRenderer::new(size.0, size.1))
+    };
+    #[cfg(not(feature = "ghostty-vt"))]
+    let _ = size;
+    let mut rendered = false;
     let mut prev_time = Duration::ZERO;
     for event in events {
         let event = event?;
         let gap = event.time.saturating_sub(prev_time);
         let sleep = sleep_for_gap(gap, opts);
         sleeper(sleep);
-        match writer.write_all(event.data.as_bytes()) {
+        // Once control sequences occur, output only reconstructed state. This
+        // avoids forwarding any recorded side effect, including split OSC 52,
+        // without a second OSC parser. Plain-text replay retains its byte form.
+        let was_rendered = rendered;
+        rendered |= event.data.as_bytes().contains(&0x1b);
+        #[cfg(feature = "ghostty-vt")]
+        let output = {
+            use crate::vt::VtEngine;
+            presentation.0.feed(event.data.as_bytes())?;
+            let _ = presentation.0.drain_clipboard();
+            let _ = presentation.0.drain_replies();
+            if rendered {
+                let dirty = if was_rendered { crate::provider::DirtyState::Partial } else { crate::provider::DirtyState::Full };
+                let update = presentation.0.render_update(dirty)?;
+                let mut bytes = Vec::new();
+                presentation.1.apply_and_render(&mut bytes, &update)?;
+                bytes
+            } else {
+                event.data.into_bytes()
+            }
+        };
+        #[cfg(not(feature = "ghostty-vt"))]
+        let output = {
+            let _ = was_rendered;
+            if rendered {
+                return Err("replaying terminal control sequences requires a functional Ghostty VT build".into());
+            }
+            event.data.into_bytes()
+        };
+        match writer.write_all(&output) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
             Err(err) => return Err(format!("write output: {err}")),
@@ -94,7 +144,13 @@ where
     S: FnMut(Duration),
 {
     let iter = crate::cast_reader::iter_output_between(cast_path, start_offset, end_offset)?;
-    play(iter, opts, writer, sleeper)
+    use std::io::BufRead;
+    let mut header = String::new();
+    std::io::BufReader::new(std::fs::File::open(cast_path).map_err(|e| e.to_string())?)
+        .read_line(&mut header)
+        .map_err(|e| e.to_string())?;
+    let header = crate::asciicast::decode_header(header.trim())?;
+    play_at_size(iter, opts, writer, sleeper, (header.cols.max(1), header.rows.max(1)))
 }
 
 /// Validate the speed value from clap. Called by the CLI value parser.
@@ -110,6 +166,17 @@ pub fn parse_speed(s: &str) -> Result<f64, String> {
 mod tests {
     use super::*;
     use crate::asciicast::EventCode;
+
+    #[cfg(not(feature = "ghostty-vt"))]
+    #[test]
+    fn rust_only_replay_refuses_control_sequences_without_forwarding_them() {
+        // Without a real parser, terminal-control replay is unsupported rather
+        // than forwarding recorded clipboard writes to the enclosing terminal.
+        let events = [Ok(Event { time: Duration::ZERO, code: EventCode::Output, data: "\x1b]52;c;aGVsbG8=\x07".into() })];
+        let mut bytes = Vec::new();
+        assert!(play(events.into_iter(), &ReplayOptions::default(), &mut bytes, |_| {}).is_err());
+        assert!(bytes.is_empty());
+    }
 
     #[test]
     fn sleep_for_gap_default_is_identity() {

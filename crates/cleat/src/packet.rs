@@ -39,6 +39,7 @@ pub const MSG_SESSION_CLIPBOARD: u8 = 27;
 pub const MSG_SESSION_CLIPBOARD_LOSS: u8 = 28;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ClipboardLoss {
+    /// Cumulative observed drops for the current host actor; a new/restarted actor resets the total.
     pub dropped: u64,
 }
 

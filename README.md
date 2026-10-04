@@ -25,6 +25,42 @@ subscriptions are admitted untracked, with an acknowledgement warning that cycle
 protection does not cover remote relationships. No graph edge is recorded for
 them. See [output admission and rollout](docs/output-cycle-admission.md).
 
+## Forwarded and remote daemon sockets
+
+For an SSH exposure or other Unix socket forward, point the client directly at
+its endpoint:
+
+```bash
+cleat attach --socket /path/to/forwarded.sock SESSION
+cleat packets --socket /path/to/forwarded.sock SESSION --count 3
+```
+
+These are connect-only commands: they never discover a runtime layout, read
+local session metadata, sweep dead daemons, or start a daemon. Attach requires
+an existing session ID; it cannot create one. Creation options (`--cmd`, `--cwd`,
+`--vt`, recording flags) and local targeting options (`--server`,
+`--runtime-root`, `--hosting-epoch`) conflict with `--socket`. Ambient local
+session and daemon coordinates do not select the target. `--strict`, `--take`,
+and attachment identity flags work as usual. Packets opens a read-only channel
+and prints the requested number of render summaries.
+
+Socket mode declares a **remote output context**, even without SSH environment
+variables. Admission validates the declaration and protocol version, but cannot
+verify the ultimate client through the forwarder's local process environment.
+Remote subscriptions have no local cycle protection; the daemon acknowledges
+this with a warning printed to stderr. Access to the socket is the trust
+boundary. Local-peer admission remains unchanged. See
+[output admission](docs/output-cycle-admission.md) for the complete contract.
+Remote image file offers are declined in favor of packet bytes.
+
+Disconnect or channel closure exits with a diagnostic. There is no replay,
+automatic reconnect, or transfer redirect following; recovery requires a fresh
+connect to the desired exposed socket. A deliberate detach still succeeds.
+Unix sockets are supported on Unix platforms; `--socket` reports
+“unsupported on this platform” on Windows and other platforms. Named-pipe
+endpoints are not supported by this mode. Other commands retain local runtime
+targeting.
+
 ## Terminal hyperlinks
 
 Render feeds carry frame-owned OSC 8 destinations, and packet attachment relays

@@ -97,7 +97,7 @@ fn help_lists_expected_subcommands() {
 #[test]
 fn packets_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "packets", "demo", "--count", "3"]).expect("packets parses");
-    assert_eq!(cli.command, Command::Packets { id: "demo".into(), count: 3 });
+    assert_eq!(cli.command, Command::Packets { id: "demo".into(), socket: None, count: 3 });
 }
 
 #[test]
@@ -123,6 +123,7 @@ fn attach_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "attach", "demo"]).expect("attach positional parses");
     assert_eq!(cli.command, Command::Attach {
         id: Some("demo".into()),
+        socket: None,
         no_create: false,
         vt: None,
         cwd: None,
@@ -139,6 +140,7 @@ fn attach_command_parses_no_create() {
     let cli = Cli::try_parse_from(["cleat", "attach", "--no-create", "demo"]).expect("attach --no-create parses");
     assert_eq!(cli.command, Command::Attach {
         id: Some("demo".into()),
+        socket: None,
         no_create: true,
         vt: None,
         cwd: None,
@@ -155,6 +157,7 @@ fn attach_command_parses_vt() {
     let cli = Cli::try_parse_from(["cleat", "attach", "--vt", "passthrough", "demo"]).expect("attach --vt parses");
     assert_eq!(cli.command, Command::Attach {
         id: Some("demo".into()),
+        socket: None,
         no_create: false,
         vt: Some(VtEngineKind::Passthrough),
         cwd: None,
@@ -1136,4 +1139,28 @@ fn drain_parses_nested_command_and_global_server_option() {
     let cli = Cli::try_parse_from(["cleat", "server", "drain", "--server", "fleet", "--json"]).unwrap();
     assert_eq!(cli.server.as_deref(), Some("fleet"));
     assert_eq!(cli.command, Command::Server { command: cli::ServerCommand::Drain { json: true } });
+}
+
+// Socket mode is restricted to existing sessions and cannot mix local targets
+// or creation options with the remote endpoint.
+#[test]
+fn socket_commands_validate_scope() {
+    for verb in ["attach", "packets"] {
+        let cli = Cli::try_parse_from(["cleat", verb, "--socket", "/tmp/remote.sock", "demo"]).unwrap();
+        assert!(matches!(cli.command, Command::Attach { socket: Some(_), .. } | Command::Packets { socket: Some(_), .. }));
+        for option in ["--server", "--runtime-root", "--hosting-epoch"] {
+            let value = if option == "--hosting-epoch" { "1" } else { "local" };
+            assert!(Cli::try_parse_from(["cleat", option, value, verb, "--socket", "/tmp/remote.sock", "demo"]).is_err());
+        }
+    }
+    assert!(Cli::try_parse_from(["cleat", "attach", "--socket", "/tmp/remote.sock"]).is_err());
+    for (option, value) in [("--cmd", "bash"), ("--cwd", "/tmp"), ("--vt", "passthrough")] {
+        assert!(Cli::try_parse_from(["cleat", "attach", "demo", "--socket", "/tmp/remote.sock", option, value]).is_err());
+    }
+    for flag in ["--record", "--no-record"] {
+        assert!(Cli::try_parse_from(["cleat", "attach", "demo", "--socket", "/tmp/remote.sock", flag]).is_err());
+    }
+    for verb in ["list", "kill", "wait", "watch"] {
+        assert!(Cli::try_parse_from(["cleat", verb, "--socket", "/tmp/remote.sock", "demo"]).is_err());
+    }
 }

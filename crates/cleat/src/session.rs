@@ -71,6 +71,7 @@ enum ForegroundTransport {
 
 #[derive(Debug)]
 struct PacketForegroundAttach {
+    connect_only: bool,
     session_name: String,
     stream: Arc<Mutex<SessionStream>>,
     channel: u32,
@@ -355,10 +356,14 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let read_handle = packet.stream.lock().map_err(|_| "packet stream poisoned")?.try_clone().map_err(|e| e.to_string())?;
     let alive = Arc::new(AtomicBool::new(true));
     let controller = Arc::new(AtomicBool::new(packet.initial_role.role == ChannelRole::Controller));
+    let detach_requested = Arc::new(AtomicBool::new(false));
     let mut renderer = PacketTerminalRenderer::new(packet.initial_update.cols, packet.initial_update.rows);
     renderer.keyboard = keyboard.clone();
-    let nested_in =
-        crate::runtime::ambient_session_coordinates()?.map(|source| format!("{}/{}", source.daemon_name(), source.session_id()));
+    let nested_in = if packet.connect_only {
+        None
+    } else {
+        crate::runtime::ambient_session_coordinates()?.map(|source| format!("{}/{}", source.daemon_name(), source.session_id()))
+    };
     let chrome = Arc::new(Mutex::new(AttachChrome {
         session_name: packet.session_name,
         renderer,
@@ -378,6 +383,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let initial_update = packet.initial_update;
     let mut images = packet.images;
     let identity = packet.identity.clone();
+    let connect_only = packet.connect_only;
+    let detach_out = Arc::clone(&detach_requested);
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut read_stream = read_handle;
         // A transferred session announces its new address before closing the
@@ -397,7 +404,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             }
             stdout.flush().map_err(|e| e.to_string())?;
         }
-        write_packet_frame(
+        write_packet_relay_frame(
+            &detach_out,
             &write_stream,
             PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: initial_update.render_generation }),
         )?;
@@ -405,7 +413,12 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             let frame = match PacketFrame::read(&mut read_stream) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    alive_out.store(false, Ordering::SeqCst);
+                    // Detach clears alive before shutting down the stream;
+                    // a still-live relay instead observed transport loss.
+                    let was_alive = alive_out.swap(false, Ordering::SeqCst);
+                    if connect_only && was_alive {
+                        return Err(format!("socket disconnected: {err}; recovery requires a fresh connect"));
+                    }
                     return if is_graceful_socket_shutdown(&err) { Ok(()) } else { Err(err.to_string()) };
                 }
             };
@@ -413,8 +426,9 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             match (frame.channel, frame.msg_type) {
                 (id, crate::packet::MSG_SESSION_IMAGE_FILE) if id == channel => {
                     let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| e.to_string())?;
-                    let acquired = images.file(&file);
-                    write_packet_frame(
+                    let acquired = !connect_only && images.file(&file);
+                    write_packet_relay_frame(
+                        &detach_out,
                         &write_stream,
                         PacketFrame::new(channel, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT, &crate::packet::ImageFileResult {
                             image_id: file.image_id,
@@ -438,7 +452,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     chrome.view = packet.view;
                     chrome.renderer.images.set_assets(images.commit(&packet.update.image_resources)?);
                     chrome.paint(&mut stdout, Some(&packet.update))?;
-                    write_packet_frame(
+                    write_packet_relay_frame(
+                        &detach_out,
                         &write_stream,
                         PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: packet.update.render_generation }),
                     )?;
@@ -471,6 +486,10 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {
                     let error = frame.decode::<ControlError>().map_err(|e| e.to_string())?;
                     if error.channel == channel {
+                        if connect_only {
+                            alive_out.store(false, Ordering::SeqCst);
+                            return Err(format!("socket channel closed: {}; recovery requires a fresh connect", error.message));
+                        }
                         let Some(moved) = redirect.take().filter(|_| !followed) else {
                             alive_out.store(false, Ordering::SeqCst);
                             return Ok(());
@@ -495,7 +514,8 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                         chrome.renderer.images.set_assets(images.commit(&opened.update.image_resources)?);
                         chrome.paint(&mut stdout, Some(&opened.update))?;
                         drop(chrome);
-                        write_packet_frame(
+                        write_packet_relay_frame(
+                            &detach_out,
                             &write_stream,
                             PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: opened.update.render_generation }),
                         )?;
@@ -509,6 +529,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     let resize_stream = Arc::clone(&packet.stream);
     let alive_resize = Arc::clone(&alive);
     let chrome_resize = Arc::clone(&chrome);
+    let detach_resize = Arc::clone(&detach_requested);
     let resize_loop = thread::spawn(move || -> Result<(), String> {
         let mut last = None;
         let mut cell_query = Instant::now();
@@ -520,8 +541,13 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     chrome_resize.lock().map_err(|_| "chrome poisoned")?.paint(&mut stdout, None)?;
                     stdout.flush().map_err(|e| e.to_string())?;
                 }
-                write_packet_frame(&resize_stream, PacketFrame::new(channel, MSG_SESSION_RESIZE, &Resize { cols: next.0, rows: next.1 }))?;
-                write_packet_frame(
+                write_packet_relay_frame(
+                    &detach_resize,
+                    &resize_stream,
+                    PacketFrame::new(channel, MSG_SESSION_RESIZE, &Resize { cols: next.0, rows: next.1 }),
+                )?;
+                write_packet_relay_frame(
+                    &detach_resize,
                     &resize_stream,
                     PacketFrame::new(channel, MSG_SESSION_VIEWPORT, &crate::packet::Viewport {
                         command: crate::provider::ViewportCommand::DeltaRows(0),
@@ -654,7 +680,10 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                     stdout.flush().map_err(|e| e.to_string())?;
                 }
                 Action::Hint(text) => hint = Some(text.to_string()),
-                Action::Command(Command::Detach) => break 'input Ok(()),
+                Action::Command(Command::Detach) => {
+                    detach_requested.store(true, Ordering::SeqCst);
+                    break 'input Ok(());
+                }
                 Action::Command(Command::AutoSize) => {
                     if let Err(err) = write_packet_frame(
                         &packet.stream,
@@ -751,9 +780,54 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
 }
 
 fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
+    write_packet_frame_with_detach(stream, frame, None)
+}
+
+fn write_packet_relay_frame(
+    detach_requested: &AtomicBool,
+    stream: &Arc<Mutex<SessionStream>>,
+    frame: std::io::Result<PacketFrame>,
+) -> Result<(), String> {
+    write_packet_frame_with_detach(stream, frame, Some(detach_requested))
+}
+
+fn write_packet_frame_with_detach(
+    stream: &Arc<Mutex<SessionStream>>,
+    frame: std::io::Result<PacketFrame>,
+    detach_requested: Option<&AtomicBool>,
+) -> Result<(), String> {
     let frame = frame.map_err(|err| format!("encode packet attach frame: {err}"))?;
     let mut stream = stream.lock().map_err(|_| "packet attach stream lock poisoned".to_string())?;
-    frame.write(&mut *stream).map_err(|err| format!("write packet attach frame: {err}"))
+    match frame.write(&mut *stream) {
+        // Deliberate detach may close the socket while background ACK/resize
+        // writes are in flight. Suppress only shutdown errors observed after
+        // that request; earlier errors and non-socket failures still propagate.
+        Err(err) if detach_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) && is_graceful_socket_shutdown(&err) => Ok(()),
+        result => result.map_err(|err| format!("write packet attach frame: {err}")),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod packet_detach_tests {
+    use super::*;
+
+    // A prior transport error is retained; only shutdown writes after an
+    // explicit detach are cleanup. Encoding errors are never suppressed.
+    #[test]
+    fn detach_suppresses_only_subsequent_socket_shutdown_errors() {
+        let (stream, peer) = SessionStream::pair().unwrap();
+        drop(peer);
+        let stream = Arc::new(Mutex::new(stream));
+        let detach = AtomicBool::new(false);
+        let frame = || PacketFrame::new(1, MSG_SESSION_ACK, &Ack { generation: 1 });
+        let prior_error = write_packet_relay_frame(&detach, &stream, frame());
+        assert!(prior_error.is_err());
+        detach.store(true, Ordering::SeqCst);
+        assert!(prior_error.is_err(), "detach cannot reinterpret a prior failure");
+        assert!(write_packet_relay_frame(&detach, &stream, frame()).is_ok());
+        let invalid = Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid packet"));
+        assert!(write_packet_relay_frame(&detach, &stream, invalid).unwrap_err().contains("encode packet attach frame"));
+    }
 }
 
 #[derive(Debug)]
@@ -1326,6 +1400,16 @@ pub fn attach_foreground(
     connect_foreground_upgrade(layout, id, "attach", identity, strict, take)
 }
 
+/// Named options keep local recovery and connect-only policy explicit at
+/// each foreground packet entry point.
+pub(crate) struct PacketAttachOptions {
+    pub identity: AttachmentIdentity,
+    pub role: ChannelRole,
+    pub strict: bool,
+    pub take: bool,
+    pub connect_only: bool,
+}
+
 pub fn attach_packet_foreground(
     layout: &RuntimeLayout,
     id: &str,
@@ -1334,12 +1418,21 @@ pub fn attach_packet_foreground(
     strict: bool,
     take: bool,
 ) -> Result<ForegroundAttach, String> {
-    let (mut stream, directory) = crate::provider_daemon::connect_packet_stream(layout, &[])?;
+    let (stream, directory) = crate::provider_daemon::connect_packet_stream(layout, &[])?;
+    attach_packet_stream((stream, directory), id, PacketAttachOptions { identity, role, strict, take, connect_only: false })
+}
+
+pub(crate) fn attach_packet_stream(
+    connection: (SessionStream, crate::packet::DirectorySnapshot),
+    id: &str,
+    options: PacketAttachOptions,
+) -> Result<ForegroundAttach, String> {
+    let (mut stream, directory) = connection;
     if !directory.sessions.iter().any(|entry| entry.session_id == id) {
         return Err(format!("session {id} was not present in packet directory"));
     }
-    let opened = open_foreground_channel(&mut stream, id, identity.clone(), role, take)?;
-    if strict && opened.role.role != ChannelRole::Controller {
+    let opened = open_foreground_channel(&mut stream, id, &options)?;
+    if options.strict && opened.role.role != ChannelRole::Controller {
         let holder = opened
             .role
             .controller
@@ -1350,13 +1443,14 @@ pub fn attach_packet_foreground(
     }
     Ok(ForegroundAttach {
         transport: ForegroundTransport::Packet(Box::new(PacketForegroundAttach {
+            connect_only: options.connect_only,
             session_name: id.to_owned(),
             stream: Arc::new(Mutex::new(stream)),
             channel: FOREGROUND_CHANNEL,
             initial_update: opened.update,
             initial_role: opened.role,
             images: opened.images,
-            identity,
+            identity: options.identity,
         })),
     })
 }
@@ -1364,20 +1458,14 @@ pub fn attach_packet_foreground(
 const FOREGROUND_CHANNEL: u32 = 1;
 
 /// Open the foreground channel and wait for its role grant and first render.
-fn open_foreground_channel(
-    stream: &mut SessionStream,
-    id: &str,
-    identity: AttachmentIdentity,
-    role: ChannelRole,
-    take: bool,
-) -> Result<ForegroundChannel, String> {
+fn open_foreground_channel(stream: &mut SessionStream, id: &str, options: &PacketAttachOptions) -> Result<ForegroundChannel, String> {
     let (cols, rows) = current_terminal_size();
     PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
         channel: FOREGROUND_CHANNEL,
         session_id: id.to_string(),
-        role,
-        take,
-        identity,
+        role: options.role,
+        take: options.take,
+        identity: options.identity.clone(),
     })
     .map_err(|err| format!("encode foreground packet channel: {err}"))?
     .write(stream)
@@ -1398,7 +1486,7 @@ fn open_foreground_channel(
             }
             (FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE_FILE) => {
                 let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| e.to_string())?;
-                let acquired = images.file(&file);
+                let acquired = !options.connect_only && images.file(&file);
                 PacketFrame::new(FOREGROUND_CHANNEL, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT, &crate::packet::ImageFileResult {
                     image_id: file.image_id,
                     generation: file.generation,
@@ -1439,7 +1527,13 @@ fn follow_foreground_redirect(
     let layout = RuntimeLayout::new(PathBuf::from(&redirect.runtime_root)).with_daemon(redirect.daemon.clone())?;
     let (mut stream, _) = crate::provider_daemon::connect_packet_stream(&layout, &[])
         .map_err(|err| format!("session {} moved to {}, but reconnecting failed: {err}", redirect.session_id, redirect.address))?;
-    let opened = open_foreground_channel(&mut stream, &redirect.session_id, identity, role, false)?;
+    let opened = open_foreground_channel(&mut stream, &redirect.session_id, &PacketAttachOptions {
+        identity,
+        role,
+        strict: false,
+        take: false,
+        connect_only: false,
+    })?;
     Ok((stream, opened))
 }
 

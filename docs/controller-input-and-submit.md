@@ -41,7 +41,11 @@ is explicitly refused, does not advance generation, and gets a raw `Frame::Error
 or packet `ControlError`. Previously admitted events still replay. Mouse/wheel
 PTY input is explicitly refused while submission owns the actor. A PTY write or
 session-exit failure is reported as an error; successful submission requires
-Enter and all admitted replay writes to succeed.
+Enter and all admitted replay writes to succeed. An error can occur after paste
+and Enter were delivered (for example, during controller replay), so it does not
+prove that submission was absent: callers must reconcile delivery before retrying
+to avoid double submission. Even if Enter fails, the actor attempts every admitted
+replay event to preserve controller input; the resulting draft state is uncertain.
 
 Without the new guard, existing sends retain their byte behavior. `--submit`
 uses one daemon transaction instead of CLI paste/sleep/Enter requests. Ordinary

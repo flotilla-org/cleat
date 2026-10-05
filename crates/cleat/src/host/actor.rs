@@ -1524,6 +1524,7 @@ fn session_actor_handle_command(
             let result = if state.submission.is_some() {
                 let result = state.controller_queue.push(QueuedControllerInput::Event { source, event });
                 if result.is_ok() && active {
+                    // Quiet time measures controller admission, not the later replay write.
                     state.controller.accepted(Instant::now());
                 }
                 result
@@ -1917,7 +1918,8 @@ fn finish_submission(runtime: &mut SessionRuntime, state: &mut SessionActorLoopS
     }
     let submission = state.submission.take().expect("submission exists");
     let result = if state.exited { Err("session exited before submission Enter".into()) } else { runtime.write_input(b"\r") };
-    // Replay accepted controller events in order after Enter, including key releases.
+    // Replay accepted controller events in order after the Enter attempt, including key releases.
+    // Even if Enter fails, try every admitted event to preserve input; the resulting draft is uncertain.
     let mut replay_result = Ok(());
     while let Some(input) = state.controller_queue.pop() {
         let written = match input {
@@ -1939,6 +1941,7 @@ fn finish_submission(runtime: &mut SessionRuntime, state: &mut SessionActorLoopS
             replay_result = written.map(|_| ());
         }
     }
+    // An error may follow a successful Enter: callers must not infer that retrying is safe.
     let _ = submission.reply.send(result.and(replay_result).map(|_| submission.marker_offset));
     wake();
 }

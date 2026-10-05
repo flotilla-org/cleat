@@ -201,6 +201,8 @@ pub(super) fn controller_event_size(event: &crate::provider::TerminalInputEvent)
                     _ => 0,
                 }
         }
+        // Only keyboard/text/paste/raw events enter the replay queue. Mouse/wheel PTY
+        // input is refused while busy; other events use separate maintenance variants.
         _ => 0,
     }
 }

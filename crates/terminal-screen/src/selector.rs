@@ -73,7 +73,7 @@ impl Selector {
         let mut evaluation = Evaluation::new(tree);
         evaluation.query(self, None);
         // query always caches a result, including an empty match set.
-        evaluation.cache.remove(&(self as *const Self, None)).unwrap().ordered
+        evaluation.cache.remove(&(self as *const Self, None)).expect("query caches its result, even for an empty match set").ordered
     }
 }
 
@@ -106,7 +106,7 @@ impl<'a> Evaluation<'a> {
             ends[id.0] = position + 1;
         }
         for id in order.iter().rev() {
-            if let Some(parent) = tree.node(*id).unwrap().parent() {
+            if let Some(parent) = tree.node(*id).expect("preorder contains only attached nodes").parent() {
                 ends[parent.0] = ends[parent.0].max(ends[id.0]);
             }
         }
@@ -163,7 +163,7 @@ impl<'a> Evaluation<'a> {
             Relation::Child => {
                 let mut related = vec![false; end - start];
                 for parent in parents {
-                    for child in self.tree.node(*parent).unwrap().children() {
+                    for child in self.tree.node(*parent).expect("matched parents are attached nodes").children() {
                         let position = self.positions[child.0];
                         if (start..end).contains(&position) {
                             related[position - start] = true;
@@ -197,7 +197,7 @@ impl<'a> Evaluation<'a> {
     }
 
     fn matches(&mut self, segment: &Segment, id: NodeId) -> bool {
-        let node = self.tree.node(id).unwrap();
+        let node = self.tree.node(id).expect("candidate IDs come from tree preorder");
         if segment.element.as_ref().is_some_and(|element| node.element != *element && !node.roles.contains(element)) {
             return false;
         }

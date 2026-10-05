@@ -233,7 +233,7 @@ pub fn analyze(grid: &ScreenGrid) -> ScreenTree {
             SemanticPrompt::Continuation => "continuation",
         });
         let row_id = tree.push(parent, node);
-        let cells = grid.row(row).unwrap();
+        let cells = grid.row(row).expect("row iteration stays inside validated grid dimensions");
         let mut start = 0;
         for end in 1..=cells.len() {
             if end == cells.len() || cells[end].style != cells[start].style || cells[end].semantic != cells[start].semantic {

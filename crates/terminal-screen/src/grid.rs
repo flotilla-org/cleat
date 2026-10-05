@@ -200,7 +200,7 @@ impl ScreenGrid {
                 text.push('\n');
             }
             for x in u32::from(rect.col)..(u32::from(rect.col) + u32::from(rect.width)).min(u32::from(self.cols)) {
-                text.push_str(self.cell(x as u16, y as u16).unwrap().text());
+                text.push_str(self.cell(x as u16, y as u16).expect("text bounds are clipped to validated grid dimensions").text());
             }
         }
         text

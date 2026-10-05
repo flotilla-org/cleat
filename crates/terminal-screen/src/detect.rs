@@ -21,7 +21,7 @@ pub struct Band {
 pub fn detect_bands(grid: &ScreenGrid) -> Vec<Band> {
     let mut bands = Vec::new();
     for row in 0..grid.rows() {
-        let cells = grid.row(row).unwrap();
+        let cells = grid.row(row).expect("row iteration stays inside validated grid dimensions");
         if cells.is_empty() {
             continue;
         }
@@ -34,7 +34,7 @@ pub fn detect_bands(grid: &ScreenGrid) -> Vec<Band> {
         let contrast = [row.checked_sub(1), row.checked_add(1).filter(|r| *r < grid.rows())]
             .into_iter()
             .flatten()
-            .any(|r| grid.row(r).unwrap().iter().any(|c| c.style != cells[0].style));
+            .any(|r| grid.row(r).expect("neighbour indices are checked against grid dimensions").iter().any(|c| c.style != cells[0].style));
         let kind = if text.trim().is_empty() {
             Some((BandKind::Blank, 0.5))
         } else if separator && grid.cols() >= 2 {

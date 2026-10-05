@@ -1,0 +1,80 @@
+[
+  {
+    "session": "osc133-claude-ready-normal",
+    "sha256": "49f2d5572768c3cea30fe9daa1884e7190ceb6af2d8d3a186a918d211fb8a8b8",
+    "output_chars": 7163,
+    "marks": []
+  },
+  {
+    "session": "osc133-claude-ready-ax",
+    "sha256": "5e8d720eb76bde64ba0454449ce120cb2852f2fed4bbf4dddb09bc37d012a784",
+    "output_chars": 1890,
+    "marks": [
+      {
+        "payload": "A;redraw=0",
+        "output_offset": 1387,
+        "context": "'<u\\x1b[>5u\\x1b[>4;2m\\x1b[2G\\xa0 Reply exactly OK. Do not use tools.\\x1b[39G\\x1b]133;A;redraw=0\\x07\\x1b]0;\u25d0 Claude Code\\x07\\x1b[2K\\x1b[1A\\x1b[2K\\x1b[Gyou: Reply exactly OK. Do not use tools.\\r\\nGarnishing\u2026\\r\\nauto mode on'"
+      },
+      {
+        "payload": "C",
+        "output_offset": 1706,
+        "context": "'uto mode on (shift+tab to cycle)  \u00b7  esc to interrupt\\r\\n$\\x1b[2G\\x1b]133;C\\x07\\x1b]133;D\\x07\\x07\\x1b]0;\u2733 Reply exactly OK\\x07\\x1b[2K\\x1b[1A\\x1b[2K\\x1b[1A\\x1b[2K\\x1b[GBrewed for 1s \u00b7 done 12:04 AM\\r\\nauto mode on ('"
+      },
+      {
+        "payload": "D",
+        "output_offset": 1714,
+        "context": "' on (shift+tab to cycle)  \u00b7  esc to interrupt\\r\\n$\\x1b[2G\\x1b]133;C\\x07\\x1b]133;D\\x07\\x07\\x1b]0;\u2733 Reply exactly OK\\x07\\x1b[2K\\x1b[1A\\x1b[2K\\x1b[1A\\x1b[2K\\x1b[GBrewed for 1s \u00b7 done 12:04 AM\\r\\nauto mode on (shift+ta'"
+      }
+    ]
+  },
+  {
+    "session": "osc133-claude-wezterm",
+    "sha256": "80ff4a0413bba87d6f80ad017b92d245827eb12e5e66082b44e03ae2241ce425",
+    "output_chars": 981,
+    "marks": []
+  },
+  {
+    "session": "osc133-codex-normal",
+    "sha256": "3453676aaaf3e078d0a8c9c0f71681eed767fb163b6950e16ed9f3242c311d65",
+    "output_chars": 12077,
+    "marks": []
+  },
+  {
+    "session": "osc133-codex-inline",
+    "sha256": "c46e23b8a82e32b8795dddc049e5e40da8c1027520fa786d7d21338b3edecc58",
+    "output_chars": 12242,
+    "marks": []
+  },
+  {
+    "session": "osc133-shell",
+    "sha256": "760ac9520c7539fc401034db342595ab233ff81b870edd8c4a3671b239de1bf3",
+    "output_chars": 212,
+    "marks": [
+      {
+        "payload": "C",
+        "output_offset": 149,
+        "context": "'BUG; PROMPT_COMMAND=\\'printf \"\\\\033]133;D;\\r;0\\\\007\"\\'\\r\\n\\x1b[?2004l\\r\\x1b]133;C\\x07\\x1b]133;C\\x07\\x1b]133;D;0\\x07\\x1b[?2004h\\x1b]133;A\\x07$ \\x1b]133;B\\x07draft probe'"
+      },
+      {
+        "payload": "C",
+        "output_offset": 157,
+        "context": "'MPT_COMMAND=\\'printf \"\\\\033]133;D;\\r;0\\\\007\"\\'\\r\\n\\x1b[?2004l\\r\\x1b]133;C\\x07\\x1b]133;C\\x07\\x1b]133;D;0\\x07\\x1b[?2004h\\x1b]133;A\\x07$ \\x1b]133;B\\x07draft probe'"
+      },
+      {
+        "payload": "D;0",
+        "output_offset": 165,
+        "context": "'AND=\\'printf \"\\\\033]133;D;\\r;0\\\\007\"\\'\\r\\n\\x1b[?2004l\\r\\x1b]133;C\\x07\\x1b]133;C\\x07\\x1b]133;D;0\\x07\\x1b[?2004h\\x1b]133;A\\x07$ \\x1b]133;B\\x07draft probe'"
+      },
+      {
+        "payload": "A",
+        "output_offset": 183,
+        "context": "'133;D;\\r;0\\\\007\"\\'\\r\\n\\x1b[?2004l\\r\\x1b]133;C\\x07\\x1b]133;C\\x07\\x1b]133;D;0\\x07\\x1b[?2004h\\x1b]133;A\\x07$ \\x1b]133;B\\x07draft probe'"
+      },
+      {
+        "payload": "B",
+        "output_offset": 193,
+        "context": "'007\"\\'\\r\\n\\x1b[?2004l\\r\\x1b]133;C\\x07\\x1b]133;C\\x07\\x1b]133;D;0\\x07\\x1b[?2004h\\x1b]133;A\\x07$ \\x1b]133;B\\x07draft probe'"
+      }
+    ]
+  }
+]

@@ -1,0 +1,6 @@
+initial at_prompt=0 cells=000000
+empty-B at_prompt=1 cells=220000
+draft at_prompt=1 cells=221111
+C-same-row at_prompt=1 cells=221111
+D-same-row at_prompt=1 cells=221111
+alternate at_prompt=0 cells=000000

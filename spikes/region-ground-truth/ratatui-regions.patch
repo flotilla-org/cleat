@@ -1,0 +1,257 @@
+diff --git a/ratatui-core/src/lib.rs b/ratatui-core/src/lib.rs
+index 36ea9f5..da2f777 100644
+--- a/ratatui-core/src/lib.rs
++++ b/ratatui-core/src/lib.rs
+@@ -75,6 +75,8 @@ extern crate std;
+ pub mod backend;
+ pub mod buffer;
+ pub mod layout;
++#[cfg(feature = "std")]
++pub mod regions;
+ pub mod style;
+ pub mod symbols;
+ pub mod terminal;
+diff --git a/ratatui-core/src/regions.rs b/ratatui-core/src/regions.rs
+new file mode 100644
+index 0000000..1397834
+--- /dev/null
++++ b/ratatui-core/src/regions.rs
+@@ -0,0 +1,163 @@
++//! SPIKE (cleat#319): record widget rectangles per frame and emit them as a
++//! draft `OSC 7701` region snapshot. Enabled by `RATATUI_REGIONS=1`.
++//!
++//! Every `Frame::render_widget`/`render_stateful_widget` call opens a region
++//! whose parent is the region being rendered at the time (a thread-local
++//! stack), so widgets that render other widgets through the instrumented
++//! paths nest correctly. Ids are structural paths (`Block.0/List.1`), stable
++//! across redraws while the tree shape is stable. Apps may label the next
++//! region with [`label`].
++use std::cell::RefCell;
++use std::format;
++use std::string::{String, ToString};
++use std::vec::Vec;
++use std::fmt::Write as _;
++use std::sync::OnceLock;
++
++use crate::layout::Rect;
++
++#[derive(Debug, Clone)]
++pub struct Region {
++    pub id: String,
++    pub parent: Option<String>,
++    pub kind: String,
++    pub name: Option<String>,
++    pub area: Rect,
++}
++
++#[derive(Default)]
++struct State {
++    regions: Vec<Region>,
++    /// (region id, per-kind child counters)
++    stack: Vec<(String, Vec<(String, usize)>)>,
++    roots: Vec<(String, usize)>,
++    pending_label: Option<String>,
++    frame: u64,
++}
++
++std::thread_local! {
++    static STATE: RefCell<State> = RefCell::new(State::default());
++}
++
++pub fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("RATATUI_REGIONS").is_some_and(|v| v != "0"))
++}
++
++/// Label the next region opened on this thread (e.g. `label("composer")`).
++pub fn label(name: impl Into<String>) {
++    if enabled() {
++        STATE.with(|s| s.borrow_mut().pending_label = Some(name.into()));
++    }
++}
++
++fn short_kind(type_name: &str) -> String {
++    // "&ratatui_widgets::block::Block<'_>" -> "Block"
++    let base = type_name.split('<').next().unwrap_or(type_name);
++    let base = base.rsplit("::").next().unwrap_or(base);
++    base.trim_start_matches('&').to_string()
++}
++
++fn next_ordinal(counters: &mut Vec<(String, usize)>, kind: &str) -> usize {
++    if let Some(entry) = counters.iter_mut().find(|(k, _)| k == kind) {
++        entry.1 += 1;
++        entry.1
++    } else {
++        counters.push((kind.to_string(), 0));
++        0
++    }
++}
++
++/// Open a region; it closes when the returned guard drops.
++pub fn enter(type_name: &str, area: Rect) -> Option<RegionGuard> {
++    if !enabled() {
++        return None;
++    }
++    let kind = short_kind(type_name);
++    STATE.with(|s| {
++        let mut s = s.borrow_mut();
++        let name = s.pending_label.take();
++        // Widgets that draw their own optional Block (List::block, etc.) call
++        // Block::render on the same rect; Frame already recorded a Block there.
++        let parent = s.stack.last().map(|(id, _)| id.clone());
++        if kind == "Block" {
++            if let Some(p) = s.regions.iter().rev().find(|r| Some(&r.id) == parent.as_ref()) {
++                if p.kind == "Block" && p.area == area {
++                    return None;
++                }
++            }
++        }
++        let ordinal = match s.stack.last_mut() {
++            Some((_, counters)) => next_ordinal(counters, &kind),
++            None => next_ordinal(&mut s.roots, &kind),
++        };
++        let segment = match &name {
++            Some(n) => n.clone(),
++            None => format!("{kind}.{ordinal}"),
++        };
++        let id = match &parent {
++            Some(p) => format!("{p}/{segment}"),
++            None => segment,
++        };
++        s.regions.push(Region { id: id.clone(), parent, kind, name, area });
++        s.stack.push((id, Vec::new()));
++        Some(RegionGuard(()))
++    })
++}
++
++pub struct RegionGuard(());
++
++impl Drop for RegionGuard {
++    fn drop(&mut self) {
++        STATE.with(|s| {
++            s.borrow_mut().stack.pop();
++        });
++    }
++}
++
++fn escape(value: &str, out: &mut String) {
++    // Draft escaping, as OSC 3008: printable ASCII only; ';', '\\', '=' hex-escaped.
++    for b in value.bytes() {
++        match b {
++            b';' | b'\\' | b'=' | 0..=31 | 127.. => {
++                let _ = write!(out, "\\x{b:02x}");
++            }
++            _ => out.push(b as char),
++        }
++    }
++}
++
++/// Take the recorded frame as a draft OSC 7701 snapshot (empty if disabled).
++pub fn take_osc() -> String {
++    if !enabled() {
++        return String::new();
++    }
++    STATE.with(|s| {
++        let mut s = s.borrow_mut();
++        let regions = std::mem::take(&mut s.regions);
++        s.stack.clear();
++        s.roots.clear();
++        s.pending_label = None;
++        s.frame += 1;
++        let mut out = String::new();
++        let _ = write!(out, "\x1b]7701;B;f={};o=a\x1b\\", s.frame);
++        for r in regions {
++            out.push_str("\x1b]7701;R;id=");
++            escape(&r.id, &mut out);
++            if let Some(p) = &r.parent {
++                out.push_str(";parent=");
++                escape(p, &mut out);
++            }
++            out.push_str(";kind=");
++            escape(&r.kind, &mut out);
++            if let Some(n) = &r.name {
++                out.push_str(";name=");
++                escape(n, &mut out);
++            }
++            let a = r.area;
++            let _ = write!(out, ";x={};y={};w={};h={}\x1b\\", a.x, a.y, a.width, a.height);
++        }
++        out.push_str("\x1b]7701;E\x1b\\");
++        out
++    })
++}
+diff --git a/ratatui-core/src/terminal/frame.rs b/ratatui-core/src/terminal/frame.rs
+index 25a92b9..d65383a 100644
+--- a/ratatui-core/src/terminal/frame.rs
++++ b/ratatui-core/src/terminal/frame.rs
+@@ -91,6 +91,8 @@ impl Frame<'_> {
+     ///
+     /// [`Layout`]: crate::layout::Layout
+     pub fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
++        #[cfg(feature = "std")]
++        let _region = crate::regions::enter(core::any::type_name::<W>(), area);
+         widget.render(area, self.buffer);
+     }
+ 
+@@ -125,6 +127,8 @@ impl Frame<'_> {
+     where
+         W: StatefulWidget,
+     {
++        #[cfg(feature = "std")]
++        let _region = crate::regions::enter(core::any::type_name::<W>(), area);
+         widget.render(area, self.buffer, state);
+     }
+ 
+diff --git a/ratatui-core/src/terminal/terminal.rs b/ratatui-core/src/terminal/terminal.rs
+index f17d96d..1c6a220 100644
+--- a/ratatui-core/src/terminal/terminal.rs
++++ b/ratatui-core/src/terminal/terminal.rs
+@@ -463,6 +463,19 @@ where
+         // Buffer. Thus, we're taking the important data out of the Frame and dropping it.
+         let cursor_position = frame.cursor_position;
+ 
++        // SPIKE (cleat#319): bracket the frame in a synchronized update and
++        // append the region snapshot before ESU. Assumes the backend writes
++        // to process stdout (true for CrosstermBackend<Stdout>).
++        #[cfg(feature = "std")]
++        let regions = crate::regions::enabled();
++        #[cfg(not(feature = "std"))]
++        let regions = false;
++        #[cfg(feature = "std")]
++        if regions {
++            use std::io::Write as _;
++            let _ = std::io::stdout().write_all(b"\x1b[?2026h");
++        }
++
+         // Draw to stdout
+         self.flush()?;
+ 
+@@ -476,6 +489,15 @@ where
+ 
+         self.swap_buffers();
+ 
++        #[cfg(feature = "std")]
++        if regions {
++            use std::io::Write as _;
++            self.backend.flush()?;
++            let mut out = std::io::stdout();
++            let _ = out.write_all(crate::regions::take_osc().as_bytes());
++            let _ = out.write_all(b"\x1b[?2026l");
++        }
++
+         // Flush
+         self.backend.flush()?;
+ 
+diff --git a/ratatui-widgets/src/block.rs b/ratatui-widgets/src/block.rs
+index 1117fb1..5258b99 100644
+--- a/ratatui-widgets/src/block.rs
++++ b/ratatui-widgets/src/block.rs
+@@ -776,6 +776,8 @@ impl Widget for Block<'_> {
+ 
+ impl Widget for &Block<'_> {
+     fn render(self, area: Rect, buf: &mut Buffer) {
++        // SPIKE (cleat#319): Blocks drawn inside other widgets are regions too.
++        let _region = ratatui_core::regions::enter("Block", area);
+         let area = area.intersection(buf.area);
+         if area.is_empty() {
+             return;

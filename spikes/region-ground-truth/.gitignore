@@ -1,0 +1,4 @@
+ratatui-demo/vendor
+ratatui-demo/target
+ratatui-demo/Cargo.lock
+ink-demo/node_modules

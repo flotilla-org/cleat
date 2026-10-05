@@ -85,13 +85,15 @@ parent/child links are private. Node IDs are valid only within that tree.
 ```sh
 cargo test -p terminal-screen --locked
 # With cleat's pinned Ghostty install prepared:
-cargo test -p terminal-screen --locked --features ghostty-vt
+cargo test -p cleat --locked --features ghostty-vt --test terminal_screen_cast
 ```
 
-The default crate has no cleat or Ghostty dependency. The `regex` dependency
+The crate has no cleat or Ghostty dependency. The `regex` dependency
 provides bounded, non-backtracking regex matching for `:matches`; default regex
-features are disabled. The optional feature enables cleat only for real-VT cast
-replay in the integration test.
+features are disabled. The real-VT cast replay lives in cleat's integration tests,
+gated by its
+`ghostty-vt` feature. Cleat depends on terminal-screen only for tests until #24
+wires it into the runtime.
 
 The committed Codex 0.160 fixture has a **non-faint `›` marker** at the start of
 its cursor row. The literal `row:has(cursor) span:not([faint])` query therefore
@@ -100,7 +102,7 @@ The faint placeholder is excluded correctly. Obtaining just the editable value
 requires #313's recognizer/content-extraction rule; structural analysis preserves
 all matching cells rather than silently removing application-specific prefixes.
 
-For this recorded fixture, adding `:not([bold])` excludes the bold marker and
-produces the issue's requested empty/draft values. The fixture test verifies this
-possible revised query as well; changing the literal acceptance query requires
-scope guidance. This is observed style evidence, not a general composer rule.
+The governor-authorized acceptance query is
+`row:has(cursor) span:not([faint]):not([bold])`, yielding empty then `draft probe`.
+The test separately asserts the marker-inclusive results above. This is observed
+style evidence for this fixture, not a general composer rule.

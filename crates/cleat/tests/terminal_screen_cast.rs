@@ -6,7 +6,7 @@ use cleat::{
 };
 use terminal_screen::*;
 
-// Test-local producer adapter: only the fixture test depends on cleat/VT.
+// Test-local producer adapter: terminal-screen itself has no cleat/VT dependency.
 // The full render update supplies row metadata and resolved cell styles.
 fn snapshot(vt: &mut GhosttyVtEngine, generation: u64) -> ScreenGrid {
     let update = vt.render_update(DirtyState::Full).unwrap();
@@ -86,10 +86,10 @@ fn selected_text(grid: &ScreenGrid, selector: &str) -> String {
     analyze(grid).select(selector).unwrap().iter().map(|node| node.text.as_str()).collect::<String>().trim().to_string()
 }
 
-// #23 fixture evidence: replay the actual Codex 0.160 recording through the
-// real VT engine. The placeholder is faint; the prompt marker is not faint.
-// Structural selectors preserve that marker at both checkpoints. Stripping it
-// belongs to #313 recognizers, and differs from #23's literal acceptance example.
+// #23 acceptance, amended by governor guidance: replay Codex 0.160 through
+// the real VT. Exclude faint placeholder and bold marker for empty/draft values.
+// Separately preserve marker-inclusive structural evidence; do not strip any
+// application prefix in the structural tree (recognizer extraction is #313).
 #[test]
 fn recorded_codex_placeholder_and_draft() {
     let cast = include_str!("../../../docs/design/semantic-prompt-evidence/osc133-codex-normal.cast");
@@ -107,7 +107,7 @@ fn recorded_codex_placeholder_and_draft() {
             assert_eq!(tree.select("row:has(cursor)").unwrap().len(), 1);
             assert!(!tree.select("row:has(cursor) span[faint]").unwrap().is_empty(), "placeholder style is present");
             assert_eq!(selected_text(&grid, "row:has(cursor) span:not([faint])"), "›");
-            // A possible revised acceptance query excludes the bold marker.
+            // The authorized acceptance query excludes the bold marker by style.
             assert_eq!(selected_text(&grid, "row:has(cursor) span:not([faint]):not([bold])"), "");
             empty_checked = true;
         }

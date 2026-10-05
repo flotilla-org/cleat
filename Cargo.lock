@@ -191,6 +191,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tempfile",
+ "terminal-screen",
  "uuid",
  "windows-sys",
 ]
@@ -842,9 +843,7 @@ dependencies = [
 name = "terminal-screen"
 version = "0.1.0"
 dependencies = [
- "cleat",
  "regex",
- "serde_json",
 ]
 
 [[package]]

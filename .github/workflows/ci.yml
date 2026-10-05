@@ -82,7 +82,6 @@ jobs:
             ${{ runner.os }}-cargo-test-
       - run: ./tools/prepare-ghostty-vt.sh
       - run: cargo test --workspace --locked
-      - run: cargo test -p terminal-screen --locked --features ghostty-vt
 
   no-vt:
     name: No-VT variant
@@ -217,5 +216,3 @@ jobs:
           }
       - name: Test workspace with Ghostty VT
         run: cargo test --workspace --locked --features cleat/ghostty-vt
-      - name: Test structural selectors against recorded Codex cast
-        run: cargo test -p terminal-screen --locked --features ghostty-vt

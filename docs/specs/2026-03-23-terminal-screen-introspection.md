@@ -225,8 +225,10 @@ assumed empty. A recognizer chooses application-specific evidence and content
 extraction; the structural layer never assumes a `›` prefix is editable text or
 removes it. In the #312 Codex cast, that prefix is non-faint, so the literal
 `row:has(cursor) span:not([faint])` retains it while excluding the faint
-placeholder. Mapping these observations to an empty/drafted composer belongs
-in recognizers.
+placeholder. For the #23 fixture, the governor-authorized query additionally
+uses `:not([bold])` and yields empty then `draft probe`; the marker-inclusive
+result remains a separate structural assertion. General editable-value extraction
+belongs in recognizers.
 
 OSC 133 tags are one evidence source among several, as established by
 [semantic prompt research](../design/semantic-prompt-awareness.md). #24 wires

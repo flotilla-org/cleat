@@ -429,3 +429,15 @@ fn selector_timing_span_heavy() {
         eprintln!("{source}: {:.3} ms/query", start.elapsed().as_secs_f64() * 100.0);
     }
 }
+
+// The README promises inline regex flags such as (?i). Unicode-aware case
+// matching must work for both ASCII and non-ASCII text; other flags remain usable.
+#[test]
+fn regex_inline_flags_include_unicode_case_matching() {
+    let t = analyze(&grid(&["ÉCOLE", "Alpha"]));
+    for selector in ["row:matches(/(?i)école/)", "row:matches(/(?i)alpha/)", "row:matches(/(?i-u)alpha/)"] {
+        assert_eq!(t.select(selector).unwrap().len(), 1, "{selector}");
+    }
+    assert_eq!(t.select("screen:matches(/(?m)^Alpha$/)").unwrap().len(), 1);
+    assert!(t.select("row:matches(/école/)").unwrap().is_empty());
+}

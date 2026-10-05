@@ -72,6 +72,7 @@ impl Selector {
     pub fn evaluate(&self, tree: &ScreenTree) -> Vec<NodeId> {
         let mut evaluation = Evaluation::new(tree);
         evaluation.query(self, None);
+        // query always caches a result, including an empty match set.
         evaluation.cache.remove(&(self as *const Self, None)).unwrap().ordered
     }
 }
@@ -81,6 +82,10 @@ struct Matches {
     members: BTreeSet<NodeId>,
 }
 
+// Pointer identity is never dereferenced: the immutable selector tree is
+// borrowed for the whole evaluation, so its addresses cannot move during use.
+type QueryKey = (*const Selector, Option<NodeId>);
+
 /// One query owns one preorder index and memo table. Selector addresses are
 /// stable identities only during this evaluation; nothing survives a frame.
 struct Evaluation<'a> {
@@ -88,7 +93,7 @@ struct Evaluation<'a> {
     order: Vec<NodeId>,
     positions: Vec<usize>,
     ends: Vec<usize>,
-    cache: HashMap<(*const Selector, Option<NodeId>), Matches>,
+    cache: HashMap<QueryKey, Matches>,
 }
 
 impl<'a> Evaluation<'a> {

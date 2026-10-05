@@ -74,7 +74,9 @@ The parser is handwritten; element names and attribute names have no registry.
   restricts the first segment to direct children. The candidate is not in scope.
 - `:has-text('substring')` is case-sensitive over the node's observed text.
 - `:matches(/regex/)` compiles a Rust regex at parse time. Escape a slash as
-  `\/`; inline flags such as `(?i)` work. Invalid regexes are parse errors.
+  `\/`; inline flags such as `(?i)` work, including Unicode-aware case matching.
+  Unicode word/digit/whitespace classes are enabled; Unicode general-category
+  and script tables (`\p{…}`) are not enabled. Invalid regexes are parse errors.
 - Comma-separated selector groups return a deduplicated union in document order.
 
 `Selector::parse` yields a reusable selector; `evaluate` returns `NodeId`s.
@@ -105,6 +107,10 @@ build measurements in the same vessel gave:
 These are diagnostic timings, not CI thresholds or a per-frame latency promise.
 Broad nested `:has` queries can still scan overlapping subtrees; evaluation cost
 also depends on tree size and selector structure, not just parser input limits.
+The memo stores both ordered matches and a membership set for every visited
+selector/scope pair; peak memory grows with the number of scopes plus the total
+cached matches. Broad nested queries can therefore use substantial memory on
+large trees. The memo is dropped when evaluation returns.
 Reproduce with `cargo test -p terminal-screen --test structure
 selector_timing_span_heavy -- --ignored --nocapture`.
 

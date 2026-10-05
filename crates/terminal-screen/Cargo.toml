@@ -1,0 +1,18 @@
+[package]
+name = "terminal-screen"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Pure structural analysis and CSS-like queries of terminal cell snapshots"
+
+[features]
+default = []
+# Only the recorded-cast integration test uses this optional dependency.
+ghostty-vt = ["dep:cleat", "cleat/ghostty-vt"]
+
+[dependencies]
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
+cleat = { path = "../cleat", default-features = false, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

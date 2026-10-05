@@ -2,6 +2,9 @@
 
 Research slice of [cleat#306](https://github.com/flotilla-org/cleat/issues/306), 2026-10-05. No CLI flags or runtime features are implemented by this change.
 
+The structural selector and recognizer direction is recorded in
+[Selectors and recognizers](../specs/2026-03-23-terminal-screen-introspection.md#selectors-and-recognizers).
+
 ## Recommendation
 
 Do not use OSC 133 alone to authorize delivery into today's agent composers. Claude Code screen-reader mode emits turn-navigation marks, but our probe found no input-start B. Codex emitted no semantic marks in either tested mode. First ship a daemon-owned controller-activity fence and atomic submit transaction as a heuristic mitigation for [flotilla#2614](https://github.com/flotilla-org/flotilla/issues/2614). Exact draft safety additionally requires a verified producer/editor contract; quiet time cannot detect an abandoned draft. The flotilla classifier in [flotilla#2602](https://github.com/flotilla-org/flotilla/issues/2602) remains outside this work.

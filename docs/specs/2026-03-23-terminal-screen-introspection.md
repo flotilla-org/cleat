@@ -197,6 +197,42 @@ pub struct ScreenAnalysis {
 }
 ```
 
+### Selectors and recognizers
+
+The [2026-10-05 direction on #306](https://github.com/flotilla-org/cleat/issues/306)
+revises #23's analysis surface to a structural tree and CSS-like selectors.
+`crates/terminal-screen` owns a validated snapshot and derives `screen`, `box`,
+`band`, `row`, `span` and a cursor pseudo-element. It remains independent of
+Ghostty and daemon state. Rows preserve physical indices, wrap and semantic
+prompt metadata; spans preserve resolved style, colours and input/prompt/output
+tags. Complete borders and full-width visual bands carry confidence scores,
+not application roles. Each physical row appears once and nests only under a
+region containing its full bounds; narrower boxes retain bounded text without
+duplicating rows.
+
+Selectors follow [xa11y's grammar](https://github.com/xa11y/xa11y/blob/main/docs/site/src/content/docs/reference/selectors.mdx)
+where it fits: element/role names, attribute operators, child and descendant
+combinators, and one-based `:nth(n)` over segment matches. #23 adds boolean
+attributes, `:last`, `:not`, `:has`, `:has-text` and `/regex/` matching. Names and
+attributes are data-driven. See the [crate contract](../../crates/terminal-screen/README.md)
+for exact scope, ordering, whitespace and coordinate semantics.
+
+[#313 recognizers](https://github.com/flotilla-org/cleat/issues/313) add roles,
+values and states to this same tree, either as annotations or bounded role
+nodes. Selectors such as `composer[value='']`, `status[state=working]` and
+`dialog[kind=approval]` need no grammar changes. Unknown roles are absent, not
+assumed empty. A recognizer chooses application-specific evidence and content
+extraction; the structural layer never assumes a `›` prefix is editable text or
+removes it. In the #312 Codex cast, that prefix is non-faint, so the literal
+`row:has(cursor) span:not([faint])` retains it while excluding the faint
+placeholder. Mapping these observations to an empty/drafted composer belongs
+in recognizers.
+
+OSC 133 tags are one evidence source among several, as established by
+[semantic prompt research](../design/semantic-prompt-awareness.md). #24 wires
+selection into inspect/wait; conditional send and controller-generation fencing
+remain separate work. No daemon, CLI or VT integration is part of this crate.
+
 ### Layer 3: Expose via inspect
 
 New inspect mode in cleat's CLI:

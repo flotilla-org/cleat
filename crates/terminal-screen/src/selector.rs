@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+};
 
 use regex::Regex;
 
@@ -67,36 +70,74 @@ impl Selector {
     }
     /// Matches in preorder document order, with selector groups deduplicated.
     pub fn evaluate(&self, tree: &ScreenTree) -> Vec<NodeId> {
-        self.scoped(tree, None)
+        let mut evaluation = Evaluation::new(tree);
+        evaluation.query(self, None);
+        evaluation.cache.remove(&(self as *const Self, None)).unwrap().ordered
+    }
+}
+
+struct Matches {
+    ordered: Vec<NodeId>,
+    members: BTreeSet<NodeId>,
+}
+
+/// One query owns one preorder index and memo table. Selector addresses are
+/// stable identities only during this evaluation; nothing survives a frame.
+struct Evaluation<'a> {
+    tree: &'a ScreenTree,
+    order: Vec<NodeId>,
+    positions: Vec<usize>,
+    ends: Vec<usize>,
+    cache: HashMap<(*const Selector, Option<NodeId>), Matches>,
+}
+
+impl<'a> Evaluation<'a> {
+    fn new(tree: &'a ScreenTree) -> Self {
+        let order = tree.document_order();
+        let mut positions = vec![0; order.len()];
+        let mut ends = vec![0; order.len()];
+        for (position, id) in order.iter().enumerate() {
+            positions[id.0] = position;
+            ends[id.0] = position + 1;
+        }
+        for id in order.iter().rev() {
+            if let Some(parent) = tree.node(*id).unwrap().parent() {
+                ends[parent.0] = ends[parent.0].max(ends[id.0]);
+            }
+        }
+        Self { tree, order, positions, ends, cache: HashMap::new() }
     }
 
-    fn scoped(&self, tree: &ScreenTree, scope: Option<NodeId>) -> Vec<NodeId> {
-        let order = tree.document_order();
-        let mut union = std::collections::BTreeSet::new();
-        for group in &self.groups {
+    fn query(&mut self, selector: &Selector, scope: Option<NodeId>) {
+        let key = (selector as *const Selector, scope);
+        if self.cache.contains_key(&key) {
+            return;
+        }
+        // Preorder makes every subtree contiguous. :has scans only strict
+        // descendants, while its :not arguments retain documented global scope.
+        let start = scope.map_or(0, |id| self.positions[id.0] + 1);
+        let end = scope.map_or(self.order.len(), |id| self.ends[id.0]);
+        let mut union = BTreeSet::new();
+        for group in &selector.groups {
             let mut previous = Vec::new();
             for (index, segment) in group.iter().enumerate() {
-                // Negations are frame-wide predicates: evaluate each once per
-                // segment, rather than once again for every candidate node.
-                let excluded = segment
-                    .filters
-                    .iter()
-                    .filter_map(|filter| if let Filter::Not(selector) = filter { Some(selector.evaluate(tree)) } else { None })
-                    .flatten()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let mut matches = order
-                    .iter()
-                    .copied()
-                    .filter(|id| {
-                        let related = |parent: NodeId| match segment.relation {
-                            Relation::Child => tree.node(*id).unwrap().parent() == Some(parent),
-                            Relation::Descendant => tree.descendant_of(*id, parent),
-                        };
-                        let in_scope = if index == 0 { scope.is_none_or(related) } else { previous.iter().copied().any(related) };
-                        in_scope && !excluded.contains(id) && segment.matches(tree, *id)
-                    })
-                    .collect::<Vec<_>>();
-                // xa11y indices apply to the segment's matches, not siblings.
+                let related = if index == 0 {
+                    if matches!(segment.relation, Relation::Child) {
+                        self.related(&scope.into_iter().collect::<Vec<_>>(), Relation::Child, start, end)
+                    } else {
+                        vec![true; end - start]
+                    }
+                } else {
+                    self.related(&previous, segment.relation, start, end)
+                };
+                let mut matches = Vec::new();
+                for (offset, in_scope) in related.into_iter().enumerate() {
+                    let id = self.order[start + offset];
+                    if in_scope && self.matches(segment, id) {
+                        matches.push(id);
+                    }
+                }
+                // xa11y indices apply to segment matches, not CSS siblings.
                 for filter in &segment.filters {
                     match filter {
                         Filter::Nth(n) => matches = matches.get(n - 1).copied().into_iter().collect(),
@@ -108,20 +149,63 @@ impl Selector {
             }
             union.extend(previous);
         }
-        order.into_iter().filter(|id| union.contains(id)).collect()
+        let ordered = self.order[start..end].iter().copied().filter(|id| union.contains(id)).collect();
+        self.cache.insert(key, Matches { ordered, members: union });
     }
-}
 
-impl Segment {
-    fn matches(&self, tree: &ScreenTree, id: NodeId) -> bool {
-        let node = tree.node(id).unwrap();
-        if self.element.as_ref().is_some_and(|element| node.element != *element && !node.roles.contains(element)) {
+    fn related(&self, parents: &[NodeId], relation: Relation, start: usize, end: usize) -> Vec<bool> {
+        match relation {
+            Relation::Child => {
+                let mut related = vec![false; end - start];
+                for parent in parents {
+                    for child in self.tree.node(*parent).unwrap().children() {
+                        let position = self.positions[child.0];
+                        if (start..end).contains(&position) {
+                            related[position - start] = true;
+                        }
+                    }
+                }
+                related
+            }
+            Relation::Descendant => {
+                // Mark subtree intervals in a difference array, avoiding the
+                // previous-set × candidate × ancestor-depth matching loop.
+                let mut changes = vec![0isize; end - start + 1];
+                for parent in parents {
+                    let lower = (self.positions[parent.0] + 1).max(start);
+                    let upper = self.ends[parent.0].min(end);
+                    if lower < upper {
+                        changes[lower - start] += 1;
+                        changes[upper - start] -= 1;
+                    }
+                }
+                let mut active = 0;
+                changes[..end - start]
+                    .iter()
+                    .map(|change| {
+                        active += change;
+                        active > 0
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn matches(&mut self, segment: &Segment, id: NodeId) -> bool {
+        let node = self.tree.node(id).unwrap();
+        if segment.element.as_ref().is_some_and(|element| node.element != *element && !node.roles.contains(element)) {
             return false;
         }
-        self.filters.iter().all(|filter| match filter {
-            Filter::Attribute(name, comparison) => attribute_matches(node, name, comparison),
-            Filter::Not(_) => true,
-            Filter::Has(selector) => !selector.scoped(tree, Some(id)).is_empty(),
+        segment.filters.iter().all(|filter| match filter {
+            Filter::Attribute(name, comparison) => attribute_matches(node, name, comparison.as_ref()),
+            Filter::Not(selector) => {
+                self.query(selector, None);
+                !self.cache[&(selector as *const Selector, None)].members.contains(&id)
+            }
+            Filter::Has(selector) => {
+                self.query(selector, Some(id));
+                !self.cache[&(selector as *const Selector, Some(id))].ordered.is_empty()
+            }
             Filter::Text(text) => node.text.contains(text),
             Filter::Matches(regex) => regex.is_match(&node.text),
             Filter::Nth(_) | Filter::Last => true,
@@ -129,7 +213,7 @@ impl Segment {
     }
 }
 
-fn attribute_matches(node: &Node, name: &str, comparison: &Option<(Operator, String)>) -> bool {
+fn attribute_matches(node: &Node, name: &str, comparison: Option<&(Operator, String)>) -> bool {
     let Some(actual) = node.attribute(name) else {
         return false;
     };
@@ -137,10 +221,10 @@ fn attribute_matches(node: &Node, name: &str, comparison: &Option<(Operator, Str
         return true;
     };
     match op {
-        Operator::Equal => actual == expected,
-        Operator::Prefix => actual.to_lowercase().starts_with(&expected.to_lowercase()),
-        Operator::Contains => actual.to_lowercase().contains(&expected.to_lowercase()),
-        Operator::Suffix => actual.to_lowercase().ends_with(&expected.to_lowercase()),
+        Operator::Equal => actual == expected.as_str(),
+        Operator::Prefix => actual.to_lowercase().starts_with(expected),
+        Operator::Contains => actual.to_lowercase().contains(expected),
+        Operator::Suffix => actual.to_lowercase().ends_with(expected),
     }
 }
 
@@ -289,6 +373,7 @@ impl Parser<'_> {
                     let value = if matches!(self.peek(), Some('\'' | '"')) { self.quoted()? } else { self.identifier()? };
                     self.whitespace();
                     self.expect(']')?;
+                    let value = if matches!(op, Operator::Equal) { value } else { value.to_lowercase() };
                     Some((op, value))
                 };
                 filters.push(Filter::Attribute(name, comparison));

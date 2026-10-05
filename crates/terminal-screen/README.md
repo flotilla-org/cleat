@@ -63,7 +63,13 @@ The parser is handwritten; element names and attribute names have no registry.
   nodes in document order, **not** CSS sibling indices. Non-positional predicates
   run first, then positional filters in their written order. Out-of-range nth
   returns an empty result. `row:last` is the bottom physical row.
-- `:not(selector)` rejects nodes matching that selector in the whole tree.
+  `row:nth(1):has-text('x')` first keeps rows containing `x`, then selects the
+  first; it equals `row:has-text('x'):nth(1)`. `row:nth(2):last` selects the
+  second match, while `row:last:nth(2)` selects nothing.
+- `:not(selector)` rejects nodes matching that selector in the whole tree,
+  including when it appears inside a scoped `:has`. For example,
+  `screen:has(row:not(screen row))` cannot match: every row matches the global
+  `screen row` selector.
 - `:has(selector)` searches strict descendants of the candidate; `:has(> span)`
   restricts the first segment to direct children. The candidate is not in scope.
 - `:has-text('substring')` is case-sensitive over the node's observed text.
@@ -74,11 +80,33 @@ The parser is handwritten; element names and attribute names have no registry.
 `Selector::parse` yields a reusable selector; `evaluate` returns `NodeId`s.
 `ScreenTree::select` is the convenience API returning nodes with bounds/text.
 Errors include a byte offset. Parsing limits input to 16384 bytes, predicate
-nesting to 32 levels, and compiled regex size to 1 MiB.
+nesting to 32 selector levels (including the top-level selector), and compiled regex size to 1 MiB.
 
-Recognizers can annotate a node's `roles` and `attributes` via `node_mut`, or
+Recognizers can annotate a node's `roles` and `attributes` via `annotations_mut`, or
 attach a new `Node` with `add_node`. New node bounds must fit the parent, and
-parent/child links are private. Node IDs are valid only within that tree.
+attached geometry and parent/child links cannot be changed through annotations. Node IDs are valid only within that tree.
+
+## Evaluation cost
+
+Each `evaluate` builds one preorder index. Subtree intervals restrict `:has` to
+strict descendants, and interval/child masks avoid checking every previous
+match's ancestor chain for combinators. Nested selector results are cached by
+selector and scope for that evaluation only; frame-wide `:not` results are
+computed once. Substring comparison values are lowercased at parse time.
+
+On a synthetic 200×50 screen with a style split at every cell, ten-query dev
+build measurements in the same vessel gave:
+
+| Query | Before subtree indexing | After |
+| --- | ---: | ---: |
+| `row:has(cursor) span:not([faint])` | 45.1 ms/query | 6.9 ms/query |
+| `row:has(span:not([faint])) > span:last` | 414.1 ms/query | 15.1 ms/query |
+
+These are diagnostic timings, not CI thresholds or a per-frame latency promise.
+Broad nested `:has` queries can still scan overlapping subtrees; evaluation cost
+also depends on tree size and selector structure, not just parser input limits.
+Reproduce with `cargo test -p terminal-screen --test structure
+selector_timing_span_heavy -- --ignored --nocapture`.
 
 ## Validation
 

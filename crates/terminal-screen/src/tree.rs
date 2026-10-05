@@ -61,6 +61,13 @@ impl Node {
     }
 }
 
+/// Recognizer-editable metadata; attached geometry and links stay immutable.
+pub struct NodeAnnotations<'a> {
+    pub roles: &'a mut BTreeSet<String>,
+    pub attributes: &'a mut BTreeMap<String, String>,
+    pub confidence: &'a mut Option<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScreenTree {
     pub generation: u64,
@@ -85,8 +92,9 @@ impl ScreenTree {
     }
     /// Recognizers can add roles, state/value attributes and evidence confidence.
     /// Links remain private, so annotations cannot introduce tree cycles.
-    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes.get_mut(id.0)
+    pub fn annotations_mut(&mut self, id: NodeId) -> Option<NodeAnnotations<'_>> {
+        let node = self.nodes.get_mut(id.0)?;
+        Some(NodeAnnotations { roles: &mut node.roles, attributes: &mut node.attributes, confidence: &mut node.confidence })
     }
     /// Add a recognizer-produced node. Bounds must lie within the parent.
     pub fn add_node(&mut self, parent: NodeId, mut node: Node) -> Result<NodeId, TreeError> {
@@ -117,15 +125,6 @@ impl ScreenTree {
     }
     pub fn select(&self, source: &str) -> Result<Vec<&Node>, SelectorError> {
         Ok(Selector::parse(source)?.evaluate(self).into_iter().map(|id| &self.nodes[id.0]).collect())
-    }
-    pub(crate) fn descendant_of(&self, mut id: NodeId, ancestor: NodeId) -> bool {
-        while let Some(parent) = self.nodes[id.0].parent {
-            if parent == ancestor {
-                return true;
-            }
-            id = parent;
-        }
-        false
     }
     fn push(&mut self, parent: NodeId, node: Node) -> NodeId {
         self.add_node(parent, node).expect("analysis bounds are contained")

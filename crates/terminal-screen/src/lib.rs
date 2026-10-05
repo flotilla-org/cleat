@@ -12,4 +12,4 @@ mod tree;
 pub use detect::{detect_bands, detect_boxes, Band, BandKind, BorderStyle, DetectedBox};
 pub use grid::*;
 pub use selector::{Selector, SelectorError};
-pub use tree::{analyze, Node, NodeId, ScreenTree, TreeError};
+pub use tree::{analyze, Node, NodeAnnotations, NodeId, ScreenTree, TreeError};

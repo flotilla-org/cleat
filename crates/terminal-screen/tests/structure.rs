@@ -223,14 +223,16 @@ fn partial_and_nested_boxes_keep_rows_unique() {
 fn recognizers_extend_the_tree_without_grammar_changes() {
     let mut t = analyze(&grid(&["draft probe"]));
     let row = Selector::parse("row").unwrap().evaluate(&t)[0];
-    t.node_mut(row).unwrap().roles.insert("composer".into());
-    t.node_mut(row).unwrap().attributes.insert("value".into(), "draft probe".into());
+    t.annotations_mut(row).unwrap().roles.insert("composer".into());
+    t.annotations_mut(row).unwrap().attributes.insert("value".into(), "draft probe".into());
     let mut status = Node::new("status", Rect { col: 0, row: 0, width: 2, height: 1 }, "OK");
     status.attributes.insert("state".into(), "idle".into());
     t.add_node(t.root(), status).unwrap();
     assert_eq!(t.select("composer[value='draft probe'] > span").unwrap().len(), 1);
     assert_eq!(t.select("status[state=idle]").unwrap()[0].text, "OK");
     assert!(t.add_node(NodeId(999), Node::new("dialog", Rect::default(), "")).is_err());
+    assert!(t.annotations_mut(NodeId(999)).is_none());
+    assert!(t.add_node(t.root(), t.node(row).unwrap().clone()).is_err());
     assert!(t.add_node(row, Node::new("dialog", Rect { col: 11, row: 0, width: 1, height: 1 }, "")).is_err());
 }
 
@@ -317,4 +319,113 @@ fn empty_and_invalid_grids() {
     assert!(g.cell(3, 0).is_none());
     assert!(g.cell(0, 1).is_none());
     assert!(g.row(1).is_none());
+}
+
+// The parser contract bounds the input and selector levels (including the root),
+// rejects over-budget compiled regexes, and locates an invalid nth at its number.
+#[test]
+fn parser_budget_boundaries_and_error_offsets() {
+    assert!(Selector::parse(&"a".repeat(16_384)).is_ok());
+    let size_error = Selector::parse(&"a".repeat(16_385)).unwrap_err();
+    assert_eq!(size_error.offset, 0);
+    assert!(size_error.message.contains("16384"));
+    let nested = |levels| format!("{}span{}", "row:has(".repeat(levels), ")".repeat(levels));
+    assert!(Selector::parse(&nested(31)).is_ok());
+    let depth_error = Selector::parse(&nested(32)).unwrap_err();
+    assert!(depth_error.message.contains("nesting exceeds 32"));
+    let regex_error = Selector::parse("row:matches(/a{100000}/)").unwrap_err();
+    assert!(regex_error.message.starts_with("invalid regex:"));
+    assert!(regex_error.message.to_lowercase().contains("size limit"), "{regex_error}");
+    assert_eq!(Selector::parse("row:nth(0)").unwrap_err().offset, 8);
+}
+
+// The README defines global negation, predicate-before-position ordering, and
+// group unions in document order. These remain true inside scoped :has queries.
+#[test]
+fn scoped_negation_positions_and_group_order() {
+    let t = analyze(&grid(&["a", "x", "x"]));
+    assert!(t.select("screen:has(row:not(screen row))").unwrap().is_empty());
+    assert_eq!(t.select("screen:has(row:nth(1):has-text('x'))").unwrap().len(), 1);
+    assert_eq!(t.select("row:nth(1):has-text('x')").unwrap()[0].bounds.row, 1);
+    assert_eq!(t.select("row:has-text('x'):nth(1)").unwrap()[0].bounds.row, 1);
+    assert_eq!(t.select("row:nth(2):last").unwrap()[0].bounds.row, 1);
+    assert_eq!(t.select("row:last:nth(1)").unwrap()[0].bounds.row, 2);
+    assert!(t.select("row:last:nth(2)").unwrap().is_empty());
+    let ids = Selector::parse("span, row:nth(1), row, span:nth(1)").unwrap().evaluate(&t);
+    assert_eq!(ids, Selector::parse("row, span").unwrap().evaluate(&t));
+    let bounds = ids
+        .iter()
+        .map(|id| {
+            let n = t.node(*id).unwrap();
+            (n.element.as_str(), n.bounds.row)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bounds, vec![("row", 0), ("span", 0), ("row", 1), ("span", 1), ("row", 2), ("span", 2)]);
+}
+
+// Unquoted values intentionally accept ASCII name tokens, including negative
+// integers. Punctuation such as decimal points requires quotes; case semantics
+// remain exact equality vs lowercase substring matching, including Unicode.
+#[test]
+fn attribute_value_tokens_and_unicode_case() {
+    let mut t = analyze(&grid(&["ÉCOLE"]));
+    t.annotations_mut(t.root()).unwrap().attributes.insert("x".into(), "-1".into());
+    t.annotations_mut(t.root()).unwrap().attributes.insert("version".into(), "1.2".into());
+    assert_eq!(t.select("screen[x=-1]").unwrap().len(), 1);
+    assert!(Selector::parse("screen[version=1.2]").is_err());
+    assert_eq!(t.select("screen[version='1.2']").unwrap().len(), 1);
+    for selector in ["row[text^='é']", "row[text*='éco']", "row[text$=cole]"] {
+        assert_eq!(t.select(selector).unwrap().len(), 1);
+    }
+    assert!(t.select("row[text='école']").unwrap().is_empty());
+    assert_eq!(t.select("row[text='ÉCOLE']").unwrap().len(), 1);
+}
+
+fn span_heavy_grid(cols: u16, rows: u16) -> ScreenGrid {
+    // Generate a style boundary at every column, and put the cursor in the
+    // bottom row: this covers maximal span count and the last subtree boundary.
+    let cells = (0..u32::from(cols) * u32::from(rows))
+        .map(|i| Cell { grapheme: "x".into(), style: Style { faint: i % 2 == 0, ..Style::default() }, ..Cell::default() })
+        .collect();
+    ScreenGrid::new(
+        cols,
+        rows,
+        cells,
+        vec![RowMetadata::default(); usize::from(rows)],
+        Cursor { col: cols - 1, row: rows - 1, visible: true, ..Cursor::default() },
+        0,
+    )
+    .unwrap()
+}
+
+// #24's per-frame queries must preserve selection on span-heavy screens and
+// after role nodes are attached in an allocation order differing from preorder.
+#[test]
+fn span_heavy_scoped_queries_and_appended_roles() {
+    for (cols, rows) in [(2, 1), (20, 5), (200, 50)] {
+        let mut t = analyze(&span_heavy_grid(cols, rows));
+        let row = Selector::parse("row:last").unwrap().evaluate(&t)[0];
+        t.add_node(row, Node::new("composer", Rect { col: 0, row: rows - 1, width: cols, height: 1 }, "draft")).unwrap();
+        let matches = t.select("row:has(cursor) span:not([faint])").unwrap();
+        assert_eq!(matches.len(), usize::from(cols) / 2);
+        assert!(matches.iter().all(|node| node.bounds.row == rows - 1));
+        assert_eq!(t.select("row:has(> composer) > composer").unwrap().len(), 1);
+        assert_eq!(t.select("screen:has(row:has(cursor):not([soft-wrap])) composer").unwrap().len(), 1);
+    }
+}
+
+// Diagnostic timing uses the same public fixture as the behavior test above;
+// no wall-clock threshold affects correctness. Invoke explicitly with nocapture.
+#[test]
+#[ignore = "diagnostic selector timing, run explicitly with --ignored --nocapture"]
+fn selector_timing_span_heavy() {
+    let t = analyze(&span_heavy_grid(200, 50));
+    for source in ["row:has(cursor) span:not([faint])", "row:has(span:not([faint])) > span:last"] {
+        let selector = Selector::parse(source).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            assert!(!std::hint::black_box(selector.evaluate(&t)).is_empty());
+        }
+        eprintln!("{source}: {:.3} ms/query", start.elapsed().as_secs_f64() * 100.0);
+    }
 }

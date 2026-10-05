@@ -254,3 +254,5 @@ for lookup, platform and compatibility details.
 - **Text `capture` reports the VT engine's screen text.** Graphics resources and placements are delivered separately to packet/native viewers; text capture is not an image export.
 - **Recording is raw PTY output** with escape sequences intact. `transcript` emits them verbatim; use `capture` to get human-readable text from the current screen state.
 - **Non-Ghostty builds return errors** for `capture` and other VT-dependent operations. The `passthrough` engine is a test seam, not a real VT. A functional binary requires `--features ghostty-vt`.
+
+Controller activity and `send --controller-idle` are documented in [Controller input and daemon submission](docs/controller-input-and-submit.md).

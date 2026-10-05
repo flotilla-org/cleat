@@ -1714,6 +1714,11 @@ fn apply_attach_state(
     }
 }
 
+struct PendingSend {
+    stream: SessionStream,
+    result: std::sync::mpsc::Receiver<Result<Option<u64>, String>>,
+}
+
 struct PendingWait {
     stream: SessionStream,
     conditions: Vec<crate::protocol::WaitCondition>,
@@ -1863,6 +1868,7 @@ struct HostedSession {
     applied_cell_size: (u32, u32),
     packet_render_cache: PacketRenderCache,
     had_foreground_client: bool,
+    pending_sends: Vec<PendingSend>,
     pending_waits: Vec<PendingWait>,
     pending_expects: Vec<PendingExpect>,
     /// Render generation at the last screen-stable fingerprint snapshot; lets
@@ -1912,6 +1918,7 @@ impl HostedSession {
             focused: false,
             packet_render_cache: PacketRenderCache::default(),
             had_foreground_client: false,
+            pending_sends: Vec::new(),
             pending_waits: Vec::new(),
             pending_expects: Vec::new(),
             screen_stable_snapshot_generation: None,
@@ -2899,7 +2906,11 @@ fn service_hosted_session(
             did_work = true;
             match frame {
                 Frame::Input(bytes) => {
-                    hosted.actor.write_input(bytes)?;
+                    if let Err(error) = hosted.actor.controller_input(0, TerminalInputEvent::RawBytes(bytes)) {
+                        if let Some(client) = hosted.active_client.as_mut() {
+                            client.enqueue_frame(&Frame::Error(error))?;
+                        }
+                    }
                 }
                 Frame::Resize { cols, rows } => {
                     let size = hosted.fixed_size.unwrap_or((cols, rows));
@@ -2941,6 +2952,7 @@ fn service_hosted_session(
         broadcast_directory_upsert(directory_entry_for_session(layout, hosted, packet_clients)?, packet_clients)?;
     }
 
+    service_pending_sends(&mut hosted.pending_sends);
     service_pending_waits(&hosted.actor, &mut hosted.pending_waits, &mut hosted.screen_stable_snapshot_generation);
     service_pending_expects(layout, id, &hosted.actor, &mut hosted.pending_expects)?;
     // Recording flush happens actor-side after each pump slice; no per-tick
@@ -2980,6 +2992,25 @@ fn coalesce_resize_bursts(pending: &mut VecDeque<Frame>) {
 /// existing stability window simply keeps aging without a snapshot.
 fn screen_stable_needs_snapshot(current_generation: u64, last_snapshot_generation: Option<u64>) -> bool {
     last_snapshot_generation != Some(current_generation)
+}
+
+fn service_pending_sends(sends: &mut Vec<PendingSend>) {
+    sends.retain_mut(|send| {
+        let result = match send.result.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("session actor unavailable".into()),
+        };
+        match result {
+            Ok(marker_offset) => {
+                let _ = http_uds::write_json(&mut send.stream, StatusCode::OK, &http_uds::SendResponse { marker_offset });
+            }
+            Err(error) => {
+                let _ = http_uds::write_error(&mut send.stream, StatusCode::CONFLICT, &error);
+            }
+        }
+        false
+    });
 }
 
 fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWait>, last_snapshot_generation: &mut Option<u64>) {
@@ -3096,6 +3127,10 @@ fn finish_exited_session(
     packet_clients: &mut [PacketClient],
 ) -> Result<bool, String> {
     drain_raw_output_tap(layout, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
+    service_pending_sends(&mut hosted.pending_sends);
+    for mut send in hosted.pending_sends.drain(..) {
+        let _ = http_uds::write_error(&mut send.stream, StatusCode::CONFLICT, "session exited during submission");
+    }
     for mut wait in hosted.pending_waits.drain(..) {
         let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
         let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::SessionGone, elapsed_ms);
@@ -3782,6 +3817,22 @@ fn handle_http_request(
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
+                http_uds::InputRequest::Send { text, submit, no_enter, controller_idle_ms, marker_name } => {
+                    if submit && no_enter {
+                        return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "submit and no_enter are mutually exclusive")
+                            .map_err(|error| format!("write send validation error: {error}"));
+                    }
+                    let pending_stream = stream.try_clone().map_err(|err| format!("clone send response: {err}"))?;
+                    let result = hosted.actor.begin_send(
+                        text.into_bytes(),
+                        submit,
+                        no_enter,
+                        crate::host::actor::SendPreconditions { controller_idle: controller_idle_ms.map(Duration::from_millis) },
+                        marker_name,
+                    )?;
+                    hosted.pending_sends.push(PendingSend { stream: pending_stream, result });
+                    return Ok(());
+                }
                 http_uds::InputRequest::Text { text } => {
                     hosted.actor.write_input(text.into_bytes())?;
                 }
@@ -4679,7 +4730,9 @@ fn handle_packet_frame(
                                 event.y_px = event
                                     .y_px
                                     .clamp(0.0, (f32::from(hosted.applied_size.1) * hosted.applied_cell_size.1 as f32 - 1.0).max(0.0));
-                                route_packet_mouse_event(&hosted.actor, key.view_id(), event)?;
+                                if let Err(message) = route_packet_mouse_event(&hosted.actor, key.view_id(), event) {
+                                    packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message })?;
+                                }
                             }
                         }
                         event if session.role == ChannelRole::Controller => {
@@ -4700,7 +4753,9 @@ fn handle_packet_frame(
                                     session.view_changed = true;
                                 }
                             }
-                            route_packet_input_event(&hosted.actor, key.view_id(), event)?;
+                            if let Err(message) = route_packet_input_event(&hosted.actor, key.view_id(), event) {
+                                packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message })?;
+                            }
                         }
                         _ => {}
                     }
@@ -5096,9 +5151,10 @@ fn push_due_packet_renders(
 
 fn route_packet_input_event(actor: &SessionActor, source: u128, event: TerminalInputEvent) -> Result<(), String> {
     match event {
-        TerminalInputEvent::Text(event) => actor.write_input(event.text.into_bytes()),
-        TerminalInputEvent::Paste(event) => actor.paste(event.text.into_bytes()).map(|_| ()),
-        TerminalInputEvent::RawBytes(bytes) => actor.write_input(bytes),
+        event @ (TerminalInputEvent::Text(_)
+        | TerminalInputEvent::Paste(_)
+        | TerminalInputEvent::RawBytes(_)
+        | TerminalInputEvent::Key(_)) => actor.controller_input(source, event),
         TerminalInputEvent::Resize(event) => {
             actor.resize(event.cols, event.rows)?;
             if event.cell_width_px.is_finite()
@@ -5111,7 +5167,7 @@ fn route_packet_input_event(actor: &SessionActor, source: u128, event: TerminalI
             Ok(())
         }
         TerminalInputEvent::Mouse(event) => route_packet_mouse_event(actor, source, event),
-        TerminalInputEvent::Key(event) => actor.key(source, event).map(|_| ()),
+
         TerminalInputEvent::Focus(_) => Ok(()),
     }
 }

@@ -28,7 +28,16 @@ use nix::{
     fcntl::{fcntl, FcntlArg, OFlag},
 };
 
-use super::presentation::{GateTransition, PresentationGate};
+pub(crate) use super::submission::SendPreconditions;
+#[cfg(all(test, unix))]
+use super::submission::CONTROLLER_QUEUE_BYTES;
+use super::{
+    presentation::{GateTransition, PresentationGate},
+    submission::{
+        controller_event_is_activity, controller_expected_echo, ControllerActivity, ControllerReplayQueue, QueuedControllerInput,
+        SUBMIT_ENTER_DELAY,
+    },
+};
 #[cfg(unix)]
 use crate::platform::pty::PtyChild;
 use crate::{
@@ -423,6 +432,19 @@ pub(crate) enum SessionCommand {
         cell_width_px: u32,
         cell_height_px: u32,
         reply: mpsc::Sender<Result<(), String>>,
+    },
+    ControllerInput {
+        source: u128,
+        event: Box<crate::provider::TerminalInputEvent>,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    Send {
+        text: Vec<u8>,
+        submit: bool,
+        no_enter: bool,
+        preconditions: SendPreconditions,
+        marker_name: Option<String>,
+        reply: mpsc::Sender<Result<Option<u64>, String>>,
     },
     WriteInput {
         bytes: Vec<u8>,
@@ -1015,6 +1037,25 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::SetCellSize { cell_width_px, cell_height_px, reply })
     }
 
+    pub(crate) fn controller_input(&self, source: u128, event: crate::provider::TerminalInputEvent) -> Result<(), String> {
+        self.request_result(|reply| SessionCommand::ControllerInput { source, event: Box::new(event), reply })
+    }
+
+    pub(crate) fn begin_send(
+        &self,
+        text: Vec<u8>,
+        submit: bool,
+        no_enter: bool,
+        preconditions: SendPreconditions,
+        marker_name: Option<String>,
+    ) -> Result<Receiver<Result<Option<u64>, String>>, String> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(SessionCommand::Send { text, submit, no_enter, preconditions, marker_name, reply })
+            .map_err(|_| "session actor unavailable".to_string())?;
+        Ok(rx)
+    }
+
     pub(crate) fn write_input(&self, bytes: Vec<u8>) -> Result<(), String> {
         self.request_result(|reply| SessionCommand::WriteInput { bytes, reply })
     }
@@ -1209,7 +1250,16 @@ struct PumpResult {
     chunks: Vec<Arc<[u8]>>,
 }
 
+struct Submission {
+    enter_at: Instant,
+    marker_offset: Option<u64>,
+    reply: mpsc::Sender<Result<Option<u64>, String>>,
+}
+
 struct SessionActorLoopState {
+    controller: ControllerActivity,
+    submission: Option<Submission>,
+    controller_queue: ControllerReplayQueue,
     images: crate::image_delivery::CaptureImages,
     observation: ObservationState,
     presentation: PresentationGate,
@@ -1302,6 +1352,9 @@ fn session_actor_loop(
     pty_paused: bool,
 ) {
     let mut state = SessionActorLoopState {
+        controller: ControllerActivity::from_history(runtime.controller_input_history.clone()),
+        submission: None,
+        controller_queue: Default::default(),
         images: Default::default(),
         observation,
         presentation: PresentationGate::default(),
@@ -1317,6 +1370,7 @@ fn session_actor_loop(
     let _ = runtime.drain_clipboard();
     let _ = ready.send(Ok(runtime.screen_activity_tracker()));
     loop {
+        finish_submission(&mut runtime, &mut state, &wake);
         // Exit has been reaped and final output drained. EOF remains readable
         // forever, so monitoring the PTY here would turn an idle retained
         // terminal into a busy loop. Keep its state available for commands,
@@ -1332,7 +1386,8 @@ fn session_actor_loop(
         }
         #[cfg(unix)]
         {
-            let timeout = state.presentation.deadline().map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let deadline = state.presentation.deadline().into_iter().chain(state.submission.as_ref().map(|s| s.enter_at)).min();
+            let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             let readiness = match wait_actor_ready(runtime.pty_child(), command_wake.raw_fd(), timeout) {
                 Ok(readiness) => readiness,
                 Err(_) => {
@@ -1401,6 +1456,7 @@ fn session_actor_handle_command(
     state: &mut SessionActorLoopState,
     wake: &WakeCallback,
 ) -> bool {
+    finish_submission(runtime, state, wake);
     let mut stop = false;
     match command {
         SessionCommand::SetClipboardTarget { target, reply } => {
@@ -1451,33 +1507,133 @@ fn session_actor_handle_command(
         }
         SessionCommand::ReleaseAttachmentView { id } => runtime.release_attachment_view(id),
         SessionCommand::Focus { focused, reply } => {
-            let _ = reply.send(runtime.focus(focused));
+            let result = if state.submission.is_some() {
+                state.controller_queue.push(QueuedControllerInput::Focus(focused))
+            } else {
+                runtime.focus(focused)
+            };
+            let _ = reply.send(result);
+        }
+        SessionCommand::ControllerInput { source, event, reply } => {
+            let event = *event;
+            if runtime.input_transfer_pending() || state.pty_paused || state.exited {
+                let _ = reply.send(Err("controller input refused: session transferring or unavailable".into()));
+                return false;
+            }
+            let active = controller_event_is_activity(&event);
+            let result = if state.submission.is_some() {
+                let result = state.controller_queue.push(QueuedControllerInput::Event { source, event });
+                if result.is_ok() && active {
+                    // Quiet time measures controller admission, not the later replay write.
+                    state.controller.accepted(Instant::now());
+                }
+                result
+            } else {
+                // Pump before writing so pre-existing output cannot satisfy this input's fence.
+                session_actor_pump(runtime, state, wake);
+                let expected = controller_expected_echo(&event);
+                let result = write_controller_event(runtime, source, event);
+                if let Ok(written) = result {
+                    if active {
+                        state.controller.accepted(Instant::now());
+                    }
+                    if written {
+                        state.controller.written(expected);
+                    }
+                }
+                result.map(|_| ())
+            };
+            let _ = reply.send(result);
+        }
+        SessionCommand::Send { text, submit, no_enter, preconditions, marker_name, reply } => {
+            session_actor_pump(runtime, state, wake);
+            let result = (|| {
+                if state.submission.is_some() || state.pty_paused || state.exited {
+                    return Err("submission busy or session unavailable".into());
+                }
+                // Output pump -> controller observation fence -> predicates -> first write.
+                state.controller.check(&preconditions, Instant::now())?;
+                let marker_offset = marker_name.map(|name| runtime.mark(Some(name))).transpose()?;
+                if submit {
+                    route_paste_on_actor(runtime, &text)?;
+                } else {
+                    let mut bytes = text;
+                    if !no_enter {
+                        bytes.push(b'\r');
+                    }
+                    runtime.write_input(&bytes)?;
+                }
+                Ok(marker_offset)
+            })();
+            match result {
+                Ok(marker_offset) if submit => {
+                    state.submission = Some(Submission { enter_at: Instant::now() + SUBMIT_ENTER_DELAY, marker_offset, reply });
+                }
+                result => {
+                    let _ = reply.send(result);
+                }
+            }
         }
         SessionCommand::WriteInput { bytes, reply } => {
-            let _ = reply.send(runtime.write_input(&bytes));
+            let result = if state.submission.is_some() {
+                Err("submission busy: automation input refused".into())
+            } else {
+                runtime.write_input(&bytes)
+            };
+            let _ = reply.send(result);
         }
         SessionCommand::Wheel { event, reply } => {
-            let result = route_wheel_event_on_actor(wake, runtime, &mut state.observation, event, true);
+            let result = if state.submission.is_some() {
+                Err("submission busy: wheel input refused".into())
+            } else {
+                route_wheel_event_on_actor(wake, runtime, &mut state.observation, event, true)
+            };
             let _ = reply.send(result);
         }
         SessionCommand::ApplicationWheel { event, reply } => {
-            let result = route_wheel_event_on_actor(wake, runtime, &mut state.observation, event, false);
+            let result = if state.submission.is_some() {
+                Err("submission busy: wheel input refused".into())
+            } else {
+                route_wheel_event_on_actor(wake, runtime, &mut state.observation, event, false)
+            };
             let _ = reply.send(result);
         }
         SessionCommand::RetainInputSources { sources, reply } => {
-            let _ = reply.send(runtime.retain_input_sources(&sources));
+            let result = if state.submission.is_some() {
+                state.controller_queue.push(QueuedControllerInput::Retain(sources))
+            } else {
+                runtime.retain_input_sources(&sources)
+            };
+            let _ = reply.send(result);
         }
         SessionCommand::Key { source, event, reply } => {
-            let _ = reply.send(runtime.key(source, *event));
+            let result = if state.submission.is_some() {
+                Err("submission busy: direct key input refused".into())
+            } else {
+                runtime.key(source, *event)
+            };
+            let _ = reply.send(result);
         }
         SessionCommand::ReleaseInput { source, reply } => {
-            let _ = reply.send(runtime.release_input(source));
+            let result = if state.submission.is_some() {
+                state.controller_queue.push(QueuedControllerInput::Release(source))
+            } else {
+                runtime.release_input(source)
+            };
+            let _ = reply.send(result);
         }
         SessionCommand::Mouse { source, event, reply } => {
-            let _ = reply.send(runtime.mouse(source, event));
+            let result =
+                if state.submission.is_some() { Err("submission busy: mouse input refused".into()) } else { runtime.mouse(source, event) };
+            let _ = reply.send(result);
         }
         SessionCommand::Paste { text, reply } => {
-            let _ = reply.send(route_paste_on_actor(runtime, &text));
+            let result = if state.submission.is_some() {
+                Err("submission busy: automation paste refused".into())
+            } else {
+                route_paste_on_actor(runtime, &text)
+            };
+            let _ = reply.send(result);
         }
         SessionCommand::ScrollViewport { command, reply } => {
             let result = runtime.scroll_viewport(command).inspect(|outcome| {
@@ -1546,7 +1702,10 @@ fn session_actor_handle_command(
             let _ = reply.send(result);
         }
         SessionCommand::Inspect { has_controller, watcher_count, reply } => {
-            let _ = reply.send(Ok(runtime.inspect(has_controller, watcher_count)));
+            let mut inspect = runtime.inspect(has_controller, watcher_count);
+            inspect.controller_input_generation = state.controller.generation;
+            inspect.last_controller_input_at = state.controller.unix_ms;
+            let _ = reply.send(Ok(inspect));
         }
         SessionCommand::ApplyAttachState { cols, rows, capabilities, reply } => {
             let cols = cols.max(1);
@@ -1600,10 +1759,19 @@ fn session_actor_handle_command(
             let _ = reply.send(Ok(()));
         }
         SessionCommand::WriteInputWithMark { bytes, marker_name, reply } => {
-            let _ = reply.send(runtime.write_input_with_mark(&bytes, marker_name));
+            let result = if state.submission.is_some() {
+                Err("submission busy: automation input refused".into())
+            } else {
+                runtime.write_input_with_mark(&bytes, marker_name)
+            };
+            let _ = reply.send(result);
         }
         SessionCommand::PasteWithMark { text, marker_name, reply } => {
-            let result = runtime.encode_paste(&text).and_then(|bytes| runtime.write_input_with_mark(&bytes, marker_name));
+            let result = if state.submission.is_some() {
+                Err("submission busy: automation input refused".into())
+            } else {
+                runtime.encode_paste(&text).and_then(|bytes| runtime.write_input_with_mark(&bytes, marker_name))
+            };
             let _ = reply.send(result);
         }
         SessionCommand::SetRecording { enable, reply } => {
@@ -1669,8 +1837,12 @@ fn session_actor_handle_command(
         }
         #[cfg(unix)]
         SessionCommand::PrepareTransfer { reply } => {
-            let result =
-                if state.exited { Err(format!("session {} has exited", runtime.session_id())) } else { runtime.prepare_transfer() };
+            runtime.controller_input_history = state.controller.history();
+            let result = if state.exited || state.submission.is_some() {
+                Err(format!("session {} has exited or submission is busy", runtime.session_id()))
+            } else {
+                runtime.prepare_transfer()
+            };
             if result.is_ok() {
                 state.clipboard.suspend();
             }
@@ -1704,6 +1876,9 @@ fn session_actor_handle_command(
         #[cfg(unix)]
         SessionCommand::ResumeAdopted { tail, reply } => {
             let result = runtime.resume_adopted(&tail);
+            if result.is_ok() {
+                state.controller.observe_output(&tail, Instant::now());
+            }
             let _ = runtime.drain_clipboard();
             state.clipboard.queue.clear();
             if result.is_ok() {
@@ -1724,6 +1899,51 @@ fn session_actor_handle_command(
         session_actor_pump(runtime, state, wake);
     }
     stop
+}
+
+fn write_controller_event(runtime: &mut SessionRuntime, source: u128, event: crate::provider::TerminalInputEvent) -> Result<bool, String> {
+    use crate::provider::TerminalInputEvent as E;
+    match event {
+        E::RawBytes(bytes) => runtime.write_input(&bytes).map(|_| !bytes.is_empty()),
+        E::Text(event) => runtime.write_input(event.text.as_bytes()).map(|_| !event.text.is_empty()),
+        E::Paste(event) => route_paste_on_actor(runtime, event.text.as_bytes()).map(|n| n > 0),
+        E::Key(event) => runtime.key(source, event).map(|n| n > 0),
+        _ => Err("unsupported controller input event".into()),
+    }
+}
+
+fn finish_submission(runtime: &mut SessionRuntime, state: &mut SessionActorLoopState, wake: &WakeCallback) {
+    if !state.submission.as_ref().is_some_and(|s| state.exited || Instant::now() >= s.enter_at) {
+        return;
+    }
+    let submission = state.submission.take().expect("submission exists");
+    let result = if state.exited { Err("session exited before submission Enter".into()) } else { runtime.write_input(b"\r") };
+    // Replay accepted controller events in order after the Enter attempt, including key releases.
+    // Even if Enter fails, try every admitted event to preserve input; the resulting draft is uncertain.
+    let mut replay_result = Ok(());
+    while let Some(input) = state.controller_queue.pop() {
+        let written = match input {
+            QueuedControllerInput::Event { source, event } => {
+                let expected = controller_expected_echo(&event);
+                let result = write_controller_event(runtime, source, event);
+                if let Ok(written) = result {
+                    if written {
+                        state.controller.written(expected);
+                    }
+                }
+                result
+            }
+            QueuedControllerInput::Release(source) => runtime.release_input(source).map(|_| false),
+            QueuedControllerInput::Retain(sources) => runtime.retain_input_sources(&sources).map(|_| false),
+            QueuedControllerInput::Focus(focused) => runtime.focus(focused).map(|_| false),
+        };
+        if replay_result.is_ok() {
+            replay_result = written.map(|_| ());
+        }
+    }
+    // An error may follow a successful Enter: callers must not infer that retrying is safe.
+    let _ = submission.reply.send(result.and(replay_result).map(|_| submission.marker_offset));
+    wake();
 }
 
 fn runtime_released(runtime: &SessionRuntime) -> bool {
@@ -1760,6 +1980,9 @@ fn session_actor_pump(runtime: &mut SessionRuntime, state: &mut SessionActorLoop
             // Fires only on pumps that read output, so session creation
             // (whose command handling also pumps) completes first.
             if !result.chunks.is_empty() {
+                for chunk in &result.chunks {
+                    state.controller.observe_output(chunk, Instant::now());
+                }
                 maybe_panic_actor_for_test(runtime.session_id());
             }
             publish_raw_output(&mut state.raw_output_taps, &mut state.last_raw_output_sequence, &result.chunks);
@@ -2343,5 +2566,161 @@ mod tests {
         let future = observation.render_generation + 1;
         assert!(!mark_observed_and_wake(&mut observation, future, &wake));
         assert_eq!(wakes.load(AtomicOrdering::SeqCst), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod submission_tests {
+    use super::*;
+    use crate::provider::{TerminalInputEvent, TerminalPasteEvent, TerminalTextEvent};
+
+    pub(crate) fn spawn(command: &str) -> (tempfile::TempDir, SessionActor, RawOutputTap) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let command = command.to_string();
+        let actor = SessionActor::spawn(3, Arc::new(|| {}), move || {
+            let session = crate::runtime::SessionMetadata {
+                id: "submission-test".into(),
+                vt_engine: vt::VtEngineKind::Passthrough,
+                cwd: None,
+                cmd: Some(command),
+                tags: vec![],
+                environment: vec![],
+                record: false,
+                initial_size: Default::default(),
+                colors: Default::default(),
+            };
+            SessionRuntime::spawn(
+                dir,
+                &session,
+                vt::make_vt_engine_with_colors(vt::VtEngineKind::Passthrough, 20, 3, Default::default()).unwrap(),
+            )
+        })
+        .unwrap();
+        let tap = actor.subscribe_raw_output().unwrap();
+        (temp, actor, tap)
+    }
+
+    fn collect_until(tap: &RawOutputTap, bytes: &mut Vec<u8>, needle: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !bytes.windows(needle.len()).any(|w| w == needle) {
+            assert!(Instant::now() < deadline, "missing {:?} in {:?}", needle, bytes);
+            while let Ok(chunk) = tap.try_recv() {
+                bytes.extend_from_slice(&chunk.bytes);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    // The actor must replay controller input after paste+Enter, byte-for-byte, and reject competing automation.
+    // A real PTY child is the process boundary; its hex dump observes exactly the bytes delivered.
+    #[test]
+    fn submission_replays_raw_and_packet_input_losslessly_without_vt() {
+        // Explicit generator: empty, ASCII, UTF-8, binary, LF and CR controller payloads.
+        for payload in [vec![], b"x".to_vec(), "λ".as_bytes().to_vec(), vec![0, 255, b'\n', b'\r']] {
+            let count = 12 + payload.len();
+            let command =
+                format!("stty raw -echo; sleep 0.05; printf READY; dd bs=1 count={count} 2>/dev/null | od -An -tx1; printf DONE; sleep 10");
+            let (_temp, actor, tap) = spawn(&command);
+            let mut output = Vec::new();
+            collect_until(&tap, &mut output, b"READY");
+            let submit = actor.begin_send(b"abc".to_vec(), true, false, Default::default(), None).unwrap();
+            actor.inspect(false, 0).unwrap(); // FIFO barrier: paste is written, Enter is still held.
+            assert!(submit.try_recv().is_err());
+            actor.controller_input(0, TerminalInputEvent::RawBytes(payload.clone())).unwrap();
+            actor.controller_input(1, TerminalInputEvent::Text(TerminalTextEvent { text: "txt".into() })).unwrap();
+            actor.controller_input(2, TerminalInputEvent::Paste(TerminalPasteEvent { text: "paste".into() })).unwrap();
+            let second = actor.begin_send(b"BAD".to_vec(), true, false, Default::default(), None).unwrap();
+            assert!(second.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().contains("busy"));
+            assert!(actor.write_input(b"BAD".to_vec()).unwrap_err().contains("busy"));
+            assert_eq!(submit.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(), None);
+            collect_until(&tap, &mut output, b"DONE");
+            let text = String::from_utf8(output).unwrap();
+            let hex = text.split("READY").nth(1).unwrap().split("DONE").next().unwrap();
+            let delivered: Vec<u8> = hex.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect();
+            let mut expected = b"abc\r".to_vec();
+            expected.extend(&payload);
+            expected.extend(b"txtpaste");
+            assert_eq!(delivered, expected);
+            assert_eq!(actor.inspect(false, 0).unwrap().controller_input_generation, u64::from(!payload.is_empty()) + 2);
+        }
+    }
+
+    // Before any paste, quiet-time and the pending-output fence must both authorize the write.
+    // Echo delayed beyond the requested quiet time must continue to refuse, including a zero-duration guard.
+    #[test]
+    fn controller_input_before_predicate_and_delayed_echo_fail_closed() {
+        for event in [
+            TerminalInputEvent::RawBytes(b"x".to_vec()),
+            TerminalInputEvent::Text(TerminalTextEvent { text: "x".into() }),
+            TerminalInputEvent::Paste(TerminalPasteEvent { text: "x".into() }),
+        ] {
+            let (_temp, actor, tap) =
+                spawn("stty raw -echo; sleep 0.05; printf READY; dd bs=1 count=1 of=/dev/null 2>/dev/null; printf NOISE; sleep 0.4; printf xECHO; sleep 10");
+            let mut output = Vec::new();
+            collect_until(&tap, &mut output, b"READY");
+            actor.controller_input(0, event).unwrap();
+            for idle in [Duration::ZERO, Duration::from_millis(1), Duration::from_secs(10)] {
+                let result =
+                    actor.begin_send(b"BAD".to_vec(), true, false, SendPreconditions { controller_idle: Some(idle) }, None).unwrap();
+                assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+            }
+            thread::sleep(Duration::from_millis(150));
+            let result =
+                actor.begin_send(b"BAD".to_vec(), true, false, SendPreconditions { controller_idle: Some(Duration::ZERO) }, None).unwrap();
+            assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().contains("PTY echo"));
+            collect_until(&tap, &mut output, b"ECHO");
+            thread::sleep(SUBMIT_ENTER_DELAY + Duration::from_millis(20));
+            let result =
+                actor.begin_send(b"ok".to_vec(), false, true, SendPreconditions { controller_idle: Some(Duration::ZERO) }, None).unwrap();
+            assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
+            assert_eq!(actor.inspect(false, 0).unwrap().controller_input_generation, 1);
+        }
+    }
+
+    // Packet text/paste and raw attachment bytes share the same counter; HTTP automation and resize do not.
+    #[test]
+    fn controller_sources_share_activity_and_queue_overflow_is_explicit() {
+        let (_temp, actor, _tap) = spawn("stty raw -echo; sleep 10");
+        actor.write_input(b"automation".to_vec()).unwrap();
+        actor.resize(20, 3).unwrap();
+        assert_eq!(actor.inspect(false, 0).unwrap().controller_input_generation, 0);
+        for (source, event) in [
+            (0, TerminalInputEvent::RawBytes(b"raw".to_vec())),
+            (1, TerminalInputEvent::Text(TerminalTextEvent { text: "text".into() })),
+            (2, TerminalInputEvent::Paste(TerminalPasteEvent { text: "paste".into() })),
+        ] {
+            actor.controller_input(source, event).unwrap();
+        }
+        let inspection = actor.inspect(false, 0).unwrap();
+        assert_eq!(inspection.controller_input_generation, 3);
+        assert!(inspection.last_controller_input_at.is_some());
+        let send = actor.begin_send(vec![], true, false, Default::default(), None).unwrap();
+        actor.inspect(false, 0).unwrap();
+        let error = actor.controller_input(0, TerminalInputEvent::RawBytes(vec![b'x'; CONTROLLER_QUEUE_BYTES + 1])).unwrap_err();
+        assert!(error.contains("input refused"));
+        assert_eq!(actor.inspect(false, 0).unwrap().controller_input_generation, 3);
+        assert!(send.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
+    }
+
+    // Explicit sequence generator crosses zero, threshold-1, threshold, threshold+1 and pending-output states.
+    // The quiet-time boundary is inclusive; unobserved accepted input always refuses, even after long quiet.
+    #[test]
+    fn controller_guard_boundaries_and_monotonicity() {
+        let start = Instant::now();
+        let preconditions = SendPreconditions { controller_idle: Some(Duration::from_millis(10)) };
+        let mut activity = ControllerActivity::default();
+        assert!(activity.check(&preconditions, start).is_ok());
+        for generation in 1..=4 {
+            activity.accepted(start);
+            assert_eq!(activity.generation, generation);
+            for elapsed in [0, 9, 10, 11, 1000] {
+                for pending in [false, true] {
+                    activity.pending_output = pending;
+                    let accepted = activity.check(&preconditions, start + Duration::from_millis(elapsed)).is_ok();
+                    assert_eq!(accepted, !pending && elapsed >= 10);
+                }
+            }
+        }
     }
 }

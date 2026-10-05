@@ -62,6 +62,8 @@ pub struct FdTransferManifest {
     /// The recording is paused (`cleat record` off) rather than absent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recording_paused: bool,
+    #[serde(default, skip_serializing_if = "crate::protocol::ControllerInputHistory::is_empty")]
+    pub controller_input_history: crate::protocol::ControllerInputHistory,
 }
 
 #[derive(Deserialize)]

@@ -51,6 +51,7 @@ fn manifest() -> FdTransferManifest {
         replay_snapshot: ReplaySnapshot { engine: "passthrough".into(), cols: 100, rows: 30, state: "\x1b[Hscreen".into() },
         markers: Default::default(),
         recording_paused: false,
+        controller_input_history: Default::default(),
     }
 }
 fn pair() -> (UnixStream, UnixStream) {
@@ -70,7 +71,15 @@ fn is_open(fd: i32) -> bool {
 #[test]
 fn round_trip_all_roles_cloexec_and_shared_flags() {
     let (mut sender, mut receiver) = pair();
-    let expected = manifest();
+    let mut expected = manifest();
+    // The live transfer must preserve controller generation and partial echo evidence.
+    expected.controller_input_history = cleat::protocol::ControllerInputHistory {
+        generation: 7,
+        last_input_at: Some(123),
+        pending_output: true,
+        expected_echo: Some(b"draft".to_vec()),
+        echo_matched: 2,
+    };
     let sent = expected.clone();
     let (read_end, write_end) = nix::unistd::pipe().unwrap();
     nix::fcntl::fcntl(&read_end, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).unwrap();

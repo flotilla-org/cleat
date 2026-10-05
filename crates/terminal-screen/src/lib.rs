@@ -6,6 +6,7 @@
 
 mod detect;
 mod grid;
+pub mod segment;
 mod selector;
 mod tree;
 

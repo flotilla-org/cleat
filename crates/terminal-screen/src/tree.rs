@@ -84,6 +84,10 @@ impl fmt::Display for TreeError {
 impl std::error::Error for TreeError {}
 
 impl ScreenTree {
+    /// A tree with only a root; producers other than `analyze` attach nodes with `add_node`.
+    pub fn from_root(generation: u64, root: Node) -> Self {
+        Self { generation, nodes: vec![root] }
+    }
     pub fn root(&self) -> NodeId {
         NodeId(0)
     }
@@ -131,7 +135,7 @@ impl ScreenTree {
     }
 }
 
-fn span_node(cells: &[Cell], col: u16, row: u16) -> Node {
+pub(crate) fn span_node(cells: &[Cell], col: u16, row: u16) -> Node {
     let first = &cells[0];
     let mut node =
         Node::new("span", Rect { col, row, width: cells.len() as u16, height: 1 }, cells.iter().map(Cell::text).collect::<String>());

@@ -147,11 +147,17 @@ pub(crate) struct SessionTransferRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum InputRequest {
+    Send { text: String, submit: bool, no_enter: bool, controller_idle_ms: Option<u64>, marker_name: Option<String> },
     Text { text: String },
     Paste { text: String },
     Key { key: KeyRequest },
     RawBytes { bytes: Vec<u8> },
     Resize { cols: u16, rows: u16 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SendResponse {
+    pub marker_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

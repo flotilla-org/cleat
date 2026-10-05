@@ -1065,6 +1065,15 @@ impl SessionService {
         Ok(response.offset)
     }
 
+    pub(crate) fn send_transaction(&self, id: &str, input: &http_uds::InputRequest) -> Result<Option<u64>, String> {
+        if !self.layout.session_dir(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let response: http_uds::SendResponse = self.http_json(id, Method::POST, &format!("/sessions/{id}/input"), input)?;
+        Ok(response.marker_offset)
+    }
+
+    #[cfg(all(test, unix))]
     pub(crate) fn send_input(&self, id: &str, input: &http_uds::InputRequest) -> Result<(), String> {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
@@ -1073,6 +1082,7 @@ impl SessionService {
         self.http_no_content(id, Method::POST, &format!("/sessions/{id}/input"), input)
     }
 
+    #[cfg(all(test, unix))]
     pub(crate) fn send_paste_with_mark(&self, id: &str, text: &str, marker_name: &str) -> Result<u64, String> {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));

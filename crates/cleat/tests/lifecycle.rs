@@ -4714,3 +4714,85 @@ fn packet_shared_input_releases_on_driver_loss_and_history() {
         service.kill("alpha").unwrap();
     }
 }
+
+// Real raw attachment frames advance controller activity; watcher, resize and HTTP writes do not.
+// The raw no-VT path must expose the counter and refuse before writing a guarded send or its marker.
+#[test]
+fn controller_activity_raw_path_without_vt() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service.create(Some("controller-raw".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).unwrap();
+    let mut controller = http_attach_stream(temp.path(), "controller-raw", 80, 24, ClientCapabilities::conservative_fallback());
+    let mut watcher = http_watch_stream(temp.path(), "controller-raw", 80, 24, ClientCapabilities::conservative_fallback());
+    Frame::Input(b"ignored".to_vec()).write(&mut watcher).unwrap();
+    Frame::Resize { cols: 80, rows: 24 }.write(&mut controller).unwrap();
+    service.send_keys("controller-raw", b"automation").unwrap();
+    assert_eq!(service.inspect("controller-raw").unwrap().controller_input_generation, 0);
+    for generation in 1..=2 {
+        Frame::Input(b"human".to_vec()).write(&mut controller).unwrap();
+        wait_until("raw controller input counted", || service.inspect("controller-raw").unwrap().controller_input_generation == generation);
+    }
+    let inspect = service.inspect("controller-raw").unwrap();
+    assert!(inspect.last_controller_input_at.is_some());
+    let cli =
+        Cli::try_parse_from(["cleat", "send", "controller-raw", "BAD", "--submit", "--controller-idle", "0", "--mark-before", "refused"])
+            .unwrap();
+    assert!(matches!(cli::execute(cli, &service), ExecResult::Err(message) if message.contains("controller input")));
+    assert!(!service.inspect("controller-raw").unwrap().recording.markers.contains_key("refused"));
+    service.kill("controller-raw").unwrap();
+}
+
+// Real packet routing counts keyboard presses/repeats, text, paste and raw events, across shared controllers.
+// Key release, watcher input and packet resize never advance activity.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn controller_activity_packet_paths() {
+    use cleat::provider::{TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers, TerminalResizeEvent};
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service.create(Some("controller-packet".into()), Some(VtEngineKind::Ghostty), None, Some("cat".into()), false).unwrap();
+    let mut stream = http_packet_stream(temp.path(), "controller-packet");
+    let mut buffer = Vec::new();
+    PacketFrame::read(&mut stream).unwrap();
+    PacketFrame::read(&mut stream).unwrap();
+    packet_open_channel(&mut stream, 1, "controller-packet");
+    let initial = read_packet_render(&mut stream, &mut buffer, 1, Duration::from_secs(2));
+    packet_ack(&mut stream, 1, initial.render_generation);
+    let key = |action| {
+        TerminalInputEvent::Key(TerminalKeyEvent {
+            key: TerminalKey::UnicodeScalar(u32::from('x')),
+            modifiers: TerminalModifiers::empty(),
+            consumed_modifiers: TerminalModifiers::empty(),
+            action,
+            generated_text: Some("x".into()),
+            platform_keycode: 0,
+            physical_key: None,
+        })
+    };
+    for (index, event) in [
+        TerminalInputEvent::Text(TerminalTextEvent { text: "text".into() }),
+        TerminalInputEvent::Paste(TerminalPasteEvent { text: "paste".into() }),
+        TerminalInputEvent::RawBytes(b"raw".to_vec()),
+        key(TerminalKeyAction::Press),
+        key(TerminalKeyAction::Repeat),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        packet_input(&mut stream, 1, event);
+        wait_until("packet controller input counted", || {
+            service.inspect("controller-packet").unwrap().controller_input_generation == index as u64 + 1
+        });
+    }
+    packet_input(&mut stream, 1, key(TerminalKeyAction::Release));
+    packet_input(
+        &mut stream,
+        1,
+        TerminalInputEvent::Resize(TerminalResizeEvent { cols: 81, rows: 24, cell_width_px: 8.0, cell_height_px: 16.0 }),
+    );
+    wait_until("packet resize handled", || service.inspect("controller-packet").unwrap().terminal.cols == 81);
+    assert_eq!(service.inspect("controller-packet").unwrap().controller_input_generation, 5);
+    service.kill("controller-packet").unwrap();
+}

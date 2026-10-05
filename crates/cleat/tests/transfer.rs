@@ -774,3 +774,31 @@ fn handover_of_a_recreated_session_leaves_no_husk_blocking_a_return_transfer() {
     root.transfer("recreated", "default", &[], &[]).unwrap();
     assert_eq!(root.inspect(&["inspect", "recreated"]).generation, Some(2));
 }
+
+// Accepted controller activity must remain monotonic across a real daemon-to-daemon transfer.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn controller_activity_survives_live_transfer() {
+    let root = Root::new();
+    root.launch_shell("controller-history");
+    let drive = |generation| {
+        let service = SessionService::new(RuntimeLayout::new(root.path().to_path_buf())).for_session("controller-history").unwrap();
+        let (mut client, _) = service.connect_packets("controller-history").unwrap();
+        client.get_ref().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        client.open_channel(1, "controller-history", cleat::packet::ChannelRole::Controller).unwrap();
+        let render = client.read_render(1).unwrap();
+        client.ack(1, render.update.render_generation).unwrap();
+        client.input(1, cleat::provider::TerminalInputEvent::RawBytes(b"echo controller-history\n".to_vec())).unwrap();
+        wait_until("controller generation", Duration::from_secs(5), || {
+            service.inspect("controller-history").unwrap().controller_input_generation == generation
+        });
+    };
+    drive(1);
+    let before = root.inspect(&["inspect", "controller-history"]);
+    root.transfer("controller-history", "other", &[], &[]).unwrap();
+    let after = root.inspect(&["inspect", "controller-history"]);
+    assert_eq!(after.controller_input_generation, before.controller_input_generation);
+    assert_eq!(after.last_controller_input_at, before.last_controller_input_at);
+    drive(2);
+    root.ok(&["kill", "controller-history"]);
+}

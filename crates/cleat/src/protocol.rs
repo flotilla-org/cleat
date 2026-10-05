@@ -95,6 +95,23 @@ pub enum SessionStatus {
     Detached,
 }
 
+/// Controller history carried across live host transfers. A new child activation starts fresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerInputHistory {
+    pub generation: u64,
+    pub last_input_at: Option<u64>,
+    pub pending_output: bool,
+    pub expected_echo: Option<Vec<u8>>,
+    #[serde(default)]
+    pub echo_matched: usize,
+}
+
+impl ControllerInputHistory {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResult {
     #[serde(default)]
@@ -115,6 +132,12 @@ pub struct InspectResult {
     /// Unix timestamp in milliseconds of the most recent render-changing output.
     #[serde(default)]
     pub last_output_at: Option<u64>,
+    /// Unix milliseconds of the last accepted controller keyboard/text/paste/raw event.
+    #[serde(default)]
+    pub last_controller_input_at: Option<u64>,
+    /// Monotonic within a child activation, including host transfers; automation and resize do not advance it.
+    #[serde(default)]
+    pub controller_input_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

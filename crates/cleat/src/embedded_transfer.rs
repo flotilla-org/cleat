@@ -52,6 +52,7 @@ pub(crate) fn offer(source: TransferSource) -> Result<Offer, String> {
             replay_snapshot: source.replay_snapshot,
             markers: source.markers,
             recording_paused: source.recording_paused,
+            controller_input_history: source.controller_input_history,
         },
         fds,
         status_writer,
@@ -89,6 +90,7 @@ pub(crate) fn actor(
         replay_snapshot: manifest.replay_snapshot,
         markers: manifest.markers,
         recording_paused: manifest.recording_paused,
+        controller_input_history: manifest.controller_input_history,
         pty_child,
         recording: descriptors.recording,
     };

@@ -753,6 +753,7 @@ fn send_command_parses() {
         text: "echo hello".into(),
         no_enter: false,
         submit: false,
+        controller_idle: None,
         mark_before: None
     });
 }
@@ -760,13 +761,27 @@ fn send_command_parses() {
 #[test]
 fn send_command_parses_no_enter() {
     let cli = Cli::try_parse_from(["cleat", "send", "--no-enter", "demo", "partial"]).expect("send --no-enter parses");
-    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "partial".into(), no_enter: true, submit: false, mark_before: None });
+    assert_eq!(cli.command, Command::Send {
+        id: "demo".into(),
+        text: "partial".into(),
+        no_enter: true,
+        submit: false,
+        controller_idle: None,
+        mark_before: None
+    });
 }
 
 #[test]
 fn send_command_parses_submit() {
     let cli = Cli::try_parse_from(["cleat", "send", "--submit", "demo", "prompt"]).expect("send --submit parses");
-    assert_eq!(cli.command, Command::Send { id: "demo".into(), text: "prompt".into(), no_enter: false, submit: true, mark_before: None });
+    assert_eq!(cli.command, Command::Send {
+        id: "demo".into(),
+        text: "prompt".into(),
+        no_enter: false,
+        submit: true,
+        controller_idle: None,
+        mark_before: None
+    });
 }
 
 #[test]
@@ -774,74 +789,60 @@ fn send_command_rejects_submit_with_no_enter() {
     assert!(Cli::try_parse_from(["cleat", "send", "--submit", "--no-enter", "demo", "prompt"]).is_err());
 }
 
+// Network-boundary fake: verify each submit crosses HTTP exactly once, including its marker and guard.
 #[cfg(unix)]
 #[test]
-fn send_submit_posts_paste_then_enter_input_requests() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-    std::fs::create_dir_all(service.session_dir("alpha")).expect("create session dir");
-
-    let socket_path = session_socket_path(temp.path(), "alpha");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind socket");
-    let reader = std::thread::spawn(move || {
-        let mut requests = Vec::new();
-        for _ in 0..2 {
+fn send_submit_posts_one_transaction() {
+    for (flags, idle, marker, offset) in [
+        (vec![], serde_json::Value::Null, serde_json::Value::Null, serde_json::Value::Null),
+        (vec!["--mark-before", "m1", "--controller-idle", "500ms"], serde_json::json!(500), serde_json::json!("m1"), serde_json::json!(42)),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+        std::fs::create_dir_all(service.session_dir("alpha")).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(session_socket_path(temp.path(), "alpha")).unwrap();
+        let response_offset = offset.clone();
+        let reader = std::thread::spawn(move || {
             use std::io::Write;
-
-            let (mut stream, _) = listener.accept().expect("accept connection");
-            requests.push(read_http_request_for_cli_test(&mut stream));
-            stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("write response");
-        }
-        requests
-    });
-
-    let cli = Cli::try_parse_from(["cleat", "send", "--submit", "alpha", "hello"]).expect("parse send --submit");
-    assert_eq!(execute(cli, &service).expect("execute send --submit"), None);
-
-    let requests = reader.join().expect("join reader");
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{}", requests[0]);
-    assert!(requests[0].ends_with(r#"{"kind":"paste","text":"hello"}"#), "{}", requests[0]);
-    assert!(requests[1].starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{}", requests[1]);
-    assert!(requests[1].ends_with(r#"{"kind":"key","key":{"kind":"named","key":"enter"}}"#), "{}", requests[1]);
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request_for_cli_test(&mut stream);
+            let body = serde_json::json!({"marker_offset": response_offset}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request
+        });
+        let mut args = vec!["cleat", "send", "--submit"];
+        args.extend(flags);
+        args.extend(["alpha", "hello"]);
+        assert_eq!(
+            execute(Cli::try_parse_from(args).unwrap(), &service).expect("send transaction"),
+            offset.as_u64().map(|v| v.to_string())
+        );
+        let request = reader.join().unwrap();
+        assert!(request.starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"));
+        let body: serde_json::Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"kind":"send", "text":"hello", "submit":true, "no_enter":false, "controller_idle_ms":idle, "marker_name":marker})
+        );
+    }
 }
 
-#[cfg(unix)]
+// Durations use the existing CLI parser, including zero, fractions and invalid values.
 #[test]
-fn send_submit_with_mark_marks_before_paste_and_returns_offset() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
-    std::fs::create_dir_all(service.session_dir("alpha")).expect("create session dir");
-
-    let socket_path = session_socket_path(temp.path(), "alpha");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind socket");
-    let reader = std::thread::spawn(move || {
-        let mut requests = Vec::new();
-        for index in 0..2 {
-            use std::io::Write;
-
-            let (mut stream, _) = listener.accept().expect("accept connection");
-            requests.push(read_http_request_for_cli_test(&mut stream));
-            if index == 0 {
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"offset\":42}")
-                    .expect("write mark response");
-            } else {
-                stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("write response");
-            }
-        }
-        requests
-    });
-
-    let cli = Cli::try_parse_from(["cleat", "send", "--submit", "--mark-before", "m1", "alpha", "hello"]).expect("parse send --submit");
-    assert_eq!(execute(cli, &service).expect("execute send --submit"), Some("42".to_string()));
-
-    let requests = reader.join().expect("join reader");
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].starts_with("POST /sessions/alpha/paste-with-mark HTTP/1.1\r\n"), "{}", requests[0]);
-    assert!(requests[0].ends_with(r#"{"text":"hello","marker_name":"m1"}"#), "{}", requests[0]);
-    assert!(requests[1].starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"), "{}", requests[1]);
-    assert!(requests[1].ends_with(r#"{"kind":"key","key":{"kind":"named","key":"enter"}}"#), "{}", requests[1]);
+fn send_controller_idle_parses_durations() {
+    for (input, millis) in [("0", 0), ("0.5", 500), ("2s", 2000)] {
+        let cli = Cli::try_parse_from(["cleat", "send", "demo", "text", "--controller-idle", input]).unwrap();
+        assert!(matches!(cli.command, Command::Send { controller_idle: Some(d), .. } if d.as_millis() == millis));
+    }
+    for input in ["-1", "NaN", "invalid"] {
+        assert!(Cli::try_parse_from(["cleat", "send", "demo", "text", "--controller-idle", input]).is_err());
+    }
 }
 
 #[test]
@@ -999,6 +1000,7 @@ fn send_mark_before_parses() {
         text: "echo hi".into(),
         no_enter: false,
         submit: false,
+        controller_idle: None,
         mark_before: Some("m1".into())
     });
 }

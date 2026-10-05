@@ -42,6 +42,7 @@ pub(crate) struct SessionRuntime {
     session: SessionMetadata,
     session_dir: PathBuf,
     hosting_epoch: u64,
+    pub(crate) controller_input_history: crate::protocol::ControllerInputHistory,
     pty_child: PtyChild,
     vt_engine: Box<dyn VtEngine>,
     detached_da: Option<DeviceAttributeTracker>,
@@ -85,6 +86,7 @@ pub(crate) struct TransferSource {
     pub replay_snapshot: crate::recording::ReplaySnapshot,
     pub markers: HashMap<String, u64>,
     pub recording_paused: bool,
+    pub controller_input_history: crate::protocol::ControllerInputHistory,
     pub pty_master: std::os::fd::OwnedFd,
     pub recording: Option<std::fs::File>,
     /// This host forked the child (and so reaps it).
@@ -103,6 +105,7 @@ pub(crate) struct AdoptedSession {
     pub replay_snapshot: crate::recording::ReplaySnapshot,
     pub markers: HashMap<String, u64>,
     pub recording_paused: bool,
+    pub controller_input_history: crate::protocol::ControllerInputHistory,
     pub pty_child: PtyChild,
     pub recording: Option<std::fs::File>,
 }
@@ -185,6 +188,7 @@ impl SessionRuntime {
         let hosting_epoch = crate::runtime::hosting_epoch(&session_dir)?;
         let mut runtime = Self {
             hosting_epoch,
+            controller_input_history: Default::default(),
             session: session.clone(),
             session_dir,
             pty_child,
@@ -240,6 +244,7 @@ impl SessionRuntime {
         };
         let mut runtime = Self {
             hosting_epoch: adopted.hosting_epoch,
+            controller_input_history: adopted.controller_input_history,
             session: adopted.session,
             session_dir: adopted.session_dir,
             pty_child: adopted.pty_child,
@@ -314,6 +319,7 @@ impl SessionRuntime {
             },
             markers: self.markers.clone(),
             recording_paused: self.recorder.as_ref().is_some_and(SessionRecorder::is_paused),
+            controller_input_history: self.controller_input_history.clone(),
             pty_master,
             recording,
             forked_here: self.pty_child.forked_here(),
@@ -669,6 +675,8 @@ impl SessionRuntime {
             screen_activity: activity.screen_activity,
             stable_since: activity.stable_since,
             last_output_at: activity.last_output_at,
+            last_controller_input_at: None,
+            controller_input_generation: 0,
         }
     }
 
@@ -791,6 +799,17 @@ impl SessionRuntime {
 
     pub(crate) fn drain_clipboard(&mut self) -> (Vec<crate::clipboard::ClipboardEvent>, u64) {
         self.vt_engine.drain_clipboard()
+    }
+
+    pub(crate) fn input_transfer_pending(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.transfer_tail.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     pub(crate) fn session_id(&self) -> &str {

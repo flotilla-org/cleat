@@ -1,3 +1,10 @@
+/* Demonstrate existing semantic cell tags and the navigation getter's
+ * same-row C/D behavior; this is not an editable-buffer safety guarantee.
+ * Build against a pinned Ghostty prefix:
+ * cc -I "$OSC133_PREFIX/include" ghostty-proof.c
+ *    "$OSC133_PREFIX/lib/libghostty-vt.a" -lm -lpthread -ldl -o /tmp/ghostty-proof
+ * Run: /tmp/ghostty-proof
+ */
 #include <ghostty/vt.h>
 #include <stdio.h>
 #include <string.h>

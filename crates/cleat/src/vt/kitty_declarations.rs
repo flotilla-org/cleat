@@ -16,21 +16,71 @@ pub(super) struct Command {
 impl Command {
     fn parse(header: &[u8]) -> Option<Self> {
         let mut command = Self { action: b't', delete: b'a', ..Self::default() };
-        for part in header.split(|b| *b == b',') {
-            if part.len() < 3 || part[1] != b'=' {
-                return None;
-            }
-            let value = &part[2..];
-            match part[0] {
-                b'a' if value.len() == 1 => command.action = value[0],
-                b'd' if value.len() == 1 => command.delete = value[0],
-                b'i' => command.image_id = Some(std::str::from_utf8(value).ok()?.parse().ok()?),
-                b'I' => command.image_number = Some(std::str::from_utf8(value).ok()?.parse().ok()?),
-                b'p' => command.placement_id = Some(std::str::from_utf8(value).ok()?.parse().ok()?),
-                b'm' => command.more = value == b"1",
+        // Match the pinned Ghostty Parser's 11-byte key/value buffer and
+        // ignore states. A one-byte non-digit is its ASCII numeric value;
+        // integer parse failures reject the command, but malformed keys are ignored.
+        let mut key = Vec::new();
+        let mut value: Vec<u8> = Vec::new();
+        let mut current = 0;
+        let mut medium = u32::from(b'd');
+        let mut state = 0; // key, ignored key, value, ignored value
+        for byte in header.iter().copied().chain(b";".iter().copied()) {
+            match state {
+                0 | 1 if byte == b'=' => {
+                    current = key.first().copied().unwrap_or(0);
+                    state = if state == 0 && key.len() == 1 { 2 } else { 3 };
+                    key.clear();
+                }
+                0 | 1 if byte == b';' => break,
+                0 => {
+                    key.push(byte);
+                    if key.len() > 11 {
+                        state = 1;
+                        key.clear();
+                    }
+                }
+                2 if matches!(byte, b',' | b';') => {
+                    let number = if value.len() == 1 && !value[0].is_ascii_digit() {
+                        u32::from(value[0])
+                    } else {
+                        let text = std::str::from_utf8(&value).ok()?.replace('_', "");
+                        if matches!(current, b'z' | b'H' | b'V') {
+                            text.parse::<i32>().ok()? as u32
+                        } else {
+                            text.parse::<u32>().ok()?
+                        }
+                    };
+                    match current {
+                        b'a' => command.action = number.try_into().ok()?,
+                        b'd' => command.delete = number.try_into().ok()?,
+                        b'i' => command.image_id = Some(number),
+                        b'I' => command.image_number = Some(number),
+                        b'p' => command.placement_id = Some(number),
+                        // Ghostty treats every nonzero direct-transmission m as more.
+                        b'm' => command.more = number > 0,
+                        b't' => medium = number,
+                        _ => {}
+                    }
+                    value.clear();
+                    state = 0;
+                    if byte == b';' {
+                        break;
+                    }
+                }
+                2 => {
+                    value.push(byte);
+                    if value.len() > 11 {
+                        state = 3;
+                        value.clear();
+                    }
+                }
+                3 if byte == b',' => state = 1,
+                3 if byte == b';' => break,
                 _ => {}
             }
         }
+        // Local file/shared-memory media ignore m in Ghostty.
+        command.more &= medium == u32::from(b'd');
         Some(command)
     }
     fn targets_explicit(&self, entry: &Entry) -> bool {
@@ -74,7 +124,7 @@ impl Observer {
         if let State::String { apc, osc, header, .. } = &self.state {
             if matches!(byte, 0x1b | 0x18 | 0x1a | 0x9c) || (*osc && byte == 7) {
                 let kitty = *apc && header.first() == Some(&b'G');
-                let command = if kitty { Command::parse(&header[1..]) } else { None };
+                let command = if kitty && header.len() <= 4096 { Command::parse(&header[1..]) } else { None };
                 self.state = if byte == 0x1b { State::Escape } else { State::Ground };
                 if kitty {
                     let command = match command {
@@ -134,7 +184,7 @@ impl Observer {
             State::String { apc, header, payload, .. } => {
                 if byte == b';' {
                     *payload = true;
-                } else if *apc && !*payload && header.len() < 4096 {
+                } else if *apc && !*payload && header.len() < 4097 {
                     header.push(byte);
                 }
             }
@@ -151,7 +201,7 @@ struct Entry {
     original_id: u32,
     explicit: bool,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Registry {
     screens: [Vec<Entry>; 2],
     sequence: u64,
@@ -421,6 +471,24 @@ mod tests {
             };
             assert_eq!(normalize(actual), normalize(expected.clone()), "split={split}");
         }
+    }
+
+    // Ghostty accepts ASCII-valued IDs and ignored multi-byte keys. Metadata
+    // observation must preserve original p without turning accepted output into an error.
+    #[test]
+    fn ghostty_accepted_headers_preserve_metadata() {
+        for header in ["a=p,i=7,p=A,U=1,c=4,r=2", "a=p,i=7,p=+1,U=1,c=4,r=2", "a=p,i=7,p=1,U=1,c=4,r=2,ignored=value"] {
+            let mut e = engine();
+            e.feed(format!("\x1b_G{header};\x1b\\").as_bytes()).unwrap();
+            let declarations = e.virtual_placements();
+            assert_eq!(declarations.len(), 1);
+            assert!(declarations[0].placement_id_explicit);
+            assert_eq!(declarations[0].placement_id, if header.contains("p=A") { 65 } else { 1 });
+        }
+        let mut e = engine();
+        e.feed(b"\x1b_Ga=T,i=8,p=9,U=1,c=4,r=2,f=32,s=1,v=1,m=2;ESIz\x1b\\").unwrap();
+        e.feed(b"\x1b_Gm=0;/w==\x1b\\").unwrap();
+        assert_eq!(e.virtual_placements()[0].placement_id, 9);
     }
 
     // Chunked transmit+display inherits p/U/geometry from the first chunk.

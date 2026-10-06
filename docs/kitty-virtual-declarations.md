@@ -98,3 +98,10 @@ makes no fork change. Its driver is
 [rjwittams/katzensteg#121](https://github.com/rjwittams/katzensteg/issues/121)
 (convoy `session-window-images`); Flotilla's cleat provider consumers receive
 the additive interface, and Wheelhouse does not consume declarations.
+
+If a live declaration cannot be attributed to an observed command (for example,
+a control header exceeds the observer’s 4096-byte limit), cleat logs the metadata
+error and withholds that screen’s declaration set until all its declarations are deleted
+or the terminal is reset. Later commands cannot relabel an unattributed entry. Terminal
+output and resolved fragments continue; cleat never guesses whether `p` was sent.
+History captures reconcile on a copy of the registry and cannot change live handles.

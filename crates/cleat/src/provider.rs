@@ -36,6 +36,8 @@ pub struct TerminalSnapshot {
     pub cursor: TerminalCursor,
     pub dirty: DirtyState,
     pub dirty_rows: Vec<u16>,
+    #[serde(skip)]
+    pub virtual_placements: Vec<TerminalVirtualPlacement>,
 }
 
 impl TerminalSnapshot {
@@ -54,6 +56,7 @@ impl TerminalSnapshot {
             cursor: TerminalCursor::from_cursor_state(grid.cursor),
             dirty,
             dirty_rows,
+            virtual_placements: Vec::new(),
         }
     }
 }
@@ -151,6 +154,9 @@ pub struct TerminalRenderUpdate {
     pub ops: Vec<TerminalRenderUpdateOp>,
     pub image_resources: Vec<TerminalImageResource>,
     pub image_placements: Vec<TerminalImagePlacement>,
+    /// Complete live declarations, carried separately on negotiated packet streams.
+    #[serde(skip)]
+    pub virtual_placements: Vec<TerminalVirtualPlacement>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -225,6 +231,29 @@ pub struct TerminalImagePlacement {
     pub flags: u32,
 }
 
+/// Original Kitty virtual declaration. Opaque handles are session-local and
+/// remain stable until deletion. Creation order is monotonic within a session.
+/// A zero fragment placement ID does not identify an individual declaration.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalVirtualPlacement {
+    pub handle: u64,
+    pub creation_order: u64,
+    pub image_id: u32,
+    pub generation: u64,
+    pub placement_id: u32,
+    /// Whether the original command contained p (including explicit p=0).
+    pub placement_id_explicit: bool,
+    pub columns: u32,
+    pub rows: u32,
+    pub z: i32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub x_offset_px: u32,
+    pub y_offset_px: u32,
+}
+
 impl TerminalRenderUpdate {
     pub fn from_snapshot(snapshot: TerminalSnapshot) -> Self {
         let mut ops = Vec::new();
@@ -276,6 +305,7 @@ impl TerminalRenderUpdate {
             ops,
             image_resources: Vec::new(),
             image_placements: Vec::new(),
+            virtual_placements: snapshot.virtual_placements,
         }
     }
 }
@@ -806,6 +836,7 @@ mod tests {
     #[test]
     fn render_update_uses_row_ops_for_partial_dirty_rows() {
         let snapshot = TerminalSnapshot {
+            virtual_placements: Vec::new(),
             cols: 2,
             rows: 2,
             dirty: DirtyState::Partial,
@@ -907,6 +938,7 @@ mod tests {
     #[test]
     fn postcard_round_trip_preserves_render_update_packet_fields() {
         let update = TerminalRenderUpdate {
+            virtual_placements: Vec::new(),
             cols: 120,
             rows: 40,
             geometry: TerminalGeometry {
@@ -1021,6 +1053,7 @@ mod tests {
     #[test]
     fn postcard_round_trip_preserves_snapshot_and_input_packets() {
         let snapshot = TerminalSnapshot {
+            virtual_placements: Vec::new(),
             cols: 2,
             rows: 1,
             geometry: TerminalGeometry::from_cell_size(2, 1, 8.0, 16.0),

@@ -387,6 +387,30 @@ pub struct CleatRenderRow {
     pub dirty: bool,
 }
 
+/// Additive ABI-11 export; no existing structure grows.
+pub const CLEAT_VIRTUAL_PLACEMENT_VERSION: u32 = 1;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CleatVirtualPlacement {
+    pub size: usize,
+    pub version: u32,
+    pub handle: u64,
+    pub creation_order: u64,
+    pub image_id: u32,
+    pub generation: u64,
+    pub placement_id: u32,
+    pub placement_id_explicit: bool,
+    pub columns: u32,
+    pub rows: u32,
+    pub z: i32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub x_offset_px: u32,
+    pub y_offset_px: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CleatRenderUpdateOp {
@@ -739,6 +763,7 @@ struct OwnedSnapshot {
     cells: Vec<CleatCell>,
     dirty_rows: Vec<u16>,
     _graphemes: Vec<Vec<u32>>,
+    virtual_placements: Vec<CleatVirtualPlacement>,
 }
 
 struct OwnedRenderUpdate {
@@ -748,6 +773,7 @@ struct OwnedRenderUpdate {
     cells: Vec<CleatRenderCell>,
     image_resources: Vec<CleatImageResource>,
     image_placements: Vec<CleatImagePlacement>,
+    virtual_placements: Vec<CleatVirtualPlacement>,
     _hyperlinks: Vec<Vec<u8>>,
     _graphemes: Vec<Vec<u32>>,
 }
@@ -787,6 +813,7 @@ impl OwnedSnapshot {
             },
             cells,
             dirty_rows: snapshot.dirty_rows,
+            virtual_placements: snapshot.virtual_placements.iter().map(virtual_placement_to_ffi).collect(),
             _graphemes: graphemes,
         });
         owned.snapshot.cells = owned.cells.as_ptr();
@@ -895,6 +922,7 @@ impl OwnedRenderUpdate {
             cells,
             image_resources,
             image_placements,
+            virtual_placements: update.virtual_placements.iter().map(virtual_placement_to_ffi).collect(),
             _hyperlinks: hyperlinks,
             _graphemes: graphemes,
         });
@@ -927,6 +955,28 @@ impl OwnedRenderUpdate {
         owned.update.image_resources = if owned.image_resources.is_empty() { ptr::null() } else { owned.image_resources.as_ptr() };
         owned.update.image_placements = if owned.image_placements.is_empty() { ptr::null() } else { owned.image_placements.as_ptr() };
         owned
+    }
+}
+
+fn virtual_placement_to_ffi(declaration: &crate::provider::TerminalVirtualPlacement) -> CleatVirtualPlacement {
+    CleatVirtualPlacement {
+        size: std::mem::size_of::<CleatVirtualPlacement>(),
+        version: CLEAT_VIRTUAL_PLACEMENT_VERSION,
+        handle: declaration.handle,
+        creation_order: declaration.creation_order,
+        image_id: declaration.image_id,
+        generation: declaration.generation,
+        placement_id: declaration.placement_id,
+        placement_id_explicit: declaration.placement_id_explicit,
+        columns: declaration.columns,
+        rows: declaration.rows,
+        z: declaration.z,
+        source_x: declaration.source_x,
+        source_y: declaration.source_y,
+        source_width: declaration.source_width,
+        source_height: declaration.source_height,
+        x_offset_px: declaration.x_offset_px,
+        y_offset_px: declaration.y_offset_px,
     }
 }
 
@@ -2188,6 +2238,54 @@ pub unsafe extern "C" fn cleat_session_render_update(session: *mut CleatSession,
     true
 }
 
+/// Borrow the declarations belonging to the outstanding snapshot.
+/// # Safety
+/// `session` must be a valid session pointer; `count` must be writable.
+/// The result is valid until that snapshot is released or the session destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_snapshot_virtual_placements(
+    session: *mut CleatSession,
+    count: *mut usize,
+) -> *const CleatVirtualPlacement {
+    let Some(count) = (unsafe { count.as_mut() }) else {
+        return ptr::null();
+    };
+    *count = 0;
+    let Some(owned) = (unsafe { session.as_ref() }).and_then(|s| s.last_snapshot.as_ref()) else {
+        return ptr::null();
+    };
+    *count = owned.virtual_placements.len();
+    if *count == 0 {
+        ptr::null()
+    } else {
+        owned.virtual_placements.as_ptr()
+    }
+}
+
+/// Borrow the declarations belonging to the outstanding render_update.
+/// # Safety
+/// `session` must be a valid session pointer; `count` must be writable.
+/// The result is valid until that render_update is released or the session destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_render_update_virtual_placements(
+    session: *mut CleatSession,
+    count: *mut usize,
+) -> *const CleatVirtualPlacement {
+    let Some(count) = (unsafe { count.as_mut() }) else {
+        return ptr::null();
+    };
+    *count = 0;
+    let Some(owned) = (unsafe { session.as_ref() }).and_then(|s| s.last_render_update.as_ref()) else {
+        return ptr::null();
+    };
+    *count = owned.virtual_placements.len();
+    if *count == 0 {
+        ptr::null()
+    } else {
+        owned.virtual_placements.as_ptr()
+    }
+}
+
 /// # Safety
 ///
 /// `session` must be a valid session pointer. `callback`, when non-null, is
@@ -2823,6 +2921,7 @@ fn mock_snapshot(cols: u16, rows: u16, dirty: DirtyState, input_count: u64) -> T
         }
     }
     TerminalSnapshot {
+        virtual_placements: Vec::new(),
         cols,
         rows,
         geometry: TerminalGeometry::default(),
@@ -2995,6 +3094,65 @@ mod tests {
     unsafe extern "C" fn count_wake(user_data: *mut c_void) {
         let counter = unsafe { &*(user_data as *const AtomicUsize) };
         counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // Additive ABI-11 accessors borrow one immutable declaration set per
+    // outstanding observation and clear the borrow on its matching release.
+    #[test]
+    fn virtual_declaration_accessors_preserve_metadata_and_release_lifetimes() {
+        use crate::provider::TerminalVirtualPlacement;
+        let declarations = vec![TerminalVirtualPlacement {
+            handle: 11,
+            creation_order: 19,
+            image_id: 7,
+            generation: 23,
+            placement_id: 0,
+            placement_id_explicit: false,
+            columns: 4,
+            rows: 2,
+            z: -5,
+            source_x: 1,
+            source_y: 2,
+            source_width: 3,
+            source_height: 4,
+            x_offset_px: 5,
+            y_offset_px: 6,
+        }];
+        unsafe {
+            assert_eq!(CLEAT_PROVIDER_ABI_VERSION, 11);
+            let provider = cleat_provider_open(ptr::null());
+            let session = cleat_session_create(provider, ptr::null());
+            let mut count = usize::MAX;
+            assert!(cleat_session_render_update_virtual_placements(session, &mut count).is_null());
+            assert_eq!(count, 0);
+            (*session).last_render_update = Some(OwnedRenderUpdate::from_update(TerminalRenderUpdate {
+                virtual_placements: declarations.clone(),
+                ..Default::default()
+            }));
+            let borrowed = cleat_session_render_update_virtual_placements(session, &mut count);
+            assert_eq!(count, 1);
+            assert_eq!(*borrowed, virtual_placement_to_ffi(&declarations[0]));
+            assert_eq!((*borrowed).size, std::mem::size_of::<CleatVirtualPlacement>());
+            assert_eq!((*borrowed).version, CLEAT_VIRTUAL_PLACEMENT_VERSION);
+            assert_eq!(borrowed, cleat_session_render_update_virtual_placements(session, &mut count));
+            let mut snapshot = mock_snapshot(4, 2, DirtyState::Full, 0);
+            snapshot.virtual_placements = declarations.clone();
+            (*session).last_snapshot = Some(OwnedSnapshot::from_snapshot(snapshot));
+            let snapshot_borrow = cleat_session_snapshot_virtual_placements(session, &mut count);
+            assert_eq!(count, 1);
+            assert_eq!(*snapshot_borrow, *borrowed);
+            cleat_session_release_render_update(session, ptr::null_mut());
+            assert!(cleat_session_render_update_virtual_placements(session, &mut count).is_null());
+            assert_eq!(count, 0);
+            assert!(!cleat_session_snapshot_virtual_placements(session, &mut count).is_null());
+            cleat_session_release_snapshot(session, ptr::null_mut());
+            assert!(cleat_session_snapshot_virtual_placements(session, &mut count).is_null());
+            assert_eq!(count, 0);
+            assert!(cleat_session_snapshot_virtual_placements(ptr::null_mut(), &mut count).is_null());
+            assert!(cleat_session_render_update_virtual_placements(session, ptr::null_mut()).is_null());
+            cleat_session_destroy(session);
+            cleat_provider_close(provider);
+        }
     }
 
     #[test]

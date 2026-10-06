@@ -1,0 +1,10 @@
+A: internal p=1 is 4x2, external p=1 is 2x1 declarations (before any placeholder cells):
+  image=7 placement=1 columns=2 rows=1 virtual=1
+  image=7 placement=0 columns=1 rows=1 virtual=1
+  image=7 placement=1 columns=4 rows=2 virtual=1
+  fragment image=7 placement=0 source=1x1 pixels=10x20
+B: external p=1 is 4x2, internal p=1 is 2x1 declarations (before any placeholder cells):
+  image=7 placement=1 columns=4 rows=2 virtual=1
+  image=7 placement=0 columns=1 rows=1 virtual=1
+  image=7 placement=1 columns=2 rows=1 virtual=1
+  fragment image=7 placement=0 source=0x1 pixels=10x20

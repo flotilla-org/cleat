@@ -325,6 +325,9 @@ pub(crate) struct SessionListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct PacketSubscribeRequest {
+    /// Opt in to atomic render envelopes carrying original virtual declarations.
+    #[serde(default)]
+    pub virtual_placements: bool,
     #[serde(default)]
     pub selectors: Vec<String>,
     #[serde(default)]

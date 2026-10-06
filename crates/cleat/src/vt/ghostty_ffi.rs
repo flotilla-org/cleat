@@ -681,6 +681,7 @@ pub type GhosttySysDecodePngFn = unsafe extern "C" fn(
 pub enum GhosttyKittyGraphicsData {
     Invalid = 0,
     PlacementIterator = 1,
+    Generation = 2,
 }
 
 #[allow(dead_code)]
@@ -777,6 +778,17 @@ pub struct KittyImageResourceInfo {
     pub format: u32,
     pub compression: u32,
     pub data_len: usize,
+}
+
+pub type KittyImageState = (Vec<KittyImageResourceInfo>, Vec<KittyImagePlacementInfo>, Vec<KittyVirtualDeclaration>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KittyVirtualDeclaration {
+    pub image_number: u32,
+    // Ghostty's getter drops the internal/external namespace. This is never
+    // exported as the original placement ID; the command observer supplies it.
+    pub raw_placement_id: u32,
+    pub declaration: crate::provider::TerminalVirtualPlacement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1548,17 +1560,25 @@ impl TerminalHandle {
         Ok(Some(generation))
     }
 
-    pub fn kitty_image_state(&self) -> Result<(Vec<KittyImageResourceInfo>, Vec<KittyImagePlacementInfo>), String> {
+    pub fn kitty_storage_generation(&self) -> Result<u64, String> {
+        let Some(graphics) = self.kitty_graphics_for_anchor(None)? else {
+            return Ok(0);
+        };
+        let mut generation = 0u64;
+        let result =
+            unsafe { ghostty_kitty_graphics_get(graphics, GhosttyKittyGraphicsData::Generation, (&mut generation as *mut u64).cast()) };
+        check_result(result, "ghostty_kitty_graphics_get(Generation)")?;
+        Ok(generation)
+    }
+
+    pub fn kitty_image_state(&self) -> Result<KittyImageState, String> {
         self.kitty_image_state_for_anchor(None)
     }
 
-    pub fn kitty_image_state_for_anchor(
-        &self,
-        anchor: Option<&HistoryAnchor>,
-    ) -> Result<(Vec<KittyImageResourceInfo>, Vec<KittyImagePlacementInfo>), String> {
+    pub fn kitty_image_state_for_anchor(&self, anchor: Option<&HistoryAnchor>) -> Result<KittyImageState, String> {
         let graphics = match self.kitty_graphics_for_anchor(anchor)? {
             Some(graphics) => graphics,
-            None => return Ok((Vec::new(), Vec::new())),
+            None => return Ok((Vec::new(), Vec::new(), Vec::new())),
         };
 
         let mut iterator = PlacementIteratorHandle::new()?;
@@ -1573,6 +1593,7 @@ impl TerminalHandle {
 
         let mut resources = BTreeMap::new();
         let mut placements = Vec::new();
+        let mut declarations = Vec::new();
         while unsafe { ghostty_kitty_graphics_placement_next(iterator.raw) } {
             let mut image_id = 0u32;
             let result = unsafe {
@@ -1590,6 +1611,39 @@ impl TerminalHandle {
             }
 
             let resource = image_resource_info(image)?;
+            let mut is_virtual = false;
+            let result = unsafe {
+                ghostty_kitty_graphics_placement_get(
+                    iterator.raw,
+                    GhosttyKittyGraphicsPlacementData::IsVirtual,
+                    &mut is_virtual as *mut bool as *mut c_void,
+                )
+            };
+            check_result(result, "ghostty_kitty_graphics_placement_get(IsVirtual)")?;
+            if is_virtual {
+                let raw_placement_id = placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::PlacementId, "PlacementId")?;
+                declarations.push(KittyVirtualDeclaration {
+                    image_number: image_u32(image, GhosttyKittyGraphicsImageData::Number, "Number")?,
+                    raw_placement_id,
+                    declaration: crate::provider::TerminalVirtualPlacement {
+                        image_id,
+                        generation: resource.generation,
+                        columns: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::Columns, "Columns")?,
+                        rows: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::Rows, "Rows")?,
+                        z: placement_i32(iterator.raw, GhosttyKittyGraphicsPlacementData::Z, "Z")?,
+                        source_x: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::SourceX, "SourceX")?,
+                        source_y: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::SourceY, "SourceY")?,
+                        source_width: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::SourceWidth, "SourceWidth")?,
+                        source_height: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::SourceHeight, "SourceHeight")?,
+                        x_offset_px: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::XOffset, "XOffset")?,
+                        y_offset_px: placement_u32(iterator.raw, GhosttyKittyGraphicsPlacementData::YOffset, "YOffset")?,
+                        ..Default::default()
+                    },
+                });
+                resources.entry((resource.image_id, resource.generation)).or_insert(resource);
+                continue;
+            }
+
             let mut render_info = GhosttyKittyGraphicsPlacementRenderInfo::init();
             let result = unsafe {
                 match anchor {
@@ -1601,19 +1655,6 @@ impl TerminalHandle {
             };
             check_result(result, "ghostty_kitty_graphics_placement_render_info")?;
             if !render_info.viewport_visible {
-                continue;
-            }
-
-            let mut is_virtual = false;
-            let result = unsafe {
-                ghostty_kitty_graphics_placement_get(
-                    iterator.raw,
-                    GhosttyKittyGraphicsPlacementData::IsVirtual,
-                    &mut is_virtual as *mut bool as *mut c_void,
-                )
-            };
-            check_result(result, "ghostty_kitty_graphics_placement_get(IsVirtual)")?;
-            if is_virtual {
                 continue;
             }
 
@@ -1693,7 +1734,7 @@ impl TerminalHandle {
             }
         }
 
-        Ok((resources.into_values().collect(), placements))
+        Ok((resources.into_values().collect(), placements, declarations))
     }
 
     pub fn with_kitty_image_data(&self, image_id: u32, generation: u64, callback: &mut dyn FnMut(&[u8]) -> bool) -> Result<bool, String> {
@@ -2433,7 +2474,7 @@ mod tests {
             term.set_kitty_image_media(true, true, true).unwrap();
             let encoded = base64_path(path.to_str().unwrap().as_bytes());
             term.feed(format!("\x1b_Ga=T,t=t,f=24,i=1,s=1,v=1,c=1,r=1;{encoded}\x1b\\").as_bytes());
-            let (images, placements) = term.kitty_image_state().unwrap();
+            let (images, placements, _) = term.kitty_image_state().unwrap();
             assert_eq!(images.len(), 1, "{:?}", term.drain_replies());
             assert_eq!(placements.len(), 1);
             assert_eq!(path.exists(), !deleted);

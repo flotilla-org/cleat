@@ -1531,7 +1531,7 @@ fn follow_foreground_redirect(
     identity: AttachmentIdentity,
     role: ChannelRole,
 ) -> Result<(SessionStream, ForegroundChannel), String> {
-    if let Some(reason) = redirect.incompatibility(crate::packet::PROTOCOL_VERSION) {
+    if let Some(reason) = redirect.current_incompatibility() {
         return Err(reason);
     }
     let layout = RuntimeLayout::new(PathBuf::from(&redirect.runtime_root)).with_daemon(redirect.daemon.clone())?;
@@ -3562,13 +3562,14 @@ fn handle_http_request(
                 activity.as_ref(),
                 output_context.expect("validated packet output context"),
             )?;
+            client.virtual_placements = subscribe.virtual_placements;
             if let Some(activity) = &activity {
                 if let Err(message) = client.admit_activity(state.layout, &activity.sessions) {
                     return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                         .map_err(|err| format!("write activity admission error: {err}"));
                 }
             }
-            client.enqueue_control(MSG_CONTROL_HELLO, &advertised_hello())?;
+            client.enqueue_control(MSG_CONTROL_HELLO, &hello_for_subscription(client.virtual_placements))?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
             if let Some(activity) = activity {
                 client.enqueue_control(MSG_CONTROL_ACTIVITY_SNAPSHOT, &activity)?;
@@ -4115,6 +4116,20 @@ fn advertised_hello() -> ControlHello {
     ControlHello::current()
 }
 
+fn hello_for_subscription(virtual_placements: bool) -> ControlHello {
+    let hello = advertised_hello();
+    if !virtual_placements && hello == ControlHello::current() {
+        // Some protocol-12 clients compare the maximum version directly.
+        // Preserve their original hello as well as their render payloads.
+        ControlHello {
+            version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION,
+            min_supported_version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION,
+        }
+    } else {
+        hello
+    }
+}
+
 fn write_http_not_found(stream: &mut SessionStream) -> Result<(), String> {
     http_uds::write_error(stream, StatusCode::NOT_FOUND, "not found").map_err(|err| format!("write HTTP not found response: {err}"))
 }
@@ -4168,6 +4183,7 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 }
 
 struct PacketClient {
+    virtual_placements: bool,
     activity_output_leases: HashMap<String, Option<crate::output_admission::OutputLease>>,
     output_context: crate::output_admission::OutputContext,
     image_output_cursor: u32,
@@ -4325,6 +4341,7 @@ impl PacketClient {
             stream,
             pending_output: PendingOutput::new(),
             image_output_cursor: 0,
+            virtual_placements: false,
             output_context,
             activity_output_leases: HashMap::new(),
             input_reader,
@@ -4989,7 +5006,7 @@ fn open_packet_channel(
         .map_err(|err| format!("encode role state packet: {err}"))?,
     )?;
     let channel = client.channels.get_mut(&open.channel).expect("opened channel");
-    channel.image_transfer = Some(ImageTransfer::new(open.channel, update, &mut channel.image_resident)?);
+    channel.image_transfer = Some(ImageTransfer::negotiated(open.channel, update, &mut channel.image_resident, client.virtual_placements)?);
     sync_packet_geometry(hosted)?;
     sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
     if let Some(hosted) = sessions.get(&session_id) {
@@ -5117,8 +5134,10 @@ fn push_due_packet_renders(
         let result = result.and_then(|mut packet| {
             packet.packet.update.render_generation = next_generation;
             let view = packet.packet.view.clone();
-            let session = packet_clients[index].channels.get_mut(&key.channel).expect("due channel");
-            let transfer = ImageTransfer::new(key.channel, packet, &mut session.image_resident)?.local_files(session.local_images);
+            let client = &mut packet_clients[index];
+            let session = client.channels.get_mut(&key.channel).expect("due channel");
+            let transfer = ImageTransfer::negotiated(key.channel, packet, &mut session.image_resident, client.virtual_placements)?
+                .local_files(session.local_images);
             Ok((transfer, view))
         });
         match result {

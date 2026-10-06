@@ -196,7 +196,10 @@ fn run_source_exchange(
 ) {
     let probed = match &socket {
         Some(socket) => probe_target(socket, deadline),
-        None => Ok(TargetProtocol { version: crate::packet::PROTOCOL_VERSION, min_supported_version: crate::packet::PROTOCOL_VERSION }),
+        None => Ok(TargetProtocol {
+            version: crate::packet::PROTOCOL_VERSION,
+            min_supported_version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION,
+        }),
     };
     let failed = probed.is_err();
     if events.send(SourceEvent::Probed(probed)).is_err() || failed {

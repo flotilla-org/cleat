@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    packet::{ImageChunk, PacketFrame, RenderPacket, MSG_SESSION_IMAGE, MSG_SESSION_RENDER},
+    packet::{ImageChunk, PacketFrame, RenderPacket, MSG_SESSION_IMAGE},
     provider::{TerminalImageResource, TerminalRenderUpdate},
 };
 
@@ -94,7 +94,32 @@ pub(crate) struct ImageTransfer {
     local: bool,
 }
 impl ImageTransfer {
+    #[cfg(test)]
     pub fn new(channel: u32, bundle: RenderBundle, resident: &mut HashSet<ImageKey>) -> Result<Self, String> {
+        Self::negotiated(channel, bundle, resident, false)
+    }
+    pub fn negotiated(
+        channel: u32,
+        mut bundle: RenderBundle,
+        resident: &mut HashSet<ImageKey>,
+        virtual_placements: bool,
+    ) -> Result<Self, String> {
+        if !virtual_placements {
+            bundle.packet.update.image_resources.retain(|resource| {
+                !bundle
+                    .packet
+                    .update
+                    .virtual_placements
+                    .iter()
+                    .any(|p| p.image_id == resource.image_id && p.generation == resource.generation)
+                    || bundle
+                        .packet
+                        .update
+                        .image_placements
+                        .iter()
+                        .any(|p| p.image_id == resource.image_id && p.generation == resource.generation)
+            });
+        }
         let wanted: HashSet<_> = bundle.packet.update.image_resources.iter().map(resource_key).collect();
         let available: HashSet<_> = bundle.images.iter().map(|image| key(image)).collect();
         if !wanted.is_subset(&available) {
@@ -104,8 +129,8 @@ impl ImageTransfer {
         if total > MAX_VIEW_IMAGE_BYTES {
             return Err("view exceeds 320 MiB image budget".into());
         }
-        let render = PacketFrame::new(channel, MSG_SESSION_RENDER, &bundle.packet).map_err(|e| e.to_string())?;
-        let images = bundle.images.into_iter().filter(|image| !resident.contains(&key(image))).collect();
+        let render = bundle.packet.frame(channel, virtual_placements).map_err(|e| e.to_string())?;
+        let images = bundle.images.into_iter().filter(|image| wanted.contains(&key(image)) && !resident.contains(&key(image))).collect();
         *resident = wanted;
         Ok(Self { images, offset: 0, render: Some(render), offered: false, waiting: false, local: true })
     }
@@ -263,6 +288,7 @@ impl ImageReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet::MSG_SESSION_RENDER;
     fn bundle(generation: u64, size: usize) -> RenderBundle {
         let image = Arc::new(RetainedImage { image_id: 7, generation, backing: ImageBacking::Bytes(vec![generation as u8; size]) });
         RenderBundle::live(
@@ -428,5 +454,90 @@ mod tests {
         assert!(ImageReceiver::default()
             .chunk(ImageChunk { image_id: 7, generation: 1, total_len: MAX_VIEW_IMAGE_BYTES as u64 + 1, offset: 0, bytes: vec![1] })
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod virtual_declaration_tests {
+    use super::*;
+    use crate::provider::{TerminalImagePlacement, TerminalVirtualPlacement};
+
+    // #317: capability opt-in is atomic with the corresponding render generation.
+    // Without opt-in, unseen declarations cause neither packets nor pixel transfers.
+    #[test]
+    fn negotiated_declarations_and_legacy_bytes_share_one_transport_contract() {
+        for visible in [false, true] {
+            let image = Arc::new(RetainedImage { image_id: 7, generation: 9, backing: ImageBacking::Bytes(vec![1, 2, 3, 255]) });
+            let mut update = TerminalRenderUpdate {
+                render_generation: 42,
+                image_resources: vec![TerminalImageResource { image_id: 7, generation: 9, data_len: 4, ..Default::default() }],
+                virtual_placements: vec![TerminalVirtualPlacement {
+                    image_id: 7,
+                    generation: 9,
+                    columns: 4,
+                    rows: 2,
+                    handle: 1,
+                    creation_order: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            if visible {
+                update.image_placements.push(TerminalImagePlacement {
+                    image_id: 7,
+                    generation: 9,
+                    grid_cols: 4,
+                    grid_rows: 1,
+                    ..Default::default()
+                });
+            }
+            for opt_in in [false, true] {
+                let bundle = RenderBundle::live(update.clone(), vec![image.clone()]);
+                let mut transfer = ImageTransfer::negotiated(3, bundle, &mut HashSet::new(), opt_in).unwrap().local_files(false);
+                let mut receiver = ImageReceiver::default();
+                let mut chunks = 0;
+                let rendered = loop {
+                    let frame = transfer.next(3).unwrap().unwrap();
+                    if frame.msg_type == MSG_SESSION_IMAGE {
+                        receiver.chunk(frame.decode().unwrap()).unwrap();
+                        chunks += 1;
+                    } else {
+                        assert_eq!(
+                            frame.msg_type,
+                            if opt_in { crate::packet::MSG_SESSION_RENDER_VIRTUAL } else { crate::packet::MSG_SESSION_RENDER }
+                        );
+                        if !opt_in {
+                            let mut legacy = update.clone();
+                            legacy.virtual_placements.clear();
+                            if !visible {
+                                legacy.image_resources.clear();
+                            }
+                            let expected = PacketFrame::new(3, crate::packet::MSG_SESSION_RENDER, &RenderPacket::live(legacy)).unwrap();
+                            assert_eq!(frame.payload, expected.payload);
+                        }
+                        break RenderPacket::decode_frame(&frame).unwrap();
+                    }
+                };
+                assert_eq!(chunks, usize::from(visible || opt_in));
+                assert_eq!(rendered.update.render_generation, 42);
+                assert_eq!(rendered.update.virtual_placements.len(), usize::from(opt_in));
+                assert_eq!(rendered.update.image_placements, update.image_placements);
+                let images = receiver.commit(&rendered.update.image_resources).unwrap();
+                assert_eq!(images.len(), usize::from(visible || opt_in));
+                assert!(transfer.complete());
+            }
+        }
+    }
+
+    // An empty declaration envelope replaces the previous set after deletion,
+    // even when no pixels or cell damage need to be transmitted.
+    #[test]
+    fn deletion_transmits_an_empty_declaration_set() {
+        let update = TerminalRenderUpdate { render_generation: 43, ..Default::default() };
+        let mut transfer = ImageTransfer::negotiated(3, RenderBundle::live(update, vec![]), &mut HashSet::new(), true).unwrap();
+        let packet = RenderPacket::decode_frame(&transfer.next(3).unwrap().unwrap()).unwrap();
+        assert_eq!(packet.update.render_generation, 43);
+        assert!(packet.update.virtual_placements.is_empty());
+        assert!(packet.update.image_placements.is_empty());
     }
 }

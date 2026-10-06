@@ -647,7 +647,7 @@ impl OutgoingTransfer {
 
 /// Shared by the generation preflight and the per-session commit gate.
 pub(super) fn incompatible_clients(hosted: &HostedSession, protocol: TargetProtocol, packet_clients: &[PacketClient]) -> Vec<String> {
-    let packet_compatible = protocol.accepts(PROTOCOL_VERSION);
+    let packet_compatible = protocol.accepts(PROTOCOL_VERSION) || protocol.accepts(crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION);
     let mut incompatible = Vec::new();
     if !packet_compatible {
         for client in packet_clients.iter().filter(|client| !client.dead) {

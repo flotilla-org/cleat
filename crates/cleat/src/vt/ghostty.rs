@@ -42,6 +42,11 @@ const DEFAULT_KITTY_IMAGE_STORAGE_LIMIT: u64 = 320 * 1000 * 1000;
 
 pub struct GhosttyVtEngine {
     terminal: TerminalHandle,
+    declaration_observer: super::kitty_declarations::Observer,
+    declaration_registry: super::kitty_declarations::Registry,
+    virtual_declarations: Vec<crate::provider::TerminalVirtualPlacement>,
+    declaration_stamp: Option<(usize, u64)>,
+    declaration_unavailable: [bool; 2],
     history_reader: Option<HistoryReader>,
     attachment_views: BTreeMap<u128, HistoryView>,
     history_cache: BTreeMap<(HistoryScreen, u64), Arc<HistoryFrame>>,
@@ -86,6 +91,11 @@ impl GhosttyVtEngine {
         mouse_encoder.set_size(u32::from(cols), u32::from(rows), 1, 1);
         Self {
             terminal,
+            declaration_observer: Default::default(),
+            declaration_registry: Default::default(),
+            virtual_declarations: Vec::new(),
+            declaration_stamp: None,
+            declaration_unavailable: [false; 2],
             history_reader: None,
             attachment_views: BTreeMap::new(),
             history_cache: BTreeMap::new(),
@@ -104,6 +114,41 @@ impl GhosttyVtEngine {
             deferred_render_dirty: GhosttyRenderStateDirty::False,
             deferred_render_dirty_rows: Vec::new(),
         }
+    }
+
+    fn sync_declarations(&mut self, command: Option<&super::kitty_declarations::Command>) -> Result<(), String> {
+        let screen = usize::from(self.terminal.active_screen()? == GhosttyTerminalScreen::Alternate);
+        let stamp = (screen, self.terminal.kitty_storage_generation()?);
+        if self.declaration_stamp == Some(stamp) {
+            return Ok(());
+        }
+        let (_, _, declarations) = self.terminal.kitty_image_state()?;
+        if self.declaration_unavailable[screen] {
+            if !declarations.is_empty() {
+                self.virtual_declarations.clear();
+                self.declaration_stamp = Some(stamp);
+                return Ok(());
+            }
+            self.declaration_unavailable[screen] = false;
+        }
+        // Metadata is additive: failure to attribute a declaration must not
+        // reject output Ghostty already consumed, or invent an omitted p.
+        let mut registry = self.declaration_registry.clone();
+        match registry.reconcile(screen, declarations, command) {
+            Ok(declarations) => {
+                self.declaration_registry = registry;
+                self.virtual_declarations = declarations;
+            }
+            Err(error) => {
+                eprintln!("cleat: virtual declaration metadata unavailable: {error}");
+                self.virtual_declarations.clear();
+                self.declaration_unavailable[screen] = true;
+                self.declaration_stamp = Some(stamp);
+                return Ok(());
+            }
+        }
+        self.declaration_stamp = Some(stamp);
+        Ok(())
     }
 
     /// Keep the mouse encoder's renderer geometry in sync with the grid + cell
@@ -298,9 +343,31 @@ fn rgb_to_ghostty(rgb: Rgb) -> ghostty_ffi::GhosttyColorRgb {
 }
 
 impl VtEngine for GhosttyVtEngine {
+    fn virtual_placements(&self) -> Vec<crate::provider::TerminalVirtualPlacement> {
+        self.virtual_declarations.clone()
+    }
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.history_cache.clear();
-        self.terminal.feed(bytes);
+        let mut start = 0;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            if let Some(event) = self.declaration_observer.byte(byte) {
+                self.terminal.feed(&bytes[start..=index]);
+                start = index + 1;
+                let command = match &event {
+                    super::kitty_declarations::Event::Command(command) => command.as_ref(),
+                    super::kitty_declarations::Event::Reset => {
+                        self.declaration_registry.reset();
+                        self.declaration_unavailable = [false; 2];
+                        self.declaration_stamp = None;
+                        None
+                    }
+                    super::kitty_declarations::Event::Sync => None,
+                };
+                self.sync_declarations(command)?;
+            }
+        }
+        self.terminal.feed(&bytes[start..]);
+        self.sync_declarations(None)?;
         if !bytes.is_empty() {
             self.saw_output = true;
         }
@@ -490,6 +557,7 @@ impl VtEngine for GhosttyVtEngine {
         update.scrollback_offset_rows = frame.offset;
         update.terminal_modes = self.terminal_mode_state()?;
         update.image_placements = frame.placements.clone();
+        update.virtual_placements = frame.virtual_placements.clone();
         update.image_resources = frame
             .images
             .iter()
@@ -559,7 +627,7 @@ impl VtEngine for GhosttyVtEngine {
     fn transfer_payload(&self) -> Result<Option<Vec<u8>>, String> {
         use std::io::Write;
         let mut payload = self.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, true))?.unwrap_or_default();
-        let (resources, placements) = self.terminal.kitty_image_state()?;
+        let (resources, placements, _) = self.terminal.kitty_image_state()?;
         for resource in resources {
             let format = match resource.format {
                 0 => 24,
@@ -794,7 +862,7 @@ impl VtEngine for GhosttyVtEngine {
                 .collect(),
         };
 
-        let (image_resources, image_placements) = self.terminal.kitty_image_state()?;
+        let (image_resources, image_placements, _) = self.terminal.kitty_image_state()?;
 
         Ok(TerminalRenderUpdate {
             cols,
@@ -815,6 +883,7 @@ impl VtEngine for GhosttyVtEngine {
                     data_len: resource.data_len,
                 })
                 .collect(),
+            virtual_placements: self.virtual_declarations.clone(),
             image_placements: image_placements
                 .into_iter()
                 .map(|placement| TerminalImagePlacement {
@@ -1210,6 +1279,7 @@ pub struct HistoryFrame {
     /// Ready image versions; pending images have placements but no entry yet.
     pub images: Vec<Arc<HistoryImage>>,
     pub placements: Vec<TerminalImagePlacement>,
+    pub virtual_placements: Vec<crate::provider::TerminalVirtualPlacement>,
 }
 
 #[derive(Debug)]
@@ -1308,7 +1378,7 @@ impl GhosttyVtEngine {
         if cells.len() != count {
             return Err("history capture returned too few cells".into());
         }
-        let (resources, positions) = self.terminal.kitty_image_state_for_anchor(Some(&view.anchor))?;
+        let (resources, positions, declarations) = self.terminal.kitty_image_state_for_anchor(Some(&view.anchor))?;
         let mut images = Vec::new();
         images.try_reserve_exact(resources.len()).map_err(|e| e.to_string())?;
         self.history_images.retain(|_, image| image.strong_count() > 0);
@@ -1391,6 +1461,13 @@ impl GhosttyVtEngine {
             links,
             images,
             placements,
+            // History observations must never remove live registry entries or
+            // advance its handle sequence. Reconcile on an isolated copy.
+            virtual_placements: if self.declaration_unavailable[usize::from(view.screen == HistoryScreen::Alternate)] {
+                Vec::new()
+            } else {
+                self.declaration_registry.clone().reconcile(usize::from(view.screen == HistoryScreen::Alternate), declarations, None)?
+            },
         }))
     }
 }
@@ -1410,6 +1487,39 @@ mod history_tests {
     }
     fn text(frame: &HistoryFrame) -> String {
         frame.grid.cells.iter().flat_map(|cell| cell.graphemes.iter().copied()).filter_map(char::from_u32).collect()
+    }
+
+    // History captures preserve live declaration handles across later live
+    // commands, including views of the inactive primary screen.
+    #[test]
+    fn history_capture_preserves_live_declaration_handles() {
+        let mut engine = GhosttyVtEngine::new(10, 4);
+        engine.feed(b"\x1b_Ga=t,i=7,f=32,s=1,v=1;ESIz/w==\x1b\\\x1b_Ga=p,i=7,U=1,c=4,r=2;\x1b\\").unwrap();
+        let before = engine.virtual_placements();
+        let mut view = engine.history_view(HistoryScreen::Primary, 0).unwrap();
+        let captured = frame(engine.capture_history(&mut view, limits()).unwrap());
+        assert_eq!(captured.virtual_placements, before);
+        engine.feed(b"\x1b[?1049h").unwrap();
+        assert_eq!(frame(engine.capture_history(&mut view, limits()).unwrap()).virtual_placements, before);
+        engine.feed(b"\x1b[?1049l\x1b_Ga=p,i=7,p=9,U=1,c=2,r=1;\x1b\\").unwrap();
+        assert!(engine.virtual_placements().contains(&before[0]));
+    }
+
+    // Exceeding the bounded observer header must not reject valid terminal
+    // output. Withhold unprovable declarations instead of fabricating p metadata.
+    #[test]
+    fn unattributed_declarations_do_not_fail_terminal_output() {
+        let mut engine = GhosttyVtEngine::new(10, 4);
+        engine.feed(b"\x1b_Ga=t,i=7,f=32,s=1,v=1;ESIz/w==\x1b\\").unwrap();
+        let header = format!("\x1b_G{}a=p,i=7,p=9,U=1,c=4,r=2;\x1b\\OK", "q=0,".repeat(1100));
+        engine.feed(header.as_bytes()).unwrap();
+        assert!(engine.virtual_placements().is_empty());
+        assert_eq!(engine.terminal.kitty_image_state().unwrap().2.len(), 1);
+        engine.feed(b"\x1b_Ga=p,i=7,p=10,U=1,c=2,r=1;\x1b\\").unwrap();
+        assert!(engine.virtual_placements().is_empty());
+        engine.feed(b"\x1b_Ga=d,d=I,i=7;\x1b\\\x1b_Ga=t,i=7,f=32,s=1,v=1;ESIz/w==\x1b\\\x1b_Ga=p,i=7,p=11,U=1,c=2,r=1;\x1b\\").unwrap();
+        assert_eq!(engine.virtual_placements()[0].placement_id, 11);
+        assert_eq!(engine.screen_grid().unwrap().cell(0, 0).unwrap().graphemes, vec![u32::from('O')]);
     }
 
     #[test]

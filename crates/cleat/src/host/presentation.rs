@@ -124,6 +124,7 @@ impl PresentationGate {
             ops: _,
             image_resources,
             image_placements,
+            virtual_placements,
         } = update;
         self.retained = Some(TerminalRenderUpdate {
             cols: *cols,
@@ -139,6 +140,7 @@ impl PresentationGate {
             ops: Vec::new(),
             image_resources: image_resources.clone(),
             image_placements: image_placements.clone(),
+            virtual_placements: virtual_placements.clone(),
         });
     }
 }

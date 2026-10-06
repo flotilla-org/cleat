@@ -22,8 +22,8 @@ use cleat::{
     cli::{self, Cli, ExecResult},
     packet::{
         ActivityEvent, ActivitySnapshot, ControlHello, DirectoryDelta, DirectorySnapshot, PacketFrame, CHANNEL_CONTROL,
-        MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT,
-        MSG_CONTROL_HELLO, PROTOCOL_VERSION,
+        MIN_SUPPORTED_PROTOCOL_VERSION, MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_DIRECTORY_DELTA,
+        MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO,
     },
     protocol::{AttachmentIdentity, AttachmentKind, Frame, SeatState, SessionInfo},
     provider::ProviderFeatures,
@@ -43,7 +43,7 @@ use cleat::{
 use cleat::{
     packet::{
         Ack, ChannelRole, Input, OpenChannel, RenderPacket, RoleRequest, RoleState, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK,
-        MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_ROLE,
+        MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_ROLE, PROTOCOL_VERSION,
     },
     provider::{TerminalInputEvent, TerminalPasteEvent, TerminalRenderUpdate, TerminalTextEvent},
     provider_ffi::{
@@ -2093,7 +2093,8 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
 
     assert_eq!(hello_frame.channel, CHANNEL_CONTROL);
     assert_eq!(hello_frame.msg_type, MSG_CONTROL_HELLO);
-    assert_eq!(hello_frame.decode::<ControlHello>().expect("decode hello").version, PROTOCOL_VERSION);
+    // Clients without the capability retain their exact protocol-12 hello.
+    assert_eq!(hello_frame.decode::<ControlHello>().expect("decode hello").version, MIN_SUPPORTED_PROTOCOL_VERSION);
     assert_eq!(directory_frame.channel, CHANNEL_CONTROL);
     assert_eq!(directory_frame.msg_type, MSG_CONTROL_DIRECTORY_SNAPSHOT);
     assert_eq!(directory_frame.decode::<DirectorySnapshot>().expect("decode directory").sessions, vec![
@@ -2120,6 +2121,70 @@ fn packet_connect_emits_hello_and_directory_snapshot() {
             rows: 24,
         },
     ]);
+}
+
+// #317: the JSON capability selects a new atomic render envelope. A peer
+// without it receives the legacy hello/render and no undrawn image bytes.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn packet_declaration_capability_preserves_legacy_output() {
+    use cleat::packet::{
+        ImageFile, ImageFileResult, MSG_SESSION_IMAGE, MSG_SESSION_IMAGE_FILE, MSG_SESSION_IMAGE_FILE_RESULT, MSG_SESSION_RENDER_VIRTUAL,
+    };
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("alpha".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some(r"printf '_Ga=t,i=7,f=32,s=1,v=1;ESIz/w==\_Ga=p,i=7,U=1,c=4,r=2;\READY'; sleep 30".into()),
+            false,
+        )
+        .unwrap();
+    wait_until("declaration ready", || service.capture("alpha").unwrap().contains("READY"));
+    for opt_in in [false, true] {
+        let mut stream = UnixStream::connect(session_socket_path(temp.path(), "alpha")).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let body = serde_json::json!({"virtual_placements": opt_in}).to_string();
+        write!(stream, "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n{}", body.len(), body).unwrap();
+        assert!(read_http_response_head(&mut stream).starts_with("HTTP/1.1 101"));
+        let hello = PacketFrame::read(&mut stream).unwrap().decode::<ControlHello>().unwrap();
+        assert_eq!(hello.version, if opt_in { PROTOCOL_VERSION } else { MIN_SUPPORTED_PROTOCOL_VERSION });
+        PacketFrame::read(&mut stream).unwrap();
+        packet_open_channel_role(&mut stream, 1, "alpha", ChannelRole::Watcher, false);
+        let mut images = 0;
+        let render = loop {
+            let frame = PacketFrame::read(&mut stream).unwrap();
+            match frame.msg_type {
+                MSG_SESSION_IMAGE_FILE => {
+                    let offer = frame.decode::<ImageFile>().unwrap();
+                    packet_write(&mut stream, 1, MSG_SESSION_IMAGE_FILE_RESULT, &ImageFileResult {
+                        image_id: offer.image_id,
+                        generation: offer.generation,
+                        acquired: false,
+                    });
+                }
+                MSG_SESSION_IMAGE => images += 1,
+                MSG_SESSION_RENDER | MSG_SESSION_RENDER_VIRTUAL => {
+                    assert_eq!(frame.msg_type, if opt_in { MSG_SESSION_RENDER_VIRTUAL } else { MSG_SESSION_RENDER });
+                    break RenderPacket::decode_frame(&frame).unwrap();
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(images, usize::from(opt_in));
+        assert_eq!(render.update.virtual_placements.len(), usize::from(opt_in));
+        assert_eq!(render.update.image_resources.len(), usize::from(opt_in));
+        assert!(render.update.image_placements.is_empty());
+        if opt_in {
+            let p = &render.update.virtual_placements[0];
+            assert_eq!((p.image_id, p.placement_id, p.placement_id_explicit, p.columns, p.rows), (7, 0, false, 4, 2));
+            assert_eq!(p.generation, render.update.image_resources[0].generation);
+        }
+    }
+    service.kill("alpha").unwrap();
 }
 
 #[test]

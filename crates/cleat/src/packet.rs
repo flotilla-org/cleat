@@ -8,8 +8,10 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 12 adds live clipboard effects independent of render credit.
-pub const PROTOCOL_VERSION: u16 = 12;
+/// Version 13 adds opt-in virtual-declaration render envelopes. Protocol 12
+/// remains supported with byte-for-byte unchanged legacy render layouts.
+pub const PROTOCOL_VERSION: u16 = 13;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 12;
 pub const CHANNEL_CONTROL: u32 = 0;
 
 pub const MSG_CONTROL_HELLO: u8 = 1;
@@ -37,6 +39,7 @@ pub const MSG_SESSION_IMAGE_FILE: u8 = 25;
 pub const MSG_SESSION_IMAGE_FILE_RESULT: u8 = 26;
 pub const MSG_SESSION_CLIPBOARD: u8 = 27;
 pub const MSG_SESSION_CLIPBOARD_LOSS: u8 = 28;
+pub const MSG_SESSION_RENDER_VIRTUAL: u8 = 29;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ClipboardLoss {
     /// Cumulative observed drops for the current host actor; a new/restarted actor resets the total.
@@ -79,7 +82,11 @@ pub struct ControlHello {
 
 impl ControlHello {
     pub fn current() -> Self {
-        Self { version: PROTOCOL_VERSION, min_supported_version: PROTOCOL_VERSION }
+        Self { version: PROTOCOL_VERSION, min_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION }
+    }
+
+    pub fn compatible_with_current(&self) -> bool {
+        self.accepts(PROTOCOL_VERSION) || self.accepts(MIN_SUPPORTED_PROTOCOL_VERSION)
     }
 
     /// The hello advertises the version range this daemon speaks,
@@ -276,6 +283,16 @@ impl SessionRedirect {
     }
 }
 
+impl SessionRedirect {
+    pub fn current_incompatibility(&self) -> Option<String> {
+        if self.accepts_protocol(PROTOCOL_VERSION) || self.accepts_protocol(MIN_SUPPORTED_PROTOCOL_VERSION) {
+            None
+        } else {
+            self.incompatibility(PROTOCOL_VERSION)
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelRedirect {
     pub channel: u32,
@@ -298,6 +315,46 @@ pub struct RenderPacket {
 impl RenderPacket {
     pub fn live(update: TerminalRenderUpdate) -> Self {
         Self { update, links: Vec::new(), view: Default::default() }
+    }
+}
+
+/// One atomic render generation: declarations are a complete replacement set,
+/// including an empty set after deletion. Existing fragment fields are unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VirtualRenderPacket {
+    pub render: RenderPacket,
+    pub virtual_placements: Vec<crate::provider::TerminalVirtualPlacement>,
+}
+
+impl RenderPacket {
+    pub fn frame(&self, channel: u32, virtual_placements: bool) -> std::io::Result<PacketFrame> {
+        if virtual_placements {
+            PacketFrame::new(channel, MSG_SESSION_RENDER_VIRTUAL, &VirtualRenderPacket {
+                render: self.clone(),
+                virtual_placements: self.update.virtual_placements.clone(),
+            })
+        } else {
+            let mut legacy = self.clone();
+            // Declarations without visible fragments must not introduce image
+            // resources (or image transfers) into legacy clients' output.
+            legacy.update.image_resources.retain(|resource| {
+                !legacy.update.virtual_placements.iter().any(|p| p.image_id == resource.image_id && p.generation == resource.generation)
+                    || legacy.update.image_placements.iter().any(|p| p.image_id == resource.image_id && p.generation == resource.generation)
+            });
+            PacketFrame::new(channel, MSG_SESSION_RENDER, &legacy)
+        }
+    }
+
+    pub fn decode_frame(frame: &PacketFrame) -> std::io::Result<Self> {
+        match frame.msg_type {
+            MSG_SESSION_RENDER => frame.decode(),
+            MSG_SESSION_RENDER_VIRTUAL => {
+                let mut packet = frame.decode::<VirtualRenderPacket>()?;
+                packet.render.update.virtual_placements = packet.virtual_placements;
+                Ok(packet.render)
+            }
+            _ => Err(Error::new(ErrorKind::InvalidData, "not a render frame")),
+        }
     }
 }
 
@@ -531,7 +588,8 @@ mod tests {
 
     #[test]
     fn clipboard_effects_require_protocol_version_twelve() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
+        assert!(ControlHello::current().accepts(12));
         assert!(!ControlHello::current().accepts(11));
     }
 

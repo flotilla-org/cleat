@@ -435,6 +435,28 @@ typedef struct cleat_image_placement {
     uint32_t flags;
 } cleat_image_placement;
 
+/* Additive ABI-11 declarations API, versioned independently. */
+#define CLEAT_VIRTUAL_PLACEMENT_VERSION 1u
+typedef struct cleat_virtual_placement {
+    size_t size;
+    uint32_t version;
+    uint64_t handle;
+    uint64_t creation_order;
+    uint32_t image_id;
+    uint64_t generation;
+    uint32_t placement_id;
+    bool placement_id_explicit;
+    uint32_t columns;
+    uint32_t rows;
+    int32_t z;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t x_offset_px;
+    uint32_t y_offset_px;
+} cleat_virtual_placement;
+
 typedef struct cleat_render_update {
     size_t size;
     uint32_t version;
@@ -669,6 +691,19 @@ bool cleat_session_snapshot(cleat_session *session, cleat_snapshot *out);
  * exposes scroll/copy damage.
  */
 bool cleat_session_render_update(cleat_session *session, cleat_render_update *out);
+/* Complete declaration set for an outstanding snapshot/render update. Borrowed
+ * until its corresponding release or session destruction. Empty sets return
+ * NULL and count=0. Read arrays with sizeof(cleat_virtual_placement) stride.
+ * handle is session-local, stable until deletion; creation_order is monotonic.
+ * Omitted p is placement_id=0, placement_id_explicit=false. Explicit p=0 has
+ * placement_id_explicit=true and still uses Kitty's ambiguous target rules.
+ * Re-emit declarations in creation_order before placeholders. Exact fragment
+ * matching requires nonzero explicit p; fragment p=0 is ambiguous. Image
+ * generation must also match. Original fragments and ABI-11 structs are intact.
+ * Only sessions connected with declaration capability receive daemon metadata.
+ */
+const cleat_virtual_placement *cleat_session_snapshot_virtual_placements(cleat_session *session, size_t *count);
+const cleat_virtual_placement *cleat_session_render_update_virtual_placements(cleat_session *session, size_t *count);
 /* Acquire backing for a committed daemon generation. FILE borrows the existing
  * private path and retains it until release/session destruction and at least
  * while the generation remains in the committed view. FILE fails for byte

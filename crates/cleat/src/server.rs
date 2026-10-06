@@ -680,6 +680,7 @@ impl SessionService {
             initial_size,
             colors: crate::vt::TerminalColors::default(),
             tags: Vec::new(),
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
         })
     }

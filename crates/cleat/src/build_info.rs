@@ -14,6 +14,9 @@ pub struct BuildInfo {
     pub target: String,
     pub protocol_version: u16,
     pub ghostty_vt: bool,
+    /// Empty for older binaries; consumers must require `launch_env_clear`.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 impl BuildInfo {
@@ -30,6 +33,7 @@ impl BuildInfo {
             target: env!("CLEAT_BUILD_TARGET").into(),
             protocol_version: crate::packet::PROTOCOL_VERSION,
             ghostty_vt: cfg!(feature = "ghostty-vt"),
+            capabilities: vec!["launch_env_clear".into()],
         }
     }
 }
@@ -95,6 +99,16 @@ mod tests {
         build.git_sha = None;
         build.dirty = None;
         assert!(build.to_string().contains("unknown (dirty unknown)"));
+    }
+
+    // Build JSON is the discovery contract; absent capabilities mean unsupported.
+    #[test]
+    fn declared_environment_capability_is_discoverable_and_old_builds_decode() {
+        let build = BuildInfo::current();
+        let mut value = serde_json::to_value(&build).unwrap();
+        assert!(value["capabilities"].as_array().unwrap().contains(&serde_json::json!("launch_env_clear")));
+        value.as_object_mut().unwrap().remove("capabilities");
+        assert!(serde_json::from_value::<BuildInfo>(value).unwrap().capabilities.is_empty());
     }
 
     #[test]

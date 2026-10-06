@@ -620,7 +620,12 @@ impl ChildExecSpec {
             argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
             argv.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
         }
-        let envp = child_envp_from(env::vars_os(), session.vt_engine, &session.environment, coordinates, session.cwd.as_deref())?;
+        let inherited = if session.environment_policy == crate::runtime::ChildEnvironmentPolicy::Declared {
+            Vec::new()
+        } else {
+            env::vars_os().collect()
+        };
+        let envp = child_envp_from(inherited, session.vt_engine, &session.environment, coordinates, session.cwd.as_deref())?;
         let cwd = session.cwd.as_ref().map(|cwd| cstring_from_os(cwd.as_os_str(), "cwd contains interior nul")).transpose()?;
         let argv_ptrs = null_terminated_ptrs(&argv);
         let envp_ptrs = null_terminated_ptrs(&envp);
@@ -954,6 +959,7 @@ mod tests {
             cwd: None,
             cmd: Some("sleep 0.2; printf READY; sleep 0.2".to_string()),
             tags: Vec::new(),
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
@@ -1002,6 +1008,7 @@ mod tests {
             cwd: None,
             cmd: Some("sleep 5".to_string()),
             tags: Vec::new(),
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),

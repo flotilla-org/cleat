@@ -1012,6 +1012,7 @@ fn list_and_inspect_report_opaque_tags() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec!["task=99".into(), "role=impl".into(), "role=impl".into()],
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             },
         )
@@ -1119,6 +1120,7 @@ fn list_selector_requires_exact_opaque_tag_matches() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec!["role=impl".into(), "task=99".into()],
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             },
         )
@@ -1134,6 +1136,7 @@ fn list_selector_requires_exact_opaque_tag_matches() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec!["role=shepherd".into()],
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             },
         )
@@ -1221,6 +1224,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec![selector.clone()],
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             },
         )
@@ -1249,6 +1253,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec![selector.clone()],
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             },
         )
@@ -1279,6 +1284,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec![selector.clone()],
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             },
         )
@@ -1308,6 +1314,7 @@ fn activity_subscription_snapshot_covers_all_matching_sessions() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags,
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             })
             .expect("create session");
@@ -1351,6 +1358,7 @@ fn activity_subscription_emits_threshold_transitions() {
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags: vec![selector.clone()],
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             },
         )
@@ -1407,6 +1415,7 @@ fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_sna
                 initial_size: TerminalSize::default(),
                 colors: cleat::vt::TerminalColors::default(),
                 tags,
+                environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
             })
             .expect("create session");
@@ -1426,6 +1435,7 @@ fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_sna
             initial_size: TerminalSize::default(),
             colors: cleat::vt::TerminalColors::default(),
             tags: vec![selector.clone()],
+            environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
         })
         .expect("create gamma");

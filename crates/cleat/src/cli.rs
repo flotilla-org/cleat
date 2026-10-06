@@ -253,6 +253,9 @@ pub enum Command {
         tags: Vec<String>,
         #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_environment, help = "Set a child environment variable; repeatable")]
         environment: Vec<(String, String)>,
+        /// Start with an empty child environment before applying --env and Cleat identity/coordinates.
+        #[arg(long)]
+        env_clear: bool,
         #[command(flatten)]
         record: RecordFlags,
     },
@@ -830,7 +833,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, environment, record } => {
+        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, environment, env_clear, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -846,6 +849,11 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 initial_size: size.unwrap_or_default(),
                 colors: crate::vt::TerminalColors::default(),
                 tags,
+                environment_policy: if env_clear {
+                    crate::runtime::ChildEnvironmentPolicy::Declared
+                } else {
+                    crate::runtime::ChildEnvironmentPolicy::Inherit
+                },
                 environment,
             };
             let create_result = match &daemon_target {

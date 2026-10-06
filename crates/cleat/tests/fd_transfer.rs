@@ -39,6 +39,7 @@ fn manifest() -> FdTransferManifest {
             cwd: Some("/workspace".into()),
             cmd: Some("cargo test".into()),
             tags: vec!["transfer".into()],
+            environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
             environment: vec![],
             record: true,
             initial_size: TerminalSize::default(),

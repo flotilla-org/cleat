@@ -95,6 +95,7 @@ pub struct SessionStartOptions {
     pub initial_size: TerminalSize,
     pub colors: vt::TerminalColors,
     pub tags: Vec<String>,
+    pub environment_policy: crate::runtime::ChildEnvironmentPolicy,
     pub environment: Vec<(String, String)>,
 }
 
@@ -1373,6 +1374,7 @@ fn start_session(
     session.initial_size = options.initial_size;
     session.colors = options.colors;
     session.tags = options.tags;
+    session.environment_policy = options.environment_policy;
     session.environment = options.environment;
     crate::runtime::normalize_tags(&mut session.tags);
 
@@ -6906,6 +6908,7 @@ mod tests {
             cwd: None,
             cmd: None,
             tags: Vec::new(),
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),
@@ -6931,6 +6934,7 @@ mod tests {
             cwd: None,
             cmd: None,
             tags: Vec::new(),
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
             record: false,
             initial_size: TerminalSize { cols: 120, rows: 40 },

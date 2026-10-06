@@ -1,0 +1,9 @@
+[package]
+name = "terminal-screen"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Pure structural analysis and CSS-like queries of terminal cell snapshots"
+
+[dependencies]
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }

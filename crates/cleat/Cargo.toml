@@ -43,4 +43,5 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+terminal-screen = { path = "../terminal-screen" }
 tempfile = "3"

@@ -197,6 +197,46 @@ pub struct ScreenAnalysis {
 }
 ```
 
+### Selectors and recognizers
+
+The [2026-10-05 direction on #306](https://github.com/flotilla-org/cleat/issues/306)
+revises #23's analysis surface to a structural tree and CSS-like selectors.
+The [2026-10-06 owner direction](https://github.com/flotilla-org/cleat/pull/316#issuecomment-6005165949)
+supersedes the box/band analysis model below. `crates/terminal-screen` owns a
+validated snapshot and a switchable `RegionProducer` seam. Graph segmentation
+is the default producer; corner-matched box detection and per-row bands are
+removed. Producers emit regions with provenance, confidence and evidence; row
+slice leaves partition every cell exactly once. Selectors walk
+`screen > region… > row slice > span`, plus cursor overlays. Physical row indices,
+wrap/prompt metadata and resolved style/semantic tags remain available.
+
+Selector syntax is experimental until #24 lands. Match-set positions use
+`:nth-match` and `:last-match`; sibling positions use `:first-child`, `:last-child`
+and `:nth-child(n of S)`. Child, descendant and sibling `+`/`~` relations include
+relative `:has(+ …)`. Positions inside `:not` are rejected. Value comparisons and
+negated comparisons fail closed for absent subject attributes; case matching is
+sensitive unless explicitly flagged `i`. Positive regex named groups are exposed
+in match results. See the [crate contract](../../crates/terminal-screen/README.md)
+for exact scope, ordering, whitespace, capture and coordinate semantics.
+
+[#313 recognizers](https://github.com/flotilla-org/cleat/issues/313) add roles,
+values and states to this same tree, either as annotations or bounded role
+nodes. Selectors such as `composer[value='']`, `status[state=working]` and
+`dialog[kind=approval]` need no grammar changes. Unknown roles are absent, not
+assumed empty. A recognizer chooses application-specific evidence and content
+extraction; the structural layer never assumes a `›` prefix is editable text or
+removes it. In the #312 Codex cast, that prefix is non-faint, so the literal
+`row:has(cursor) span:not([faint])` retains it while excluding the faint
+placeholder. For the #23 fixture, the governor-authorized query additionally
+uses `:not([bold])` and yields empty then `draft probe`; the marker-inclusive
+result remains a separate structural assertion. General editable-value extraction
+belongs in recognizers.
+
+OSC 133 tags are one evidence source among several, as established by
+[semantic prompt research](../design/semantic-prompt-awareness.md). #24 wires
+selection into inspect/wait; conditional send and controller-generation fencing
+remain separate work. No daemon, CLI or VT integration is part of this crate.
+
 ### Layer 3: Expose via inspect
 
 New inspect mode in cleat's CLI:

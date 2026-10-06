@@ -51,6 +51,26 @@ impl fmt::Display for TerminalSize {
     }
 }
 
+/// Policy for the environment passed to the child before shell startup.
+/// Kept separate from entries so future transparent/provider modes share one policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildEnvironmentPolicy {
+    #[default]
+    Inherit,
+    Declared,
+}
+
+impl ChildEnvironmentPolicy {
+    /// Select the baseline once for all native spawn adapters.
+    pub(crate) fn base_environment(self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        match self {
+            Self::Inherit => env::vars_os().collect(),
+            Self::Declared => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionMetadata {
     pub id: String,
@@ -59,6 +79,8 @@ pub struct SessionMetadata {
     pub cmd: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub environment_policy: ChildEnvironmentPolicy,
     /// Explicit environment entries supplied when the session was launched.
     #[serde(default)]
     pub environment: Vec<(String, String)>,
@@ -416,6 +438,7 @@ impl RuntimeLayout {
             cwd,
             cmd,
             tags: Vec::new(),
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),

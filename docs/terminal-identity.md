@@ -72,3 +72,35 @@ Existing sessions retain their original environment.
 Sources: [pinned Ghostty terminfo](https://github.com/rjwittams/ghostty/blob/c361de9691f006f65c400be73896d1e48a8ec56c/src/terminfo/ghostty.zig),
 [Ghostty's terminfo guidance](https://ghostty.org/docs/help/terminfo), and
 [ncurses infocmp lookup](https://invisible-island.net/ncurses/man/infocmp.1m.html).
+
+## Declared child environments
+
+`cleat launch --env-clear --env PATH=/usr/bin:/bin --env HOME=/home/agent`
+starts the child with an empty environment at the native process spawn seam,
+before any shell startup files run. Repeat `--env NAME=VALUE` to declare entries;
+empty values are preserved and the last duplicate name wins (case insensitive
+on Windows). Without `--env-clear`, existing additive inheritance is preserved.
+Callers must explicitly declare any baseline they need, such as `PATH`, `HOME`,
+`USER` and `LANG`; Cleat does not supply them. On Windows, declare `SystemRoot`
+(and usually `PATH`) for shells, Winsock and programs that rely on the Windows
+installation directory. Cleat does not copy even `SystemRoot` from the daemon.
+Shell startup files can still add variables afterwards.
+
+Precedence is: inherited entries (inherit mode only), engine terminal defaults,
+then explicit entries. Thus explicit `TERM`, `TERM_PROGRAM`, `COLORTERM` and
+`TERM_PROGRAM_VERSION` win, including empty values. Terminfo probing uses only
+the selected baseline plus explicit entries. Fresh `CLEAT_RUNTIME_DIR`,
+`CLEAT_DAEMON`, `CLEAT_SESSION` and `CLEAT_OUTPUT_DAEMON` coordinates are applied
+last; explicit declarations of these reserved names are rejected.
+
+HTTP session metadata carries `environment_policy: "declared"` alongside the
+`environment` list of name/value pairs. Missing policy decodes as `"inherit"`,
+including older stored records. The C provider ABI remains unchanged and uses
+inheritance until it gains environment declarations.
+
+Managed launchers should require `launch_env_clear` in `client.capabilities` from
+`cleat version --json` and in `daemon.capabilities` from
+`cleat version --daemon --json` for an existing daemon. Older build metadata decodes with an empty capability list; refuse an
+unsafe launch instead of falling back. `launch --help` also advertises
+`--env-clear`. This capability does not enable transparent mode (#176); that
+future mode can extend the same policy enum independently of the VT selection.

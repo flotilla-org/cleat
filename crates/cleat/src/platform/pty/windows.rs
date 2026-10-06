@@ -1,5 +1,4 @@
 use std::{
-    env,
     ffi::{c_void, OsStr, OsString},
     io,
     mem::{size_of, zeroed},
@@ -365,7 +364,7 @@ fn spawn_with_conpty(
 }
 
 fn child_environment_block(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Vec<u16>, String> {
-    let inherited: Vec<_> = env::vars_os().collect();
+    let inherited = session.environment_policy.base_environment();
     let identity = crate::terminal_identity::defaults(session.vt_engine, &inherited, &session.environment, session.cwd.as_deref());
     let mut variables: Vec<(OsString, OsString)> = inherited
         .into_iter()
@@ -476,6 +475,26 @@ mod tests {
         vt::VtEngineKind,
     };
 
+    // Declared mode's native CreateProcessW block contains only declarations,
+    // engine defaults and fresh coordinates; names collide case-insensitively.
+    #[test]
+    fn declared_environment_block_preserves_empty_and_last_case_insensitive_entry() {
+        let layout = crate::runtime::RuntimeLayout::new(std::env::temp_dir().join("cleat-env-test"));
+        let coordinates = layout.session_coordinates("declared").unwrap();
+        let mut session = layout.session_metadata("declared".into(), VtEngineKind::Ghostty, None, None);
+        session.environment_policy = crate::runtime::ChildEnvironmentPolicy::Declared;
+        session.environment = vec![("Empty".into(), "".into()), ("AGENT".into(), "first".into()), ("agent".into(), "last".into())];
+        let block = super::child_environment_block(&session, Some(&coordinates)).unwrap();
+        let entries: Vec<_> = block.split(|c| *c == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf16(s).unwrap()).collect();
+        assert!(block.ends_with(&[0, 0]));
+        assert_eq!(entries.len(), 9); // two declarations, three identity defaults, four coordinates
+        for entry in
+            ["Empty=", "agent=last", "TERM=xterm-256color", "TERM_PROGRAM=ghostty", "COLORTERM=truecolor", "CLEAT_SESSION=declared"]
+        {
+            assert!(entries.iter().any(|e| e == entry), "{entries:?}");
+        }
+    }
+
     #[test]
     fn quotes_empty_argument() {
         assert_eq!(quote_windows_arg(""), "\"\"");
@@ -507,6 +526,7 @@ mod tests {
             cwd: None,
             cmd: Some("echo ready".into()),
             tags: Vec::new(),
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
             record: false,
             initial_size: TerminalSize::default(),

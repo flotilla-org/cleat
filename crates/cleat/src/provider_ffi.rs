@@ -2504,6 +2504,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         initial_size: TerminalSize { cols, rows },
         colors,
         tags,
+        environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
         environment: Vec::new(),
     })?;
     let (channel, slot) = connection.open_session_channel(

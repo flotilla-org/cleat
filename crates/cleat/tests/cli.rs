@@ -210,6 +210,7 @@ fn launch_command_parses() {
         cwd: None,
         cmd: Some("bash".into()),
         tags: Vec::new(),
+        env_clear: false,
         environment: Vec::new(),
         record: RecordFlags::default()
     });
@@ -272,6 +273,7 @@ fn launch_command_parses_positional_name() {
         cwd: None,
         cmd: Some("bash".into()),
         tags: Vec::new(),
+        env_clear: false,
         environment: Vec::new(),
         record: RecordFlags::default()
     });
@@ -323,6 +325,7 @@ fn launch_command_parses_json() {
         cwd: None,
         cmd: None,
         tags: Vec::new(),
+        env_clear: false,
         environment: Vec::new(),
         record: RecordFlags::default()
     });
@@ -340,6 +343,7 @@ fn launch_command_parses_vt() {
         cwd: None,
         cmd: None,
         tags: Vec::new(),
+        env_clear: false,
         environment: Vec::new(),
         record: RecordFlags::default()
     });
@@ -357,6 +361,7 @@ fn create_alias_still_parses_as_launch() {
         cwd: None,
         cmd: Some("bash".into()),
         tags: Vec::new(),
+        env_clear: false,
         environment: Vec::new(),
         record: RecordFlags::default()
     });
@@ -1165,4 +1170,14 @@ fn socket_commands_validate_scope() {
     for verb in ["list", "kill", "wait", "watch"] {
         assert!(Cli::try_parse_from(["cleat", verb, "--socket", "/tmp/remote.sock", "demo"]).is_err());
     }
+}
+
+// Glue: CLI declarations preserve empty values and expose the isolation capability.
+#[test]
+fn launch_declared_environment_and_help() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--env-clear", "--env", "EMPTY=", "--env", "CLAUDECODE=owned"]).unwrap();
+    assert!(matches!(cli.command, Command::Launch { env_clear: true, environment, .. }
+        if environment == vec![("EMPTY".into(), "".into()), ("CLAUDECODE".into(), "owned".into())]));
+    let help = Cli::try_parse_from(["cleat", "launch", "--help"]).unwrap_err().to_string();
+    assert!(help.contains("--env-clear"));
 }

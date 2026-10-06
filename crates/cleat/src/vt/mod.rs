@@ -326,6 +326,9 @@ pub struct MouseModifiers {
 // NOTE: VtEngine is intentionally not Send. Engines may wrap foreign terminal-state
 // handles that are only accessed from the single session daemon event loop.
 pub trait VtEngine {
+    fn virtual_placements(&self) -> Vec<crate::provider::TerminalVirtualPlacement> {
+        Vec::new()
+    }
     fn clipboard_supported(&self) -> bool {
         false
     }
@@ -593,3 +596,6 @@ mod tests {
 
 #[cfg(feature = "ghostty-vt")]
 mod ghostty_key;
+
+#[cfg(feature = "ghostty-vt")]
+mod kitty_declarations;

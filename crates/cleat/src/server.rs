@@ -1232,8 +1232,12 @@ impl SessionService {
         let socket_path = self.layout.socket_path();
         let mut stream = connect_session_socket(&socket_path)?;
         let output_context = crate::output_admission::client_header()?;
-        let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms })
-            .map_err(|err| format!("serialize packet subscription request: {err}"))?;
+        let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest {
+            selectors: selectors.to_vec(),
+            screen_activity_stable_ms,
+            virtual_placements: false,
+        })
+        .map_err(|err| format!("serialize packet subscription request: {err}"))?;
         write!(
             stream,
             "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {output_context}\r\n\r\n",
@@ -1253,7 +1257,7 @@ impl SessionService {
             return Err("packet stream did not start with control hello".to_string());
         }
         let hello = hello.decode::<crate::packet::ControlHello>().map_err(|err| format!("decode packet hello: {err}"))?;
-        if hello.version != crate::packet::PROTOCOL_VERSION {
+        if !hello.compatible_with_current() {
             return Err(format!("unsupported packet protocol version {}", hello.version));
         }
 

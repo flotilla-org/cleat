@@ -42,6 +42,10 @@ const DEFAULT_KITTY_IMAGE_STORAGE_LIMIT: u64 = 320 * 1000 * 1000;
 
 pub struct GhosttyVtEngine {
     terminal: TerminalHandle,
+    declaration_observer: super::kitty_declarations::Observer,
+    declaration_registry: super::kitty_declarations::Registry,
+    virtual_declarations: Vec<crate::provider::TerminalVirtualPlacement>,
+    declaration_stamp: Option<(usize, u64)>,
     history_reader: Option<HistoryReader>,
     attachment_views: BTreeMap<u128, HistoryView>,
     history_cache: BTreeMap<(HistoryScreen, u64), Arc<HistoryFrame>>,
@@ -86,6 +90,10 @@ impl GhosttyVtEngine {
         mouse_encoder.set_size(u32::from(cols), u32::from(rows), 1, 1);
         Self {
             terminal,
+            declaration_observer: Default::default(),
+            declaration_registry: Default::default(),
+            virtual_declarations: Vec::new(),
+            declaration_stamp: None,
             history_reader: None,
             attachment_views: BTreeMap::new(),
             history_cache: BTreeMap::new(),
@@ -104,6 +112,18 @@ impl GhosttyVtEngine {
             deferred_render_dirty: GhosttyRenderStateDirty::False,
             deferred_render_dirty_rows: Vec::new(),
         }
+    }
+
+    fn sync_declarations(&mut self, command: Option<&super::kitty_declarations::Command>) -> Result<(), String> {
+        let screen = usize::from(self.terminal.active_screen()? == GhosttyTerminalScreen::Alternate);
+        let stamp = (screen, self.terminal.kitty_storage_generation()?);
+        if self.declaration_stamp == Some(stamp) {
+            return Ok(());
+        }
+        let (_, _, declarations) = self.terminal.kitty_image_state()?;
+        self.virtual_declarations = self.declaration_registry.reconcile(screen, declarations, command)?;
+        self.declaration_stamp = Some(stamp);
+        Ok(())
     }
 
     /// Keep the mouse encoder's renderer geometry in sync with the grid + cell
@@ -298,9 +318,30 @@ fn rgb_to_ghostty(rgb: Rgb) -> ghostty_ffi::GhosttyColorRgb {
 }
 
 impl VtEngine for GhosttyVtEngine {
+    fn virtual_placements(&self) -> Vec<crate::provider::TerminalVirtualPlacement> {
+        self.virtual_declarations.clone()
+    }
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.history_cache.clear();
-        self.terminal.feed(bytes);
+        let mut start = 0;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            if let Some(event) = self.declaration_observer.byte(byte) {
+                self.terminal.feed(&bytes[start..=index]);
+                start = index + 1;
+                let command = match &event {
+                    super::kitty_declarations::Event::Command(command) => command.as_ref(),
+                    super::kitty_declarations::Event::Reset => {
+                        self.declaration_registry.reset();
+                        self.declaration_stamp = None;
+                        None
+                    }
+                    super::kitty_declarations::Event::Sync => None,
+                };
+                self.sync_declarations(command)?;
+            }
+        }
+        self.terminal.feed(&bytes[start..]);
+        self.sync_declarations(None)?;
         if !bytes.is_empty() {
             self.saw_output = true;
         }
@@ -490,6 +531,7 @@ impl VtEngine for GhosttyVtEngine {
         update.scrollback_offset_rows = frame.offset;
         update.terminal_modes = self.terminal_mode_state()?;
         update.image_placements = frame.placements.clone();
+        update.virtual_placements = frame.virtual_placements.clone();
         update.image_resources = frame
             .images
             .iter()
@@ -559,7 +601,7 @@ impl VtEngine for GhosttyVtEngine {
     fn transfer_payload(&self) -> Result<Option<Vec<u8>>, String> {
         use std::io::Write;
         let mut payload = self.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, true))?.unwrap_or_default();
-        let (resources, placements) = self.terminal.kitty_image_state()?;
+        let (resources, placements, _) = self.terminal.kitty_image_state()?;
         for resource in resources {
             let format = match resource.format {
                 0 => 24,
@@ -794,7 +836,7 @@ impl VtEngine for GhosttyVtEngine {
                 .collect(),
         };
 
-        let (image_resources, image_placements) = self.terminal.kitty_image_state()?;
+        let (image_resources, image_placements, _) = self.terminal.kitty_image_state()?;
 
         Ok(TerminalRenderUpdate {
             cols,
@@ -815,6 +857,7 @@ impl VtEngine for GhosttyVtEngine {
                     data_len: resource.data_len,
                 })
                 .collect(),
+            virtual_placements: self.virtual_declarations.clone(),
             image_placements: image_placements
                 .into_iter()
                 .map(|placement| TerminalImagePlacement {
@@ -1210,6 +1253,7 @@ pub struct HistoryFrame {
     /// Ready image versions; pending images have placements but no entry yet.
     pub images: Vec<Arc<HistoryImage>>,
     pub placements: Vec<TerminalImagePlacement>,
+    pub virtual_placements: Vec<crate::provider::TerminalVirtualPlacement>,
 }
 
 #[derive(Debug)]
@@ -1308,7 +1352,7 @@ impl GhosttyVtEngine {
         if cells.len() != count {
             return Err("history capture returned too few cells".into());
         }
-        let (resources, positions) = self.terminal.kitty_image_state_for_anchor(Some(&view.anchor))?;
+        let (resources, positions, declarations) = self.terminal.kitty_image_state_for_anchor(Some(&view.anchor))?;
         let mut images = Vec::new();
         images.try_reserve_exact(resources.len()).map_err(|e| e.to_string())?;
         self.history_images.retain(|_, image| image.strong_count() > 0);
@@ -1391,6 +1435,11 @@ impl GhosttyVtEngine {
             links,
             images,
             placements,
+            virtual_placements: self.declaration_registry.reconcile(
+                usize::from(view.screen == HistoryScreen::Alternate),
+                declarations,
+                None,
+            )?,
         }))
     }
 }

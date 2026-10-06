@@ -74,6 +74,7 @@ pub(crate) struct LastKnown {
     pub terminal_modes: vt::TerminalModeState,
     pub cursor: TerminalCursor,
     pub render_generation: u64,
+    pub virtual_placements: Vec<crate::provider::TerminalVirtualPlacement>,
 }
 
 impl LastKnown {
@@ -87,6 +88,7 @@ impl LastKnown {
             terminal_modes: vt::TerminalModeState::default(),
             cursor: TerminalCursor::default(),
             render_generation: 0,
+            virtual_placements: Vec::new(),
         }
     }
 
@@ -99,6 +101,7 @@ impl LastKnown {
         self.terminal_modes = update.terminal_modes;
         self.cursor = update.cursor;
         self.render_generation = update.render_generation;
+        self.virtual_placements = update.virtual_placements.clone();
     }
 
     pub(crate) fn clean_update(&self) -> TerminalRenderUpdate {
@@ -116,6 +119,7 @@ impl LastKnown {
             ops: Vec::new(),
             image_resources: Vec::new(),
             image_placements: Vec::new(),
+            virtual_placements: self.virtual_placements.clone(),
         }
     }
 }
@@ -370,7 +374,7 @@ impl DaemonConnection {
     /// Follow a transferred session: re-home the channel's slot on the new
     /// daemon, re-requesting the role it last held.
     fn follow_redirect(&self, channel: u32, slot: Arc<Mutex<ChannelSlot>>, redirect: SessionRedirect) {
-        if let Some(reason) = redirect.incompatibility(PROTOCOL_VERSION) {
+        if let Some(reason) = redirect.current_incompatibility() {
             recover_lock(&slot).closed = Some(reason);
             return;
         }
@@ -550,7 +554,7 @@ impl DaemonConnection {
     fn reader_loop(self: Arc<Self>) {
         let mut backoff = RECONNECT_BACKOFF_START;
         while !self.stop.load(Ordering::SeqCst) {
-            match connect_packet_stream(&self.layout, &self.selectors) {
+            match connect_declaration_stream(&self.layout, &self.selectors) {
                 Ok((mut stream, snapshot)) => {
                     backoff = RECONNECT_BACKOFF_START;
                     if !self.install_connection(&stream, snapshot) {
@@ -741,8 +745,8 @@ impl DaemonConnection {
                     }
                 }
             }
-            (channel, MSG_SESSION_RENDER) if channel != CHANNEL_CONTROL => {
-                if let Ok(packet) = frame.decode::<RenderPacket>() {
+            (channel, MSG_SESSION_RENDER | crate::packet::MSG_SESSION_RENDER_VIRTUAL) if channel != CHANNEL_CONTROL => {
+                if let Ok(packet) = RenderPacket::decode_frame(&frame) {
                     let slot = {
                         let state = recover_lock(&self.state);
                         state.channels.get(&channel).cloned()
@@ -842,15 +846,32 @@ pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]
     connect_packet_endpoint(&layout.socket_path(), selectors, &crate::output_admission::client_header()?)
 }
 
+fn connect_declaration_stream(layout: &RuntimeLayout, selectors: &[String]) -> Result<(SessionStream, DirectorySnapshot), String> {
+    connect_packet_endpoint_with_declarations(&layout.socket_path(), selectors, &crate::output_admission::client_header()?, true)
+}
+
 /// Connect without runtime discovery, session metadata, startup, or recovery.
 pub(crate) fn connect_packet_endpoint(
     socket_path: &std::path::Path,
     selectors: &[String],
     output_context: &str,
 ) -> Result<(SessionStream, DirectorySnapshot), String> {
+    connect_packet_endpoint_with_declarations(socket_path, selectors, output_context, false)
+}
+
+fn connect_packet_endpoint_with_declarations(
+    socket_path: &std::path::Path,
+    selectors: &[String],
+    output_context: &str,
+    virtual_placements: bool,
+) -> Result<(SessionStream, DirectorySnapshot), String> {
     let mut stream = try_connect_session_stream(socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
-    let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest { selectors: selectors.to_vec(), screen_activity_stable_ms: None })
-        .map_err(|err| format!("serialize packet subscribe request: {err}"))?;
+    let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest {
+        selectors: selectors.to_vec(),
+        screen_activity_stable_ms: None,
+        virtual_placements,
+    })
+    .map_err(|err| format!("serialize packet subscribe request: {err}"))?;
     let head = format!(
         "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {output_context}\r\n\r\n",
         body.len()
@@ -867,7 +888,7 @@ pub(crate) fn connect_packet_endpoint(
         return Err("packet stream did not start with control hello".to_string());
     }
     let hello = hello.decode::<ControlHello>().map_err(|err| format!("decode packet hello: {err}"))?;
-    if !hello.accepts(PROTOCOL_VERSION) {
+    if !hello.compatible_with_current() {
         return Err(format!(
             "incompatible packet protocol: daemon supports {}..={}, client speaks {}",
             hello.min_supported_version, hello.version, PROTOCOL_VERSION
@@ -1067,6 +1088,42 @@ mod tests {
             command: crate::provider::ViewportCommand::DeltaRows(-12)
         });
 
+        connection.shutdown();
+    }
+
+    // A daemon provider accepts both legacy renders and negotiated envelopes;
+    // consuming an envelope retains its complete declaration set between polls.
+    #[test]
+    fn declaration_envelopes_reach_provider_observations_atomically() {
+        let (_temp, layout) = test_layout();
+        let daemon = FakeDaemon::bind(&layout);
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let (channel, slot) =
+            connection.open_session_channel("alpha".into(), geometry(80, 24), ChannelRole::Watcher, AttachmentIdentity::default());
+        PacketFrame::read(&mut server).unwrap();
+        PacketFrame::read(&mut server).unwrap();
+        let declarations = vec![crate::provider::TerminalVirtualPlacement {
+            handle: 1,
+            creation_order: 1,
+            image_id: 7,
+            generation: 9,
+            columns: 4,
+            rows: 2,
+            ..Default::default()
+        }];
+        let mut update = render_update(7);
+        update.virtual_placements = declarations.clone();
+        RenderPacket::live(update).frame(channel, true).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).pending.is_some());
+        let observed = recover_lock(&slot).pending.take().unwrap();
+        assert_eq!(observed.virtual_placements, declarations);
+        recover_lock(&slot).last.absorb(&observed);
+        assert_eq!(recover_lock(&slot).last.clean_update().virtual_placements, declarations);
+        RenderPacket::live(render_update(8)).frame(channel, true).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).pending.is_some());
+        assert!(recover_lock(&slot).pending.as_ref().unwrap().virtual_placements.is_empty());
         connection.shutdown();
     }
 

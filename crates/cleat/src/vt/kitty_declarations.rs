@@ -16,6 +16,8 @@ pub(super) struct Command {
 impl Command {
     fn parse(header: &[u8]) -> Option<Self> {
         let mut command = Self { action: b't', delete: b'a', ..Self::default() };
+        // Mirrors rjwittams/ghostty@c361de9, src/terminal/kitty/graphics_command.zig.
+        // Recheck these rules when tools/prepare-ghostty-vt.sh changes its pin.
         // Match the pinned Ghostty Parser's 11-byte key/value buffer and
         // ignore states. A one-byte non-digit is its ASCII numeric value;
         // integer parse failures reject the command, but malformed keys are ignored.

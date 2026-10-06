@@ -4,90 +4,14 @@
 
 use std::fmt::Write as _;
 
-use cleat::{
-    provider::{DirtyState, TerminalCellFlags as Flags, TerminalCellWidth, TerminalCursorStyle},
-    vt::{ghostty::GhosttyVtEngine, VtEngine},
-};
+use cleat::vt::{ghostty::GhosttyVtEngine, VtEngine};
 use terminal_screen::{
     segment::{GraphSegmenter, RegionKind, RegionTree},
     *,
 };
-
-// Test-local producer adapter: terminal-screen itself has no cleat/VT dependency.
-// The full render update supplies row metadata and resolved cell styles.
-fn snapshot(vt: &mut GhosttyVtEngine, generation: u64) -> ScreenGrid {
-    let update = vt.render_update(DirtyState::Full).unwrap();
-    let mut cells = vec![Cell::default(); usize::from(update.cols) * usize::from(update.rows)];
-    let mut metadata = vec![RowMetadata::default(); usize::from(update.rows)];
-    for row in update.ops.iter().flat_map(|op| &op.rows) {
-        metadata[usize::from(row.row)] = RowMetadata {
-            soft_wrap: row.wrap,
-            wrap_continuation: row.wrap_continuation,
-            semantic_prompt: match row.semantic_prompt {
-                1 => SemanticPrompt::Prompt,
-                2 => SemanticPrompt::Continuation,
-                _ => SemanticPrompt::None,
-            },
-        };
-        for (col, cell) in row.cells.iter().enumerate() {
-            let style = &cell.style;
-            let flags = style.flags;
-            cells[usize::from(row.row) * usize::from(update.cols) + col] = Cell {
-                grapheme: cell.graphemes.iter().filter_map(|cp| char::from_u32(*cp)).collect(),
-                width: match style.width {
-                    TerminalCellWidth::Narrow => CellWidth::Narrow,
-                    TerminalCellWidth::Wide => CellWidth::Wide,
-                    TerminalCellWidth::SpacerTail => CellWidth::SpacerTail,
-                    TerminalCellWidth::SpacerHead => CellWidth::SpacerHead,
-                },
-                semantic: match style.semantic {
-                    1 => SemanticContent::Input,
-                    2 => SemanticContent::Prompt,
-                    _ => SemanticContent::Output,
-                },
-                style: Style {
-                    fg: Rgb(style.resolved_fg.r, style.resolved_fg.g, style.resolved_fg.b),
-                    bg: Rgb(style.resolved_bg.r, style.resolved_bg.g, style.resolved_bg.b),
-                    bold: flags.contains(Flags::BOLD),
-                    faint: flags.contains(Flags::FAINT),
-                    inverse: flags.contains(Flags::INVERSE),
-                    invisible: flags.contains(Flags::INVISIBLE),
-                    italic: flags.contains(Flags::ITALIC),
-                    blink: flags.contains(Flags::BLINK),
-                    strikethrough: flags.contains(Flags::STRIKETHROUGH),
-                    overline: flags.contains(Flags::OVERLINE),
-                    underline_style: style.underline_style,
-                    protected: style.protected,
-                    hyperlink: (!style.hyperlink_uri.is_empty()).then(|| String::from_utf8_lossy(&style.hyperlink_uri).into_owned()),
-                    ..Style::default()
-                },
-            };
-        }
-    }
-    ScreenGrid::new(
-        update.cols,
-        update.rows,
-        cells,
-        metadata,
-        Cursor {
-            col: update.cursor.col,
-            row: update.cursor.row,
-            visible: update.cursor.visible,
-            blinking: update.cursor.blink,
-            wide_tail: update.cursor.wide_tail,
-            style: match update.cursor.style {
-                TerminalCursorStyle::Bar => CursorStyle::Bar,
-                TerminalCursorStyle::Block => CursorStyle::Block,
-                TerminalCursorStyle::Underline => CursorStyle::Underline,
-                TerminalCursorStyle::BlockHollow => CursorStyle::Hollow,
-            },
-            // Current cleat render snapshots do not expose password-input state.
-            password_input: false,
-        },
-        generation,
-    )
-    .unwrap()
-}
+#[path = "support/screen_grid.rs"]
+mod screen_grid;
+use screen_grid::snapshot;
 
 fn frames(cast: &str) -> Vec<(String, ScreenGrid)> {
     let mut lines = cast.lines();
@@ -182,11 +106,7 @@ fn dump(name: &str, label: &str, g: &ScreenGrid, t: &RegionTree, out: &mut Strin
 fn graph_segmentation_dump_casts() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/semantic-prompt-evidence");
     let out_dir = std::env::var("GRAPH_OUT").ok();
-    let mut seg = GraphSegmenter::default();
-    // GRAPH_K enables the Felzenszwalb–Huttenlocher adaptive term at block level.
-    if let Some(k) = std::env::var("GRAPH_K").ok().and_then(|k| k.parse().ok()) {
-        seg.params.block_k = k;
-    }
+    let seg = GraphSegmenter::default();
     for name in [
         "osc133-claude-ready-normal",
         "osc133-claude-ready-ax",
@@ -203,7 +123,7 @@ fn graph_segmentation_dump_casts() {
             let t = seg.segment(&g);
             let us = start.elapsed().as_micros();
             dump(name, &label, &g, &t, &mut out);
-            let boxes = analyze(&g).select("box").unwrap().len();
+
             let summary = match anchor(&g) {
                 Some((c, r)) => {
                     let e = t.region_at(c, r, RegionKind::Enclosure).unwrap();
@@ -235,11 +155,62 @@ fn graph_segmentation_dump_casts() {
             };
             let enclosures = t.regions.iter().filter(|r| r.is(RegionKind::Enclosure)).count();
             let blocks = t.regions.iter().filter(|r| r.is(RegionKind::Block)).count();
-            println!("  [{label}] {us}us(debug) enclosures={enclosures} blocks={blocks} #316-boxes={boxes}\n    {summary}");
+            println!("  [{label}] {us}us(debug) enclosures={enclosures} blocks={blocks}\n    {summary}");
         }
         if let Some(d) = &out_dir {
             std::fs::create_dir_all(d).unwrap();
             std::fs::write(std::path::Path::new(d).join(format!("{name}.graph.txt")), out).unwrap();
         }
+    }
+}
+
+// Owner acceptance: both normal-mode composers must be structurally separated
+// from their footers without interpreting app-specific prefix/value semantics.
+#[test]
+fn both_recorded_composers_and_footers_are_separate_regions() {
+    for (name, cast, kind, footer_text) in [
+        (
+            "Claude",
+            include_str!("../../../docs/design/semantic-prompt-evidence/osc133-claude-ready-normal.cast"),
+            RegionKind::Enclosure,
+            "auto mode on",
+        ),
+        ("Codex", include_str!("../../../docs/design/semantic-prompt-evidence/osc133-codex-normal.cast"), RegionKind::Block, "GPT-6.1"),
+    ] {
+        let frames = frames(cast);
+        let mut checked = 0;
+        for (label, grid) in &frames {
+            let Some((col, row)) = anchor(grid) else { continue };
+            let regions = GraphSegmenter::default().segment(grid);
+            let composer = regions.region_at(col, row, kind).expect("composer has region");
+            let footer = regions
+                .regions
+                .iter()
+                .enumerate()
+                .find(|(id, r)| r.is(kind) && regions.text(grid, *id).contains(footer_text))
+                .map(|(id, _)| id);
+            let Some(footer) = footer else { continue }; // Startup before the footer is painted.
+            assert_ne!(composer, footer, "{name} {label}");
+            assert!(!regions.text(grid, composer).contains(footer_text), "footer is outside composer cells");
+            assert!(regions.text(grid, composer).contains(if name == "Claude" { "❯" } else { "›" }), "{name} {label}");
+            assert_eq!(regions.regions[composer].bounds.height, 1, "{name} {label}");
+            let tree = regions.to_screen_tree(grid);
+            let selector = if name == "Claude" { "enclosure:has(span[inverse])" } else { "block:has(cursor)" };
+            assert!(tree.select(selector).unwrap().iter().any(|n| n.text == regions.text(grid, composer)), "{name} {label}");
+            let mut count = vec![0; grid.cells().len()];
+            for span in tree.select("span").unwrap() {
+                for c in span.bounds.col..span.bounds.col + span.bounds.width {
+                    count[usize::from(span.bounds.row) * usize::from(grid.cols()) + usize::from(c)] += 1;
+                }
+            }
+            assert!(count.iter().all(|c| *c == 1));
+            checked += 1;
+        }
+        assert!(checked >= 2, "{name}: checked empty/working/draft frames, got {checked}");
+        let (_, last) = frames.last().unwrap();
+        let (col, row) = anchor(last).expect("final composer anchor");
+        let regions = GraphSegmenter::default().segment(last);
+        let composer = regions.region_at(col, row, kind).unwrap();
+        assert!(regions.text(last, composer).contains("draft probe"), "{name} final");
     }
 }

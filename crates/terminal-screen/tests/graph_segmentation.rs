@@ -1,5 +1,4 @@
-//! SPIKE (#319): graph segmentation on synthetic layouts that defeat #316's
-//! corner-matched boxes. Run with `--nocapture` to see the region maps.
+//! Graph segmentation contracts on synthetic panels, rules and styles.
 
 use std::time::Instant;
 
@@ -60,8 +59,8 @@ fn sel_text(g: &ScreenGrid, t: &RegionTree, selector: &str) -> Vec<String> {
 fn check_leaves_partition(t: &RegionTree) {
     let mut count = vec![0u32; usize::from(t.cols) * usize::from(t.rows)];
     for r in &t.regions {
-        if r.children.is_empty() {
-            assert!(r.is(RegionKind::Line));
+        if r.children.is_empty() && !r.is(RegionKind::Screen) {
+            assert!(r.is(RegionKind::RowSlice));
             assert_eq!(r.bounds.height, 1);
             for c in r.bounds.col..r.bounds.col + r.bounds.width {
                 count[usize::from(r.bounds.row) * usize::from(t.cols) + usize::from(c)] += 1;
@@ -306,8 +305,145 @@ fn timing() {
             }
             let analyze_us = start.elapsed().as_micros() as f64 / f64::from(iters);
             println!(
-                "{cols}x{rows} {name:24} segment {seg_us:8.0} us  to_screen_tree {tree_us:8.0} us  #316 analyze {analyze_us:9.0} us  regions {regions}"
+                "{cols}x{rows} {name:24} segment {seg_us:8.0} us  to_screen_tree {tree_us:8.0} us  full analysis {analyze_us:9.0} us  regions {regions}"
             );
         }
     }
+}
+
+// The producer contract partitions all cells for every generated layout,
+// including empty dimensions, thin screens, colours, glyph walls and cursor edges.
+#[test]
+fn generated_partition_and_switchable_producer_contract() {
+    use terminal_screen::segment::{Provenance, RegionProducer};
+    for cols in [0, 1, 2, 7, 20] {
+        for rows in [0, 1, 2, 5] {
+            for pattern in 0..4 {
+                let g = filled(cols, rows, |c, r| {
+                    let ch = match pattern {
+                        0 => '+',
+                        1 => {
+                            if c % 3 == 0 {
+                                '│'
+                            } else {
+                                'x'
+                            }
+                        }
+                        2 => {
+                            if r % 2 == 0 {
+                                ' '
+                            } else {
+                                'a'
+                            }
+                        }
+                        _ => 'x',
+                    };
+                    (ch, Style { bg: Rgb((c % 2) as u8, (r % 2) as u8, 0), ..Style::default() })
+                });
+                let producer: &dyn RegionProducer = &GraphSegmenter::default();
+                let t = producer.produce(&g, None);
+                assert_eq!(producer.provenance(), Provenance::Graph);
+                let rebuilt = RegionTree::new(&g, t.regions.clone()).unwrap();
+                for r in 0..rows {
+                    for c in 0..cols {
+                        assert_eq!(t.leaf_at(c, r), rebuilt.leaf_at(c, r));
+                    }
+                }
+                assert_eq!(t.regions[0].cell_count as usize, g.cells().len());
+                assert!(t.regions.iter().all(|r| r.provenance == Provenance::Graph));
+                let screen = t.to_screen_tree(&g);
+                assert!(screen.select("box, band, line").unwrap().is_empty());
+                let mut count = vec![0; g.cells().len()];
+                for node in screen.select("span").unwrap() {
+                    for c in node.bounds.col..node.bounds.col + node.bounds.width {
+                        count[usize::from(node.bounds.row) * usize::from(cols) + usize::from(c)] += 1;
+                    }
+                }
+                assert!(count.iter().all(|c| *c == 1));
+                if !g.cells().is_empty() {
+                    let leaf = t.leaf_at(0, 0);
+                    let mut invalid = t.regions.clone();
+                    invalid[leaf].cell_count += 1;
+                    assert!(RegionTree::new(&g, invalid).is_err());
+                    let mut invalid = t.regions.clone();
+                    invalid[leaf].confidence = f32::NAN;
+                    assert!(RegionTree::new(&g, invalid).is_err());
+                    let mut invalid = t.regions.clone();
+                    invalid[leaf].bounds.width = 0;
+                    assert!(RegionTree::new(&g, invalid).is_err());
+                }
+            }
+        }
+    }
+}
+
+// Owner acceptance: the adversarial grid that triggered corner-search blowup
+// must segment in less than 5ms per frame in an optimized build. Run explicitly
+// to avoid making ordinary debug tests or shared CI scheduling a timing gate.
+#[test]
+#[ignore = "release acceptance: cargo test --release -p terminal-screen adversarial_plus_budget -- --ignored --nocapture"]
+fn adversarial_plus_budget() {
+    if cfg!(debug_assertions) {
+        panic!("this budget is for release builds");
+    }
+    let g = filled(200, 50, |_, _| ('+', Style::default()));
+    let producer = GraphSegmenter::default();
+    for _ in 0..5 {
+        std::hint::black_box(producer.segment(&g));
+    }
+    let start = Instant::now();
+    for _ in 0..100 {
+        std::hint::black_box(producer.segment(&g));
+    }
+    let per_frame = start.elapsed().as_secs_f64() / 100.0;
+    eprintln!("200x50 '+' segmentation: {:.3}ms/frame", per_frame * 1000.0);
+    assert!(per_frame < 0.005, "{per_frame}s exceeds 5ms");
+}
+
+// Alternate producers use the same validated partition and selector contract;
+// provenance stays visible to consumers without changing selector grammar.
+#[test]
+fn declared_producer_uses_common_tree() {
+    use terminal_screen::segment::{FrameHistory, Provenance, Region, RegionProducer};
+    struct Declared;
+    impl RegionProducer for Declared {
+        fn provenance(&self) -> Provenance {
+            Provenance::Declared
+        }
+        fn produce(&self, grid: &ScreenGrid, _history: Option<&FrameHistory<'_>>) -> RegionTree {
+            let make = |kind, parent, children, bounds, count| Region {
+                kinds: [kind].into(),
+                bounds,
+                cell_count: count,
+                provenance: Provenance::Declared,
+                confidence: 1.0,
+                evidence: "producer fixture rectangle".into(),
+                parent,
+                children,
+            };
+            RegionTree::new(grid, vec![
+                make(RegionKind::Screen, None, vec![1], grid.bounds(), 2),
+                make(RegionKind::Block, Some(0), vec![2], grid.bounds(), 2),
+                make(RegionKind::RowSlice, Some(1), vec![], grid.bounds(), 2),
+            ])
+            .unwrap()
+        }
+    }
+    let g = grid(&["ok"], &[], None);
+    let tree = Declared.produce(&g, None).to_screen_tree(&g);
+    assert_eq!(tree.select("region[provenance=declared] > row > span").unwrap()[0].text, "ok");
+    let mut invalid = GraphSegmenter::default().segment(&g).regions;
+    let duplicate = invalid[0].children[0];
+    invalid[0].children.push(duplicate);
+    assert!(RegionTree::new(&g, invalid).is_err());
+    use terminal_screen::segment::GraphParams;
+    for params in
+        [GraphParams { block_tau: 1.0, ..GraphParams::default() }, GraphParams { w_bg: f32::NAN, ..GraphParams::default() }, GraphParams {
+            gutter_min: 0,
+            ..GraphParams::default()
+        }]
+    {
+        assert!(GraphSegmenter::new(params).is_err());
+    }
+    assert!(GraphSegmenter::new(GraphParams::default()).is_ok());
 }

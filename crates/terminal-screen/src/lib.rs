@@ -4,13 +4,11 @@
 //! Coordinates are zero-based half-open cell rectangles; text preserves spaces
 //! and soft-wrapped physical rows. See the crate README for selector semantics.
 
-mod detect;
 mod grid;
 pub mod segment;
 mod selector;
 mod tree;
 
-pub use detect::{detect_bands, detect_boxes, Band, BandKind, BorderStyle, DetectedBox};
 pub use grid::*;
-pub use selector::{Selector, SelectorError};
+pub use selector::{Selector, SelectorError, SelectorMatch};
 pub use tree::{analyze, Node, NodeAnnotations, NodeId, ScreenTree, TreeError};

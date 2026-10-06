@@ -201,21 +201,23 @@ pub struct ScreenAnalysis {
 
 The [2026-10-05 direction on #306](https://github.com/flotilla-org/cleat/issues/306)
 revises #23's analysis surface to a structural tree and CSS-like selectors.
-`crates/terminal-screen` owns a validated snapshot and derives `screen`, `box`,
-`band`, `row`, `span` and a cursor pseudo-element. It remains independent of
-Ghostty and daemon state. Rows preserve physical indices, wrap and semantic
-prompt metadata; spans preserve resolved style, colours and input/prompt/output
-tags. Complete borders and full-width visual bands carry confidence scores,
-not application roles. Each physical row appears once and nests only under a
-region containing its full bounds; narrower boxes retain bounded text without
-duplicating rows.
+The [2026-10-06 owner direction](https://github.com/flotilla-org/cleat/pull/316#issuecomment-6005165949)
+supersedes the box/band analysis model below. `crates/terminal-screen` owns a
+validated snapshot and a switchable `RegionProducer` seam. Graph segmentation
+is the default producer; corner-matched box detection and per-row bands are
+removed. Producers emit regions with provenance, confidence and evidence; row
+slice leaves partition every cell exactly once. Selectors walk
+`screen > region… > row slice > span`, plus cursor overlays. Physical row indices,
+wrap/prompt metadata and resolved style/semantic tags remain available.
 
-Selectors follow [xa11y's grammar](https://github.com/xa11y/xa11y/blob/main/docs/site/src/content/docs/reference/selectors.mdx)
-where it fits: element/role names, attribute operators, child and descendant
-combinators, and one-based `:nth(n)` over segment matches. #23 adds boolean
-attributes, `:last`, `:not`, `:has`, `:has-text` and `/regex/` matching. Names and
-attributes are data-driven. See the [crate contract](../../crates/terminal-screen/README.md)
-for exact scope, ordering, whitespace and coordinate semantics.
+Selector syntax is experimental until #24 lands. Match-set positions use
+`:nth-match` and `:last-match`; sibling positions use `:first-child`, `:last-child`
+and `:nth-child(n of S)`. Child, descendant and sibling `+`/`~` relations include
+relative `:has(+ …)`. Positions inside `:not` are rejected. Value comparisons and
+negated comparisons fail closed for absent subject attributes; case matching is
+sensitive unless explicitly flagged `i`. Positive regex named groups are exposed
+in match results. See the [crate contract](../../crates/terminal-screen/README.md)
+for exact scope, ordering, whitespace, capture and coordinate semantics.
 
 [#313 recognizers](https://github.com/flotilla-org/cleat/issues/313) add roles,
 values and states to this same tree, either as annotations or bounded role

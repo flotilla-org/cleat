@@ -3,9 +3,7 @@ use std::{
     fmt,
 };
 
-use crate::{
-    detect_bands, detect_boxes, BandKind, Cell, CursorStyle, Rect, ScreenGrid, Selector, SelectorError, SemanticContent, SemanticPrompt,
-};
+use crate::{Cell, Rect, ScreenGrid, Selector, SelectorError, SemanticContent};
 
 /// Identity within one tree only; never an identity across generations.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -130,9 +128,6 @@ impl ScreenTree {
     pub fn select(&self, source: &str) -> Result<Vec<&Node>, SelectorError> {
         Ok(Selector::parse(source)?.evaluate(self).into_iter().map(|id| &self.nodes[id.0]).collect())
     }
-    fn push(&mut self, parent: NodeId, node: Node) -> NodeId {
-        self.add_node(parent, node).expect("analysis bounds are contained")
-    }
 }
 
 pub(crate) fn span_node(cells: &[Cell], col: u16, row: u16) -> Node {
@@ -173,97 +168,7 @@ pub(crate) fn span_node(cells: &[Cell], col: u16, row: u16) -> Node {
     node
 }
 
-/// Build observations. Each physical row occurs exactly once. A full-width row
-/// nests only under a box that contains its entire bounds; partial-width boxes
-/// are observations with their own bounded text, not duplicated physical rows.
+/// Analyze one frame with the default graph region producer.
 pub fn analyze(grid: &ScreenGrid) -> ScreenTree {
-    let mut root = Node::new("screen", grid.bounds(), grid.text(grid.bounds()));
-    root.attr("generation", grid.generation);
-    root.attr("cols", grid.cols());
-    root.attr("rows", grid.rows());
-    let mut tree = ScreenTree { generation: grid.generation, nodes: vec![root] };
-    let mut boxes = detect_boxes(grid);
-    boxes.sort_by_key(|b| std::cmp::Reverse(b.rect.area()));
-    let mut box_ids: Vec<NodeId> = Vec::new();
-    for b in boxes {
-        let parent = box_ids
-            .iter()
-            .copied()
-            .filter(|id| tree.nodes[id.0].bounds != b.rect && tree.nodes[id.0].bounds.contains(b.rect))
-            .min_by_key(|id| tree.nodes[id.0].bounds.area())
-            .unwrap_or(tree.root());
-        let mut node = Node::new("box", b.rect, grid.text(b.rect));
-        node.confidence = Some(b.confidence);
-        node.attr("confidence", b.confidence);
-        node.attr("border-style", match b.border_style {
-            crate::BorderStyle::Unicode => "unicode",
-            crate::BorderStyle::Ascii => "ascii",
-        });
-        if let Some(title) = b.title {
-            node.attr("title", title);
-        }
-        box_ids.push(tree.push(parent, node));
-    }
-    let bands = detect_bands(grid);
-    for row in 0..grid.rows() {
-        let bounds = Rect { col: 0, row, width: grid.cols(), height: 1 };
-        let mut parent = box_ids
-            .iter()
-            .copied()
-            .filter(|id| tree.nodes[id.0].bounds.contains(bounds))
-            .min_by_key(|id| tree.nodes[id.0].bounds.area())
-            .unwrap_or(tree.root());
-        if let Some(band) = bands.iter().find(|b| b.rect.row == row) {
-            let mut node = Node::new("band", band.rect, band.text.clone());
-            node.confidence = Some(band.confidence);
-            node.attr("confidence", band.confidence);
-            node.attr("kind", match band.kind {
-                BandKind::Styled => "styled",
-                BandKind::Separator => "separator",
-                BandKind::Blank => "blank",
-            });
-            parent = tree.push(parent, node);
-        }
-        let metadata = grid.row_metadata()[usize::from(row)];
-        let mut node = Node::new("row", bounds, grid.text(bounds));
-        node.attr("index", row);
-        node.attr("index-from-bottom", grid.rows() - row - 1);
-        node.flag("soft-wrap", metadata.soft_wrap);
-        node.flag("wrap-continuation", metadata.wrap_continuation);
-        node.flag("prompt", metadata.semantic_prompt != SemanticPrompt::None);
-        node.attr("semantic-prompt", match metadata.semantic_prompt {
-            SemanticPrompt::None => "none",
-            SemanticPrompt::Prompt => "prompt",
-            SemanticPrompt::Continuation => "continuation",
-        });
-        let row_id = tree.push(parent, node);
-        let cells = grid.row(row).expect("row iteration stays inside validated grid dimensions");
-        let mut start = 0;
-        for end in 1..=cells.len() {
-            if end == cells.len() || cells[end].style != cells[start].style || cells[end].semantic != cells[start].semantic {
-                tree.push(row_id, span_node(&cells[start..end], start as u16, row));
-                start = end;
-            }
-        }
-        if grid.cursor.visible && grid.cursor.row == row {
-            let cursor = grid.cursor;
-            let mut node = Node::new("cursor", Rect { col: cursor.col, row, width: 1, height: 1 }, "");
-            node.flag("visible", true);
-            node.flag("blinking", cursor.blinking);
-            node.flag("password-input", cursor.password_input);
-            node.flag("wide-tail", cursor.wide_tail);
-            node.attr("style", match cursor.style {
-                CursorStyle::Bar => "bar",
-                CursorStyle::Block => "block",
-                CursorStyle::Underline => "underline",
-                CursorStyle::Hollow => "hollow",
-            });
-            tree.push(row_id, node);
-        }
-    }
-    let keys = tree.nodes.iter().map(|n| (n.bounds.row, n.bounds.col)).collect::<Vec<_>>();
-    for node in &mut tree.nodes {
-        node.children.sort_by_key(|id| keys[id.0]);
-    }
-    tree
+    crate::segment::GraphSegmenter::default().segment(grid).to_screen_tree(grid)
 }

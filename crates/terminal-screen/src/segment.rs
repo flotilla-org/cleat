@@ -1,4 +1,4 @@
-//! SPIKE (#319): graph-based segmentation as a switchable region producer.
+//! graph-based segmentation as a switchable region producer.
 //!
 //! The cell grid is a 4-connected graph. Each edge between neighbouring cells
 //! gets a dissimilarity built from explainable terms (background change,
@@ -6,19 +6,19 @@
 //! change). Border glyphs are walls: no edge joins a wall to a non-wall cell,
 //! so wall cells form their own regions ("frames") and the non-wall cells they
 //! enclose form "enclosures". Inside an enclosure a Kruskal-ordered merge
-//! (single linkage, optionally with the Felzenszwalb–Huttenlocher `k/|C|`
-//! term) is swept over increasing thresholds: block -> zone -> enclosure. The
+//! (single linkage) is swept over increasing thresholds: block -> group ->
+//! zone -> enclosure. The
 //! nested partitions form the region tree; its leaves are row slices, so every
 //! cell belongs to exactly one leaf.
 //!
-//! Not production code: weights are hand-tuned on a handful of recordings.
+//! Weights are heuristic and uncalibrated; see the README for known limitations.
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::{tree::span_node, Cell, CellWidth, CursorStyle, Node, NodeId, Rect, Rgb, ScreenGrid, ScreenTree};
+use crate::{tree::span_node, Cell, CellWidth, CursorStyle, Node, NodeId, Rect, Rgb, ScreenGrid, ScreenTree, SemanticPrompt};
 
 // ---------------------------------------------------------------------------
-// Producer interface (sketch)
+// Producer interface
 // ---------------------------------------------------------------------------
 
 /// Where a region came from. Recognizers prefer declared over inferred.
@@ -60,7 +60,7 @@ pub enum RegionKind {
     /// A whitespace component at block level.
     Gap,
     /// Leaf: one contiguous row slice of one block/gap/frame.
-    Line,
+    RowSlice,
 }
 
 impl RegionKind {
@@ -73,7 +73,7 @@ impl RegionKind {
             Self::Group => "group",
             Self::Block => "block",
             Self::Gap => "gap",
-            Self::Line => "line",
+            Self::RowSlice => "row-slice",
         }
     }
 }
@@ -126,6 +126,75 @@ pub trait RegionProducer {
 }
 
 impl RegionTree {
+    /// Construct another producer's partition. Entries must be preorder with
+    /// mutually consistent links, bounded geometry and complete row-slice leaves.
+    /// Region IDs are local to this frame; confidence is producer-defined.
+    pub fn new(grid: &ScreenGrid, regions: Vec<Region>) -> Result<Self, crate::TreeError> {
+        let fail = |message: &str| crate::TreeError(message.to_string());
+        let Some(root) = regions.first() else {
+            return Err(fail("region tree needs a screen root"));
+        };
+        if root.parent.is_some() || !root.is(RegionKind::Screen) || root.bounds != grid.bounds() {
+            return Err(fail("invalid region root"));
+        }
+        let mut leaf_of = vec![u32::MAX; grid.cells().len()];
+        let mut counts = vec![0u32; regions.len()];
+        for (id, region) in regions.iter().enumerate() {
+            if region.kinds.is_empty() || !region.confidence.is_finite() || !(0.0..=1.0).contains(&region.confidence) {
+                return Err(fail("region needs a kind and finite confidence in 0..1"));
+            }
+            if id != 0 {
+                let Some(parent) = region.parent.filter(|p| *p < id) else {
+                    return Err(fail("parent must precede child"));
+                };
+                if !regions[parent].bounds.contains(region.bounds) || regions[parent].children.iter().filter(|c| **c == id).count() != 1 {
+                    return Err(fail("region must nest under its linked parent"));
+                }
+            }
+            let mut unique = BTreeSet::new();
+            for &child in &region.children {
+                if child <= id || child >= regions.len() || regions[child].parent != Some(id) || !unique.insert(child) {
+                    return Err(fail("invalid or duplicate child link"));
+                }
+            }
+            if region.children.is_empty() && id != 0 {
+                let b = region.bounds;
+                if !region.is(RegionKind::RowSlice) || b.height != 1 || b.width == 0 || !grid.bounds().contains(b) {
+                    return Err(fail("leaf must be a nonempty bounded row slice"));
+                }
+                for col in b.col..b.col + b.width {
+                    let slot = &mut leaf_of[usize::from(b.row) * usize::from(grid.cols()) + usize::from(col)];
+                    if *slot != u32::MAX {
+                        return Err(fail("leaf cells overlap"));
+                    }
+                    *slot = id as u32;
+                }
+                counts[id] = u32::from(b.width);
+            }
+        }
+        if leaf_of.contains(&u32::MAX) {
+            return Err(fail("leaves do not cover every cell"));
+        }
+        for id in (0..regions.len()).rev() {
+            if !regions[id].children.is_empty() {
+                counts[id] = regions[id].children.iter().map(|c| counts[*c]).sum();
+            }
+            if regions[id].cell_count != counts[id] {
+                return Err(fail("region cell count must equal its descendant leaves"));
+            }
+        }
+        // Strict preorder is required by the screen-tree adapter.
+        let mut order = Vec::new();
+        let mut stack = vec![0];
+        while let Some(id) = stack.pop() {
+            order.push(id);
+            stack.extend(regions[id].children.iter().rev());
+        }
+        if order != (0..regions.len()).collect::<Vec<_>>() {
+            return Err(fail("regions must be in preorder"));
+        }
+        Ok(Self { cols: grid.cols(), rows: grid.rows(), generation: grid.generation, regions, leaf_of })
+    }
     pub fn root(&self) -> usize {
         0
     }
@@ -205,19 +274,24 @@ impl RegionTree {
         text
     }
 
-    /// Adapter so #316 selectors walk this tree: `region` elements carry their
-    /// kinds as roles (`enclosure`, `zone`, `block`, `gap`, `frame`), leaves
-    /// are `line` elements holding the clipped `span`s and the `cursor`.
+    /// Selectors walk `screen > region… > row > span`. Kinds are roles;
+    /// rows are slices, with their physical row index available as an attribute.
+    /// Cursor nodes are observational overlays and do not own cells.
     pub fn to_screen_tree(&self, grid: &ScreenGrid) -> ScreenTree {
+        assert_eq!((self.cols, self.rows, self.generation), (grid.cols(), grid.rows(), grid.generation), "region/grid frame must agree");
         let mut ids: Vec<NodeId> = Vec::with_capacity(self.regions.len());
-        let mut tree = ScreenTree::from_root(grid.generation, Node::new("screen", grid.bounds(), grid.text(grid.bounds())));
+        let mut root = Node::new("screen", grid.bounds(), grid.text(grid.bounds()));
+        root.attributes.insert("generation".into(), grid.generation.to_string());
+        root.attributes.insert("cols".into(), grid.cols().to_string());
+        root.attributes.insert("rows".into(), grid.rows().to_string());
+        let mut tree = ScreenTree::from_root(grid.generation, root);
         for (i, region) in self.regions.iter().enumerate() {
             if i == 0 {
                 ids.push(tree.root());
                 continue;
             }
             let leaf = region.children.is_empty();
-            let mut node = Node::new(if leaf { "line" } else { "region" }, region.bounds, self.text(grid, i));
+            let mut node = Node::new(if leaf { "row" } else { "region" }, region.bounds, self.text(grid, i));
             for k in &region.kinds {
                 node.roles.insert(k.as_str().into());
             }
@@ -231,6 +305,29 @@ impl RegionTree {
             ids.push(id);
             if leaf {
                 let b = region.bounds;
+                let metadata = grid.row_metadata()[usize::from(b.row)];
+                let annotations = tree.annotations_mut(id).expect("new row is attached");
+                annotations.attributes.insert("index".into(), b.row.to_string());
+                annotations.attributes.insert("index-from-bottom".into(), (grid.rows() - b.row - 1).to_string());
+                annotations.attributes.insert("slice-col".into(), b.col.to_string());
+                annotations.attributes.insert(
+                    "semantic-prompt".into(),
+                    match metadata.semantic_prompt {
+                        SemanticPrompt::None => "none",
+                        SemanticPrompt::Prompt => "prompt",
+                        SemanticPrompt::Continuation => "continuation",
+                    }
+                    .into(),
+                );
+                for (name, enabled) in [
+                    ("soft-wrap", metadata.soft_wrap),
+                    ("wrap-continuation", metadata.wrap_continuation),
+                    ("prompt", metadata.semantic_prompt != SemanticPrompt::None),
+                ] {
+                    if enabled {
+                        annotations.attributes.insert(name.into(), "true".into());
+                    }
+                }
                 let cells = &grid.row(b.row).expect("leaf row in grid")[usize::from(b.col)..usize::from(b.col + b.width)];
                 let mut start = 0;
                 for end in 1..=cells.len() {
@@ -243,6 +340,11 @@ impl RegionTree {
                 if c.visible && c.row == b.row && c.col >= b.col && c.col < b.col + b.width {
                     let mut node = Node::new("cursor", Rect { col: c.col, row: c.row, width: 1, height: 1 }, "");
                     node.attributes.insert("visible".into(), "true".into());
+                    for (name, enabled) in [("blinking", c.blinking), ("password-input", c.password_input), ("wide-tail", c.wide_tail)] {
+                        if enabled {
+                            node.attributes.insert(name.into(), "true".into());
+                        }
+                    }
                     node.attributes.insert(
                         "style".into(),
                         match c.style {
@@ -307,9 +409,8 @@ pub struct GraphParams {
     pub w_attr: f32,
     pub w_semantic: f32,
     pub w_prompt: f32,
-    /// Block level: single-linkage threshold, plus optional FH `k`.
+    /// Block level: fixed single-linkage threshold.
     pub block_tau: f32,
-    pub block_k: f32,
     /// A blank run of at most this many rows between content above and below
     /// is a thin gap; content joins across it at the group level.
     pub thin_rows: u16,
@@ -331,7 +432,6 @@ impl Default for GraphParams {
             w_semantic: 0.4,
             w_prompt: 0.2,
             block_tau: 0.35,
-            block_k: 0.0,
             thin_rows: 1,
             w_thin: 0.4,
             group_tau: 0.45,
@@ -342,7 +442,7 @@ impl Default for GraphParams {
 
 #[derive(Clone, Debug, Default)]
 pub struct GraphSegmenter {
-    pub params: GraphParams,
+    params: GraphParams,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -659,6 +759,31 @@ fn confidence(level: &str, int: f32, boundary: Option<&(f32, u8)>) -> (f32, Stri
 }
 
 impl GraphSegmenter {
+    /// Override heuristic weights while preserving nested merge thresholds.
+    pub fn new(params: GraphParams) -> Result<Self, crate::TreeError> {
+        let values = [
+            params.w_bg,
+            params.w_gutter,
+            params.w_vertical,
+            params.w_fg,
+            params.w_attr,
+            params.w_semantic,
+            params.w_prompt,
+            params.w_thin,
+            params.block_tau,
+            params.group_tau,
+            params.zone_tau,
+        ];
+        if params.gutter_min == 0
+            || values.iter().any(|v| !v.is_finite() || *v < 0.0)
+            || params.block_tau > params.group_tau
+            || params.group_tau > params.zone_tau
+        {
+            return Err(crate::TreeError("graph weights must be finite/nonnegative, gutter_min positive, thresholds ordered".into()));
+        }
+        Ok(Self { params })
+    }
+
     fn edges(&self, grid: &ScreenGrid, feats: &[Feat]) -> (Vec<Edge>, Vec<(u32, u32)>) {
         let p = &self.params;
         let cols = usize::from(grid.cols());
@@ -742,18 +867,13 @@ impl GraphSegmenter {
         let (edges, wall_adj) = self.edges(grid, &feats);
         let mut dsu = Dsu::new(n);
 
-        // Level 1: block (single linkage <= tau, optional FH adaptive term).
+        // Level 1: block (single linkage <= tau).
         for e in &edges {
             let (ra, rb) = (dsu.find(e.a), dsu.find(e.b));
             if ra == rb {
                 continue;
             }
-            let fh = p.block_k > 0.0 && {
-                let ta = dsu.int[ra as usize] + p.block_k / dsu.size[ra as usize] as f32;
-                let tb = dsu.int[rb as usize] + p.block_k / dsu.size[rb as usize] as f32;
-                e.w <= ta.min(tb) && e.w < p.zone_tau
-            };
-            if e.w <= p.block_tau || fh {
+            if e.w <= p.block_tau {
                 dsu.union(ra, rb, e.w);
             }
         }
@@ -771,7 +891,7 @@ impl GraphSegmenter {
         };
         let (group, group_int) = sweep(p.group_tau, &mut dsu);
         let (zone, zone_int) = sweep(p.zone_tau, &mut dsu);
-        // Level 3: enclosure (everything not separated by a wall).
+        // Level 4: enclosure (everything not separated by a wall).
         for e in &edges {
             let (ra, rb) = (dsu.find(e.a), dsu.find(e.b));
             if ra != rb {
@@ -878,7 +998,7 @@ impl GraphSegmenter {
                 for (h, count) in hits {
                     let hp = enc_proto[&h];
                     let hb = protos[hp].bounds;
-                    if count >= 3 && hb.contains(mb) && hb != mb && best.is_none_or(|b| area(hb) <= area(protos[b].bounds)) {
+                    if count >= 3 && hb.contains(mb) && hb != mb && best.is_none_or(|b| (area(hb), hp) < (area(protos[b].bounds), b)) {
                         best = Some(hp);
                     }
                 }
@@ -985,7 +1105,7 @@ impl GraphSegmenter {
                 }
                 let id = protos.len();
                 protos.push(Proto {
-                    kinds: [RegionKind::Line].into(),
+                    kinds: [RegionKind::RowSlice].into(),
                     bounds: Rect { col: start as u16, row: r, width: (c - start) as u16, height: 1 },
                     cells: (c - start) as u32,
                     confidence: 1.0,
@@ -1030,6 +1150,11 @@ impl GraphSegmenter {
             }
             for &k in kids[pid].iter().rev() {
                 stack.push((k, Some(id)));
+            }
+        }
+        for id in (0..regions.len()).rev() {
+            if !regions[id].children.is_empty() {
+                regions[id].cell_count = regions[id].children.iter().map(|&c| regions[c].cell_count).sum();
             }
         }
         let leaf_of = leaf_proto.into_iter().map(|p| remap[p as usize] as u32).collect();

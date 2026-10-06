@@ -123,10 +123,6 @@ impl Rect {
             && u32::from(other.col) + u32::from(other.width) <= u32::from(self.col) + u32::from(self.width)
             && u32::from(other.row) + u32::from(other.height) <= u32::from(self.row) + u32::from(self.height)
     }
-
-    pub(crate) fn area(self) -> u32 {
-        u32::from(self.width) * u32::from(self.height)
-    }
 }
 
 /// An owned, validated, rectangular snapshot. Producers resolve styles first.

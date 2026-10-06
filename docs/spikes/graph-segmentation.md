@@ -1,5 +1,10 @@
 # Spike: graph-based screen segmentation (#319)
 
+> Historical spike report. PR #316 adopts the fixed-threshold producer and
+> replaces the experimental interface/test dumps with the contracts in the
+> [crate README](../../crates/terminal-screen/README.md). The adaptive `GRAPH_K`
+> rerun mode and old `line` selector name below apply to the spike only.
+
 Branch `spike/graph-segmentation` (on top of PR #316). This is spike code and is not meant to be merged as it stands.
 
 - `crates/terminal-screen/src/segment.rs` holds the producer interface sketch and the graph producer.

@@ -1,5 +1,4 @@
 use std::{
-    env,
     ffi::{c_void, OsStr, OsString},
     io,
     mem::{size_of, zeroed},
@@ -365,8 +364,7 @@ fn spawn_with_conpty(
 }
 
 fn child_environment_block(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Vec<u16>, String> {
-    let inherited: Vec<_> =
-        if session.environment_policy == crate::runtime::ChildEnvironmentPolicy::Declared { Vec::new() } else { env::vars_os().collect() };
+    let inherited = session.environment_policy.base_environment();
     let identity = crate::terminal_identity::defaults(session.vt_engine, &inherited, &session.environment, session.cwd.as_deref());
     let mut variables: Vec<(OsString, OsString)> = inherited
         .into_iter()

@@ -61,6 +61,16 @@ pub enum ChildEnvironmentPolicy {
     Declared,
 }
 
+impl ChildEnvironmentPolicy {
+    /// Select the baseline once for all native spawn adapters.
+    pub(crate) fn base_environment(self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        match self {
+            Self::Inherit => env::vars_os().collect(),
+            Self::Declared => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionMetadata {
     pub id: String,

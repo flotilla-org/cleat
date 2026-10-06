@@ -620,11 +620,7 @@ impl ChildExecSpec {
             argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
             argv.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
         }
-        let inherited = if session.environment_policy == crate::runtime::ChildEnvironmentPolicy::Declared {
-            Vec::new()
-        } else {
-            env::vars_os().collect()
-        };
+        let inherited = session.environment_policy.base_environment();
         let envp = child_envp_from(inherited, session.vt_engine, &session.environment, coordinates, session.cwd.as_deref())?;
         let cwd = session.cwd.as_ref().map(|cwd| cstring_from_os(cwd.as_os_str(), "cwd contains interior nul")).transpose()?;
         let argv_ptrs = null_terminated_ptrs(&argv);

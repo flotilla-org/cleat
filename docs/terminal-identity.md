@@ -80,6 +80,10 @@ starts the child with an empty environment at the native process spawn seam,
 before any shell startup files run. Repeat `--env NAME=VALUE` to declare entries;
 empty values are preserved and the last duplicate name wins (case insensitive
 on Windows). Without `--env-clear`, existing additive inheritance is preserved.
+Callers must explicitly declare any baseline they need, such as `PATH`, `HOME`,
+`USER` and `LANG`; Cleat does not supply them. On Windows, declare `SystemRoot`
+(and usually `PATH`) for shells, Winsock and programs that rely on the Windows
+installation directory. Cleat does not copy even `SystemRoot` from the daemon.
 Shell startup files can still add variables afterwards.
 
 Precedence is: inherited entries (inherit mode only), engine terminal defaults,

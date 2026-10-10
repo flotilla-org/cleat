@@ -7,6 +7,11 @@ colliding internal/external numeric placement IDs. Swapping the namespace of
 the two declarations changes the source geometry chosen for a zero-ID
 placeholder, despite identical exported declaration multisets.
 
+The current pin is `rjwittams/ghostty@1d7fb7a15838b82244a067bdaf7c8e4ed8130127`.
+The reproducer was rerun against this pin with byte-identical output. The
+original SHA is retained as provenance; the cleat regression test below also
+exercises the rebased library.
+
 Run after preparing the pinned library:
 
 ```sh

@@ -2,6 +2,14 @@
 
 Research slice of [cleat#306](https://github.com/flotilla-org/cleat/issues/306), 2026-10-05. No CLI flags or runtime features are implemented by this change.
 
+The source links and proof outputs below record the previous Ghostty pin
+`c361de9691f006f65c400be73896d1e48a8ec56c`. Cleat now pins
+`1d7fb7a15838b82244a067bdaf7c8e4ed8130127`; see the [re-pin ABI audit](../ghostty-repin-2026-10.md).
+The rebased head adds OSC 133 semantic-prompt callbacks, reset callbacks and
+OSC 7501 program-status callbacks. The proposed per-screen phase/epoch and
+tracked input-start query remain separate work; the historical line links
+below retain their original evidence.
+
 The structural selector and recognizer direction is recorded in
 [Selectors and recognizers](../specs/2026-03-23-terminal-screen-introspection.md#selectors-and-recognizers).
 

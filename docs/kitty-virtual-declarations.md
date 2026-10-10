@@ -77,7 +77,7 @@ Redirect and transfer compatibility use the common protocol range.
 
 ## Pinned Ghostty API gap
 
-The unmodified fork `rjwittams/ghostty@c361de9` exposes declaration geometry but
+The pinned fork `rjwittams/ghostty@1d7fb7a15` exposes declaration geometry but
 its `PlacementId` getter drops the internal/external namespace tag. Two distinct
 live placements can have the same numeric getter ID. Resolved fragments retain
 the placeholder's ID, not its selected declaration's key. The C reproducer and

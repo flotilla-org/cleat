@@ -1,7 +1,7 @@
 # Live clipboard writes
 
-Cleat pins Ghostty `c361de9691f006f65c400be73896d1e48a8ec56c` from
-`rjwittams/ghostty` branch `patches/libvt-clipboard-write-completion`.
+Cleat pins Ghostty `1d7fb7a15838b82244a067bdaf7c8e4ed8130127` from
+`rjwittams/ghostty` branch `cleat-integration`.
 OSC 52 is parsed by that VT, never by a separate Cleat OSC parser. Its synchronous
 callback validates and copies one UTF-8 `text/plain` (or
 `text/plain;charset=utf-8`) representation, or an explicit clear with zero

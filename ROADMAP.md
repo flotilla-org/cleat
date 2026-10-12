@@ -115,6 +115,10 @@ remote/socket-only operation remains [#122](https://github.com/flotilla-org/clea
 [#126](https://github.com/flotilla-org/cleat/issues/126),
 [#127](https://github.com/flotilla-org/cleat/issues/127) and
 [#128](https://github.com/flotilla-org/cleat/issues/128).
+Agent and program status runs [#327](https://github.com/flotilla-org/cleat/issues/327) (Ghostty re-pin), then
+[#326](https://github.com/flotilla-org/cleat/issues/326) (record store and exposure), then
+[#328](https://github.com/flotilla-org/cleat/issues/328) (re-emission through attach, decided in
+[ADR 0007](docs/adr/0007-program-status-through-attach.md)).
 Session surfaces [#216](https://github.com/flotilla-org/cleat/issues/216) and the wider
 render-consumer direction [#198](https://github.com/flotilla-org/cleat/issues/198)
 remain design/backlog work, not prerequisites for the current queue.

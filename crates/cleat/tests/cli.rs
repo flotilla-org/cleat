@@ -915,7 +915,7 @@ fn wait_execute_rejects_no_conditions() {
     let result = execute(cli, &service);
     match result {
         ExecResult::Exit { code: 2, message: Some(msg), .. } => {
-            assert!(msg.contains("at least one of --idle-time, --text, or --screen-stable"));
+            assert!(msg.contains("at least one of --idle-time, --text, --screen-stable, or --state"));
         }
         other => panic!("wait without conditions should exit 2, got: {other:?}"),
     }
@@ -1180,4 +1180,15 @@ fn launch_declared_environment_and_help() {
         if environment == vec![("EMPTY".into(), "".into()), ("CLAUDECODE".into(), "owned".into())]));
     let help = Cli::try_parse_from(["cleat", "launch", "--help"]).unwrap_err().to_string();
     assert!(help.contains("--env-clear"));
+}
+
+// The state vocabulary is OSC 7501's; a comma-separated list is an OR condition.
+#[test]
+fn wait_program_states_parse_and_reject_unknown_states() {
+    use cleat::program_status::ProgramState;
+    let cli = Cli::try_parse_from(["cleat", "wait", "sess", "--state", "working,blocked"]).unwrap();
+    assert!(matches!(cli.command, Command::Wait { state, .. } if state == [ProgramState::Working, ProgramState::Blocked]));
+    for value in ["clear", "busy", "", "idle,unknown"] {
+        assert!(Cli::try_parse_from(["cleat", "wait", "sess", "--state", value]).is_err(), "{value:?}");
+    }
 }

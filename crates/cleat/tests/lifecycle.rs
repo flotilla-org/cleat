@@ -43,7 +43,7 @@ use cleat::{
 use cleat::{
     packet::{
         Ack, ChannelRole, Input, OpenChannel, RenderPacket, RoleRequest, RoleState, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK,
-        MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_ROLE, PROTOCOL_VERSION,
+        MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_ROLE,
     },
     provider::{TerminalInputEvent, TerminalPasteEvent, TerminalRenderUpdate, TerminalTextEvent},
     provider_ffi::{
@@ -2151,7 +2151,7 @@ fn packet_declaration_capability_preserves_legacy_output() {
         write!(stream, "POST /connect HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: Upgrade\r\nUpgrade: cleat-packet/1\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n{}", body.len(), body).unwrap();
         assert!(read_http_response_head(&mut stream).starts_with("HTTP/1.1 101"));
         let hello = PacketFrame::read(&mut stream).unwrap().decode::<ControlHello>().unwrap();
-        assert_eq!(hello.version, if opt_in { PROTOCOL_VERSION } else { MIN_SUPPORTED_PROTOCOL_VERSION });
+        assert_eq!(hello.version, if opt_in { 13 } else { MIN_SUPPORTED_PROTOCOL_VERSION });
         PacketFrame::read(&mut stream).unwrap();
         packet_open_channel_role(&mut stream, 1, "alpha", ChannelRole::Watcher, false);
         let mut images = 0;
@@ -4870,4 +4870,188 @@ fn controller_activity_packet_paths() {
     wait_until("packet resize handled", || service.inspect("controller-packet").unwrap().terminal.cols == 81);
     assert_eq!(service.inspect("controller-packet").unwrap().controller_input_generation, 5);
     service.kill("controller-packet").unwrap();
+}
+
+// Program status is unavailable without a functional VT, rather than inferred from raw output.
+#[test]
+fn program_status_unavailable_without_vt() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service.create(Some("status".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).unwrap();
+    let result = service.inspect("status").unwrap();
+    assert!(!result.program_status_available);
+    assert!(result.program_status.is_empty());
+    let err = service
+        .wait("status", vec![cleat::protocol::WaitCondition::ProgramState { states: vec![cleat::program_status::ProgramState::Idle] }], 100)
+        .unwrap_err();
+    assert!(err.contains("unavailable"), "{err}");
+    service.kill("status").unwrap();
+}
+
+// Scripted child output reaches inspect and level-triggered waits, including records already present.
+// Program-state waits OR with the existing conditions and retain their exit statuses.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn program_status_inspect_and_wait() {
+    use cleat::{
+        program_status::ProgramState,
+        protocol::{WaitCondition, WaitStatus},
+    };
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service.create(Some("status".into()), Some(VtEngineKind::Ghostty), None,
+        Some(r#"sh -c 'printf "\033]2;build\007"; printf "\033]7501;state=working:id=task\007"; read line; printf "\033]7501;state=done:id=task\007"; sleep 30'"#.into()), false).unwrap();
+    assert_eq!(
+        service.wait("status", vec![WaitCondition::ProgramState { states: vec![ProgramState::Working] }], 5000).unwrap().0,
+        WaitStatus::Ready
+    );
+    wait_until("session title", || service.inspect("status").unwrap().title.as_deref() == Some("build"));
+    let result = service.inspect("status").unwrap();
+    assert!(result.program_status_available);
+    assert_eq!(result.title.as_deref(), Some("build"));
+    assert_eq!(result.program_status[0].id, "task");
+    assert_eq!(
+        service
+            .wait("status", vec![WaitCondition::ProgramState { states: vec![ProgramState::Working, ProgramState::Blocked] }], 0)
+            .unwrap(),
+        (WaitStatus::Ready, 0)
+    );
+    let worker_service = service_for(temp.path());
+    let worker = std::thread::spawn(move || {
+        worker_service.wait("status", vec![WaitCondition::ProgramState { states: vec![ProgramState::Done] }], 5000).unwrap()
+    });
+    service.send_keys("status", b"\n").unwrap();
+    assert_eq!(worker.join().unwrap().0, WaitStatus::Ready);
+    assert_eq!(
+        service
+            .wait(
+                "status",
+                vec![WaitCondition::ProgramState { states: vec![ProgramState::Error] }, WaitCondition::OutputIdle { quiet_ms: 10 }],
+                5000
+            )
+            .unwrap()
+            .0,
+        WaitStatus::Ready
+    );
+    assert_eq!(
+        service.wait("status", vec![WaitCondition::ProgramState { states: vec![ProgramState::Error] }], 30).unwrap().0,
+        WaitStatus::Timeout
+    );
+    service.kill("status").unwrap();
+}
+
+// The supporting-terminal query has exactly one reply regardless of raw client attachment.
+// The real child measures the PTY input; the attached stream deliberately sends no terminal reply.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn program_status_query_with_and_without_attachment() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for attached in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let service = service_for(temp.path());
+        service.create(Some("status".into()), Some(VtEngineKind::Ghostty), None,
+            Some("sh -c 'printf READY; read line; stty -echo -icanon min 0 time 2; printf \"\\033]7501;?\\033\\\\\"; reply=$(dd bs=1 count=64 2>/dev/null | od -An -tx1 | tr -d \" \\n\"); printf \"REPLY=%s_END\" \"$reply\"; sleep 30'".into()), false).unwrap();
+        wait_until("child ready", || service.capture("status").unwrap().contains("READY"));
+        let _attachment = attached.then(|| http_attach_stream(temp.path(), "status", 80, 24, ClientCapabilities::conservative_fallback()));
+        service.send_keys("status", b"\n").unwrap();
+        wait_until("one OSC query reply", || service.capture("status").unwrap().contains("REPLY=1b5d373530313b3f1b5c_END"));
+        service.kill("status").unwrap();
+    }
+}
+
+// Only opted-in subscribers receive program status; legacy hello and activity event layouts remain unchanged.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn program_status_events_are_opt_in() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("status".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh -c 'printf READY; read line; printf \"\\033]7501;state=blocked:kind=question\\033\\\\\"; sleep 30'".into()),
+            false,
+        )
+        .unwrap();
+    wait_until("child ready", || service.capture("status").unwrap().contains("READY"));
+    let mut legacy = http_packet_stream(temp.path(), "status");
+    let hello = PacketFrame::read(&mut legacy).unwrap().decode::<ControlHello>().unwrap();
+    assert_eq!(hello, ControlHello { version: 12, min_supported_version: 12 });
+    let _directory = PacketFrame::read(&mut legacy).unwrap();
+    let mut subscriber = service.connect_program_status(&[]).unwrap();
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("initial status") };
+    assert_eq!(session.session_id, "status");
+    assert!(session.available);
+    assert!(session.records.is_empty());
+    service.send_keys("status", b"\n").unwrap();
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("changed status") };
+    assert_eq!(session.session_id, "status");
+    assert_eq!(session.records[0].state, cleat::program_status::ProgramState::Blocked);
+    // Metadata changes publish the session's new attribution even when the record generation is unchanged.
+    let records = session.records;
+    service.update_tags("status", vec!["status-tag".into()], vec![]).unwrap();
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("tagged status") };
+    assert_eq!(session.tags, ["status-tag"]);
+    assert_eq!(session.records, records);
+    // Other directory changes are allowed; a program-status event is never sent to the legacy peer.
+    legacy.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    loop {
+        match PacketFrame::read(&mut legacy) {
+            Ok(frame) => assert_ne!(frame.msg_type, MSG_CONTROL_ACTIVITY_EVENT),
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+            other => panic!("unexpected legacy read: {other:?}"),
+        }
+    }
+    service.kill("status").unwrap();
+}
+
+// Actual child exit clears live states while done/error remain inspectable until session deletion.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn program_status_survives_child_exit() {
+    use cleat::{
+        program_status::ProgramState,
+        protocol::{WaitCondition, WaitStatus},
+    };
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service
+        .create(
+            Some("status".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some(
+                r#"sh -c 'for state in idle working blocked done error; do printf "\033]7501;state=%s:id=%s\007" "$state" "$state"; done'"#
+                    .into(),
+            ),
+            false,
+        )
+        .unwrap();
+    wait_until("retained results", || service.inspect("status").is_ok_and(|result| result.session.state == "exited"));
+    let result = service.inspect("status").unwrap();
+    assert_eq!(result.program_status.iter().map(|r| r.state).collect::<Vec<_>>(), [ProgramState::Done, ProgramState::Error]);
+    assert_eq!(
+        service.wait("status", vec![WaitCondition::ProgramState { states: vec![ProgramState::Done] }], 0).unwrap().0,
+        WaitStatus::Ready
+    );
+    assert_eq!(
+        service.wait("status", vec![WaitCondition::ProgramState { states: vec![ProgramState::Working] }], 5000).unwrap().0,
+        WaitStatus::SessionGone
+    );
+    assert!(service.send_keys("status", b"input").unwrap_err().contains("exited"));
+    // Finalized sessions reject both input and raw attachments with HTTP 409, not an unrelated transport error.
+    for action in ["keys", "attach", "watch"] {
+        let response = http_session_request(temp.path(), "status", &format!(
+            "POST /sessions/status/{action} HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n"
+        ));
+        assert!(response.starts_with("HTTP/1.1 409 Conflict"), "{response}");
+        assert!(http_body(&response).contains("exited"));
+    }
+    service.kill("status").unwrap();
+    wait_until("deleted completed session", || service.inspect("status").is_err());
 }

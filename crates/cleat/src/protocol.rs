@@ -115,6 +115,12 @@ impl ControllerInputHistory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResult {
     #[serde(default)]
+    pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
+    #[serde(default)]
+    pub program_status_available: bool,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
     pub generation: Option<u64>,
     #[serde(default = "default_hosting_epoch")]
     pub hosting_epoch: u64,
@@ -243,6 +249,7 @@ pub struct SeatState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
+    ProgramState { states: Vec<crate::program_status::ProgramState> },
     OutputIdle { quiet_ms: u64 },
     TextMatch { text: String },
     ScreenStable { stable_ms: u64 },

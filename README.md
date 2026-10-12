@@ -234,6 +234,44 @@ This subscription contract starts with packet protocol v4. Version 3 used raw PT
 | `wait --idle-time` | daemon | PTY-output idle timer |
 | `wait --text` | VT engine | Consults the rendered screen grid |
 | `wait --screen-stable` | VT engine | Waits for the rendered screen grid to stop changing |
+| `wait --state working,blocked` | program status store | Level-triggered match on any current OSC 7501 record; ORs with other wait conditions |
+
+### Program status
+
+Programs can report `idle`, `working`, `done`, `blocked`, and `error` through
+OSC 7501. The session answers the support query even without an attached client.
+`inspect --json` includes the session's `title`, `program_status_available`, and
+`program_status` records (`id`, `source`, `state`, `kind`, `progress`, `app`, `msg`,
+`title`, `since`). The root id is an empty string; `since` is the last update's
+Unix timestamp in milliseconds (wall-clock corrections can move it backwards;
+eviction follows actual update order). `title` is null before a title is observed
+and an empty string when a known title is cleared. Text is untrusted and belongs to the enclosing
+session; invisible formatting is removed from `msg`/`title` before exposure.
+Ghostty validates `id`/`app` as ASCII names, so they cannot contain bidi or
+invisible formatting and their identities remain unchanged.
+
+Each report replaces its record. Clear removes that id and its descendants;
+clear without an id removes everything. The store holds up to 256 records,
+evicting the least recently updated. Prompt start and process exit remove live
+states; unacknowledged `done`/`error` results keep an exited session inspectable.
+Explicit session deletion disposes of retained results. Full terminal reset
+clears all records. A no-VT session reports status as unavailable and rejects
+`wait --state` with the existing error exit code (2).
+
+Packet subscribers opt in with `"program_status": true` in `POST /connect`.
+Protocol 14 then sends `ProgramStatusChanged` activity events containing the
+session id, tags, availability, and whole record list, initially and when changed.
+An empty list represents a clear. `SessionService::connect_program_status`
+provides the same subscription to Rust clients. Peers without the opt-in keep
+their existing hello (12, or 13 with virtual declarations) and activity layouts.
+Acknowledgement is internal for now; attach/send/provider input wiring is #328.
+Window title delivery in render updates remains #297.
+
+Retention has no timeout: discarding unacknowledged `done`/`error` results would
+break their lifetime contract. Until #328 exposes acknowledgement to consumers,
+use `cleat kill <id>` to dispose of a completed session. Unattended jobs that
+report results and exit can accumulate daemon-resident sessions and resources;
+they remain listed as `exited` and reject input/attachment rather than restarting.
 
 ### Queries and capabilities
 

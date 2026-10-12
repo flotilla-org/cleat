@@ -499,6 +499,8 @@ resolved through the live daemon socket. \n\
                            For edge-triggered text matching on new output, use the expect\n\
                            command with --since-marker.\n\
                            \n\
+                           \x20 --state working,blocked  Wait for any matching program status record\n\
+                           \n\
                            Exit codes:\n\
                            \x20 0  Condition met (ready)\n\
                            \x20 1  Timeout reached\n\
@@ -515,6 +517,9 @@ resolved through the live daemon socket. \n\
         /// Wait until the rendered screen is stable for this duration (e.g., 500ms, 2s, or plain seconds).
         #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
         screen_stable: Option<std::time::Duration>,
+        /// Wait until any record has one of these OSC 7501 states.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        state: Vec<crate::program_status::ProgramState>,
         #[arg(long, default_value_t = 30.0, help = "Maximum seconds to wait (default: 30)")]
         timeout: f64,
         #[arg(long, help = "Output as JSON")]
@@ -1252,8 +1257,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
-        Command::Wait { id, idle_time, text, screen_stable, timeout, json } => {
-            execute_wait(service, id, idle_time, text, screen_stable, timeout, json)
+        Command::Wait { id, idle_time, text, screen_stable, state, timeout, json } => {
+            execute_wait(service, id, WaitOptions { idle_time, text, screen_stable, states: state, timeout, json })
         }
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
@@ -1331,19 +1336,21 @@ pub fn resolve_daemon_target(
     Ok(DaemonTarget::AutoStart(daemon_name))
 }
 
-fn execute_wait(
-    service: &SessionService,
-    id: String,
+struct WaitOptions {
     idle_time: Option<std::time::Duration>,
     text: Option<String>,
     screen_stable: Option<std::time::Duration>,
+    states: Vec<crate::program_status::ProgramState>,
     timeout: f64,
     json: bool,
-) -> ExecResult {
-    if idle_time.is_none() && text.is_none() && screen_stable.is_none() {
+}
+
+fn execute_wait(service: &SessionService, id: String, options: WaitOptions) -> ExecResult {
+    let WaitOptions { idle_time, text, screen_stable, states, timeout, json } = options;
+    if idle_time.is_none() && text.is_none() && screen_stable.is_none() && states.is_empty() {
         return ExecResult::Exit {
             code: 2,
-            message: Some("wait requires at least one of --idle-time, --text, or --screen-stable".to_string()),
+            message: Some("wait requires at least one of --idle-time, --text, --screen-stable, or --state".to_string()),
             output: None,
         };
     }
@@ -1353,6 +1360,9 @@ fn execute_wait(
     }
 
     let mut conditions = Vec::new();
+    if !states.is_empty() {
+        conditions.push(WaitCondition::ProgramState { states });
+    }
     if let Some(dur) = idle_time {
         let secs = dur.as_secs_f64();
         if !(0.0..=86_400.0).contains(&secs) {

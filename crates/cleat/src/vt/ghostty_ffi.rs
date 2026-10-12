@@ -552,6 +552,8 @@ pub enum GhosttyTerminalOption {
     ScrollbackMaxBytes = 27,
     ModeDefault = 33,
     Mode = 34,
+    SemanticPrompt = 42,
+    ProgramStatus = 46,
 }
 
 /// Callback fired synchronously from `ghostty_terminal_vt_write` when the
@@ -1137,11 +1139,112 @@ pub struct TerminalHandle {
 
 struct TerminalEffects {
     reply_buf: Vec<u8>,
+    session_reply_buf: Vec<u8>,
     clipboard: crate::clipboard::ClipboardQueue,
+    program_status: crate::program_status::ProgramStatusTracker,
+    // A seen flag, not render dirtiness: known empty title is Some(""); unseen is None.
+    title_observed: bool,
     cols: u16,
     rows: u16,
     cell_width_px: u32,
     cell_height_px: u32,
+}
+
+// Sized C layouts audited against the pinned terminal.h. Strings live only during callbacks.
+#[repr(C)]
+struct GhosttyTerminalProgramStatus {
+    size: usize,
+    state: i32,
+    kind: i32,
+    progress: i8,
+    id: GhosttyString,
+    app: GhosttyString,
+    title: GhosttyString,
+    message: GhosttyString,
+}
+#[repr(C)]
+struct GhosttyTerminalSemanticPrompt {
+    size: usize,
+    kind: i32,
+    prompt_kind: i32,
+    has_exit_code: bool,
+    exit_code: i32,
+    command: GhosttyString,
+    error: GhosttyString,
+}
+unsafe fn copy_status_string(value: GhosttyString) -> String {
+    if value.len == 0 || value.ptr.is_null() {
+        return String::new();
+    }
+    String::from_utf8_lossy(unsafe { slice::from_raw_parts(value.ptr, value.len) }).into_owned()
+}
+unsafe extern "C" fn program_status_trampoline(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    report: *const GhosttyTerminalProgramStatus,
+) {
+    use crate::program_status::{ProgramKind, ProgramState, ProgramStatusRecord, ProgramStatusSource};
+    if userdata.is_null() || report.is_null() {
+        return;
+    }
+    let report = unsafe { &*report };
+    if report.size < std::mem::size_of::<GhosttyTerminalProgramStatus>() {
+        return;
+    }
+    let effects = unsafe { &mut *(userdata as *mut TerminalEffects) };
+    // The pinned Ghostty validator restricts id segments/app to ASCII letters,
+    // digits and _ . + - (with / separators in ids). Preserve validated keys:
+    // sanitizing them after validation could collapse distinct record identities.
+    let id = unsafe { copy_status_string(report.id) };
+    if report.state == 5 {
+        effects.program_status.clear(&id);
+        return;
+    }
+    let state = match report.state {
+        0 => ProgramState::Idle,
+        1 => ProgramState::Working,
+        2 => ProgramState::Done,
+        3 => ProgramState::Blocked,
+        4 => ProgramState::Error,
+        _ => return,
+    };
+    effects.program_status.replace(ProgramStatusRecord {
+        id,
+        state,
+        source: ProgramStatusSource::Osc7501,
+        kind: match report.kind {
+            1 => Some(ProgramKind::Permission),
+            2 => Some(ProgramKind::Question),
+            3 => Some(ProgramKind::Auth),
+            _ => None,
+        },
+        progress: u8::try_from(report.progress).ok().filter(|p| *p <= 100),
+        app: unsafe { copy_status_string(report.app) },
+        title: unsafe { copy_status_string(report.title) },
+        msg: unsafe { copy_status_string(report.message) },
+        since: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+    });
+}
+unsafe extern "C" fn semantic_prompt_trampoline(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    prompt: *const GhosttyTerminalSemanticPrompt,
+) {
+    if userdata.is_null() || prompt.is_null() {
+        return;
+    }
+    let prompt = unsafe { &*prompt };
+    if prompt.size < std::mem::size_of::<GhosttyTerminalSemanticPrompt>() {
+        return;
+    }
+    if prompt.kind == 1 {
+        unsafe { &mut *(userdata as *mut TerminalEffects) }.program_status.program_ended();
+    }
+}
+unsafe extern "C" fn title_changed_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void) {
+    if !userdata.is_null() {
+        unsafe { &mut *(userdata as *mut TerminalEffects) }.title_observed = true;
+    }
 }
 
 /// DA1 feature code for ANSI color (see device.h: GHOSTTY_DA_FEATURE_ANSI_COLOR).
@@ -1278,7 +1381,15 @@ unsafe extern "C" fn write_pty_trampoline(_terminal: GhosttyTerminal, userdata: 
     // synchronously from vt_write, so the Box is live for the duration.
     let effects = unsafe { &mut *(userdata as *mut TerminalEffects) };
     let slice = unsafe { std::slice::from_raw_parts(data, len) };
-    effects.reply_buf.extend_from_slice(slice);
+    // OSC 7501 belongs to the session terminal even when other queries are forwarded.
+    // The pinned stream_terminal.Handler.programStatus passes a complete
+    // constant OSC 7501 reply to writePty in one call. This is a
+    // callback-boundary guarantee, not an assumption about PTY read chunks.
+    if slice.starts_with(b"\x1b]7501;") {
+        effects.session_reply_buf.extend_from_slice(slice);
+    } else {
+        effects.reply_buf.extend_from_slice(slice);
+    }
 }
 
 unsafe extern "C" fn size_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void, out_size: *mut GhosttySizeReportSize) -> bool {
@@ -1410,7 +1521,10 @@ impl TerminalHandle {
 
         let mut effects = Box::new(TerminalEffects {
             reply_buf: Vec::new(),
+            session_reply_buf: Vec::new(),
             clipboard: Default::default(),
+            program_status: Default::default(),
+            title_observed: false,
             cols,
             rows,
             cell_width_px: 1,
@@ -1455,7 +1569,46 @@ impl TerminalHandle {
             unsafe { ghostty_terminal_free(raw) };
             return Err(err);
         }
+        for (option, callback) in [
+            (GhosttyTerminalOption::ProgramStatus, program_status_trampoline as *const c_void),
+            (GhosttyTerminalOption::SemanticPrompt, semantic_prompt_trampoline as *const c_void),
+            (GhosttyTerminalOption::TitleChanged, title_changed_trampoline as *const c_void),
+        ] {
+            let result = unsafe { ghostty_terminal_set(raw, option, callback) };
+            if let Err(err) = check_result(result, "ghostty_terminal_set(status callback)") {
+                unsafe { ghostty_terminal_free(raw) };
+                return Err(err);
+            }
+        }
         Ok(Self { raw, effects })
+    }
+
+    pub fn drain_session_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.effects.session_reply_buf)
+    }
+
+    pub fn program_status_tracker(&self) -> crate::program_status::ProgramStatusTracker {
+        self.effects.program_status.clone()
+    }
+    pub fn program_status(&self) -> Vec<crate::program_status::ProgramStatusRecord> {
+        self.effects.program_status.records()
+    }
+    pub fn program_ended(&mut self) {
+        self.effects.program_status.program_ended();
+    }
+    pub fn acknowledge_program_status(&mut self) {
+        self.effects.program_status.acknowledge();
+    }
+    pub fn title(&self) -> Option<String> {
+        if !self.effects.title_observed {
+            return None;
+        }
+        let mut title = GhosttyString { ptr: ptr::null(), len: 0 };
+        let result = unsafe { ghostty_terminal_get(self.raw, GhosttyTerminalData::Title, (&mut title as *mut GhosttyString).cast()) };
+        if result != GhosttyResult::Success {
+            return None;
+        }
+        Some(crate::program_status::strip_invisible_formatting(&unsafe { copy_status_string(title) }))
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {

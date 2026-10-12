@@ -1198,7 +1198,7 @@ impl SessionService {
         &self,
         selectors: &[String],
     ) -> Result<(crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot), String> {
-        let (client, directory, _) = self.connect_subscription(selectors, None)?;
+        let (client, directory, _) = self.connect_subscription(selectors, None, false)?;
         Ok((client, directory))
     }
 
@@ -1215,15 +1215,23 @@ impl SessionService {
         if stable_threshold_ms == 0 {
             return Err("screen activity stability threshold must be at least one millisecond".to_string());
         }
-        let (client, _, activity) = self.connect_subscription(selectors, Some(stable_threshold_ms))?;
+        let (client, _, activity) = self.connect_subscription(selectors, Some(stable_threshold_ms), false)?;
         let activity = activity.ok_or_else(|| "packet stream did not send an activity snapshot".to_string())?;
         Ok((client, activity))
+    }
+
+    /// Subscribe to session-attributed store snapshots on the activity event path.
+    /// An initial ProgramStatusChanged event is sent for every selected session.
+    pub fn connect_program_status(&self, selectors: &[String]) -> Result<crate::packet::PacketClient<SessionStream>, String> {
+        let (client, _, _) = self.connect_subscription(selectors, None, true)?;
+        Ok(client)
     }
 
     fn connect_subscription(
         &self,
         selectors: &[String],
         screen_activity_stable_ms: Option<u64>,
+        program_status: bool,
     ) -> Result<
         (crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot, Option<crate::packet::ActivitySnapshot>),
         String,
@@ -1234,6 +1242,7 @@ impl SessionService {
         let mut stream = connect_session_socket(&socket_path)?;
         let output_context = crate::output_admission::client_header()?;
         let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest {
+            program_status,
             selectors: selectors.to_vec(),
             screen_activity_stable_ms,
             virtual_placements: false,
@@ -1615,6 +1624,7 @@ fn signal_target_to_http(target: crate::protocol::SignalTarget) -> http_uds::Sig
 
 fn wait_condition_to_http(condition: crate::protocol::WaitCondition) -> http_uds::WaitConditionRequest {
     match condition {
+        crate::protocol::WaitCondition::ProgramState { states } => http_uds::WaitConditionRequest::ProgramState { states },
         crate::protocol::WaitCondition::OutputIdle { quiet_ms } => http_uds::WaitConditionRequest::OutputIdle { quiet_ms },
         crate::protocol::WaitCondition::TextMatch { text } => http_uds::WaitConditionRequest::TextMatch { text },
         crate::protocol::WaitCondition::ScreenStable { stable_ms } => http_uds::WaitConditionRequest::ScreenStable { stable_ms },

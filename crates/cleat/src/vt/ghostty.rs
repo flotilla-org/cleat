@@ -386,6 +386,24 @@ impl VtEngine for GhosttyVtEngine {
         self.terminal.drain_clipboard()
     }
 
+    fn drain_session_replies(&mut self) -> Vec<u8> {
+        self.terminal.drain_session_replies()
+    }
+    fn program_status_tracker(&self) -> Option<crate::program_status::ProgramStatusTracker> {
+        Some(self.terminal.program_status_tracker())
+    }
+    fn program_status(&self) -> Option<Vec<crate::program_status::ProgramStatusRecord>> {
+        Some(self.terminal.program_status())
+    }
+    fn title(&self) -> Option<String> {
+        self.terminal.title()
+    }
+    fn program_ended(&mut self) {
+        self.terminal.program_ended();
+    }
+    fn acknowledge_program_status(&mut self) {
+        self.terminal.acknowledge_program_status();
+    }
     fn drain_replies(&mut self) -> Vec<u8> {
         self.terminal.drain_replies()
     }

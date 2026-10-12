@@ -8,9 +8,9 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 13 adds opt-in virtual-declaration render envelopes. Protocol 12
+/// Version 14 adds opt-in program-status activity events; 13 adds virtual-declaration render envelopes. Protocol 12
 /// remains supported with byte-for-byte unchanged legacy render layouts.
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 12;
 pub const CHANNEL_CONTROL: u32 = 0;
 
@@ -163,9 +163,33 @@ pub struct ActivitySnapshot {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActivityEvent {
-    ActivityChanged { session: ActivitySession, changed_at_unix_ms: u64 },
-    MembershipAdded { session: ActivitySession, changed_at_unix_ms: u64 },
-    MembershipRemoved { session_id: String, tags: Vec<String>, changed_at_unix_ms: u64 },
+    ActivityChanged {
+        session: ActivitySession,
+        changed_at_unix_ms: u64,
+    },
+    MembershipAdded {
+        session: ActivitySession,
+        changed_at_unix_ms: u64,
+    },
+    MembershipRemoved {
+        session_id: String,
+        tags: Vec<String>,
+        changed_at_unix_ms: u64,
+    },
+    /// Opt-in only: whole session store snapshot, including clears as an empty list.
+    ProgramStatusChanged {
+        session: ProgramStatusSession,
+        changed_at_unix_ms: u64,
+    },
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramStatusSession {
+    pub session_id: String,
+    pub tags: Vec<String>,
+    pub available: bool,
+    pub records: Vec<crate::program_status::ProgramStatusRecord>,
 }
 
 /// Packet controllers share input and intersect their content sizes.
@@ -588,9 +612,17 @@ mod tests {
 
     #[test]
     fn clipboard_effects_require_protocol_version_twelve() {
-        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(PROTOCOL_VERSION, 14);
         assert!(ControlHello::current().accepts(12));
         assert!(!ControlHello::current().accepts(11));
+    }
+
+    // Additive status events must not renumber the legacy activity variants or change legacy hello bytes.
+    #[test]
+    fn program_status_preserves_legacy_activity_wire_layout() {
+        let event = ActivityEvent::MembershipRemoved { session_id: "s".into(), tags: vec![], changed_at_unix_ms: 0 };
+        assert_eq!(postcard::to_allocvec(&event).unwrap(), [2, 1, b's', 0, 0]);
+        assert_eq!(postcard::to_allocvec(&ControlHello { version: 12, min_supported_version: 12 }).unwrap(), [12, 12]);
     }
 
     #[test]

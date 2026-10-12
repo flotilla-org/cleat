@@ -6,6 +6,22 @@ remote attaches, agents — over a hosting-agnostic API.
 
 ## Language
 
+### Program status
+
+**Program status record**:
+A session-attributed report of what a program is doing: idle, working, done,
+blocked or error. Its optional hierarchical id identifies a task within that session.
+_Avoid_: screen activity, update packet.
+
+**Program status source**:
+The origin of a program status record: a program's explicit OSC 7501 report,
+a title-derived inference, or a recognizer's inference.
+
+**Acknowledgement**:
+A user's recognition of the session's completed or failed work, dismissing its
+done and error records while preserving live work.
+_Avoid_: focus, watcher input, render acknowledgement.
+
 ### Sessions & hosting
 
 **Session**:

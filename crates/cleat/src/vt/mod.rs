@@ -435,6 +435,21 @@ pub trait VtEngine {
 
     /// Reply bytes (DSR, DECRQM, DA, ...) the engine has buffered since the
     /// last call. Default is empty for engines that don't synthesize replies.
+    fn drain_session_replies(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn program_status_tracker(&self) -> Option<crate::program_status::ProgramStatusTracker> {
+        None
+    }
+    fn program_status(&self) -> Option<Vec<crate::program_status::ProgramStatusRecord>> {
+        None
+    }
+    fn title(&self) -> Option<String> {
+        None
+    }
+    fn program_ended(&mut self) {}
+    fn acknowledge_program_status(&mut self) {}
+
     fn drain_replies(&mut self) -> Vec<u8> {
         Vec::new()
     }
@@ -599,3 +614,109 @@ mod ghostty_key;
 
 #[cfg(feature = "ghostty-vt")]
 mod kitty_declarations;
+
+#[cfg(all(test, feature = "ghostty-vt"))]
+mod program_status_tests {
+    use super::*;
+    use crate::program_status::ProgramState;
+    fn report(engine: &mut dyn VtEngine, body: &str) {
+        engine.feed(format!("\x1b]7501;{body}\x1b\\").as_bytes()).unwrap();
+    }
+
+    // Ghostty answers a support query once through the session reply path, not the optional outer-terminal path.
+    // Chunk boundaries may fall anywhere in an OSC sequence.
+    #[test]
+    fn program_status_query_and_chunk_boundaries() {
+        for split in 0..=10 {
+            let mut engine = make_default_vt_engine(80, 24);
+            let query = b"\x1b]7501;?\x1b\\";
+            engine.feed(&query[..split]).unwrap();
+            engine.feed(&query[split..]).unwrap();
+            assert_eq!(engine.drain_session_replies(), query);
+            assert!(engine.drain_session_replies().is_empty());
+            assert!(engine.drain_replies().is_empty());
+        }
+    }
+
+    // Valid reports replace whole records. Malformed reports never mutate any field of an existing record.
+    #[test]
+    fn program_status_reports_and_invalid_input() {
+        let mut engine = make_default_vt_engine(80, 24);
+        report(&mut *engine, "state=blocked:kind=permission:progress=42:id=build/test:app=cargo:msg=aGk=:title=dGFzaw==");
+        let records = engine.program_status().unwrap();
+        assert_eq!(records[0].id, "build/test");
+        assert_eq!(records[0].app, "cargo");
+        assert_eq!(records[0].msg, "hi");
+        assert_eq!(records[0].title, "task");
+        assert_eq!(records[0].progress, Some(42));
+        let before = records.to_vec();
+        for invalid in [
+            "id=build/test:msg=aGk=",
+            "state=bogus:id=build/test",
+            "state=error:id=build/test:msg=A",
+            "state=done:id=bad//id",
+            "state=done:id=build/test:msg=AA==",
+            "state=done:id=build/test:msg=/w==",
+        ] {
+            report(&mut *engine, invalid);
+            assert_eq!(engine.program_status().unwrap(), before);
+        }
+        report(&mut *engine, "state=done:id=build/test");
+        let records = engine.program_status().unwrap();
+        assert_eq!(records[0].state, ProgramState::Done);
+        assert!(records[0].msg.is_empty());
+        assert_eq!(records[0].progress, None);
+        assert_eq!(records[0].kind, None);
+        report(&mut *engine, "state=error:id=build/test/unit");
+        report(&mut *engine, "state=idle:id=builder");
+        report(&mut *engine, "state=clear:id=build");
+        assert_eq!(engine.program_status().unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["builder"]);
+        report(&mut *engine, "state=clear");
+        assert!(engine.program_status().unwrap().is_empty());
+    }
+
+    // Prompt start and process exit drop idle/working/blocked; acknowledgement drops done/error only.
+    // Full reset clears every record, including unacknowledged results.
+    #[test]
+    fn program_status_lifetimes_and_reset() {
+        let mut engine = make_default_vt_engine(80, 24);
+        for operation in 0..3 {
+            for state in ["idle", "working", "blocked", "done", "error"] {
+                report(&mut *engine, &format!("state={state}:id={state}"));
+            }
+            match operation {
+                0 => engine.feed(b"\x1b]133;A\x1b\\").unwrap(),
+                1 => engine.program_ended(),
+                _ => engine.acknowledge_program_status(),
+            }
+            let states = engine.program_status().unwrap().iter().map(|r| r.state).collect::<Vec<_>>();
+            if operation < 2 {
+                assert_eq!(states, [ProgramState::Done, ProgramState::Error]);
+            } else {
+                assert_eq!(states, [ProgramState::Idle, ProgramState::Working, ProgramState::Blocked]);
+            }
+            engine.feed(b"\x1bc").unwrap();
+            assert!(engine.program_status().unwrap().is_empty());
+        }
+        for n in 0..257 {
+            report(&mut *engine, &format!("state=working:id=r{n}"));
+        }
+        assert_eq!(engine.program_status().unwrap().len(), 256);
+        assert_eq!(engine.program_status().unwrap()[0].id, "r1");
+    }
+
+    // Report and session titles are untrusted: strip bidi controls before exposing decoded text.
+    #[test]
+    fn program_status_text_and_session_title() {
+        let mut engine = make_default_vt_engine(80, 24);
+        assert_eq!(engine.title(), None);
+        report(&mut *engine, "state=idle:msg=YeKArmI=:title=YeKArmI=");
+        assert_eq!(engine.program_status().unwrap()[0].msg, "ab");
+        assert_eq!(engine.program_status().unwrap()[0].title, "ab");
+        engine.feed("\x1b]2;one\u{202e}two\x1b\\".as_bytes()).unwrap();
+        assert_eq!(engine.title().as_deref(), Some("onetwo"));
+        // A known cleared title remains distinguishable from an unobserved title.
+        engine.feed(b"\x1b]2;\x1b\\").unwrap();
+        assert_eq!(engine.title().as_deref(), Some(""));
+    }
+}

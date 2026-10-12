@@ -87,6 +87,7 @@ pub(crate) struct TransferSource {
     pub markers: HashMap<String, u64>,
     pub recording_paused: bool,
     pub controller_input_history: crate::protocol::ControllerInputHistory,
+    pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
     pub pty_master: std::os::fd::OwnedFd,
     pub recording: Option<std::fs::File>,
     /// This host forked the child (and so reaps it).
@@ -106,6 +107,7 @@ pub(crate) struct AdoptedSession {
     pub markers: HashMap<String, u64>,
     pub recording_paused: bool,
     pub controller_input_history: crate::protocol::ControllerInputHistory,
+    pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
     pub pty_child: PtyChild,
     pub recording: Option<std::fs::File>,
 }
@@ -155,6 +157,11 @@ impl SessionRuntime {
             // longer exists — discard them so the first detached pump doesn't
             // write them to the new child's stdin as phantom input.
             let _ = vt_engine.drain_replies();
+            let _ = vt_engine.drain_session_replies();
+            // Historical reports are not live reports from the recreated program.
+            if let Some(tracker) = vt_engine.program_status_tracker() {
+                tracker.clear("");
+            }
         }
 
         let pty_child = PtyChild::spawn_with_ambient(session, coordinates)?;
@@ -227,6 +234,13 @@ impl SessionRuntime {
         vt_engine.feed(snapshot.state.as_bytes())?;
         // The releasing host already answered every query in this history.
         let _ = vt_engine.drain_replies();
+        let _ = vt_engine.drain_session_replies();
+        if let Some(tracker) = vt_engine.program_status_tracker() {
+            tracker.clear("");
+            for record in &adopted.program_status {
+                tracker.replace(record.clone());
+            }
+        }
         adopted.pty_child.set_nonblocking()?;
         let recorder = adopted
             .recording
@@ -274,6 +288,7 @@ impl SessionRuntime {
         if !tail.is_empty() {
             self.vt_engine.feed(tail)?;
             let _ = self.vt_engine.drain_replies();
+            let _ = self.vt_engine.drain_session_replies();
         }
         if let Some(recorder) = &mut self.recorder {
             recorder.rebind_to_session_dir()?;
@@ -320,6 +335,7 @@ impl SessionRuntime {
             markers: self.markers.clone(),
             recording_paused: self.recorder.as_ref().is_some_and(SessionRecorder::is_paused),
             controller_input_history: self.controller_input_history.clone(),
+            program_status: self.vt_engine.program_status().unwrap_or_default(),
             pty_master,
             recording,
             forked_here: self.pty_child.forked_here(),
@@ -647,6 +663,9 @@ impl SessionRuntime {
 
         let activity = self.screen_activity.json_snapshot(Instant::now());
         InspectResult {
+            program_status: self.vt_engine.program_status().unwrap_or_default(),
+            program_status_available: self.vt_engine.program_status().is_some(),
+            title: self.vt_engine.title(),
             generation: self.session_dir.parent().and_then(|p| p.parent()).and_then(crate::runtime::generation_from_daemon_dir),
             hosting_epoch: self.hosting_epoch,
             session: crate::protocol::SessionInspect {
@@ -772,6 +791,14 @@ impl SessionRuntime {
         }
     }
 
+    pub(crate) fn program_status_tracker(&self) -> Option<crate::program_status::ProgramStatusTracker> {
+        self.vt_engine.program_status_tracker()
+    }
+
+    pub(crate) fn program_ended(&mut self) {
+        self.vt_engine.program_ended();
+    }
+
     pub(crate) fn record_exit(&mut self, exit: ChildExit) {
         if let Some(ref mut recorder) = self.recorder {
             // Flush any held-back incomplete UTF-8 bytes before the exit
@@ -869,6 +896,10 @@ impl SessionRuntime {
                     // stale replies across authority changes. Only a raw-stream controller
                     // forwards queries to its terminal. Packet clients receive rendered
                     // state, so the engine must answer regardless of their driving roles.
+                    let session_reply = self.vt_engine.drain_session_replies();
+                    if !session_reply.is_empty() {
+                        self.pty_child.write_all(&session_reply)?;
+                    }
                     let engine_reply = self.vt_engine.drain_replies();
                     if !queries_forwarded_to_client {
                         self.write_detached_replies(bytes, &engine_reply)?;
@@ -1158,7 +1189,7 @@ mod tests {
         // A prior activation whose recorded output contains a CPR query
         // (\x1b[6n): the dead program asked for the cursor position.
         let mut recorder = crate::recording::SessionRecorder::new(&session_dir, 80, 24, "ghostty").expect("recorder");
-        recorder.output(b"hello\x1b[6n", Duration::from_millis(10));
+        recorder.output(b"hello\x1b[6n\x1b]7501;?\x1b\\\x1b]7501;state=done\x1b\\", Duration::from_millis(10));
         recorder.flush();
         drop(recorder);
 
@@ -1168,6 +1199,8 @@ mod tests {
         crate::recreate::seed_engine_from_cast(&mut *probe, &session_dir.join(crate::recording::CAST_FILE_NAME))
             .expect("seed probe engine");
         assert!(!probe.drain_replies().is_empty(), "seeded query should buffer a reply in the engine");
+        assert!(!probe.drain_session_replies().is_empty());
+        assert_eq!(probe.program_status().unwrap().len(), 1);
 
         let session = SessionMetadata {
             id: "recreate-replies".to_string(),
@@ -1187,6 +1220,9 @@ mod tests {
         // The stale answer belongs to the dead program: it must not be pending
         // where the first detached pump would write it to the new child's stdin.
         assert!(rt.vt_engine.drain_replies().is_empty(), "stale replies must be discarded during spawn");
+        // Recreation restores screen history but cannot resurrect acknowledged status from an old child.
+        assert!(rt.vt_engine.drain_session_replies().is_empty());
+        assert!(rt.vt_engine.program_status().unwrap().is_empty());
     }
 
     /// The child half of the ConPTY pass-through regression below. It is an

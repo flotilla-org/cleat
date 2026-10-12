@@ -802,3 +802,17 @@ fn controller_activity_survives_live_transfer() {
     drive(2);
     root.ok(&["kill", "controller-history"]);
 }
+
+// A live host transfer preserves records (including their original timestamps), not just the rendered screen.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn program_status_survives_transfer() {
+    let root = Root::new();
+    root.launch_shell("status");
+    root.ok(&["send", "status", "printf '\\033]7501;state=blocked:kind=question:id=task\\007'"]);
+    wait_until("reported status", Duration::from_secs(10), || !root.inspect(&["inspect", "status"]).program_status.is_empty());
+    let before = root.inspect(&["inspect", "status"]).program_status;
+    root.transfer("status", "other", &[], &[]).unwrap();
+    assert_eq!(root.inspect(&["inspect", "status"]).program_status, before);
+    root.ok(&["kill", "status"]);
+}

@@ -53,6 +53,7 @@ fn manifest() -> FdTransferManifest {
         markers: Default::default(),
         recording_paused: false,
         controller_input_history: Default::default(),
+        program_status: Vec::new(),
     }
 }
 fn pair() -> (UnixStream, UnixStream) {

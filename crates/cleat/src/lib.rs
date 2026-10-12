@@ -20,6 +20,7 @@ pub mod keys;
 mod kitty_output;
 pub mod packet;
 pub mod platform;
+pub mod program_status;
 pub mod protocol;
 pub mod provider;
 mod provider_daemon;

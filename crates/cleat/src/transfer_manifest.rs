@@ -64,6 +64,8 @@ pub struct FdTransferManifest {
     pub recording_paused: bool,
     #[serde(default, skip_serializing_if = "crate::protocol::ControllerInputHistory::is_empty")]
     pub controller_input_history: crate::protocol::ControllerInputHistory,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
 }
 
 #[derive(Deserialize)]

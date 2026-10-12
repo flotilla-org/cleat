@@ -1856,6 +1856,9 @@ fn begin_termination(
 }
 
 struct HostedSession {
+    /// Completed sessions remain inspectable while they have unacknowledged results.
+    exit_finalized: bool,
+    delete_requested: bool,
     #[cfg(unix)]
     termination_started: Option<Result<(), String>>,
     metadata: SessionMetadata,
@@ -1906,6 +1909,8 @@ impl HostedSession {
         let should_keep_session_dir = session.record;
         let raw_output_tap = actor.subscribe_raw_output()?;
         Ok(Self {
+            exit_finalized: false,
+            delete_requested: false,
             #[cfg(unix)]
             termination_started: None,
             applied_size: (session.initial_size.cols, session.initial_size.rows),
@@ -2351,6 +2356,14 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             if hosted.hosted_elsewhere {
                 continue;
             }
+            if hosted.exit_finalized {
+                if hosted.actor.program_status().1.is_empty() {
+                    exited_session = Some((session_id, hosted.should_keep_session_dir));
+                    break;
+                }
+                service_pending_waits(&hosted.actor, &mut hosted.pending_waits, &mut hosted.screen_stable_snapshot_generation);
+                continue;
+            }
             let service_result = contain_session_unwind(&session_id, || -> Result<(bool, Option<bool>), String> {
                 maybe_panic_for_containment_test(&session_id);
                 let session_did_work = service_hosted_session(&layout, &session_id, hosted, &mut packet_clients)?;
@@ -2367,8 +2380,17 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             match service_result {
                 Some((session_did_work, Some(should_keep_session_dir))) => {
                     did_work |= session_did_work;
-                    exited_session = Some((session_id, should_keep_session_dir));
-                    break;
+                    if hosted.delete_requested || hosted.actor.program_status().1.is_empty() {
+                        exited_session = Some((session_id, should_keep_session_dir));
+                        break;
+                    }
+                    hosted.exit_finalized = true;
+                    hosted.should_keep_session_dir = should_keep_session_dir;
+                    hosted.active_client = None;
+                    hosted.watchers.clear();
+                    let _ = fs::remove_file(layout.foreground_path(&session_id));
+                    remove_packet_channels_for_session(&session_id, &mut packet_clients);
+                    broadcast_directory_upsert(directory_entry_for_session(&layout, hosted, &packet_clients)?, &mut packet_clients)?;
                 }
                 Some((session_did_work, None)) => {
                     did_work |= session_did_work;
@@ -2648,6 +2670,9 @@ fn announce_seat_state_except(
 
 fn inspect_hosted_session(hosted: &HostedSession, packet_clients: &[PacketClient]) -> Result<crate::protocol::InspectResult, String> {
     let mut result = hosted.actor.inspect(false, 0)?;
+    if hosted.exit_finalized {
+        result.session.state = "exited".into();
+    }
     if hosted.hosted_elsewhere {
         result.session.state = "hosted-elsewhere".into();
     }
@@ -2754,6 +2779,43 @@ fn service_activity_subscriptions(
     for client in packet_clients {
         if client.dead {
             continue;
+        }
+        if client.program_status {
+            let selected = matching_activity_sessions(sessions, &client.selectors, 500);
+            if let Err(message) = client.admit_activity(layout, &selected) {
+                if matches!(message, crate::output_admission::AdmissionError::Busy) {
+                    continue;
+                }
+                client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: CHANNEL_CONTROL, message: message.to_string() })?;
+                client.program_status = false;
+                client.known_program_status.clear();
+                continue;
+            }
+            let mut current_ids = HashSet::new();
+            for selected in selected {
+                let hosted = &sessions[&selected.session_id];
+                let (available, records) = hosted.actor.program_status();
+                let session =
+                    crate::packet::ProgramStatusSession { session_id: selected.session_id, tags: selected.tags, available, records };
+                current_ids.insert(session.session_id.clone());
+                if client.known_program_status.get(&session.session_id) != Some(&session) {
+                    client.known_program_status.insert(session.session_id.clone(), session.clone());
+                    client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::ProgramStatusChanged {
+                        session,
+                        changed_at_unix_ms: unix_time_ms(),
+                    })?;
+                }
+            }
+            let removed = client.known_program_status.keys().filter(|id| !current_ids.contains(*id)).cloned().collect::<Vec<_>>();
+            for id in removed {
+                if let Some(mut session) = client.known_program_status.remove(&id) {
+                    session.records.clear();
+                    client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::ProgramStatusChanged {
+                        session,
+                        changed_at_unix_ms: unix_time_ms(),
+                    })?;
+                }
+            }
         }
         let Some(stable_threshold_ms) = client.screen_activity_stable_ms else {
             continue;
@@ -3049,6 +3111,12 @@ fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWa
 
         for condition in &wait.conditions {
             match condition {
+                crate::protocol::WaitCondition::ProgramState { states } => {
+                    if actor.program_status().1.iter().any(|record| states.contains(&record.state)) {
+                        let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
+                        return false;
+                    }
+                }
                 crate::protocol::WaitCondition::OutputIdle { quiet_ms } => {
                     let silence_since = match actor.last_pty_output_at().ok().flatten() {
                         Some(t) if t > wait.registered_at => t,
@@ -3286,6 +3354,18 @@ fn handle_http_request(
                 }
             }
             Some(hosted) => {
+                if hosted.exit_finalized
+                    && (route.mutates_session()
+                        || matches!(route, http_uds::Route::SessionAttach { .. } | http_uds::Route::SessionWatch { .. }))
+                    && !matches!(route, http_uds::Route::SessionDelete { .. })
+                {
+                    return http_uds::write_error(
+                        stream,
+                        StatusCode::CONFLICT,
+                        "session has exited; retained program status awaits acknowledgement",
+                    )
+                    .map_err(|err| err.to_string());
+                }
                 if hosted.hosted_elsewhere && !matches!(route, http_uds::Route::SessionInspect { .. }) {
                     return http_uds::write_error(stream, StatusCode::CONFLICT, "session is hosted-elsewhere")
                         .map_err(|err| err.to_string());
@@ -3563,13 +3643,14 @@ fn handle_http_request(
                 output_context.expect("validated packet output context"),
             )?;
             client.virtual_placements = subscribe.virtual_placements;
+            client.program_status = subscribe.program_status;
             if let Some(activity) = &activity {
                 if let Err(message) = client.admit_activity(state.layout, &activity.sessions) {
                     return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                         .map_err(|err| format!("write activity admission error: {err}"));
                 }
             }
-            client.enqueue_control(MSG_CONTROL_HELLO, &hello_for_subscription(client.virtual_placements))?;
+            client.enqueue_control(MSG_CONTROL_HELLO, &hello_for_subscription(client.virtual_placements, client.program_status))?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
             if let Some(activity) = activity {
                 client.enqueue_control(MSG_CONTROL_ACTIVITY_SNAPSHOT, &activity)?;
@@ -3593,6 +3674,12 @@ fn handle_http_request(
             let Some(hosted) = state.sessions.get_mut(&id) else {
                 return write_http_not_found(stream);
             };
+            hosted.delete_requested = true;
+            if hosted.exit_finalized {
+                // Explicit session deletion disposes of retained results, without signalling a stale pid.
+                hosted.actor.acknowledge_program_status();
+                return http_uds::write_no_content(stream).map_err(|err| err.to_string());
+            }
             #[cfg(unix)]
             begin_termination(&id, &mut hosted.termination_started, state.pending_terminations, Instant::now, || {
                 hosted.actor.terminate_tree()
@@ -4006,6 +4093,38 @@ fn handle_http_request(
                 break 'wait Ok(());
             }
 
+            if conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::ProgramState { .. }))
+                && !hosted.actor.program_status().0
+            {
+                http_uds::write_error(stream, StatusCode::CONFLICT, "program status unavailable for this VT engine")
+                    .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                break 'wait Ok(());
+            }
+            for condition in &conditions {
+                if let crate::protocol::WaitCondition::ProgramState { states } = condition {
+                    if states.is_empty() {
+                        http_uds::write_error(stream, StatusCode::BAD_REQUEST, "at least one program state is required")
+                            .map_err(|err| format!("write HTTP wait error: {err}"))?;
+                        break 'wait Ok(());
+                    }
+                    if hosted.actor.program_status().1.iter().any(|record| states.contains(&record.state)) {
+                        http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
+                            status: http_uds::WaitStatusResponse::Ready,
+                            elapsed_ms: 0,
+                        })
+                        .map_err(|err| format!("write HTTP wait response: {err}"))?;
+                        break 'wait Ok(());
+                    }
+                }
+            }
+            if hosted.exit_finalized {
+                http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
+                    status: http_uds::WaitStatusResponse::SessionGone,
+                    elapsed_ms: 0,
+                })
+                .map_err(|err| format!("write HTTP wait response: {err}"))?;
+                break 'wait Ok(());
+            }
             let has_text_match = conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::TextMatch { .. }));
             let has_screen_stable =
                 conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::ScreenStable { .. }));
@@ -4116,13 +4235,13 @@ fn advertised_hello() -> ControlHello {
     ControlHello::current()
 }
 
-fn hello_for_subscription(virtual_placements: bool) -> ControlHello {
+fn hello_for_subscription(virtual_placements: bool, program_status: bool) -> ControlHello {
     let hello = advertised_hello();
-    if !virtual_placements && hello == ControlHello::current() {
+    if !program_status && hello == ControlHello::current() {
         // Some protocol-12 clients compare the maximum version directly.
         // Preserve their original hello as well as their render payloads.
         ControlHello {
-            version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION,
+            version: if virtual_placements { 13 } else { crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION },
             min_supported_version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION,
         }
     } else {
@@ -4144,6 +4263,7 @@ fn signal_target_from_http(target: http_uds::SignalTargetRequest) -> crate::prot
 
 fn wait_condition_from_http(condition: http_uds::WaitConditionRequest) -> crate::protocol::WaitCondition {
     match condition {
+        http_uds::WaitConditionRequest::ProgramState { states } => crate::protocol::WaitCondition::ProgramState { states },
         http_uds::WaitConditionRequest::OutputIdle { quiet_ms } => crate::protocol::WaitCondition::OutputIdle { quiet_ms },
         http_uds::WaitConditionRequest::TextMatch { text } => crate::protocol::WaitCondition::TextMatch { text },
         http_uds::WaitConditionRequest::ScreenStable { stable_ms } => crate::protocol::WaitCondition::ScreenStable { stable_ms },
@@ -4183,6 +4303,8 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 }
 
 struct PacketClient {
+    program_status: bool,
+    known_program_status: HashMap<String, crate::packet::ProgramStatusSession>,
     virtual_placements: bool,
     activity_output_leases: HashMap<String, Option<crate::output_admission::OutputLease>>,
     output_context: crate::output_admission::OutputContext,
@@ -4342,6 +4464,8 @@ impl PacketClient {
             pending_output: PendingOutput::new(),
             image_output_cursor: 0,
             virtual_placements: false,
+            program_status: false,
+            known_program_status: HashMap::new(),
             output_context,
             activity_output_leases: HashMap::new(),
             input_reader,
@@ -4924,6 +5048,13 @@ fn open_packet_channel(
         })?;
         return Ok(());
     };
+    if hosted.exit_finalized {
+        packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+            channel: open.channel,
+            message: format!("session {} has exited", open.session_id),
+        })?;
+        return Ok(());
+    }
     if hosted.transferring || hosted.hosted_elsewhere {
         packet_clients[index]
             .enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: open.channel, message: transferring_message(&open.session_id) })?;

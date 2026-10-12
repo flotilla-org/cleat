@@ -281,6 +281,7 @@ pub(crate) struct WaitRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WaitConditionRequest {
+    ProgramState { states: Vec<crate::program_status::ProgramState> },
     OutputIdle { quiet_ms: u64 },
     TextMatch { text: String },
     ScreenStable { stable_ms: u64 },
@@ -325,6 +326,9 @@ pub(crate) struct SessionListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct PacketSubscribeRequest {
+    /// Opt in to session-attributed ProgramStatusChanged activity events (protocol 14).
+    #[serde(default)]
+    pub program_status: bool,
     /// Opt in to atomic render envelopes carrying original virtual declarations.
     #[serde(default)]
     pub virtual_placements: bool,

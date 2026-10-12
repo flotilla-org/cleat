@@ -627,6 +627,7 @@ pub(crate) struct SessionActor {
     tx: CommandSender,
     observation: Arc<ObservationMirror>,
     screen_activity: ScreenActivityTracker,
+    program_status: Option<crate::program_status::ProgramStatusTracker>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -937,7 +938,7 @@ impl SessionActor {
         #[cfg(not(unix))]
         let tx = CommandSender::new(tx);
         match ready_rx.recv().map_err(|_| "session actor did not report startup".to_string())? {
-            Ok(screen_activity) => Ok(Self { tx, observation, screen_activity, worker: Some(worker) }),
+            Ok((screen_activity, program_status)) => Ok(Self { tx, observation, screen_activity, program_status, worker: Some(worker) }),
             Err(err) => {
                 let _ = worker.join();
                 Err(err)
@@ -951,7 +952,7 @@ impl SessionActor {
         observation: Arc<ObservationMirror>,
         worker: Option<thread::JoinHandle<()>>,
     ) -> Self {
-        Self { tx: CommandSender::inert(tx), observation, screen_activity: ScreenActivityTracker::new(0), worker }
+        Self { tx: CommandSender::inert(tx), observation, screen_activity: ScreenActivityTracker::new(0), program_status: None, worker }
     }
 
     pub(crate) fn observation(&self) -> &ObservationMirror {
@@ -1019,6 +1020,17 @@ impl SessionActor {
 
     pub(crate) fn recover_raw_output(&self, capabilities: Vec<vt::ClientCapabilities>) -> Result<RawOutputRecovery, String> {
         self.request_result(|reply| SessionCommand::RecoverRawOutput { capabilities, reply })
+    }
+
+    /// Internal acknowledgement; attach/send/provider wiring follows in #328.
+    pub(crate) fn acknowledge_program_status(&self) {
+        if let Some(tracker) = &self.program_status {
+            tracker.acknowledge();
+        }
+    }
+
+    pub(crate) fn program_status(&self) -> (bool, Vec<crate::program_status::ProgramStatusRecord>) {
+        (self.program_status.is_some(), self.program_status.as_ref().map(|tracker| tracker.records()).unwrap_or_default())
     }
 
     pub(crate) fn inspect(&self, has_controller: bool, watcher_count: usize) -> Result<InspectResult, String> {
@@ -1290,7 +1302,9 @@ fn pump_session_runtime(
         }
     }
     let output = if exited_now {
-        runtime.drain_output_after_exit(queries_forwarded_to_client)?
+        let output = runtime.drain_output_after_exit(queries_forwarded_to_client)?;
+        runtime.program_ended();
+        output
     } else if *exited {
         PtyOutput { chunks: Vec::new() }
     } else {
@@ -1346,7 +1360,7 @@ fn session_actor_loop(
     mut runtime: SessionRuntime,
     wake: WakeCallback,
     observation: ObservationState,
-    ready: mpsc::Sender<Result<ScreenActivityTracker, String>>,
+    ready: mpsc::Sender<Result<(ScreenActivityTracker, Option<crate::program_status::ProgramStatusTracker>), String>>,
     rx: mpsc::Receiver<SessionCommand>,
     #[cfg(unix)] command_wake: CommandWakeReader,
     pty_paused: bool,
@@ -1368,7 +1382,7 @@ fn session_actor_loop(
     };
     // Initialization/reconstructed history is never a live effect source.
     let _ = runtime.drain_clipboard();
-    let _ = ready.send(Ok(runtime.screen_activity_tracker()));
+    let _ = ready.send(Ok((runtime.screen_activity_tracker(), runtime.program_status_tracker())));
     loop {
         finish_submission(&mut runtime, &mut state, &wake);
         // Exit has been reaped and final output drained. EOF remains readable

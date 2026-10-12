@@ -63,17 +63,23 @@ impl ProgramStatusStore {
         self.records.push(record);
     }
 
-    pub fn clear(&mut self, id: &str) {
+    pub fn clear(&mut self, id: &str) -> bool {
+        let before = self.records.len();
         self.records
             .retain(|record| !id.is_empty() && record.id != id && !record.id.strip_prefix(id).is_some_and(|rest| rest.starts_with('/')));
+        self.records.len() != before
     }
 
-    pub fn program_ended(&mut self) {
+    pub fn program_ended(&mut self) -> bool {
+        let before = self.records.len();
         self.records.retain(|record| matches!(record.state, ProgramState::Done | ProgramState::Error));
+        self.records.len() != before
     }
 
-    pub fn acknowledge(&mut self) {
+    pub fn acknowledge(&mut self) -> bool {
+        let before = self.records.len();
         self.records.retain(|record| !matches!(record.state, ProgramState::Done | ProgramState::Error));
+        self.records.len() != before
     }
 }
 
@@ -89,10 +95,11 @@ impl ProgramStatusTracker {
     fn read<T>(&self, f: impl FnOnce(&TrackedProgramStatus) -> T) -> T {
         f(&self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
-    fn update(&self, f: impl FnOnce(&mut ProgramStatusStore)) {
+    fn update(&self, f: impl FnOnce(&mut ProgramStatusStore) -> bool) {
         let mut state = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&mut state.store);
-        state.generation = state.generation.wrapping_add(1);
+        if f(&mut state.store) {
+            state.generation = state.generation.wrapping_add(1);
+        }
     }
     pub fn records(&self) -> Vec<ProgramStatusRecord> {
         self.read(|state| state.store.records().to_vec())
@@ -108,7 +115,10 @@ impl ProgramStatusTracker {
         self.read(|state| state.store.records().iter().any(|record| states.contains(&record.state)))
     }
     pub fn replace(&self, record: ProgramStatusRecord) {
-        self.update(|store| store.replace(record));
+        self.update(|store| {
+            store.replace(record);
+            true
+        });
     }
     pub fn clear(&self, id: &str) {
         self.update(|store| store.clear(id));
@@ -155,12 +165,12 @@ mod tests {
     }
 
     // Every report completely replaces the previous record, and eviction follows update order.
-    // Generate counts crossing the 256 boundary, replacements and timestamp ties.
+    // Generate counts crossing the 256 boundary, replacements, timestamp ties and backward wall-clock changes.
     #[test]
     fn replacement_and_capacity() {
         let mut store = ProgramStatusStore::default();
         for n in 0..258 {
-            store.replace(record(&n.to_string(), ProgramState::Working, n));
+            store.replace(record(&n.to_string(), ProgramState::Working, 258 - n / 2));
         }
         assert_eq!(store.records().len(), 256);
         assert_eq!(store.records()[0].id, "2");
@@ -205,7 +215,7 @@ mod tests {
         }
     }
 
-    // Unchanged snapshots are omitted; every store operation publishes a new atomic generation.
+    // Unchanged snapshots are omitted; mutations advance an atomic generation and no-op removals preserve it.
     // Generate replacement, clear, prompt/exit and acknowledgement sequences over every state.
     #[test]
     fn tracker_generations_and_read_predicates() {
@@ -226,15 +236,29 @@ mod tests {
                 assert!(!tracker.is_empty());
                 assert!(tracker.matches_states(&[state]));
                 assert!(tracker.records_since(Some(generation)).is_none());
+                tracker.clear("missing");
+                assert!(tracker.records_since(Some(generation)).is_none());
                 match operation {
                     0 => tracker.clear("task"),
                     1 => tracker.program_ended(),
                     2 => tracker.acknowledge(),
                     _ => tracker.clear(""),
                 }
-                let (updated, records) = tracker.records_since(Some(generation)).unwrap();
-                assert_ne!(updated, generation);
-                generation = updated;
+                let terminal = matches!(state, ProgramState::Done | ProgramState::Error);
+                let changed = match operation {
+                    1 => !terminal,
+                    2 => terminal,
+                    _ => true,
+                };
+                let records = if changed {
+                    let (updated, records) = tracker.records_since(Some(generation)).unwrap();
+                    assert_ne!(updated, generation);
+                    generation = updated;
+                    records
+                } else {
+                    assert!(tracker.records_since(Some(generation)).is_none());
+                    tracker.records()
+                };
                 assert_eq!(tracker.is_empty(), records.is_empty());
                 assert_eq!(tracker.matches_states(&[state]), !records.is_empty());
                 assert!(tracker.records_since(Some(generation)).is_none());

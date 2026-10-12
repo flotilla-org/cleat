@@ -1142,7 +1142,8 @@ struct TerminalEffects {
     session_reply_buf: Vec<u8>,
     clipboard: crate::clipboard::ClipboardQueue,
     program_status: crate::program_status::ProgramStatusTracker,
-    title_changed: bool,
+    // A seen flag, not render dirtiness: known empty title is Some(""); unseen is None.
+    title_observed: bool,
     cols: u16,
     rows: u16,
     cell_width_px: u32,
@@ -1242,7 +1243,7 @@ unsafe extern "C" fn semantic_prompt_trampoline(
 }
 unsafe extern "C" fn title_changed_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void) {
     if !userdata.is_null() {
-        unsafe { &mut *(userdata as *mut TerminalEffects) }.title_changed = true;
+        unsafe { &mut *(userdata as *mut TerminalEffects) }.title_observed = true;
     }
 }
 
@@ -1523,7 +1524,7 @@ impl TerminalHandle {
             session_reply_buf: Vec::new(),
             clipboard: Default::default(),
             program_status: Default::default(),
-            title_changed: false,
+            title_observed: false,
             cols,
             rows,
             cell_width_px: 1,
@@ -1599,7 +1600,7 @@ impl TerminalHandle {
         self.effects.program_status.acknowledge();
     }
     pub fn title(&self) -> Option<String> {
-        if !self.effects.title_changed {
+        if !self.effects.title_observed {
             return None;
         }
         let mut title = GhosttyString { ptr: ptr::null(), len: 0 };

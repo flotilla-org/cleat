@@ -709,10 +709,14 @@ mod program_status_tests {
     #[test]
     fn program_status_text_and_session_title() {
         let mut engine = make_default_vt_engine(80, 24);
+        assert_eq!(engine.title(), None);
         report(&mut *engine, "state=idle:msg=YeKArmI=:title=YeKArmI=");
         assert_eq!(engine.program_status().unwrap()[0].msg, "ab");
         assert_eq!(engine.program_status().unwrap()[0].title, "ab");
         engine.feed("\x1b]2;one\u{202e}two\x1b\\".as_bytes()).unwrap();
         assert_eq!(engine.title().as_deref(), Some("onetwo"));
+        // A known cleared title remains distinguishable from an unobserved title.
+        engine.feed(b"\x1b]2;\x1b\\").unwrap();
+        assert_eq!(engine.title().as_deref(), Some(""));
     }
 }

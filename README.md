@@ -243,7 +243,9 @@ OSC 7501. The session answers the support query even without an attached client.
 `inspect --json` includes the session's `title`, `program_status_available`, and
 `program_status` records (`id`, `source`, `state`, `kind`, `progress`, `app`, `msg`,
 `title`, `since`). The root id is an empty string; `since` is the last update's
-Unix timestamp in milliseconds. Text is untrusted and belongs to the enclosing
+Unix timestamp in milliseconds (wall-clock corrections can move it backwards;
+eviction follows actual update order). `title` is null before a title is observed
+and an empty string when a known title is cleared. Text is untrusted and belongs to the enclosing
 session; invisible formatting is removed from `msg`/`title` before exposure.
 Ghostty validates `id`/`app` as ASCII names, so they cannot contain bidi or
 invisible formatting and their identities remain unchanged.

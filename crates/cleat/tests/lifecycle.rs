@@ -5044,6 +5044,14 @@ fn program_status_survives_child_exit() {
         WaitStatus::SessionGone
     );
     assert!(service.send_keys("status", b"input").unwrap_err().contains("exited"));
+    // Finalized sessions reject both input and raw attachments with HTTP 409, not an unrelated transport error.
+    for action in ["keys", "attach", "watch"] {
+        let response = http_session_request(temp.path(), "status", &format!(
+            "POST /sessions/status/{action} HTTP/1.1\r\nHost: cleat\r\nContent-Length: 0\r\nx-cleat-output-context: {{\"version\":1,\"context\":{{\"kind\":\"external\"}}}}\r\n\r\n"
+        ));
+        assert!(response.starts_with("HTTP/1.1 409 Conflict"), "{response}");
+        assert!(http_body(&response).contains("exited"));
+    }
     service.kill("status").unwrap();
     wait_until("deleted completed session", || service.inspect("status").is_err());
 }

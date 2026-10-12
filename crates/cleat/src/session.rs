@@ -2357,7 +2357,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                 continue;
             }
             if hosted.exit_finalized {
-                if hosted.actor.program_status().1.is_empty() {
+                if !hosted.actor.has_program_status() {
                     exited_session = Some((session_id, hosted.should_keep_session_dir));
                     break;
                 }
@@ -2380,7 +2380,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             match service_result {
                 Some((session_did_work, Some(should_keep_session_dir))) => {
                     did_work |= session_did_work;
-                    if hosted.delete_requested || hosted.actor.program_status().1.is_empty() {
+                    if hosted.delete_requested || !hosted.actor.has_program_status() {
                         exited_session = Some((session_id, should_keep_session_dir));
                         break;
                     }
@@ -2789,15 +2789,23 @@ fn service_activity_subscriptions(
                 client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel: CHANNEL_CONTROL, message: message.to_string() })?;
                 client.program_status = false;
                 client.known_program_status.clear();
+                client.known_program_status_generation.clear();
                 continue;
             }
             let mut current_ids = HashSet::new();
             for selected in selected {
                 let hosted = &sessions[&selected.session_id];
-                let (available, records) = hosted.actor.program_status();
+                current_ids.insert(selected.session_id.clone());
+                let prior = client.known_program_status.get(&selected.session_id);
+                let generation = prior
+                    .filter(|known| known.tags == selected.tags)
+                    .and_then(|_| client.known_program_status_generation.get(&selected.session_id).copied());
+                let Some((generation, available, records)) = hosted.actor.program_status_since(generation) else {
+                    continue;
+                };
+                client.known_program_status_generation.insert(selected.session_id.clone(), generation);
                 let session =
                     crate::packet::ProgramStatusSession { session_id: selected.session_id, tags: selected.tags, available, records };
-                current_ids.insert(session.session_id.clone());
                 if client.known_program_status.get(&session.session_id) != Some(&session) {
                     client.known_program_status.insert(session.session_id.clone(), session.clone());
                     client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::ProgramStatusChanged {
@@ -2808,6 +2816,7 @@ fn service_activity_subscriptions(
             }
             let removed = client.known_program_status.keys().filter(|id| !current_ids.contains(*id)).cloned().collect::<Vec<_>>();
             for id in removed {
+                client.known_program_status_generation.remove(&id);
                 if let Some(mut session) = client.known_program_status.remove(&id) {
                     session.records.clear();
                     client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::ProgramStatusChanged {
@@ -3112,7 +3121,7 @@ fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWa
         for condition in &wait.conditions {
             match condition {
                 crate::protocol::WaitCondition::ProgramState { states } => {
-                    if actor.program_status().1.iter().any(|record| states.contains(&record.state)) {
+                    if actor.program_status_matches(states) {
                         let _ = write_http_wait_result(&mut wait.stream, crate::protocol::WaitStatus::Ready, elapsed_ms);
                         return false;
                     }
@@ -4094,7 +4103,7 @@ fn handle_http_request(
             }
 
             if conditions.iter().any(|c| matches!(c, crate::protocol::WaitCondition::ProgramState { .. }))
-                && !hosted.actor.program_status().0
+                && !hosted.actor.program_status_available()
             {
                 http_uds::write_error(stream, StatusCode::CONFLICT, "program status unavailable for this VT engine")
                     .map_err(|err| format!("write HTTP wait error: {err}"))?;
@@ -4107,7 +4116,7 @@ fn handle_http_request(
                             .map_err(|err| format!("write HTTP wait error: {err}"))?;
                         break 'wait Ok(());
                     }
-                    if hosted.actor.program_status().1.iter().any(|record| states.contains(&record.state)) {
+                    if hosted.actor.program_status_matches(states) {
                         http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
                             status: http_uds::WaitStatusResponse::Ready,
                             elapsed_ms: 0,
@@ -4305,6 +4314,7 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 struct PacketClient {
     program_status: bool,
     known_program_status: HashMap<String, crate::packet::ProgramStatusSession>,
+    known_program_status_generation: HashMap<String, u64>,
     virtual_placements: bool,
     activity_output_leases: HashMap<String, Option<crate::output_admission::OutputLease>>,
     output_context: crate::output_admission::OutputContext,
@@ -4466,6 +4476,7 @@ impl PacketClient {
             virtual_placements: false,
             program_status: false,
             known_program_status: HashMap::new(),
+            known_program_status_generation: HashMap::new(),
             output_context,
             activity_output_leases: HashMap::new(),
             input_reader,

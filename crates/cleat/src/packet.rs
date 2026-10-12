@@ -183,6 +183,7 @@ pub enum ActivityEvent {
     },
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramStatusSession {
     pub session_id: String,

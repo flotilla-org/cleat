@@ -1191,6 +1191,9 @@ unsafe extern "C" fn program_status_trampoline(
         return;
     }
     let effects = unsafe { &mut *(userdata as *mut TerminalEffects) };
+    // The pinned Ghostty validator restricts id segments/app to ASCII letters,
+    // digits and _ . + - (with / separators in ids). Preserve validated keys:
+    // sanitizing them after validation could collapse distinct record identities.
     let id = unsafe { copy_status_string(report.id) };
     if report.state == 5 {
         effects.program_status.clear(&id);
@@ -1378,6 +1381,9 @@ unsafe extern "C" fn write_pty_trampoline(_terminal: GhosttyTerminal, userdata: 
     let effects = unsafe { &mut *(userdata as *mut TerminalEffects) };
     let slice = unsafe { std::slice::from_raw_parts(data, len) };
     // OSC 7501 belongs to the session terminal even when other queries are forwarded.
+    // The pinned stream_terminal.Handler.programStatus passes a complete
+    // constant OSC 7501 reply to writePty in one call. This is a
+    // callback-boundary guarantee, not an assumption about PTY read chunks.
     if slice.starts_with(b"\x1b]7501;") {
         effects.session_reply_buf.extend_from_slice(slice);
     } else {

@@ -79,25 +79,45 @@ impl ProgramStatusStore {
 
 /// Shared observation of the actor-owned store; readers never send actor commands.
 #[derive(Clone, Default)]
-pub struct ProgramStatusTracker(std::sync::Arc<std::sync::Mutex<ProgramStatusStore>>);
+pub struct ProgramStatusTracker(std::sync::Arc<std::sync::Mutex<TrackedProgramStatus>>);
+#[derive(Default)]
+struct TrackedProgramStatus {
+    store: ProgramStatusStore,
+    generation: u64,
+}
 impl ProgramStatusTracker {
-    fn with_store<T>(&self, f: impl FnOnce(&mut ProgramStatusStore) -> T) -> T {
-        f(&mut self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    fn read<T>(&self, f: impl FnOnce(&TrackedProgramStatus) -> T) -> T {
+        f(&self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+    fn update(&self, f: impl FnOnce(&mut ProgramStatusStore)) {
+        let mut state = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut state.store);
+        state.generation = state.generation.wrapping_add(1);
     }
     pub fn records(&self) -> Vec<ProgramStatusRecord> {
-        self.with_store(|store| store.records().to_vec())
+        self.read(|state| state.store.records().to_vec())
+    }
+    /// The generation and records share one cut point. Unchanged reads allocate nothing.
+    pub fn records_since(&self, generation: Option<u64>) -> Option<(u64, Vec<ProgramStatusRecord>)> {
+        self.read(|state| (generation != Some(state.generation)).then(|| (state.generation, state.store.records().to_vec())))
+    }
+    pub fn is_empty(&self) -> bool {
+        self.read(|state| state.store.records().is_empty())
+    }
+    pub fn matches_states(&self, states: &[ProgramState]) -> bool {
+        self.read(|state| state.store.records().iter().any(|record| states.contains(&record.state)))
     }
     pub fn replace(&self, record: ProgramStatusRecord) {
-        self.with_store(|store| store.replace(record));
+        self.update(|store| store.replace(record));
     }
     pub fn clear(&self, id: &str) {
-        self.with_store(|store| store.clear(id));
+        self.update(|store| store.clear(id));
     }
     pub fn program_ended(&self) {
-        self.with_store(ProgramStatusStore::program_ended);
+        self.update(ProgramStatusStore::program_ended);
     }
     pub fn acknowledge(&self) {
-        self.with_store(ProgramStatusStore::acknowledge);
+        self.update(ProgramStatusStore::acknowledge);
     }
 }
 
@@ -182,6 +202,43 @@ mod tests {
             store.acknowledge();
             store.acknowledge();
             assert_eq!(store.records().len(), usize::from(!matches!(state, ProgramState::Done | ProgramState::Error)));
+        }
+    }
+
+    // Unchanged snapshots are omitted; every store operation publishes a new atomic generation.
+    // Generate replacement, clear, prompt/exit and acknowledgement sequences over every state.
+    #[test]
+    fn tracker_generations_and_read_predicates() {
+        let tracker = ProgramStatusTracker::default();
+        let (mut generation, records) = tracker.records_since(None).unwrap();
+        assert!(records.is_empty());
+        assert!(tracker.records_since(Some(generation)).is_none());
+        for (n, state) in [ProgramState::Idle, ProgramState::Working, ProgramState::Blocked, ProgramState::Done, ProgramState::Error]
+            .into_iter()
+            .enumerate()
+        {
+            for operation in 0..4 {
+                tracker.replace(record("task", state, n as u64));
+                let (updated, records) = tracker.records_since(Some(generation)).unwrap();
+                assert_ne!(updated, generation);
+                generation = updated;
+                assert_eq!(records, [record("task", state, n as u64)]);
+                assert!(!tracker.is_empty());
+                assert!(tracker.matches_states(&[state]));
+                assert!(tracker.records_since(Some(generation)).is_none());
+                match operation {
+                    0 => tracker.clear("task"),
+                    1 => tracker.program_ended(),
+                    2 => tracker.acknowledge(),
+                    _ => tracker.clear(""),
+                }
+                let (updated, records) = tracker.records_since(Some(generation)).unwrap();
+                assert_ne!(updated, generation);
+                generation = updated;
+                assert_eq!(tracker.is_empty(), records.is_empty());
+                assert_eq!(tracker.matches_states(&[state]), !records.is_empty());
+                assert!(tracker.records_since(Some(generation)).is_none());
+            }
         }
     }
 

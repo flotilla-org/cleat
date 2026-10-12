@@ -4991,6 +4991,12 @@ fn program_status_events_are_opt_in() {
     let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("changed status") };
     assert_eq!(session.session_id, "status");
     assert_eq!(session.records[0].state, cleat::program_status::ProgramState::Blocked);
+    // Metadata changes publish the session's new attribution even when the record generation is unchanged.
+    let records = session.records;
+    service.update_tags("status", vec!["status-tag".into()], vec![]).unwrap();
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("tagged status") };
+    assert_eq!(session.tags, ["status-tag"]);
+    assert_eq!(session.records, records);
     // Other directory changes are allowed; a program-status event is never sent to the legacy peer.
     legacy.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     loop {

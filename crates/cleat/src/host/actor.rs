@@ -1029,8 +1029,23 @@ impl SessionActor {
         }
     }
 
-    pub(crate) fn program_status(&self) -> (bool, Vec<crate::program_status::ProgramStatusRecord>) {
-        (self.program_status.is_some(), self.program_status.as_ref().map(|tracker| tracker.records()).unwrap_or_default())
+    pub(crate) fn program_status_available(&self) -> bool {
+        self.program_status.is_some()
+    }
+    pub(crate) fn has_program_status(&self) -> bool {
+        self.program_status.as_ref().is_some_and(|tracker| !tracker.is_empty())
+    }
+    pub(crate) fn program_status_matches(&self, states: &[crate::program_status::ProgramState]) -> bool {
+        self.program_status.as_ref().is_some_and(|tracker| tracker.matches_states(states))
+    }
+    pub(crate) fn program_status_since(
+        &self,
+        generation: Option<u64>,
+    ) -> Option<(u64, bool, Vec<crate::program_status::ProgramStatusRecord>)> {
+        match &self.program_status {
+            Some(tracker) => tracker.records_since(generation).map(|(generation, records)| (generation, true, records)),
+            None => (generation != Some(0)).then(|| (0, false, Vec::new())),
+        }
     }
 
     pub(crate) fn inspect(&self, has_controller: bool, watcher_count: usize) -> Result<InspectResult, String> {

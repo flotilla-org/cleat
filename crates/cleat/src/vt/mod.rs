@@ -644,6 +644,8 @@ mod program_status_tests {
         let mut engine = make_default_vt_engine(80, 24);
         report(&mut *engine, "state=blocked:kind=permission:progress=42:id=build/test:app=cargo:msg=aGk=:title=dGFzaw==");
         let records = engine.program_status().unwrap();
+        assert_eq!(records[0].id, "build/test");
+        assert_eq!(records[0].app, "cargo");
         assert_eq!(records[0].msg, "hi");
         assert_eq!(records[0].title, "task");
         assert_eq!(records[0].progress, Some(42));

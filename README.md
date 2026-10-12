@@ -244,7 +244,9 @@ OSC 7501. The session answers the support query even without an attached client.
 `program_status` records (`id`, `source`, `state`, `kind`, `progress`, `app`, `msg`,
 `title`, `since`). The root id is an empty string; `since` is the last update's
 Unix timestamp in milliseconds. Text is untrusted and belongs to the enclosing
-session; invisible formatting is removed before exposure.
+session; invisible formatting is removed from `msg`/`title` before exposure.
+Ghostty validates `id`/`app` as ASCII names, so they cannot contain bidi or
+invisible formatting and their identities remain unchanged.
 
 Each report replaces its record. Clear removes that id and its descendants;
 clear without an id removes everything. The store holds up to 256 records,
@@ -262,6 +264,12 @@ provides the same subscription to Rust clients. Peers without the opt-in keep
 their existing hello (12, or 13 with virtual declarations) and activity layouts.
 Acknowledgement is internal for now; attach/send/provider input wiring is #328.
 Window title delivery in render updates remains #297.
+
+Retention has no timeout: discarding unacknowledged `done`/`error` results would
+break their lifetime contract. Until #328 exposes acknowledgement to consumers,
+use `cleat kill <id>` to dispose of a completed session. Unattended jobs that
+report results and exit can accumulate daemon-resident sessions and resources;
+they remain listed as `exited` and reject input/attachment rather than restarting.
 
 ### Queries and capabilities
 

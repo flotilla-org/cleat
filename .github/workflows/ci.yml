@@ -49,6 +49,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-clippy-
       - run: ./tools/prepare-ghostty-vt.sh
+      - name: Check compiled Ghostty terminfo and deterministic emission
+        run: ./tools/check-ghostty-terminfo.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
@@ -81,6 +83,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
       - run: ./tools/prepare-ghostty-vt.sh
+      - name: Check compiled Ghostty terminfo and deterministic emission
+        run: ./tools/check-ghostty-terminfo.sh
       - run: cargo test --workspace --locked
 
   no-vt:

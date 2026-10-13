@@ -104,6 +104,14 @@ cp "$REPO_ROOT/tools/emit-ghostty-terminfo.zig" "$SOURCE_DIR/src/emit-cleat-term
 mkdir -p "$INSTALL_DIR/share/terminfo"
 (cd "$SOURCE_DIR" && "$zig" run src/emit-cleat-terminfo.zig) > "$INSTALL_DIR/share/ghostty.terminfo"
 tic -x -o "$INSTALL_DIR/share/terminfo" "$INSTALL_DIR/share/ghostty.terminfo"
+# Some ncurses builds use hex directories. Preserve their native lookup path
+# while also installing the canonical path consumed by crew packaging.
+if [[ ! -f "$INSTALL_DIR/share/terminfo/x/xterm-ghostty" ]]; then
+  mkdir -p "$INSTALL_DIR/share/terminfo/x"
+  cp "$INSTALL_DIR/share/terminfo/78/xterm-ghostty" "$INSTALL_DIR/share/terminfo/x/xterm-ghostty"
+fi
+# Record the verified executable for the acceptance check, outside the install.
+printf '%s\n' "$zig" > "$SOURCE_DIR/.cleat-zig-path"
 rm "$INSTALL_DIR/share/ghostty.terminfo"
 cp "$SOURCE_DIR/LICENSE" "$INSTALL_DIR/share/terminfo/LICENSE"
 

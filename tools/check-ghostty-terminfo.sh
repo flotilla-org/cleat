@@ -14,6 +14,10 @@ grep -Eq 'colors#(256|0x100),' <<< "$description"
 # Re-emitting from the same pin must produce byte-identical output.
 # prepare has already verified/provisioned this Zig version.
 version=$(awk '/^version = / {gsub(/"/, "", $3); print $3}' "$REPO_ROOT/tools/ghostty-toolchain.toml")
+if [[ ! -s "$SOURCE_DIR/.cleat-zig-path" ]]; then
+  echo "Missing prepared Zig path; rerun ./tools/prepare-ghostty-vt.sh" >&2
+  exit 1
+fi
 zig=$(cat "$SOURCE_DIR/.cleat-zig-path")
 [[ "$("$zig" version)" == "$version" ]]
 temporary=$(mktemp -d)

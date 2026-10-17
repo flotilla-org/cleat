@@ -16,7 +16,9 @@ ref = "1d7fb7a15838b82244a067bdaf7c8e4ed8130127"
 # -Doptimize matters: zig defaults to Debug, and a Debug libghostty-vt feeds
 # scroll-heavy output at ~KB/s — slow enough to wedge session actors behind
 # PTY floods. ReleaseSafe keeps bounds checks on untrusted terminal input.
-build_step = "-Demit-lib-vt=true -Dsimd=true -Doptimize=ReleaseSafe"
+# -Dcpu=baseline: zig otherwise targets the build machine's CPU, so a cached
+# libghostty-vt can die with an illegal instruction on another runner or host.
+build_step = "-Demit-lib-vt=true -Dsimd=true -Doptimize=ReleaseSafe -Dcpu=baseline"
 
 # SHA-256 from the Zig release index.
 [zig_sha256]

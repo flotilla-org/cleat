@@ -127,11 +127,14 @@ remain design/backlog work, not prerequisites for the current queue.
 
 | Label | Meaning |
 | --- | --- |
-| `priority:next` | Next implementation focus; currently #226. |
-| `priority:soon` | Near-term queue or pending delivery; use the ordered table above. |
-| `priority:later` | Explicitly deferred work or design. |
+| `priority:urgent` | Drop other work; dispatch takes it first. |
+| `priority:high` | Next implementation focus. |
+| `priority:medium` | Near-term queue or pending delivery; use the ordered table above. |
+| `priority:low` | Explicitly deferred work or design. |
 | No priority label | Not yet scheduled in this queue; not a claim that it is unnecessary. |
 | `ready` | Scope is a dispatchable implementation contract; independent of priority. |
+| `triage:clear`, `triage:blocked`, `triage:needs-answer`, `triage:needs-rewrite`, `triage:waiting` | Readiness assessment by the backlog-triage skill; the issue's triage record comment says why. Independent of priority. |
+| `needs:*` | Dispatch constraints (for example `needs:windows`) found during triage. |
 | `from-review` | Provenance from PR review, not a priority or readiness signal. |
 | `bug`, `enhancement`, `documentation`, `testing` | Type of work. |
 | `cli`, `protocol`, `recording`, `vt-engine`, `infrastructure`, `agent` | Area of work. |

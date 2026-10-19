@@ -683,14 +683,12 @@ fn relay_packet_stdio(
             stdout.flush().map_err(|e| e.to_string())?;
         }
         decoder.set_driving(controller.load(Ordering::SeqCst));
-        let actions = match terminal.read_input(Duration::from_millis(100), &mut buf) {
+        let actions = match terminal.read_input(crate::attach_status::INPUT_IDLE_TICK, &mut buf) {
             Ok(None) => {
                 let bytes = probe.feed(&[], probe_started.elapsed());
-                if bytes.is_empty() {
-                    decoder.idle()
-                } else {
-                    decoder.feed(&bytes)
-                }
+                let mut actions = decoder.feed(&bytes);
+                actions.extend(decoder.idle());
+                actions
             }
             Ok(Some(0)) => break Ok(()),
             Ok(Some(n)) => {

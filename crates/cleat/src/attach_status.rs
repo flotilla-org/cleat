@@ -1,5 +1,8 @@
 //! Attachment-owned probing, source arbitration and OSC 7501 serialization.
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Duration,
+};
 
 use crate::{
     kitty_output::base64,
@@ -17,6 +20,12 @@ pub struct StatusSnapshot {
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 pub const DISCARD_WINDOW: Duration = Duration::from_secs(3);
 pub const QUERY: &[u8] = b"\x1b]7501;?\x1b\\";
+pub const INPUT_IDLE_TICK: Duration = Duration::from_millis(100);
+const REPLIES: [&[u8]; 6] = [QUERY, b"\x1b]7501;?\x07", b"\x9d7501;?\x9c", b"\x9d7501;?\x07", b"\x1b]7501;?\x9c", b"\x9d7501;?\x1b\\"];
+
+fn prefix_matches(candidate: &[u8], pending: &VecDeque<u8>) -> bool {
+    pending.len() <= candidate.len() && pending.iter().eq(candidate[..pending.len()].iter())
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProgramStatusMode {
@@ -29,20 +38,20 @@ pub enum ProgramStatusMode {
 /// Recognize only our reply, buffering at most one candidate prefix. All other
 /// bytes retain their order and go to the existing terminal input decoder.
 pub(crate) struct Probe {
-    pending: Vec<u8>,
+    pending: VecDeque<u8>,
     auto: bool,
     paste: bool,
-    paste_tail: Vec<u8>,
+    paste_tail: VecDeque<u8>,
     pub enabled: bool,
 }
 impl Probe {
     pub fn new(mode: ProgramStatusMode) -> Self {
         Self {
-            pending: Vec::new(),
+            pending: VecDeque::new(),
             auto: matches!(mode, ProgramStatusMode::Auto),
             enabled: matches!(mode, ProgramStatusMode::On),
             paste: false,
-            paste_tail: Vec::new(),
+            paste_tail: VecDeque::new(),
         }
     }
     pub fn query(&self) -> &'static [u8] {
@@ -54,45 +63,48 @@ impl Probe {
     }
     pub fn feed(&mut self, bytes: &[u8], elapsed: Duration) -> Vec<u8> {
         if !self.auto || elapsed > DISCARD_WINDOW {
-            let mut out = std::mem::take(&mut self.pending);
+            let mut out: Vec<u8> = self.pending.drain(..).collect();
             out.extend_from_slice(bytes);
             return out;
+        }
+        // Empty input is the terminal read loop's idle tick. Release an
+        // isolated Escape promptly; keep longer OSC prefixes for late replies.
+        if bytes.is_empty() && self.pending.len() == 1 && self.pending.front() == Some(&0x1b) {
+            return self.pending.drain(..).collect();
         }
         let mut out = Vec::new();
         for &byte in bytes {
             // A bracketed paste is user text, even if it contains our reply.
             if self.paste {
                 out.push(byte);
-                self.paste_tail.push(byte);
+                self.paste_tail.push_back(byte);
                 if self.paste_tail.len() > 6 {
-                    self.paste_tail.remove(0);
+                    self.paste_tail.pop_front();
                 }
-                if self.paste_tail == b"\x1b[201~" {
+                if self.paste_tail.iter().eq(b"\x1b[201~".iter()) {
                     self.paste = false;
                     self.paste_tail.clear();
                 }
                 continue;
             }
-            self.pending.push(byte);
+            self.pending.push_back(byte);
             loop {
-                let replies: [&[u8]; 6] =
-                    [QUERY, b"\x1b]7501;?\x07", b"\x9d7501;?\x9c", b"\x9d7501;?\x07", b"\x1b]7501;?\x9c", b"\x9d7501;?\x1b\\"];
-                if self.pending == b"\x1b[200~" {
-                    out.append(&mut self.pending);
+                if self.pending.iter().eq(b"\x1b[200~".iter()) {
+                    out.extend(self.pending.drain(..));
                     self.paste = true;
                     break;
                 }
-                if replies.iter().any(|reply| *reply == self.pending) {
+                if REPLIES.iter().any(|reply| reply.len() == self.pending.len() && prefix_matches(reply, &self.pending)) {
                     self.pending.clear();
                     if elapsed <= PROBE_TIMEOUT {
                         self.enabled = true;
                     }
                     break;
                 }
-                if replies.iter().any(|reply| reply.starts_with(&self.pending)) || b"\x1b[200~".starts_with(&self.pending) {
+                if REPLIES.iter().any(|reply| prefix_matches(reply, &self.pending)) || prefix_matches(b"\x1b[200~", &self.pending) {
                     break;
                 }
-                out.push(self.pending.remove(0));
+                out.push(self.pending.pop_front().expect("nonempty candidate"));
                 if self.pending.is_empty() {
                     break;
                 }
@@ -126,6 +138,8 @@ impl StatusEmitter {
         for id in self.emitted.keys().filter(|id| !next.contains_key(*id)) {
             out.extend(clear(id));
         }
+        // A removal update conservatively re-emits each survivor once (O(records)),
+        // because a cleared root/parent may also have erased unchanged descendants.
         let removed = self.emitted.keys().any(|id| !next.contains_key(id));
         for (id, report) in &next {
             if removed || self.emitted.get(id) != Some(report) {
@@ -220,7 +234,7 @@ mod tests {
     // without enabling late. Generate every split, both terminators, and boundary times.
     #[test]
     fn probe_deadlines_and_splits() {
-        for reply in [QUERY, b"\x1b]7501;?\x07", b"\x9d7501;?\x9c", b"\x9d7501;?\x07"] {
+        for reply in REPLIES {
             for elapsed in [0, 199, 200, 201, 2999, 3000] {
                 for split in 0..=reply.len() {
                     let mut probe = Probe::new(ProgramStatusMode::Auto);
@@ -238,6 +252,36 @@ mod tests {
         assert!(!silent.enabled);
         assert_eq!(silent.feed(QUERY, DISCARD_WINDOW + Duration::from_millis(1)), QUERY);
         assert!(!silent.enabled);
+    }
+    // An isolated Esc key reaches the existing decoder on the first idle tick,
+    // including after the probe deadline but before the discard window ends.
+    #[test]
+    fn lone_escape_is_released_on_idle() {
+        use crate::attach_input::{Action, InputDecoder};
+        for start in [0, 201, 2500] {
+            let mut probe = Probe::new(ProgramStatusMode::Auto);
+            let start = Duration::from_millis(start);
+            assert!(probe.feed(b"\x1b", start).is_empty());
+            let bytes = probe.feed(&[], start + Duration::from_millis(100));
+            assert_eq!(bytes, b"\x1b");
+            let mut decoder = InputDecoder::new(0x1d);
+            let mut actions = decoder.feed(&bytes);
+            actions.extend(decoder.idle());
+            assert_eq!(actions, [Action::Raw(vec![0x1b])]);
+            assert!(!probe.enabled);
+        }
+    }
+    // Idle ticks release only a standalone Esc, not an identified OSC prefix.
+    // A fragmented late reply remains consumed and cannot enable status.
+    #[test]
+    fn late_osc_prefix_survives_idle_ticks() {
+        for split in 2..QUERY.len() {
+            let mut probe = Probe::new(ProgramStatusMode::Auto);
+            assert!(probe.feed(&QUERY[..split], Duration::from_millis(300)).is_empty());
+            assert!(probe.feed(&[], Duration::from_millis(400)).is_empty());
+            assert!(probe.feed(&QUERY[split..], Duration::from_millis(500)).is_empty());
+            assert!(!probe.enabled);
+        }
     }
     // Bracketed paste is user data: embedded replies must neither enable the
     // probe nor disappear, under every transport split.

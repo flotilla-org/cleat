@@ -274,7 +274,8 @@ their existing hello (12, or 13 with virtual declarations) and activity layouts.
 (default `auto`). Auto sends one OSC 7501 support query on the existing terminal
 input read path. A complete reply received within **200 ms** enables re-emission;
 late replies are consumed for **3 seconds from probe startup** and never enable
-it. First paint does not wait for the probe. `on` enables without probing; `off`
+it. An isolated Esc is released on the first **100 ms input idle tick**, using
+the existing decoder's idle handling. First paint does not wait for the probe. `on` enables without probing; `off`
 disables re-emission. A passthrough session forwards queries and reports unchanged
 in both directions, keeps no records, and neither probes nor clears on detach.
 
@@ -286,6 +287,8 @@ including under nested cleat. Re-emission rebuilds validated reports within the
 4096-byte sequence, 2048-byte message and 192-byte title limits, stripping bidi
 and invisible formatting. Raw VT output streams, replay snapshots and transcript
 views strip OSC 7501 so the session VT alone answers program queries.
+Re-emission omits invalid or over-limit records rather than truncating fields or
+changing ids; `inspect --json` exposes stored records for diagnosis.
 
 Recognizer/title fallback uses the root id until the program's first report;
 program reports then win until process exit or OSC 133 A. The store retains

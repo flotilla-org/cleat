@@ -305,3 +305,23 @@ fn session_end_clears_emitted_status() {
     session.service.kill("status").unwrap();
     outer.wait_for(CLEAR);
 }
+
+// A user pressing Esc immediately after a silent probe must not wait for the
+// three-second reply-discard window before the child receives the key.
+#[test]
+fn escape_during_probe_reaches_the_child_promptly() {
+    let script = r#"sh -c 'stty -echo -icanon min 1 time 0; printf READY; byte=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d " \n"); printf "BYTE=%s_END" "$byte"; sleep 30'"#;
+    let session = Session::new(VtEngineKind::Ghostty, script, false);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !session.service.capture("status").unwrap().contains("READY") {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut outer = Outer::attach(session.root(), "attach", "auto");
+    outer.wait_for(QUERY);
+    let started = Instant::now();
+    outer.input(b"\x1b");
+    outer.wait_screen("BYTE=1b_END");
+    assert!(started.elapsed() < Duration::from_secs(2), "Esc waited for the probe discard window");
+    outer.detach();
+}

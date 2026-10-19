@@ -228,6 +228,7 @@ pub trait Recognizer: Send {
     fn evaluate(&mut self, tree: &ScreenTree, title: Option<&str>) -> Result<Observation, String>;
 }
 fn provenance(tree: &ScreenTree, mut id: NodeId) -> String {
+    // Callers pass selector matches from this tree; their parent chain stays in the tree.
     loop {
         let node = tree.node(id).unwrap();
         if let Some(source) = node.attribute("provenance") {
@@ -250,6 +251,7 @@ impl Recognizer for Rules {
         let mut input = std::borrow::Cow::Borrowed(tree);
         if let Some(title) = title {
             let input = input.to_mut();
+            // ScreenTree always contains its root, including when the screen is empty.
             let bounds = input.node(input.root()).unwrap().bounds;
             let mut node = Node::new("title", bounds, title);
             node.attributes.insert("provenance".into(), "title".into());
@@ -264,6 +266,7 @@ impl Recognizer for Rules {
             let mut explanation =
                 Explanation { rule: index + 1, matched: !matches.is_empty(), captures: Vec::new(), provenance: Vec::new() };
             for matched in matches {
+                // The selector returns ids from this input, which is unchanged during evaluation.
                 let node = input.node(matched.node).unwrap();
                 let source = provenance(&input, matched.node);
                 let value = match &rule.declaration.value {

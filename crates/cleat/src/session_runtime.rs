@@ -247,7 +247,7 @@ impl SessionRuntime {
         let _ = vt_engine.drain_replies();
         let _ = vt_engine.drain_session_replies();
         if let Some(tracker) = vt_engine.program_status_tracker() {
-            tracker.clear("");
+            tracker.reset();
             if adopted.program_reported {
                 tracker.report_received();
             }

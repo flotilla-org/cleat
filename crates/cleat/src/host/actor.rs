@@ -892,6 +892,9 @@ fn wait_actor_ready_poll(pty_fd: RawFd, command_fd: RawFd, timeout: Option<Durat
     })
 }
 
+// One tracker cut point for attachment forwarding and ActivityEvent subscribers.
+type ProgramStatusObservation = (u64, bool, Vec<crate::program_status::ProgramStatusRecord>, Vec<crate::recognizer::Role>, bool);
+
 impl SessionActor {
     pub(crate) fn spawn(
         rows: u16,
@@ -1041,12 +1044,11 @@ impl SessionActor {
     pub(crate) fn program_status_matches(&self, states: &[crate::program_status::ProgramState]) -> bool {
         self.program_status.as_ref().is_some_and(|tracker| tracker.matches_states(states))
     }
-    pub(crate) fn program_status_since(
-        &self,
-        generation: Option<u64>,
-    ) -> Option<(u64, bool, Vec<crate::program_status::ProgramStatusRecord>, Vec<crate::recognizer::Role>, bool)> {
+    pub(crate) fn program_status_since(&self, generation: Option<u64>) -> Option<ProgramStatusObservation> {
         match &self.program_status {
-            Some(tracker) => tracker.observations_since(generation).map(|(generation, records, roles, reported)| (generation, true, records, roles, reported)),
+            Some(tracker) => tracker
+                .observations_since(generation)
+                .map(|(generation, records, roles, reported)| (generation, true, records, roles, reported)),
             None => (generation != Some(0)).then(|| (0, false, Vec::new(), Vec::new(), false)),
         }
     }

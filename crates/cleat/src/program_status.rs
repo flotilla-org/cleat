@@ -94,9 +94,6 @@ impl ProgramStatusStore {
     }
 
     pub fn clear(&mut self, id: &str) -> bool {
-        if id.is_empty() {
-            self.reported = false;
-        }
         let before = self.records.len();
         self.records
             .retain(|record| !id.is_empty() && record.id != id && !record.id.strip_prefix(id).is_some_and(|rest| rest.starts_with('/')));
@@ -124,7 +121,6 @@ pub struct ProgramStatusTracker(std::sync::Arc<std::sync::Mutex<TrackedProgramSt
 struct TrackedProgramStatus {
     store: ProgramStatusStore,
     generation: u64,
-    program_reported: bool,
     roles: Vec<crate::recognizer::Role>,
 }
 impl ProgramStatusTracker {
@@ -137,9 +133,13 @@ impl ProgramStatusTracker {
             state.generation = state.generation.wrapping_add(1);
         }
     }
-    pub fn observations_since(&self, generation: Option<u64>) -> Option<(u64, Vec<ProgramStatusRecord>, Vec<crate::recognizer::Role>, bool)> {
+    pub fn observations_since(
+        &self,
+        generation: Option<u64>,
+    ) -> Option<(u64, Vec<ProgramStatusRecord>, Vec<crate::recognizer::Role>, bool)> {
         self.read(|state| {
-            (generation != Some(state.generation)).then(|| (state.generation, state.store.records().to_vec(), state.roles.clone(), state.program_reported))
+            (generation != Some(state.generation))
+                .then(|| (state.generation, state.store.records().to_vec(), state.roles.clone(), state.store.reported))
         })
     }
     /// Publish the status and roles from one evaluation at one subscription cut point.
@@ -183,11 +183,7 @@ impl ProgramStatusTracker {
         })
     }
     pub fn mark_reported(&self) {
-        self.update(|store| {
-            let changed = !store.reported;
-            store.reported = true;
-            changed
-        });
+        self.report_received();
     }
     pub fn clear_inferred(&self) {
         self.update(|store| {
@@ -218,22 +214,22 @@ impl ProgramStatusTracker {
     pub fn reset(&self) {
         let mut state = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         state.store.clear("");
-        state.program_reported = false;
+        state.store.reported = false;
         state.generation = state.generation.wrapping_add(1);
     }
     pub fn report_received(&self) {
         let mut state = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !state.program_reported {
-            state.program_reported = true;
+        if !state.store.reported {
+            state.store.reported = true;
             state.generation = state.generation.wrapping_add(1);
         }
     }
     pub fn program_reported(&self) -> bool {
-        self.read(|state| state.program_reported)
+        self.read(|state| state.store.reported)
     }
     pub fn snapshot_since(&self, generation: Option<u64>) -> Option<(u64, Vec<ProgramStatusRecord>, bool)> {
         self.read(|state| {
-            (generation != Some(state.generation)).then(|| (state.generation, state.store.records().to_vec(), state.program_reported))
+            (generation != Some(state.generation)).then(|| (state.generation, state.store.records().to_vec(), state.store.reported))
         })
     }
     pub fn replace(&self, record: ProgramStatusRecord) {
@@ -250,8 +246,9 @@ impl ProgramStatusTracker {
     }
     pub fn program_ended(&self) {
         let mut state = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let changed = state.store.program_ended() || state.program_reported;
-        state.program_reported = false;
+        let reported = state.store.reported;
+        let changed = state.store.program_ended() || reported;
+        state.store.reported = false;
         if changed {
             state.generation = state.generation.wrapping_add(1);
         }
@@ -429,15 +426,19 @@ mod recognizer_tests {
                 let tracker = ProgramStatusTracker::default();
                 tracker.replace(record(source, state));
                 assert_eq!(tracker.effective_records(), [record(source, state)]);
+                assert!(!tracker.observations_since(None).unwrap().3);
                 tracker.replace(record(ProgramStatusSource::Osc7501, ProgramState::Working));
                 tracker.replace(record(source, state));
                 assert_eq!(tracker.records().len(), 2);
                 assert_eq!(tracker.effective_records(), [record(ProgramStatusSource::Osc7501, ProgramState::Working)]);
+                assert!(tracker.observations_since(None).unwrap().3);
                 tracker.clear("");
                 tracker.mark_reported(); // An explicit OSC clear remains authoritative.
                 tracker.replace(record(source, ProgramState::Working));
                 assert!(tracker.effective_records().is_empty());
+                assert!(tracker.snapshot_since(None).unwrap().2);
                 tracker.program_ended();
+                assert!(!tracker.observations_since(None).unwrap().3);
                 tracker.replace(record(source, state));
                 assert_eq!(tracker.effective_records(), [record(source, state)]);
             }
@@ -451,7 +452,7 @@ mod recognizer_tests {
         tracker.replace(record(ProgramStatusSource::Title, ProgramState::Working));
         tracker.replace(record(ProgramStatusSource::Recognizer, ProgramState::Idle));
         assert_eq!(tracker.records(), [record(ProgramStatusSource::Recognizer, ProgramState::Idle)]);
-        let (generation, _, roles) = tracker.observations_since(None).unwrap();
+        let (generation, _, roles, _) = tracker.observations_since(None).unwrap();
         assert!(roles.is_empty());
         tracker.replace_roles(Vec::new());
         assert!(tracker.observations_since(Some(generation)).is_none());

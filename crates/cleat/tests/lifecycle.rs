@@ -4954,9 +4954,20 @@ fn program_status_query_with_and_without_attachment() {
         service.create(Some("status".into()), Some(VtEngineKind::Ghostty), None,
             Some("sh -c 'printf READY; read line; stty -echo -icanon min 0 time 2; printf \"\\033]7501;?\\033\\\\\"; reply=$(dd bs=1 count=64 2>/dev/null | od -An -tx1 | tr -d \" \\n\"); printf \"REPLY=%s_END\" \"$reply\"; sleep 30'".into()), false).unwrap();
         wait_until("child ready", || service.capture("status").unwrap().contains("READY"));
-        let _attachment = attached.then(|| http_attach_stream(temp.path(), "status", 80, 24, ClientCapabilities::conservative_fallback()));
+        let mut attachment =
+            attached.then(|| http_attach_stream(temp.path(), "status", 80, 24, ClientCapabilities::conservative_fallback()));
         service.send_keys("status", b"\n").unwrap();
         wait_until("one OSC query reply", || service.capture("status").unwrap().contains("REPLY=1b5d373530313b3f1b5c_END"));
+        if let Some(stream) = &mut attachment {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|b| b == b"_END") {
+                if let Frame::Output(output) = Frame::read(stream).unwrap() {
+                    bytes.extend(output);
+                }
+            }
+            assert!(!bytes.windows(7).any(|b| b == b"\x1b]7501;"), "raw subscriber received a second terminal's query");
+        }
         service.kill("status").unwrap();
     }
 }
@@ -5054,4 +5065,43 @@ fn program_status_survives_child_exit() {
     }
     service.kill("status").unwrap();
     wait_until("deleted completed session", || service.inspect("status").is_err());
+}
+
+// Passthrough owns no records: both queries and reports retain their exact bytes
+// in both directions. Only the user's outer terminal can answer support queries.
+#[test]
+fn passthrough_program_status_is_byte_for_byte() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    let payload = b"\x1b]7501;?\x1b\\\x1b]7501;state=done:id=task\x07";
+    service.create(Some("status".into()), Some(VtEngineKind::Passthrough), None,
+        Some(format!(r#"sh -c 'read start; stty raw -echo; printf READY; read_line=$(dd bs=1 count=1 2>/dev/null); printf "\033]7501;?\033\\"; printf "\033]7501;state=done:id=task\007"; reply=$(dd bs=1 count={} 2>/dev/null | od -An -tx1 | tr -d " \n"); printf "REPLY=%s_END" "$reply"; sleep 30'"#, payload.len())), false).unwrap();
+    let mut attached = http_attach_stream(temp.path(), "status", 80, 24, ClientCapabilities::conservative_fallback());
+    attached.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    Frame::Input(b"\n".to_vec()).write(&mut attached).unwrap();
+    let mut output = Vec::new();
+    while !output.windows(5).any(|bytes| bytes == b"READY") {
+        if let Frame::Output(bytes) = Frame::read(&mut attached).unwrap_or_else(|e| panic!("{e}: {:?}", String::from_utf8_lossy(&output))) {
+            output.extend(bytes);
+        }
+    }
+    Frame::Input(b"x".to_vec()).write(&mut attached).unwrap();
+    while !output.windows(payload.len()).any(|bytes| bytes == payload) {
+        if let Frame::Output(bytes) = Frame::read(&mut attached).unwrap_or_else(|e| panic!("{e}: {:?}", String::from_utf8_lossy(&output))) {
+            output.extend(bytes);
+        }
+    }
+    Frame::Input(payload.to_vec()).write(&mut attached).unwrap();
+    let expected = payload.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let expected = format!("REPLY={expected}_END");
+    while !output.windows(expected.len()).any(|bytes| bytes == expected.as_bytes()) {
+        if let Frame::Output(bytes) = Frame::read(&mut attached).unwrap_or_else(|e| panic!("{e}: {:?}", String::from_utf8_lossy(&output))) {
+            output.extend(bytes);
+        }
+    }
+    let inspect = service.inspect("status").unwrap();
+    assert!(!inspect.program_status_available);
+    assert!(inspect.program_status.is_empty());
+    service.kill("status").unwrap();
 }

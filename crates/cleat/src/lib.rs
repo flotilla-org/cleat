@@ -1,6 +1,7 @@
 pub mod asciicast;
 mod attach_input;
 mod attach_keyboard;
+pub mod attach_status;
 mod attachment_control;
 mod attachment_view;
 pub mod build_info;
@@ -34,6 +35,7 @@ pub mod server;
 pub mod session;
 mod session_runtime;
 pub mod socket_client;
+mod status_output;
 pub mod vt;
 
 mod mouse;

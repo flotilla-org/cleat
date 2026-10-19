@@ -46,6 +46,7 @@ pub(crate) struct SessionRuntime {
     pty_child: PtyChild,
     vt_engine: Box<dyn VtEngine>,
     detached_da: Option<DeviceAttributeTracker>,
+    status_output: crate::status_output::StatusOutputFilter,
     /// The bundled ConPTY's startup handshake, until it has been answered.
     conpty_startup: Option<ConptyStartup>,
     recorder: Option<SessionRecorder>,
@@ -88,6 +89,7 @@ pub(crate) struct TransferSource {
     pub recording_paused: bool,
     pub controller_input_history: crate::protocol::ControllerInputHistory,
     pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
+    pub program_reported: bool,
     pub pty_master: std::os::fd::OwnedFd,
     pub recording: Option<std::fs::File>,
     /// This host forked the child (and so reaps it).
@@ -108,6 +110,7 @@ pub(crate) struct AdoptedSession {
     pub recording_paused: bool,
     pub controller_input_history: crate::protocol::ControllerInputHistory,
     pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
+    pub program_reported: bool,
     pub pty_child: PtyChild,
     pub recording: Option<std::fs::File>,
 }
@@ -202,6 +205,7 @@ impl SessionRuntime {
             conpty_startup,
             vt_engine,
             detached_da,
+            status_output: Default::default(),
             recorder,
             markers: HashMap::new(),
             held_keys: Default::default(),
@@ -237,6 +241,9 @@ impl SessionRuntime {
         let _ = vt_engine.drain_session_replies();
         if let Some(tracker) = vt_engine.program_status_tracker() {
             tracker.clear("");
+            if adopted.program_reported {
+                tracker.report_received();
+            }
             for record in &adopted.program_status {
                 tracker.replace(record.clone());
             }
@@ -265,6 +272,7 @@ impl SessionRuntime {
             conpty_startup: None,
             vt_engine,
             detached_da,
+            status_output: Default::default(),
             recorder,
             markers: adopted.markers,
             held_keys: Default::default(),
@@ -336,6 +344,7 @@ impl SessionRuntime {
             recording_paused: self.recorder.as_ref().is_some_and(SessionRecorder::is_paused),
             controller_input_history: self.controller_input_history.clone(),
             program_status: self.vt_engine.program_status().unwrap_or_default(),
+            program_reported: self.vt_engine.program_status_tracker().is_some_and(|tracker| tracker.program_reported()),
             pty_master,
             recording,
             forked_here: self.pty_child.forked_here(),
@@ -904,7 +913,12 @@ impl SessionRuntime {
                     if !queries_forwarded_to_client {
                         self.write_detached_replies(bytes, &engine_reply)?;
                     }
-                    chunks.push(Arc::from(bytes));
+                    // The VT owns status queries. Raw consumers must never see them.
+                    let output =
+                        if self.vt_engine.program_status_tracker().is_some() { self.status_output.push(bytes) } else { bytes.to_vec() };
+                    if !output.is_empty() {
+                        chunks.push(Arc::from(output));
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || (after_exit && is_pty_eof_after_exit(&err)) => break,
                 Err(err) if after_exit => return Err(format!("read pty output after exit: {err}")),

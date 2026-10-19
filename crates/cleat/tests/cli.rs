@@ -122,6 +122,7 @@ fn help_surfaces_vt_support_policy() {
 fn attach_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "attach", "demo"]).expect("attach positional parses");
     assert_eq!(cli.command, Command::Attach {
+        program_status: cleat::attach_status::ProgramStatusMode::Auto,
         id: Some("demo".into()),
         socket: None,
         no_create: false,
@@ -139,6 +140,7 @@ fn attach_command_parses() {
 fn attach_command_parses_no_create() {
     let cli = Cli::try_parse_from(["cleat", "attach", "--no-create", "demo"]).expect("attach --no-create parses");
     assert_eq!(cli.command, Command::Attach {
+        program_status: cleat::attach_status::ProgramStatusMode::Auto,
         id: Some("demo".into()),
         socket: None,
         no_create: true,
@@ -156,6 +158,7 @@ fn attach_command_parses_no_create() {
 fn attach_command_parses_vt() {
     let cli = Cli::try_parse_from(["cleat", "attach", "--vt", "passthrough", "demo"]).expect("attach --vt parses");
     assert_eq!(cli.command, Command::Attach {
+        program_status: cleat::attach_status::ProgramStatusMode::Auto,
         id: Some("demo".into()),
         socket: None,
         no_create: false,
@@ -172,7 +175,11 @@ fn attach_command_parses_vt() {
 #[test]
 fn watch_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "watch", "demo"]).expect("watch parses");
-    assert_eq!(cli.command, Command::Watch { id: "demo".into(), attachment: AttachmentFlags::default() });
+    assert_eq!(cli.command, Command::Watch {
+        program_status: cleat::attach_status::ProgramStatusMode::Auto,
+        id: "demo".into(),
+        attachment: AttachmentFlags::default()
+    });
 }
 
 #[test]
@@ -182,6 +189,7 @@ fn attach_command_parses_seat_control_and_identity_flags() {
     assert!(matches!(
         cli.command,
         Command::Attach {
+        program_status: cleat::attach_status::ProgramStatusMode::Auto,
             take: true,
             strict: false,
             attachment: AttachmentFlags {
@@ -754,6 +762,7 @@ fn transcript_end_bounds_are_mutually_exclusive() {
 fn send_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "send", "demo", "echo hello"]).expect("send parses");
     assert_eq!(cli.command, Command::Send {
+        ack: false,
         id: "demo".into(),
         text: "echo hello".into(),
         no_enter: false,
@@ -767,6 +776,7 @@ fn send_command_parses() {
 fn send_command_parses_no_enter() {
     let cli = Cli::try_parse_from(["cleat", "send", "--no-enter", "demo", "partial"]).expect("send --no-enter parses");
     assert_eq!(cli.command, Command::Send {
+        ack: false,
         id: "demo".into(),
         text: "partial".into(),
         no_enter: true,
@@ -780,6 +790,7 @@ fn send_command_parses_no_enter() {
 fn send_command_parses_submit() {
     let cli = Cli::try_parse_from(["cleat", "send", "--submit", "demo", "prompt"]).expect("send --submit parses");
     assert_eq!(cli.command, Command::Send {
+        ack: false,
         id: "demo".into(),
         text: "prompt".into(),
         no_enter: false,
@@ -1001,6 +1012,7 @@ fn expect_json_flag_parses() {
 fn send_mark_before_parses() {
     let cli = Cli::try_parse_from(["cleat", "send", "--mark-before", "m1", "sess", "echo hi"]).expect("parse");
     assert_eq!(cli.command, Command::Send {
+        ack: false,
         id: "sess".into(),
         text: "echo hi".into(),
         no_enter: false,

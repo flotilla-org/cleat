@@ -187,6 +187,9 @@ pub enum Command {
                            \n\
                            Press Ctrl-] then d to detach this attachment. Ctrl-] shows other commands.")]
     Attach {
+        /// Outer terminal status support: auto probes once (200 ms; late replies discarded for 3 s).
+        #[arg(long, value_enum, default_value = "auto")]
+        program_status: crate::attach_status::ProgramStatusMode,
         #[arg(value_name = "ID")]
         id: Option<String>,
         /// Connect only to this Unix socket (forwarded or remote daemon)
@@ -213,6 +216,8 @@ pub enum Command {
     #[command(after_long_help = "Attaches as a read-only watcher. The session keeps its existing\n\
                            controllers; watcher typing is discarded and its size does not affect the PTY.")]
     Watch {
+        #[arg(long, value_enum, default_value = "auto")]
+        program_status: crate::attach_status::ProgramStatusMode,
         #[arg(value_name = "ID")]
         id: String,
         #[command(flatten)]
@@ -469,6 +474,9 @@ resolved through the live daemon socket. \n\
                            \x20 sleep 2\n\
                            \x20 cleat send-keys my-session Enter")]
     Send {
+        /// Acknowledge completed/error status as user input.
+        #[arg(long)]
+        ack: bool,
         id: String,
         #[arg(value_name = "TEXT", help = "Text to send")]
         text: String,
@@ -668,12 +676,13 @@ fn check_foreground_nesting(
 /// `None` means this command uses the ordinary local runtime.
 fn execute_socket(cli: &Cli) -> Option<ExecResult> {
     match &cli.command {
-        Command::Attach { socket: Some(socket), id, attachment, strict, take, .. } => Some(
+        Command::Attach { socket: Some(socket), id, attachment, strict, take, program_status, .. } => Some(
             (|| {
                 let id = id.as_deref().ok_or("--socket requires a session ID")?;
                 crate::socket_client::ensure_supported()?;
                 let handlers = crate::platform::terminal::AttachSignalHandlers::install()?;
-                crate::socket_client::attach(socket, id, attachment.clone().resolve(), *strict, *take)?.relay_stdio_with_handlers(handlers)
+                crate::socket_client::attach(socket, id, attachment.clone().resolve(), *strict, *take)?
+                    .relay_stdio_with_program_status(handlers, *program_status)
             })()
             .map_or_else(ExecResult::Err, |_| ExecResult::Ok(None)),
         ),
@@ -791,7 +800,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
         }
     }
     match cli.command {
-        Command::Attach { id, socket: _, no_create, vt, cwd, cmd, strict, take, attachment, record } => {
+        Command::Attach { id, socket: _, no_create, vt, cwd, cmd, strict, take, attachment, record, program_status } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
@@ -814,12 +823,12 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
-            match guard.relay_stdio_with_handlers(signal_handlers) {
+            match guard.relay_stdio_with_program_status(signal_handlers, program_status) {
                 Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Watch { id, attachment } => {
+        Command::Watch { id, attachment, program_status } => {
             let signal_handlers = match crate::platform::terminal::AttachSignalHandlers::install() {
                 Ok(handlers) => handlers,
                 Err(e) => return ExecResult::Err(e),
@@ -828,7 +837,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
             };
-            match guard.relay_stdio_with_handlers(signal_handlers) {
+            match guard.relay_stdio_with_program_status(signal_handlers, program_status) {
                 Ok(()) => ExecResult::Ok(None),
                 Err(e) => ExecResult::Err(e),
             }
@@ -1214,8 +1223,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Send { id, text, no_enter, submit, controller_idle, mark_before } => {
-            if !submit && controller_idle.is_none() {
+        Command::Send { id, text, no_enter, submit, controller_idle, mark_before, ack } => {
+            if !ack && !submit && controller_idle.is_none() {
                 let mut bytes = text.into_bytes();
                 if !no_enter {
                     bytes.push(b'\r');
@@ -1244,6 +1253,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 no_enter,
                 controller_idle_ms,
                 marker_name: mark_before,
+                acknowledge: ack,
             }) {
                 Ok(offset) => ExecResult::Ok(offset.map(|offset| offset.to_string())),
                 Err(error) => ExecResult::Err(error),

@@ -91,6 +91,7 @@ fn play_at_size<W: Write, S: FnMut(Duration), I: Iterator<Item = Result<Event, S
             presentation.0.feed(event.data.as_bytes())?;
             let _ = presentation.0.drain_clipboard();
             let _ = presentation.0.drain_replies();
+            let _ = presentation.0.drain_session_replies();
             if rendered {
                 let dirty = if was_rendered { crate::provider::DirtyState::Partial } else { crate::provider::DirtyState::Full };
                 let update = presentation.0.render_update(dirty)?;
@@ -144,12 +145,7 @@ where
     S: FnMut(Duration),
 {
     let iter = crate::cast_reader::iter_output_between(cast_path, start_offset, end_offset)?;
-    use std::io::BufRead;
-    let mut header = String::new();
-    std::io::BufReader::new(std::fs::File::open(cast_path).map_err(|e| e.to_string())?)
-        .read_line(&mut header)
-        .map_err(|e| e.to_string())?;
-    let header = crate::asciicast::decode_header(header.trim())?;
+    let header = crate::cast_reader::read_header(cast_path)?;
     play_at_size(iter, opts, writer, sleeper, (header.cols.max(1), header.rows.max(1)))
 }
 

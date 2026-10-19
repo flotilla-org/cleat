@@ -10,7 +10,8 @@ remote attaches, agents — over a hosting-agnostic API.
 
 **Program status record**:
 A session-attributed report of what a program is doing: idle, working, done,
-blocked or error. Its optional hierarchical id identifies a task within that session.
+blocked or error. Its optional hierarchical id identifies a task within that session;
+records from different sources may describe the same task.
 _Avoid_: screen activity, update packet.
 
 **Program status source**:
@@ -19,8 +20,14 @@ a title-derived inference, or a recognizer's inference.
 
 **Acknowledgement**:
 A user's recognition of the session's completed or failed work, dismissing its
-done and error records while preserving live work.
+done and error records while preserving live work. Controlling attachment typing
+acknowledges work; scripts and focus-aware clients can acknowledge explicitly.
 _Avoid_: focus, watcher input, render acknowledgement.
+
+**Status re-emission**:
+An attachment's presentation of the live session's program status to its outer
+terminal, using the program's original task ids.
+_Avoid_: raw forwarding, history replay.
 
 ### Sessions & hosting
 

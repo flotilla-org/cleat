@@ -161,3 +161,24 @@ fn recorded_split_clipboard_effects_are_not_forwarded() {
         assert!(enclosing.screen_text().unwrap().contains("visible"));
     }
 }
+
+// History playback renders recorded text, but neither status queries nor reports
+// become outer-terminal effects, even when an OSC spans recording events.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn replay_program_status_has_no_outer_terminal_effects() {
+    use cleat::vt::{ghostty::GhosttyVtEngine, VtEngine};
+    let temp = tempfile::tempdir().unwrap();
+    let events = ["before", "\x1b]7501;", "?\x1b\\", "\x1b]7501;state=done:id=task", "\x1b\\after"]
+        .into_iter()
+        .enumerate()
+        .map(|(n, data)| Event { time: Duration::from_millis(n as u64), code: EventCode::Output, data: data.into() })
+        .collect::<Vec<_>>();
+    let cast = write_fixture_cast(temp.path(), &events);
+    let bytes = replay_path_to_bytes(&cast, StartBound::Offset(0), EndBound::EndOfRecording);
+    let mut outer = GhosttyVtEngine::new(80, 24);
+    outer.feed(&bytes).unwrap();
+    assert!(outer.program_status().unwrap().is_empty());
+    assert!(outer.drain_session_replies().is_empty());
+    assert!(outer.screen_text().unwrap().contains("beforeafter"));
+}

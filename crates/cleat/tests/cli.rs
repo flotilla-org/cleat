@@ -1218,3 +1218,16 @@ fn recognizer_and_explain_flags() {
     let cli = Cli::try_parse_from(["cleat", "inspect", "alpha", "--explain"]).unwrap();
     assert!(matches!(cli.command, Command::Inspect { explain: true, .. }));
 }
+
+// Conflicting explicit recognizer selections are rejected by the CLI before
+// it starts a daemon or creates any session files.
+#[test]
+fn conflicting_recognizer_selections_do_not_start_a_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli =
+        Cli::try_parse_from(["cleat", "--server", "default", "launch", "--recognizer", "synthetic", "--tag", "recognizer:other"]).unwrap();
+    let error = execute(cli, &service).expect_err("conflicting recognizers");
+    assert!(error.contains("select exactly one recognizer"), "{error}");
+    assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none(), "CLI validation must precede daemon startup");
+}

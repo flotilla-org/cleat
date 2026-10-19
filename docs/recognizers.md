@@ -2,14 +2,17 @@
 
 Recognition is opt-in: `cleat launch --recognizer synthetic --cmd ...` is
 identical to adding `--tag recognizer:synthetic` at launch. Exactly one id may
-be selected. Cleat never infers an id from the command. Selection persists in
-session metadata, including recreation and host transfer; changing tags after
-launch does not replace the active engine.
+be selected. Conflicting `--recognizer` and `--tag recognizer:` ids are rejected
+by the CLI before daemon startup. Cleat never infers an id from the command.
+Selection persists in session metadata, including recreation and host transfer;
+changing tags after launch does not replace the active engine.
 
 `cleat inspect ID --explain` displays the active id, revision, error, and each
 rule's match, named captures, and region provenance. `inspect --json` includes
 this information under `recognizer` without needing `--explain`. A role that
-has not been established is absent; it is never an empty placeholder.
+has not been established is absent; it is never an empty placeholder. Use
+`--json` as the structured contract for automation; human output and explain
+formatting are diagnostic and may change.
 
 ## Files and installation
 
@@ -17,7 +20,10 @@ Bundled sources live in `recognizers/<id>.toml`. They are embedded in the binary
 so installation does not depend on the build checkout. The shipped `synthetic`
 recognizer is an engine demonstration, not a Codex or Claude Code recognizer.
 
-Add-ons override bundled ids in the directory named by `CLEAT_RECOGNIZERS_DIR`,
+An existing add-on overrides the bundled file with the same id. Malformed or
+unreadable overrides fail loading; they do not fall back to bundled rules.
+
+Add-ons live in the directory named by `CLEAT_RECOGNIZERS_DIR`,
 or otherwise `$XDG_CONFIG_HOME/cleat/recognizers` (default
 `$HOME/.config/cleat/recognizers`) on Unix and `%APPDATA%\cleat\recognizers` on
 Windows. If no platform configuration base is available, add-ons are disabled;
@@ -90,6 +96,9 @@ internally across such observation gaps so a subsequent title-idle still
 requires working-to-idle debounce. Recognition preserves render damage and runs
 outside input admission: errors and Rust unwinding panics appear in inspect
 and cannot refuse unguarded sends. A new generation retries failed evaluation.
+Repository profiles retain Rust's default `panic = "unwind"`. Embedders must
+also use unwinding for panic isolation: with `panic = "abort"`, a panic ends the
+process before `catch_unwind` can run.
 
 `SessionService::connect_recognizer` subscribes to initial values and changes
 through `ActivityEvent::RolesChanged` and `ProgramStatusChanged`, including role

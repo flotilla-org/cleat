@@ -866,12 +866,6 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             Err(err) => ExecResult::Err(err),
         },
         Command::Launch { id, from: _, json, size, vt, cwd, cmd, mut tags, recognizer, environment, env_clear, record } => {
-            // Windows can provide basic sessions through ConPTY plus the
-            // passthrough engine while Ghostty VT support is still optional.
-            #[cfg(not(windows))]
-            if !crate::vt::functional_vt_available() {
-                return ExecResult::Err(crate::vt::nonfunctional_build_error());
-            }
             if let Some(id) = recognizer {
                 tags.push(format!("recognizer:{id}"));
             }
@@ -879,6 +873,15 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Ok(tags) => tags,
                 Err(err) => return ExecResult::Err(err),
             };
+            if let Err(error) = crate::recognizer::selected_id(&tags) {
+                return ExecResult::Err(error);
+            }
+            // Windows can provide basic sessions through ConPTY plus the
+            // passthrough engine while Ghostty VT support is still optional.
+            #[cfg(not(windows))]
+            if !crate::vt::functional_vt_available() {
+                return ExecResult::Err(crate::vt::nonfunctional_build_error());
+            }
             let options = crate::session::SessionStartOptions {
                 record: record.enabled(),
                 initial_size: size.unwrap_or_default(),

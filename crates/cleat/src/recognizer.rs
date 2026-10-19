@@ -147,29 +147,35 @@ fn resolve_addon_directory(windows: bool, lookup: impl Fn(&str) -> Option<std::f
     }
     Ok(path)
 }
+pub(crate) fn selected_id(tags: &[String]) -> Result<Option<&str>, String> {
+    let mut ids = tags.iter().filter_map(|tag| tag.strip_prefix("recognizer:"));
+    let Some(id) = ids.next() else {
+        return Ok(None);
+    };
+    if ids.next().is_some() {
+        return Err("select exactly one recognizer".into());
+    }
+    if !valid_id(id) {
+        return Err("invalid recognizer id".into());
+    }
+    Ok(Some(id))
+}
 pub fn load_selected(tags: &[String]) -> Result<Option<Rules>, String> {
     // Resolve configuration only for selected sessions.
-    if !tags.iter().any(|tag| tag.starts_with("recognizer:")) {
+    if selected_id(tags)?.is_none() {
         return Ok(None);
     }
     load_selected_in(tags, addon_directory()?.as_deref())
 }
 fn load_selected_in(tags: &[String], directory: Option<&Path>) -> Result<Option<Rules>, String> {
-    let ids: Vec<_> = tags.iter().filter_map(|t| t.strip_prefix("recognizer:")).collect();
-    if ids.len() > 1 {
-        return Err("select exactly one recognizer".into());
-    }
-    let Some(id) = ids.first() else {
+    let Some(id) = selected_id(tags)? else {
         return Ok(None);
     };
-    if !valid_id(id) {
-        return Err("invalid recognizer id".into());
-    }
     let addon = directory.map(|directory| directory.join(format!("{id}.toml")));
     let rules = if let Some(addon) = addon.filter(|path| path.exists()) {
         Rules::load(&addon)?
     } else {
-        match *id {
+        match id {
             "synthetic" => Rules::parse(Path::new("recognizers/synthetic.toml"), include_str!("../../../recognizers/synthetic.toml"))?,
             _ => {
                 return Err(format!(
@@ -179,7 +185,7 @@ fn load_selected_in(tags: &[String], directory: Option<&Path>) -> Result<Option<
             }
         }
     };
-    if rules.id != *id {
+    if rules.id != id {
         return Err("recognizer filename and id differ".into());
     }
     Ok(Some(rules))
@@ -840,6 +846,11 @@ mod tests {
         let path = temp.path().join("synthetic.toml");
         std::fs::write(&path, "id='synthetic'\nrevision=42\nmin_engine='0.1.0'\nverified=[]\n").unwrap();
         assert_eq!(load_selected_in(&["recognizer:synthetic".into()], Some(temp.path())).unwrap().unwrap().revision, 42);
+        std::fs::write(&path, "invalid TOML").unwrap();
+        assert!(
+            load_selected_in(&["recognizer:synthetic".into()], Some(temp.path())).is_err(),
+            "invalid overrides must not fall back to bundled rules"
+        );
         let tags = vec!["recognizer:addon".into()];
         let path = temp.path().join("addon.toml");
         std::fs::write(&path, "id='addon'\nrevision=2\nmin_engine='0.1.0'\nverified=[]\n").unwrap();

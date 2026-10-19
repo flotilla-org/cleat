@@ -15,22 +15,22 @@ ghostty-vt = ["dep:png"]
 test-image-link-refusal = []
 
 [dependencies]
-terminal-screen = { path = "../terminal-screen" }
-toml = "0.8"
-semver = "1"
 bitflags = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 http = "1"
 httparse = "1"
 humantime = "2"
-postcard = { version = "1", features = ["alloc"] }
-serde = { workspace = true }
-serde_json = { workspace = true }
 libc = "0.2"
 nix = { version = "0.31.2", features = ["event", "fs", "poll", "process", "signal", "socket", "uio", "term"] }
 png = { version = "0.17", optional = true }
+postcard = { version = "1", features = ["alloc"] }
+semver = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 sysinfo = "0.38"
+terminal-screen = { path = "../terminal-screen" }
+toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]

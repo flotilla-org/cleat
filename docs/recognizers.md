@@ -21,7 +21,7 @@ so installation does not depend on the build checkout. The shipped `synthetic`
 recognizer is an engine demonstration, not a Codex or Claude Code recognizer.
 
 An existing add-on overrides the bundled file with the same id. Malformed or
-unreadable overrides fail loading; they do not fall back to bundled rules.
+unreadable overrides, including broken symlinks, fail loading; they do not fall back to bundled rules.
 
 Add-ons live in the directory named by `CLEAT_RECOGNIZERS_DIR`,
 or otherwise `$XDG_CONFIG_HOME/cleat/recognizers` (default
@@ -65,7 +65,7 @@ and semver requirements; it records verification claims, not command detection.
 `state`. `select` uses terminal-screen's existing selector grammar, including
 `:matches(/regex/)` and `:has-text("literal")`. `value` substitutes named
 captures with `{name}`; literal text around captures is preserved. Unknown
-capture names fail loading; absent optional captures cause an evaluation error.
+capture names fail loading; absent optional captures cause an evaluation error. An evaluation error discards the entire observation for that frame, including otherwise successful rules, and is reported in inspect.
 Without `value`, a role retains the matched node's text, including spaces.
 
 `role` is an ASCII identifier (letters, digits, `_`, `-`). Each match produces a

@@ -11,6 +11,8 @@ use terminal_screen::{Node, NodeId, ScreenTree, Selector};
 use crate::program_status::{ProgramKind, ProgramState, ProgramStatusRecord, ProgramStatusSource};
 
 pub const ENGINE_VERSION: &str = "0.1.0";
+const IDLE_CONFIRMATION_MS: u64 = 100;
+const IDLE_MAX_WAIT_MS: u64 = 700;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,7 +174,15 @@ fn load_selected_in(tags: &[String], directory: Option<&Path>) -> Result<Option<
         return Ok(None);
     };
     let addon = directory.map(|directory| directory.join(format!("{id}.toml")));
-    let rules = if let Some(addon) = addon.filter(|path| path.exists()) {
+    let addon = addon
+        .map(|path| match std::fs::symlink_metadata(&path) {
+            Ok(_) => Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        })
+        .transpose()?
+        .flatten();
+    let rules = if let Some(addon) = addon {
         Rules::load(&addon)?
     } else {
         match id {
@@ -374,7 +384,7 @@ impl Engine {
             || self.deadline().is_some_and(|deadline| now >= deadline)
     }
     pub fn deadline(&self) -> Option<u64> {
-        self.pending.map(|(start, last, _)| (last + 100).min(start + 700))
+        self.pending.map(|(start, last, _)| (last + IDLE_CONFIRMATION_MS).min(start + IDLE_MAX_WAIT_MS))
     }
     /// Returns a status only on a confirmed change. Repeated frames reuse the cached observation.
     pub fn evaluate(&mut self, tree: &mut ScreenTree, title: Option<&str>, now: u64) -> Option<ProgramStatusRecord> {
@@ -397,6 +407,10 @@ impl Engine {
             }
         }
         let observation = &self.candidate;
+        if !observation.roles.is_empty() {
+            // Retry attachment errors on cached observations without clearing evaluation errors.
+            self.inspect.error = None;
+        }
         for role in &observation.roles {
             let mut node = Node::new(
                 &role.role,
@@ -429,11 +443,11 @@ impl Engine {
             self.pending = None;
         } else {
             let pending = self.pending.get_or_insert((now, now, 1));
-            if now >= pending.1 + 100 {
+            if now >= pending.1 + IDLE_CONFIRMATION_MS {
                 pending.1 = now;
                 pending.2 += 1;
             }
-            if pending.2 < 3 && now < pending.0 + 700 {
+            if pending.2 < 3 && now < pending.0 + IDLE_MAX_WAIT_MS {
                 return None;
             }
             self.pending = None;
@@ -660,6 +674,26 @@ mod tests {
     }
     fn tree(generation: u64) -> ScreenTree {
         ScreenTree::from_root(generation, Node::new("screen", Rect { col: 0, row: 0, width: 80, height: 24 }, ""))
+    }
+    // A cached observation can attach again after a caller supplies valid geometry.
+    #[test]
+    fn cached_role_attachment_recovers_without_clearing_evaluation_errors() {
+        let mut engine = Engine::new(Box::new(rules("[[rule]]\nselect='screen'\nrole='composer'")));
+        engine.evaluate(&mut tree(1), None, 0);
+        let mut small = ScreenTree::from_root(1, Node::new("screen", Rect { col: 0, row: 0, width: 1, height: 1 }, ""));
+        engine.evaluate(&mut small, None, 0);
+        assert!(engine.inspect.error.is_some());
+        let mut recovered = tree(1);
+        engine.evaluate(&mut recovered, None, 0);
+        assert!(engine.inspect.error.is_none());
+        assert_eq!(recovered.select("composer").unwrap().len(), 1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn broken_addon_symlink_does_not_fall_back_to_bundled_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing.toml"), temp.path().join("synthetic.toml")).unwrap();
+        assert!(load_selected_in(&["recognizer:synthetic".into()], Some(temp.path())).is_err());
     }
     fn line(tree: &mut ScreenTree, text: &str, source: &str) {
         let mut node = Node::new("row", Rect { col: 0, row: 0, width: 80, height: 1 }, text);

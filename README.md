@@ -275,7 +275,10 @@ their existing hello (12, or 13 with virtual declarations) and activity layouts.
 input read path. A complete reply received within **200 ms** enables re-emission;
 late replies are consumed for **3 seconds from probe startup** and never enable
 it. An isolated Esc is released on the first **100 ms input idle tick**, using
-the existing decoder's idle handling. First paint does not wait for the probe. `on` enables without probing; `off`
+the existing decoder's idle handling. A reply fragmented immediately after its
+leading Esc across an idle tick is indistinguishable from that key and is
+forwarded as input; longer identified OSC prefixes remain buffered.
+First paint does not wait for the probe. `on` enables without probing; `off`
 disables re-emission. A passthrough session forwards queries and reports unchanged
 in both directions, keeps no records, and neither probes nor clears on detach.
 

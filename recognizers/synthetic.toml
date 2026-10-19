@@ -1,0 +1,25 @@
+id = "synthetic"
+revision = 1
+min_engine = "0.1.0"
+verified = ["synthetic ^1.0"]
+
+# Engine demonstration only; this is not an agent recognizer.
+[[rule]]
+select = 'row:matches(/^Draft: (?P<draft>\S+)/)'
+role = "composer"
+value = "{draft}"
+
+[[rule]]
+select = 'title:has-text("Working")'
+state = "working"
+
+[[rule]]
+select = 'row:has-text("Permission required")'
+role = "dialog"
+value = "Permission required"
+state = "blocked"
+kind = "permission"
+
+[[rule]]
+select = 'row:has-text("Ready")'
+state = "idle"

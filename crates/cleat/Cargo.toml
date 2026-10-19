@@ -16,6 +16,8 @@ test-image-link-refusal = []
 
 [dependencies]
 terminal-screen = { path = "../terminal-screen" }
+toml = "0.8"
+semver = "1"
 bitflags = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"

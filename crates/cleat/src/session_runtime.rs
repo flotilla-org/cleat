@@ -45,6 +45,9 @@ pub(crate) struct SessionRuntime {
     pub(crate) controller_input_history: crate::protocol::ControllerInputHistory,
     pty_child: PtyChild,
     vt_engine: Box<dyn VtEngine>,
+    recognizer: Option<crate::recognizer::Engine>,
+    recognition_tree: Option<terminal_screen::ScreenTree>,
+    recognition_generation: u64,
     detached_da: Option<DeviceAttributeTracker>,
     status_output: crate::status_output::StatusOutputFilter,
     /// The bundled ConPTY's startup handshake, until it has been answered.
@@ -167,6 +170,7 @@ impl SessionRuntime {
             }
         }
 
+        let recognizer = crate::recognizer::load_selected(&session.tags)?.map(|rules| crate::recognizer::Engine::new(Box::new(rules)));
         let pty_child = PtyChild::spawn_with_ambient(session, coordinates)?;
         pty_child.set_nonblocking()?;
         let conpty_startup = pty_child.sends_startup_queries().then(ConptyStartup::new);
@@ -197,6 +201,9 @@ impl SessionRuntime {
 
         let hosting_epoch = crate::runtime::hosting_epoch(&session_dir)?;
         let mut runtime = Self {
+            recognizer,
+            recognition_tree: None,
+            recognition_generation: 0,
             hosting_epoch,
             controller_input_history: Default::default(),
             session: session.clone(),
@@ -264,6 +271,10 @@ impl SessionRuntime {
             vt::VtEngineKind::Ghostty => None,
         };
         let mut runtime = Self {
+            recognizer: crate::recognizer::load_selected(&adopted.session.tags)?
+                .map(|rules| crate::recognizer::Engine::new(Box::new(rules))),
+            recognition_tree: None,
+            recognition_generation: 0,
             hosting_epoch: adopted.hosting_epoch,
             controller_input_history: adopted.controller_input_history,
             session: adopted.session,
@@ -631,7 +642,10 @@ impl SessionRuntime {
         }
         let (width_px, height_px) = self.pty_pixel_size(cols, rows);
         self.pty_child.resize(cols, rows, width_px, height_px)?;
-        self.vt_engine.resize(cols, rows)
+        self.vt_engine.resize(cols, rows)?;
+        self.recognition_generation = self.recognition_generation.wrapping_add(1);
+        self.recognition_tree = None;
+        Ok(())
     }
 
     pub(crate) fn set_cell_size(&mut self, cell_width_px: u32, cell_height_px: u32) -> Result<(), String> {
@@ -672,6 +686,7 @@ impl SessionRuntime {
 
         let activity = self.screen_activity.json_snapshot(Instant::now());
         InspectResult {
+            recognizer: self.recognizer.as_ref().map(|engine| engine.inspect.clone()),
             program_status: self.vt_engine.program_status().unwrap_or_default(),
             program_status_available: self.vt_engine.program_status().is_some(),
             title: self.vt_engine.title(),
@@ -806,6 +821,9 @@ impl SessionRuntime {
 
     pub(crate) fn program_ended(&mut self) {
         self.vt_engine.program_ended();
+        if let Some(engine) = &mut self.recognizer {
+            engine.stop_confirmations();
+        }
     }
 
     pub(crate) fn record_exit(&mut self, exit: ChildExit) {
@@ -928,12 +946,48 @@ impl SessionRuntime {
         if !chunks.is_empty() {
             self.note_screen_activity_candidate(ScreenActivityTime::new(Instant::now(), unix_timestamp_millis(SystemTime::now())));
         }
+        self.recognize();
         Ok(PtyOutput { chunks })
+    }
+
+    pub(crate) fn recognition_deadline(&self) -> Option<Instant> {
+        self.recognizer.as_ref()?.deadline().map(|ms| self.epoch + Duration::from_millis(ms))
+    }
+
+    pub(crate) fn recognize(&mut self) {
+        let Some(engine) = &mut self.recognizer else {
+            return;
+        };
+        if self.recognition_tree.is_none() {
+            match self.vt_engine.recognition_tree(self.recognition_generation) {
+                Ok(tree) => self.recognition_tree = Some(tree),
+                Err(error) => {
+                    engine.inspect.error = Some(error);
+                    return;
+                }
+            }
+        }
+        let title = self.vt_engine.title();
+        if !engine.needs_update(self.recognition_generation, title.as_deref(), self.epoch.elapsed().as_millis() as u64) {
+            return;
+        }
+        let mut tree = self.recognition_tree.as_ref().unwrap().clone();
+        let record = engine.evaluate(&mut tree, title.as_deref(), self.epoch.elapsed().as_millis() as u64).map(|mut record| {
+            record.since = unix_timestamp_millis(SystemTime::now());
+            record
+        });
+        if let Some(tracker) = self.vt_engine.program_status_tracker() {
+            tracker.publish_recognition(record, engine.inspect.observation.roles.clone(), engine.inspect.observation.state.is_none());
+        }
     }
 
     fn note_screen_activity_candidate(&mut self, changed_at: ScreenActivityTime) {
         match self.vt_engine.screen_activity_changed() {
-            Ok(Some(true)) => self.pending_screen_activity_at = Some(changed_at),
+            Ok(Some(true)) => {
+                self.pending_screen_activity_at = Some(changed_at);
+                self.recognition_generation = self.recognition_generation.wrapping_add(1);
+                self.recognition_tree = None;
+            }
             Ok(Some(false) | None) => {}
             Err(err) => eprintln!("screen activity observation error: {err}"),
         }

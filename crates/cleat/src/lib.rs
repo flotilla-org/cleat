@@ -64,3 +64,5 @@ mod embedded_transfer;
 mod termination_diagnostics;
 
 pub mod clipboard;
+
+pub mod recognizer;

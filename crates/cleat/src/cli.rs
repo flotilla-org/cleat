@@ -256,6 +256,9 @@ pub enum Command {
         cmd: Option<String>,
         #[arg(long = "tag", value_name = "TAG", allow_hyphen_values = true, help = "Attach an opaque tag to the session; repeatable")]
         tags: Vec<String>,
+        /// Select an application recognizer explicitly.
+        #[arg(long)]
+        recognizer: Option<String>,
         #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_environment, help = "Set a child environment variable; repeatable")]
         environment: Vec<(String, String)>,
         /// Start with an empty child environment before applying --env and Cleat identity/coordinates.
@@ -428,6 +431,9 @@ resolved through the live daemon socket. \n\
                            It does not track the shell's current directory after cd commands.")]
     Inspect {
         id: String,
+        /// Show rule matches, captures, and provenance.
+        #[arg(long)]
+        explain: bool,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(long, help = "Output the screen region tree as JSON (--json optional; stable selectors v1)")]
@@ -859,12 +865,15 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, from: _, json, size, vt, cwd, cmd, tags, environment, env_clear, record } => {
+        Command::Launch { id, from: _, json, size, vt, cwd, cmd, mut tags, recognizer, environment, env_clear, record } => {
             // Windows can provide basic sessions through ConPTY plus the
             // passthrough engine while Ghostty VT support is still optional.
             #[cfg(not(windows))]
             if !crate::vt::functional_vt_available() {
                 return ExecResult::Err(crate::vt::nonfunctional_build_error());
+            }
+            if let Some(id) = recognizer {
+                tags.push(format!("recognizer:{id}"));
             }
             let tags = match normalize_cli_tags(tags) {
                 Ok(tags) => tags,
@@ -1193,7 +1202,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 }
             }
         }
-        Command::Inspect { id, json, screen, select, text_only, producer } => {
+        Command::Inspect { id, json, explain, screen, select, text_only, producer } => {
             if screen {
                 return match service.screen_query(&id, select.as_deref(), &producer, text_only) {
                     Ok(value) if text_only => ExecResult::Ok(Some(value["text"].as_str().unwrap_or("").to_string())),
@@ -1211,7 +1220,15 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                     Err(err) => ExecResult::Err(format!("serialize inspect result: {err}")),
                 }
             } else {
-                ExecResult::Ok(Some(format_inspect_human(&result)))
+                let mut output = format_inspect_human(&result);
+                if let Some(recognizer) = &result.recognizer {
+                    output
+                        .push_str(&format!("\nrecognizer={} revision={} error={:?}", recognizer.id, recognizer.revision, recognizer.error));
+                    if explain {
+                        output.push_str(&format!("\n{:#?}", recognizer.observation.explanations));
+                    }
+                }
+                ExecResult::Ok(Some(output))
             }
         }
         Command::Signal { id, signal, target } => {

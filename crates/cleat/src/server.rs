@@ -1210,7 +1210,7 @@ impl SessionService {
         &self,
         selectors: &[String],
     ) -> Result<(crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot), String> {
-        let (client, directory, _) = self.connect_subscription(selectors, None, false)?;
+        let (client, directory, _) = self.connect_subscription(selectors, None, false, false)?;
         Ok((client, directory))
     }
 
@@ -1227,7 +1227,7 @@ impl SessionService {
         if stable_threshold_ms == 0 {
             return Err("screen activity stability threshold must be at least one millisecond".to_string());
         }
-        let (client, _, activity) = self.connect_subscription(selectors, Some(stable_threshold_ms), false)?;
+        let (client, _, activity) = self.connect_subscription(selectors, Some(stable_threshold_ms), false, false)?;
         let activity = activity.ok_or_else(|| "packet stream did not send an activity snapshot".to_string())?;
         Ok((client, activity))
     }
@@ -1235,7 +1235,13 @@ impl SessionService {
     /// Subscribe to session-attributed store snapshots on the activity event path.
     /// An initial ProgramStatusChanged event is sent for every selected session.
     pub fn connect_program_status(&self, selectors: &[String]) -> Result<crate::packet::PacketClient<SessionStream>, String> {
-        let (client, _, _) = self.connect_subscription(selectors, None, true)?;
+        let (client, _, _) = self.connect_subscription(selectors, None, true, false)?;
+        Ok(client)
+    }
+
+    /// Subscribe to role changes and status snapshots, including their initial values.
+    pub fn connect_recognizer(&self, selectors: &[String]) -> Result<crate::packet::PacketClient<SessionStream>, String> {
+        let (client, _, _) = self.connect_subscription(selectors, None, true, true)?;
         Ok(client)
     }
 
@@ -1244,6 +1250,7 @@ impl SessionService {
         selectors: &[String],
         screen_activity_stable_ms: Option<u64>,
         program_status: bool,
+        recognizer_roles: bool,
     ) -> Result<
         (crate::packet::PacketClient<SessionStream>, crate::packet::DirectorySnapshot, Option<crate::packet::ActivitySnapshot>),
         String,
@@ -1254,6 +1261,7 @@ impl SessionService {
         let mut stream = connect_session_socket(&socket_path)?;
         let output_context = crate::output_admission::client_header()?;
         let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest {
+            recognizer_roles,
             program_status,
             selectors: selectors.to_vec(),
             screen_activity_stable_ms,

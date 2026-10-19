@@ -1200,6 +1200,7 @@ unsafe extern "C" fn program_status_trampoline(
     if report.state == 5 {
         effects.program_status.report_received();
         effects.program_status.clear(&id);
+        effects.program_status.mark_reported();
         return;
     }
     let state = match report.state {

@@ -719,6 +719,16 @@ impl VtEngine for GhosttyVtEngine {
         String::from_utf8(payload).map_err(|err| format!("ghostty plain-text snapshot was not valid utf-8: {err}"))
     }
 
+    fn recognition_tree(&mut self, generation: u64) -> Result<terminal_screen::ScreenTree, String> {
+        self.capture_activity_damage()?;
+        let (dirty, rows) = self.deferred_render_damage();
+        let result = self.render_update(DirtyState::Full);
+        self.deferred_render_dirty = dirty;
+        self.deferred_render_dirty_rows = rows;
+        let grid = crate::recognizer::screen_grid(&result?, generation);
+        Ok(terminal_screen::analyze(&grid))
+    }
+
     fn screen_grid(&mut self) -> Result<ScreenGrid, String> {
         self.render_state.update(&self.terminal)?;
 

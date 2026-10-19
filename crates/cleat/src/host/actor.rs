@@ -1044,12 +1044,10 @@ impl SessionActor {
     pub(crate) fn program_status_since(
         &self,
         generation: Option<u64>,
-    ) -> Option<(u64, bool, Vec<crate::program_status::ProgramStatusRecord>, bool)> {
+    ) -> Option<(u64, bool, Vec<crate::program_status::ProgramStatusRecord>, Vec<crate::recognizer::Role>, bool)> {
         match &self.program_status {
-            Some(tracker) => {
-                tracker.snapshot_since(generation).map(|(generation, records, reported)| (generation, true, records, reported))
-            }
-            None => (generation != Some(0)).then(|| (0, false, Vec::new(), false)),
+            Some(tracker) => tracker.observations_since(generation).map(|(generation, records, roles, reported)| (generation, true, records, roles, reported)),
+            None => (generation != Some(0)).then(|| (0, false, Vec::new(), Vec::new(), false)),
         }
     }
 
@@ -1409,6 +1407,7 @@ fn session_actor_loop(
     let _ = ready.send(Ok((runtime.screen_activity_tracker(), runtime.program_status_tracker())));
     loop {
         finish_submission(&mut runtime, &mut state, &wake);
+        runtime.recognize();
         // Exit has been reaped and final output drained. EOF remains readable
         // forever, so monitoring the PTY here would turn an idle retained
         // terminal into a busy loop. Keep its state available for commands,
@@ -1424,7 +1423,13 @@ fn session_actor_loop(
         }
         #[cfg(unix)]
         {
-            let deadline = state.presentation.deadline().into_iter().chain(state.submission.as_ref().map(|s| s.enter_at)).min();
+            let deadline = state
+                .presentation
+                .deadline()
+                .into_iter()
+                .chain(state.submission.as_ref().map(|s| s.enter_at))
+                .chain(runtime.recognition_deadline())
+                .min();
             let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             let readiness = match wait_actor_ready(runtime.pty_child(), command_wake.raw_fd(), timeout) {
                 Ok(readiness) => readiness,

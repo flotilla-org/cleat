@@ -1,0 +1,61 @@
+# Expectations stub for #352; schema local to these fixtures, not recognizer rules.
+cast = "codex-120x40.cast"
+harness = "codex-cli 0.160.0"
+
+[[expect]]
+marker = "empty"
+roles = ["composer"]
+composer.value = ""
+
+[[expect]]
+marker = "draft"
+roles = ["composer"]
+composer.value = "Describe the throwaway file."
+
+[[expect]]
+marker = "draft-placeholder-words"
+roles = ["composer"]
+composer.value = "Ask Codex to do anything with this draft"
+
+[[expect]]
+marker = "draft-multiline"
+roles = ["composer"]
+composer.value = "First throwaway line\nSecond throwaway line"
+
+[[expect]]
+marker = "draft-space"
+roles = ["composer"]
+composer.value = "   "
+
+[[expect]]
+marker = "draft-cursor-left"
+roles = ["composer"]
+composer.value = "Text after cursor"
+
+[[expect]]
+marker = "working"
+roles = ["composer", "status"]
+composer.value = ""
+status.state = "working"
+
+[[expect]]
+marker = "approval"
+roles = ["dialog"]
+dialog.kind = "approval"
+absent = ["composer"]
+
+[[expect]]
+marker = "done"
+roles = ["composer"]
+composer.value = ""
+
+[[expect]]
+marker = "resize-shrunk"
+roles = ["composer"]
+composer.value = ""
+
+[[expect]]
+marker = "resize"
+roles = ["composer"]
+composer.value = ""
+

@@ -1,5 +1,121 @@
 # Codex recognizer fixtures
 
+## Linux recordings (#350, Codex 0.160.0)
+
+Recorded 2026-10-19 with **`codex-cli 0.160.0`** (`codex --version`),
+cleat 0.1.0 (`d2f1f82925f0`, Ghostty VT), recording enabled by default
+([ADR 0002](../../../docs/adr/0002-recording-on-by-default.md)).
+These are terminal evidence for #350 / #313; recognizer rules belong to #352.
+
+| Cast | Initial and restored terminal size | Shrunk size |
+| --- | --- | --- |
+| `codex-120x40.cast` | 120 columns × 40 rows | 60 × 16 |
+| `codex-80x24.cast` | 80 columns × 24 rows | 60 × 16 |
+
+### Reproduction
+
+Use an empty scratch directory outside any checkout:
+
+```sh
+mkdir -p /tmp/codex-fixture-scratch
+cleat launch fixture-codex-120 --size 120x40 \
+  --cwd /tmp/codex-fixture-scratch --record \
+  --cmd 'codex --no-daemon --no-alt-screen -a on-request -s read-only -c check_for_update_on_startup=false'
+```
+
+For the smaller cast, use a fresh session id and `--size 80x24`.
+The nested harness uses existing provisioned credentials without copying or
+printing them. Approval is explicitly `on-request`, sandbox `read-only`;
+the crew's bypass mode is not inherited. No files were read or created by
+the nested harness. The harmless command prints only `fixture complete`.
+The startup PATH-alias warning is real and left visible.
+
+Drive drafts with `cleat send ID --no-enter TEXT`, clear with
+`cleat send-keys ID C-c`, move to the start with `Home`, and mark after
+`cleat wait ID --screen-stable 1 --timeout 5`. Multi-line text is one send
+containing a literal newline. Spaces are exactly three ASCII spaces.
+The submitted prompt (using `cleat send ID --submit`) is:
+
+```text
+For a terminal fixture, run sleep 20; printf "fixture complete\n" using the command tool, then reply Done. Use a harmless command only.
+```
+
+The local sandbox cannot create namespaces. Codex retries the same harmless
+command with an explicit approval dialog; mark it before approving once with
+Enter. Wait for `Worked for` and a stable screen before marking `done`.
+
+For resize, attach a controller in a PTY, shrink and grow its dimensions,
+and signal the controller with SIGWINCH at each change. Cleat reserves one
+row for its attachment bar: use outer dimensions 120×41 or 80×25, shrink to
+60×17, then restore the original outer size. Wait two seconds before each
+resize marker. Detach with Ctrl-] d; kill the session after all markers.
+Attachment briefly reports the full outer height before reserving its bar
+(120×41 or 80×25), then returns to the requested content height. No marker
+is placed in that transient state. The cast's `r` events contain all actual
+child dimensions.
+
+### Named points (both casts)
+
+| Marker | Screen at the marker / expected roles |
+| --- | --- |
+| `empty` | Empty composer, faint `Ask Codex to do anything` placeholder. |
+| `draft` | Composer contains `Describe the throwaway file.` |
+| `draft-placeholder-words` | Plain draft `Ask Codex to do anything with this draft`; the initial words are not a placeholder. |
+| `draft-multiline` | Composer contains `First throwaway line`, newline, `Second throwaway line`. |
+| `draft-space` | Composer contains three spaces; no placeholder. |
+| `draft-cursor-left` | `Text after cursor`, cursor at the beginning of the value. |
+| `working` | `Working (... • esc to interrupt)` status; empty composer with placeholder. |
+| `approval` | Command approval dialog for sleep/printf. The selected `›` is a dialog option, not a composer. |
+| `done` | `Done.` reply and `Worked for` footer; idle empty composer. |
+| `resize-shrunk` | Settled 60×16 screen, empty composer below reflowed history. |
+| `resize` | Restored original size; earlier submitted prompt returns to view above the current empty composer. |
+
+The adjacent TOML files are **expectations stubs**, not executable rules or
+a claim that the engine already supports their schema. Each `[[expect]]`
+identifies a cast marker, lists expected roles, and gives dotted role
+properties. `absent` lists roles that must not be inferred. Only evidenced
+properties are asserted: idle points do not invent a status node. #352 can
+adapt the stub layout to the engine's fixture API while preserving these
+values, including spaces and the literal newline.
+
+### Measured style evidence (extends #313 revision)
+
+The casts preserve output SGR and hardware cursor controls:
+
+- The composer `›` uses SGR **1** (bold), followed by SGR 22 to reset it.
+- The empty placeholder uses SGR **2** (faint). Draft text, including the
+  draft starting with the placeholder wording, is normal intensity.
+- Space-only input has a visible cursor three columns after the insertion
+  start, despite a visually blank value. `draft-cursor-left` moves the
+  cursor back to the insertion start with all draft text after it.
+- The hardware cursor is shown (DECSET `?25h`) at settled composer markers,
+  including `working`, and hidden (`?25l`) in the approval dialog. Redraws
+  temporarily hide it, so intermediate escape events are not settled state.
+- Approval also uses `›` for the selected option: bold marker evidence alone
+  cannot establish a composer. Resize exposes historical prompt markers;
+  recognition must distinguish them from the live composer.
+
+### Privacy and validation
+
+Every event in both published casts was decoded and read, including input,
+OSC title payloads, attachment metadata and output. There are no tokens,
+account names, emails, hostnames, internal URLs, or file contents. Input
+events contain only the throwaway drafts, harmless command prompt and
+control keys; no credential-shaped keystrokes were recorded.
+
+Two global, equal-width text redactions were applied to every event string:
+`OpenAI` → `Sample` in the banner, and the organization component of the
+harness's temporary path → `fixturex`. No timings, markers, terminal sizes,
+SGR, cursor controls or event ordering were changed. The public model label
+`GPT-6.1-Sol` remains; it identifies a model, not an account. The original
+recordings are not committed.
+
+Validation parses every JSON event and both TOML stubs, checks exact marker
+coverage and resize dimensions, and replays output through an independent
+terminal emulator to inspect each marker's composer text and cursor. Style
+claims were checked directly against the recorded SGR sequences. No
+recognizer implementation or rules are included.
+
 ## Authenticated macOS recordings (#355)
 
 Recorded 2026-10-19 on macOS with **codex-cli 0.162.1** (`codex --version`)

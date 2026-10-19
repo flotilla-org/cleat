@@ -127,3 +127,86 @@ independent terminal emulator to inspect composer text, reply/dialog text
 and cursor visibility. Raw SGR and OSC payloads were checked separately;
 unsupported terminal capability queries in that emulator are not treated
 as visible style evidence. No recognizer behavior is claimed by the stubs.
+
+## No-login Linux recordings (#351, partial)
+
+Recorded fixtures of **Claude Code** for the recognizer work (#313 ruling 2, issue #351). Recognizer rules are out of scope here. **This is a partial recording of #351**: see [Not recorded](#not-recorded).
+
+| | |
+|---|---|
+| Harness | Claude Code `2.1.287` (`claude --version` → `2.1.287 (Claude Code)`) |
+| Terminal sizes | `120x40` and `80x24` (cleat/Ghostty engine, `TERM_PROGRAM=ghostty`) |
+| Permission mode | default (`⏸ manual mode on` in the footer) |
+| Auth state | **not logged in** (see below) |
+
+### Files
+
+| Cast | Expectations stub |
+|---|---|
+| `claude-code-120x40.cast` | `claude-code-120x40.toml` |
+| `claude-code-80x24.cast` | `claude-code-80x24.toml` |
+
+Casts are asciicast v3, as written by `cleat` (ADR 0002). Each `cleat mark` is an `"m"` event named after the marker. The `"i"` events are the keys sent; all are the throwaway text listed below.
+
+### Launch command
+
+```sh
+cd /tmp/scratch351   # scratch dir outside any checkout, with two throwaway files
+cleat launch cc351-120x40 --tag project=cleat --tag purpose=fixture \
+    --size 120x40 --cwd /tmp/scratch351 \
+    --env CLAUDE_CONFIG_DIR=<crew config dir> \
+    --cmd "claude --permission-mode default"
+```
+
+The same command with `80x24` made the other cast. No Claude env markers were unset (`CLAUDECODE` did not stop the nested launch). The only environment passed to the child was `CLAUDE_CONFIG_DIR`, so onboarding and the folder-trust prompt were already answered; the trust dialog is not in the casts.
+
+Driving: `cleat wait <id> --screen-stable N`, then `cleat mark <id> <name>` once the screen was stable. Text went in with `cleat send --no-enter`, a newline in a draft with `\` then `Enter`, the cursor with `send-keys Left`, and a draft was cleared with `C-u` (repeated until the placeholder returned). Resize used `cleat attach` in a pseudo-terminal whose window size was changed (the `"r"` events); the `"r"` events carry a transient `+1` row (e.g. `60x21` then `60x20`; `120x41` then `120x40`) from the attach status line. Assert against the **final** size of each pair: `60x20` and `120x40` (80x24 session: `50x15` and `80x24`).
+
+### Markers
+
+"Composer" is the area between the two `─` rules. Row numbers are 1-indexed.
+
+| Marker | What is on screen (120x40 rows; 80x24 is the same layout 16 rows up) |
+|---|---|
+| `empty` | Banner (logo, `Claude Code v2.1.287`, model/plan, cwd, a tip). Composer row 38: `❯ ` then faint placeholder `Try "refactor <filepath>"`. Footer row 40: `⏸ manual mode on · ? for shortcuts · ← for agents`. |
+| `draft` | Composer row 38: `❯ list the files here`. Footer is just `⏸ manual mode on`. A red `Not logged in · Run /login` hint sits right-aligned above the top rule. |
+| `draft-placeholder-words` | Composer row 38: the current placeholder wording followed by ` in this file`, i.e. `❯ Try "refactor <filepath>" in this file` (80x24: `Try "create a util logging.py that..." in this file`). Same footer as `draft`. |
+| `draft-multiline` | Composer rows 37–38: `❯ line one` and, indented two columns with no `❯`, `  line two`. The rules move to rows 36 and 39. |
+| `draft-space` | Composer row 38: `❯` and nothing visible (three spaces typed). Footer is `⏸ manual mode on`; no placeholder. |
+| `draft-cursor-left` | Composer row 38: `❯ abc def`, cursor moved three cells left so it sits before `def`. |
+| `resize-shrunk` | Window shrunk to 60x20 (80x24 session: 50x15) with `abc def` still in the composer; rules re-drawn at the new width, banner above. |
+| `resize` | Window grown back to 120x40 (80x24) with the composer redrawn at full width at its original rows. |
+
+The placeholder wording is chosen **at random per launch** (`Try "refactor <filepath>"`, `Try "fix lint errors"`, `Try "write a test for <filepath>"`, … were all seen). Recognizers must not hard-code it; the two casts use different wording on purpose.
+
+#### Not recorded
+
+`working`, `approval`, `question` and `done` are **not recorded**. The nested instance has no inheritable auth: with the crew's `CLAUDE_CONFIG_DIR`, and with a direct `claude -p`, every turn fails with `Not logged in · Please run /login`. Making credentials available to a nested instance is an operator decision, so none were copied or injected. #351 stays open for those states and for re-recording with a logged-in instance.
+
+Consequences for the recorded states: the `Not logged in · Run /login` hint appears after the first keystroke (not in `empty`), and a logged-in instance may differ in banner, hints and style. See the caveat below.
+
+### Measured style evidence
+
+Extends the #313 revision (2.1.287: composer between two `─` rules, hardware cursor hidden, no faint text, `❯` and the draft share one span). Measured on these casts (unauthenticated, default permission mode):
+
+- **Layout** holds: the composer is between two `─` rules (SGR `38;2;136;136;136`), footer below. `❯` is followed by a **U+00A0**, not a space. `❯` and the draft are one span: `ESC[39m❯␣<draft>` with no SGR between them.
+- **Empty vs draft signal**: the placeholder **is faint** here, written as `ESC[2m` … `ESC[22m`, directly after `❯␣`. A draft is written with no `ESC[2m`. So *faint text in the composer row ⇒ placeholder ⇒ empty*, and a draft that begins with the placeholder's exact words (`draft-placeholder-words`) is distinguished from it **only by the absence of faint**, not by its text. Secondary signal: the footer loses `? for shortcuts · ← for agents` as soon as the composer holds anything (including only spaces). The #313 note "no faint text" does not hold for this unauthenticated run; the #312 casts show an empty composer as `❯␣` plus a reverse-video cell (`ESC[7m ␣ESC[27m`) instead. Which one appears may depend on login state; a logged-in re-record should settle it.
+- **Hardware cursor**: shown at rest and placed in the composer. Every frame is wrapped in a synchronized update, hides the cursor (`?25l`), repaints, parks it at `CUP row;col` and shows it (`?25h`). The `.toml` files give the cursor cell per marker. At `empty` it sits at col 3 (the start of the placeholder). This also differs from the #313 "hardware cursor hidden" note.
+- **Spaces**: a space-only draft draws no cells (`ESC[K` only). It is visible only through the cursor column (3 + number of spaces) and the missing placeholder/footer hint.
+- **Cursor left**: text after the cursor stays on screen, so the value is the whole row after `❯␣`, not text up to the cursor.
+- **Multi-line**: continuation rows are indented two columns without `❯`; the rules move to enclose them.
+- **Resize**: rules and footer are redrawn at the new width; the composer and its text survive (shrink and grow both repaint the whole screen with `ESC[2J`).
+
+### OSC 7501 and other program reports
+
+Neither cast contains **any** OSC 7501 (not even a `?` support query from the program), so `cleat inspect --json` reported `program_status: []` (with `program_status_available: true`) at **every** marker, in both sizes. `title` is `✳ Claude Code` (set once with OSC 0 at start). No OSC 133 was emitted either. So 2.1.287 in this state reports no program status and a recognizer has nothing from OSC 7501 to agree or disagree with: `working`/`blocked` waits cannot be driven by it. Working/approval markers were not recorded, so this is **unmeasured for those states**.
+
+### Privacy pass
+
+Both casts were read in full (every output and input event, decoded) before commit:
+
+- No tokens, account names, emails or organization names; no hostnames or internal URLs; the only path is the throwaway `/tmp/scratch351`. The only file names typed are throwaway text. No keystroke dump of anything credential-shaped (the keys sent are the `i` events above: short throwaway strings and `Ctrl-U`).
+- **Redaction**: the banner's billing-plan text was replaced with `[plan redacted]` (same width) in both casts with `sed`. The model name (`Opus 5.5`), version and permission-mode footer are kept.
+- Repeatable check for later re-records (should print nothing):
+  `grep -a -o -i -E 'sk-[A-Za-z0-9_-]+|[a-z0-9._-]+@[a-z0-9.-]+|https?://[^"\\ ]+|/home/[^"\\ ]*' *.cast`
+- The unauthenticated state means no account identity is shown at all.

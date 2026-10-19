@@ -1,6 +1,6 @@
 # Screen queries (version 1)
 
-`cleat inspect ID --screen [--json]` returns the graph region tree as JSON.
+`cleat inspect ID --screen [--json]` returns the graph region tree as JSON; `--json` is accepted explicitly but optional.
 `--select 'SEL'` returns the matching nodes in document order, with their
 coordinates, text and named regex captures. `--producer graph` is optional;
 other producers are rejected until implemented. `--text-only` prints physical
@@ -50,6 +50,11 @@ recognizers supply them; current queries can select graph regions, for example
 - Engines without VT screen support return HTTP 409 with
   `{"error":{"code":"unsupported","message":"…"}}`, including plain text
   requests. They never return an empty tree as a substitute for support.
+  This intentionally changes the legacy plain endpoint's **error** body from
+  `{"error":"message"}` to the structured object required by the screen API;
+  its successful `{ "text": "…" }` body is unchanged. CLI errors preserve that
+  structured JSON text, so callers can identify `unsupported`.
+  The schema's `$defs.error` documents the error envelope.
 
 `POST /sessions/{id}/wait` accepts an optional `select` string alongside the
 existing `conditions` array and `timeout_ms`. It also accepts a condition
@@ -69,6 +74,11 @@ conditions. It is level-triggered: an already matching screen succeeds
 immediately, including with timeout zero. Exit status is 0 for ready, 1 for
 timeout, and 2 for an error/session gone. Unsupported VT or malformed selector
 fails immediately with status 2. JSON ready output includes `condition`.
+If an active selector's provider fails later, the wait returns HTTP 409 with
+`error.code: "screen_query_failed"` (CLI status 2), rather than timing out.
+Finalized sessions return `session_gone` before any selector tree is requested;
+existing matching program-status conditions retain their precedence for retained
+results. Malformed selector syntax is still rejected before checking exit state.
 
 Waits are advisory. Use the atomic guard (#310) for writes that depend on screen
 state. Trees are built only for queries or active selector waits; selectors are

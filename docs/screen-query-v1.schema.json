@@ -142,6 +142,37 @@
           }
         }
       }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "enum": [
+                "invalid_query",
+                "invalid_producer",
+                "invalid_selector",
+                "unsupported",
+                "screen_query_failed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      }
     }
   }
 }

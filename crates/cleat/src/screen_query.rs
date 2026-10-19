@@ -9,6 +9,9 @@ pub fn grid_from_update(update: crate::provider::TerminalRenderUpdate) -> Result
     let mut cells = vec![Cell::default(); usize::from(update.cols) * usize::from(update.rows)];
     let mut metadata = vec![RowMetadata::default(); usize::from(update.rows)];
     for row in update.ops.iter().flat_map(|op| &op.rows) {
+        if row.row >= update.rows || row.cells.len() > usize::from(update.cols) {
+            return Err(format!("render row {} with {} cells is outside {}x{} screen", row.row, row.cells.len(), update.cols, update.rows));
+        }
         metadata[usize::from(row.row)] = RowMetadata {
             soft_wrap: row.wrap,
             wrap_continuation: row.wrap_continuation,
@@ -150,6 +153,35 @@ mod tests {
         }
         for invalid in ["select=%", "select=%Q1", "select=%FF"] {
             assert!(parameters(invalid).is_err());
+        }
+    }
+
+    // Provider rows outside the declared grid must return an error, never panic
+    // or spill cells into the next row. Generate valid and off-by-one bounds.
+    #[test]
+    fn provider_row_bounds_are_checked() {
+        use crate::provider::{TerminalRenderCell, TerminalRenderRow, TerminalRenderUpdate, TerminalRenderUpdateOp};
+        for rows in 1..=3 {
+            for cols in 1..=3 {
+                for row in [0, rows - 1, rows, rows + 1] {
+                    for width in [0, cols, cols + 1] {
+                        let update = TerminalRenderUpdate {
+                            rows,
+                            cols,
+                            ops: vec![TerminalRenderUpdateOp {
+                                rows: vec![TerminalRenderRow {
+                                    row,
+                                    cells: vec![TerminalRenderCell::default(); usize::from(width)],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        };
+                        assert_eq!(grid_from_update(update).is_ok(), row < rows && width <= cols);
+                    }
+                }
+            }
         }
     }
 

@@ -1648,7 +1648,7 @@ fn signal_target_to_http(target: crate::protocol::SignalTarget) -> http_uds::Sig
     }
 }
 
-fn wait_condition_to_http(condition: crate::protocol::WaitCondition) -> http_uds::WaitConditionRequest {
+pub(crate) fn wait_condition_to_http(condition: crate::protocol::WaitCondition) -> http_uds::WaitConditionRequest {
     match condition {
         crate::protocol::WaitCondition::Select { select } => http_uds::WaitConditionRequest::Select { select },
         crate::protocol::WaitCondition::ProgramState { states } => http_uds::WaitConditionRequest::ProgramState { states },

@@ -425,7 +425,7 @@ resolved through the live daemon socket. \n\
         id: String,
         #[arg(long, help = "Output as JSON")]
         json: bool,
-        #[arg(long, help = "Inspect the screen region tree (stable selector syntax v1)")]
+        #[arg(long, help = "Output the screen region tree as JSON (--json optional; stable selectors v1)")]
         screen: bool,
         #[arg(long, requires = "screen", conflicts_with = "text_only")]
         select: Option<String>,

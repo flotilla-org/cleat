@@ -221,3 +221,28 @@ fn selector_wait_observes_later_output_and_ors() {
         assert_eq!(invalid["error"]["code"], "invalid_selector");
     }
 }
+
+// Retained exited sessions have no active selector wait. Report session_gone
+// before reading a tree, while retaining the existing program-status semantics.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn selector_wait_on_retained_exit_is_session_gone() {
+    let f = Fixture::new();
+    f.service
+        .create(
+            Some("screen".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("printf '\\033]7501;state=done:id=finished\\007'".into()),
+            false,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f.service.inspect("screen").is_ok_and(|result| result.session.state == "exited") {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = f.cli(&["wait", "screen", "--select", "screen", "--json", "--timeout", "0"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(serde_json::from_slice::<Value>(&output.stdout).unwrap()["status"], "session_gone");
+}

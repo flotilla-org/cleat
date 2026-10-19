@@ -1949,19 +1949,9 @@ impl HostedSession {
     }
 }
 
-fn wait_condition_response(condition: &crate::protocol::WaitCondition) -> http_uds::WaitConditionRequest {
-    match condition.clone() {
-        crate::protocol::WaitCondition::Select { select } => http_uds::WaitConditionRequest::Select { select },
-        crate::protocol::WaitCondition::ProgramState { states } => http_uds::WaitConditionRequest::ProgramState { states },
-        crate::protocol::WaitCondition::OutputIdle { quiet_ms } => http_uds::WaitConditionRequest::OutputIdle { quiet_ms },
-        crate::protocol::WaitCondition::TextMatch { text } => http_uds::WaitConditionRequest::TextMatch { text },
-        crate::protocol::WaitCondition::ScreenStable { stable_ms } => http_uds::WaitConditionRequest::ScreenStable { stable_ms },
-    }
-}
-
 fn write_http_wait_ready(stream: &mut SessionStream, condition: &crate::protocol::WaitCondition, elapsed_ms: u64) -> std::io::Result<()> {
     http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
-        condition: Some(wait_condition_response(condition)),
+        condition: Some(crate::server::wait_condition_to_http(condition.clone())),
         status: http_uds::WaitStatusResponse::Ready,
         elapsed_ms,
     })
@@ -3109,6 +3099,16 @@ fn service_pending_sends(sends: &mut Vec<PendingSend>) {
     });
 }
 
+fn fail_selector_waits(pending_waits: &mut Vec<PendingWait>, error: &str) {
+    pending_waits.retain_mut(|wait| {
+        if wait.selectors.is_empty() {
+            return true;
+        }
+        let _ = http_uds::write_json(&mut wait.stream, StatusCode::CONFLICT, &crate::screen_query::error("screen_query_failed", error));
+        false
+    });
+}
+
 fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWait>, last_snapshot_generation: &mut Option<u64>) {
     let screen_stable_fingerprint = if pending_waits.iter().any(|wait| wait.screen_stable.is_some()) {
         // Read the generation before snapshotting: a pump landing in between
@@ -3128,7 +3128,17 @@ fn service_pending_waits(actor: &SessionActor, pending_waits: &mut Vec<PendingWa
         None
     };
     // One lazy tree per servicing tick, shared by all selector waits.
-    let selector_tree = pending_waits.iter().any(|wait| !wait.selectors.is_empty()).then(|| actor.screen_tree().ok()).flatten();
+    let selector_tree = if pending_waits.iter().any(|wait| !wait.selectors.is_empty()) {
+        match actor.screen_tree() {
+            Ok(tree) => Some(tree),
+            Err(error) => {
+                fail_selector_waits(pending_waits, &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let now = Instant::now();
     pending_waits.retain_mut(|wait| {
         let elapsed = wait.registered_at.elapsed();
@@ -4176,24 +4186,6 @@ fn handle_http_request(
                     }
                 }
             }
-            if !selectors.is_empty() {
-                let tree = match hosted.actor.screen_tree() {
-                    Ok(tree) => tree,
-                    Err(err) => {
-                        http_uds::write_json(stream, StatusCode::CONFLICT, &crate::screen_query::error("unsupported", err))
-                            .map_err(|e| e.to_string())?;
-                        break 'wait Ok(());
-                    }
-                };
-                for (selector, condition) in
-                    selectors.iter().zip(conditions.iter().filter(|c| matches!(c, crate::protocol::WaitCondition::Select { .. })))
-                {
-                    if !selector.evaluate(&tree).is_empty() {
-                        write_http_wait_ready(stream, condition, 0).map_err(|e| e.to_string())?;
-                        break 'wait Ok(());
-                    }
-                }
-            }
             if conditions.is_empty() {
                 http_uds::write_error(stream, StatusCode::BAD_REQUEST, "at least one wait condition is required")
                     .map_err(|err| format!("write HTTP wait error: {err}"))?;
@@ -4216,7 +4208,7 @@ fn handle_http_request(
                     }
                     if hosted.actor.program_status_matches(states) {
                         http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
-                            condition: Some(wait_condition_response(condition)),
+                            condition: Some(crate::server::wait_condition_to_http(condition.clone())),
                             status: http_uds::WaitStatusResponse::Ready,
                             elapsed_ms: 0,
                         })
@@ -4233,6 +4225,24 @@ fn handle_http_request(
                 })
                 .map_err(|err| format!("write HTTP wait response: {err}"))?;
                 break 'wait Ok(());
+            }
+            if !selectors.is_empty() {
+                let tree = match hosted.actor.screen_tree() {
+                    Ok(tree) => tree,
+                    Err(err) => {
+                        http_uds::write_json(stream, StatusCode::CONFLICT, &crate::screen_query::error("unsupported", err))
+                            .map_err(|e| e.to_string())?;
+                        break 'wait Ok(());
+                    }
+                };
+                for (selector, condition) in
+                    selectors.iter().zip(conditions.iter().filter(|c| matches!(c, crate::protocol::WaitCondition::Select { .. })))
+                {
+                    if !selector.evaluate(&tree).is_empty() {
+                        write_http_wait_ready(stream, condition, 0).map_err(|e| e.to_string())?;
+                        break 'wait Ok(());
+                    }
+                }
             }
             let has_text_match = conditions.iter().any(|condition| matches!(condition, crate::protocol::WaitCondition::TextMatch { .. }));
             let has_screen_stable =
@@ -4271,7 +4281,7 @@ fn handle_http_request(
                     if let crate::protocol::WaitCondition::TextMatch { text } = condition {
                         if hosted.actor.screen_contains(text.clone())? {
                             http_uds::write_json(stream, StatusCode::OK, &http_uds::WaitResultResponse {
-                                condition: Some(wait_condition_response(condition)),
+                                condition: Some(crate::server::wait_condition_to_http(condition.clone())),
                                 status: http_uds::WaitStatusResponse::Ready,
                                 elapsed_ms: 0,
                             })
@@ -5795,6 +5805,42 @@ fn http_error_message(response: http_uds::HttpResponse) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Once a registered selector's provider fails, reply immediately with a
+    // structured error and remove it; unrelated waits remain pending.
+    #[cfg(unix)]
+    #[test]
+    fn pending_selector_provider_failure_is_an_error() {
+        use std::io::Read;
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut waits = vec![super::PendingWait {
+            stream,
+            conditions: vec![crate::protocol::WaitCondition::Select { select: "region".into() }],
+            selectors: vec![terminal_screen::Selector::parse("region").unwrap()],
+            screen_stable: None,
+            timeout_ms: 60000,
+            registered_at: Instant::now(),
+        }];
+        let (other, _other_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        waits.push(super::PendingWait {
+            stream: other,
+            conditions: vec![crate::protocol::WaitCondition::OutputIdle { quiet_ms: 60000 }],
+            selectors: vec![],
+            screen_stable: None,
+            timeout_ms: 60000,
+            registered_at: Instant::now(),
+        });
+        super::fail_selector_waits(&mut waits, "provider unavailable");
+        assert_eq!(waits.len(), 1);
+        assert!(waits[0].selectors.is_empty());
+        let mut response = String::new();
+        peer.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 409"));
+        let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["error"]["code"], "screen_query_failed");
+        assert_eq!(body["error"]["message"], "provider unavailable");
+    }
+
     use std::{
         cell::RefCell,
         collections::VecDeque,

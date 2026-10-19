@@ -37,6 +37,9 @@ arithmetic. Roles such as `composer` and `status` will be selectable when
 recognizers supply them; current queries can select graph regions, for example
 `region:has(cursor):last-match` or `region:has-text('context left'):last-match`.
 
+See the [release note](release-notes/screen-query-v1.md) for error compatibility
+and CLI stderr/exit-status details.
+
 ## HTTP
 
 - `GET /sessions/{id}/screen` preserves `{ "text": "…" }` with no parameters.

@@ -271,4 +271,10 @@ fn program_status_hello_capability_matrix() {
     for (virtual_placements, program_status, version) in [(false, false, 12), (true, false, 13), (false, true, 14), (true, true, 14)] {
         assert_eq!(hello_for_subscription(virtual_placements, program_status, false), ControlHello { version, min_supported_version: 12 });
     }
+    for (virtual_placements, program_status) in [(false, false), (true, false), (false, true), (true, true)] {
+        assert_eq!(hello_for_subscription(virtual_placements, program_status, true), ControlHello {
+            version: 15,
+            min_supported_version: 12
+        });
+    }
 }

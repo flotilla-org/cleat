@@ -271,8 +271,7 @@ impl SessionRuntime {
             vt::VtEngineKind::Ghostty => None,
         };
         let mut runtime = Self {
-            recognizer: crate::recognizer::load_selected(&adopted.session.tags)?
-                .map(|rules| crate::recognizer::Engine::new(Box::new(rules))),
+            recognizer: crate::recognizer::Engine::load_for_adoption(&adopted.session.tags),
             recognition_tree: None,
             recognition_generation: 0,
             hosting_epoch: adopted.hosting_epoch,
@@ -950,6 +949,7 @@ impl SessionRuntime {
         Ok(PtyOutput { chunks })
     }
 
+    #[cfg(unix)]
     pub(crate) fn recognition_deadline(&self) -> Option<Instant> {
         self.recognizer.as_ref()?.deadline().map(|ms| self.epoch + Duration::from_millis(ms))
     }
@@ -962,7 +962,10 @@ impl SessionRuntime {
             match self.vt_engine.recognition_tree(self.recognition_generation) {
                 Ok(tree) => self.recognition_tree = Some(tree),
                 Err(error) => {
-                    engine.inspect.error = Some(error);
+                    engine.observation_error(error);
+                    if let Some(tracker) = self.vt_engine.program_status_tracker() {
+                        tracker.publish_recognition(None, Vec::new(), true);
+                    }
                     return;
                 }
             }

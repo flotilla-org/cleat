@@ -816,3 +816,39 @@ fn program_status_survives_transfer() {
     assert_eq!(root.inspect(&["inspect", "status"]).program_status, before);
     root.ok(&["kill", "status"]);
 }
+
+// A vanished observational add-on must not reject adoption or interrupt the
+// existing PTY. The new host exposes the recognizer failure in inspect.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn transfer_survives_a_vanished_recognizer_addon() {
+    let root = Root::new();
+    let addons = root.path().join("recognizers");
+    std::fs::create_dir(&addons).unwrap();
+    let path = addons.join("addon.toml");
+    std::fs::write(&path, "id='addon'\nrevision=1\nmin_engine='0.1.0'\nverified=[]\n").unwrap();
+    let environment = [("CLEAT_RECOGNIZERS_DIR", addons.to_str().unwrap())];
+    root.start_source(&environment);
+    let service = SessionService::new(RuntimeLayout::new(root.path().to_path_buf()));
+    service
+        .create_with_options(
+            Some("moving".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh".into()),
+            cleat::session::SessionStartOptions { record: true, tags: vec!["recognizer:addon".into()], ..Default::default() },
+        )
+        .unwrap();
+    let before = root.inspect(&["inspect", "moving"]);
+    assert_eq!(before.recognizer.unwrap().revision, 1);
+    std::fs::remove_file(&path).unwrap();
+    root.transfer("moving", "other", &[], &environment).unwrap();
+    let after = root.inspect(&["inspect", "moving"]);
+    assert_eq!(after.process.leader_pid, before.process.leader_pid);
+    let recognizer = after.recognizer.unwrap();
+    assert_eq!(recognizer.id, "addon");
+    assert!(recognizer.error.is_some());
+    root.ok(&["send", "moving", "echo still-$((40+2))"]);
+    wait_for_output(&root.cast("other@1", "moving"), "still-42");
+    root.ok(&["kill", "moving"]);
+}

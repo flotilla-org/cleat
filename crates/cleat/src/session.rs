@@ -2960,7 +2960,7 @@ fn service_activity_subscriptions(
                 if client.recognizer_roles && client.known_roles.remove(&id).is_some() {
                     client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::RolesChanged {
                         session_id: id.clone(),
-                        tags: Vec::new(),
+                        tags: client.known_program_status.get(&id).map(|known| known.tags.clone()).unwrap_or_default(),
                         roles: Vec::new(),
                         changed_at_unix_ms: unix_time_ms(),
                     })?;
@@ -4504,7 +4504,7 @@ fn hello_for_subscription(virtual_placements: bool, program_status: bool, recogn
     if !recognizer_roles && program_status && hello == ControlHello::current() {
         return ControlHello { version: 14, min_supported_version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION };
     }
-    if !program_status && hello == ControlHello::current() {
+    if !recognizer_roles && !program_status && hello == ControlHello::current() {
         // Some protocol-12 clients compare the maximum version directly.
         // Preserve their original hello as well as their render payloads.
         ControlHello {

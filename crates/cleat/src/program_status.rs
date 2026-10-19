@@ -11,6 +11,18 @@ pub enum ProgramState {
     Error,
 }
 
+impl ProgramState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProgramStatusSource {
@@ -25,6 +37,16 @@ pub enum ProgramKind {
     Permission,
     Question,
     Auth,
+}
+
+impl ProgramKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Auth => "auth",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,5 +458,15 @@ mod recognizer_tests {
         tracker.clear_inferred();
         assert!(tracker.records().is_empty());
         assert!(tracker.observations_since(Some(generation)).is_some());
+    }
+    // Role attributes use the same stable lower-case vocabulary as serialized OSC records.
+    #[test]
+    fn role_state_and_kind_names_match_the_record_wire_vocabulary() {
+        for state in [ProgramState::Idle, ProgramState::Working, ProgramState::Done, ProgramState::Blocked, ProgramState::Error] {
+            assert_eq!(serde_json::to_value(state).unwrap(), serde_json::Value::String(state.as_str().into()));
+        }
+        for kind in [ProgramKind::Permission, ProgramKind::Question, ProgramKind::Auth] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::Value::String(kind.as_str().into()));
+        }
     }
 }

@@ -20,10 +20,15 @@ recognizer is an engine demonstration, not a Codex or Claude Code recognizer.
 Add-ons override bundled ids in the directory named by `CLEAT_RECOGNIZERS_DIR`,
 or otherwise `$XDG_CONFIG_HOME/cleat/recognizers` (default
 `$HOME/.config/cleat/recognizers`) on Unix and `%APPDATA%\cleat\recognizers` on
-Windows. Install `<id>.toml` there. Files are read once when a session starts.
+Windows. If no platform configuration base is available, add-ons are disabled;
+bundled rules remain available. Configured paths must be absolute. Install
+`<id>.toml` there. Files are read once when a session starts. A missing or invalid file during
+host adoption leaves the PTY running and exposes an inspect error with the
+selected id and revision 0 (the revision could not be loaded).
 Invalid files reject launch before the child starts; diagnostics include the
 filename, line, and rule. All rules are validated and selectors compiled before
-the file is installed. Unrecognized keys are errors.
+the file is installed. Unrecognized keys are errors. Rule diagnostics use the
+parsed rule span; syntax errors identify the file and exact parser line.
 
 ```toml
 id = "example"
@@ -79,7 +84,10 @@ Selectors run only on a changed screen generation or changed title. Timer
 confirmations use cached results. A working-to-idle title transition requires
 three confirmations spaced at least 100 ms apart, with a 700 ms deadline.
 A visibly idle screen or blocked state publishes immediately. A return to
-working cancels pending idle. Recognition preserves render damage and runs
+working cancels pending idle. No match or evaluation failure clears the inferred
+record through the subscription path. The last confirmed state is retained
+internally across such observation gaps so a subsequent title-idle still
+requires working-to-idle debounce. Recognition preserves render damage and runs
 outside input admission: errors and Rust unwinding panics appear in inspect
 and cannot refuse unguarded sends. A new generation retries failed evaluation.
 
@@ -116,7 +124,9 @@ role = []
 ```
 
 Role lists are exact, ordered observations; omitted `role` means empty. Optional
-state and source constrain those fields. Duplicate expectations, missing
+state and source constrain those fields. State assertions compare the last
+confirmed, debounced engine state rather than the current candidate. Duplicate
+expectations, missing
 markers, evaluation errors and mismatches fail the harness. See the synthetic
 fixture and `synthetic_cast_fixture` test. The harness never forwards recorded
 terminal replies or clipboard effects.

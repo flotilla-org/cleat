@@ -725,7 +725,7 @@ impl VtEngine for GhosttyVtEngine {
         let result = self.render_update(DirtyState::Full);
         self.deferred_render_dirty = dirty;
         self.deferred_render_dirty_rows = rows;
-        let grid = crate::recognizer::screen_grid(&result?, generation);
+        let grid = crate::recognizer::screen_grid(&result?, generation)?;
         Ok(terminal_screen::analyze(&grid))
     }
 

@@ -20,7 +20,7 @@ struct File {
     min_engine: String,
     verified: Vec<String>,
     #[serde(default)]
-    rule: Vec<toml::Spanned<Declaration>>,
+    rule: Vec<toml::Spanned<toml::Value>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,8 +50,7 @@ impl Rules {
         };
         let file: File = toml::from_str(source).map_err(|e: toml::de::Error| {
             let offset = e.span().map_or(0, |s| s.start);
-            let count = source[..offset.min(source.len())].matches("[[rule]]").count();
-            error(offset, count.checked_sub(1), e.message().into())
+            error(offset, None, e.message().into())
         })?;
         if !valid_id(&file.id) {
             return Err(error(0, None, "id must contain only ASCII letters, digits, - or _".into()));
@@ -72,8 +71,8 @@ impl Rules {
         let mut rules = Vec::new();
         for (index, declaration) in file.rule.into_iter().enumerate() {
             let offset = declaration.span().start;
-            let declaration = declaration.into_inner();
             let fail = |message| error(offset, Some(index), message);
+            let declaration: Declaration = declaration.into_inner().try_into().map_err(|e: toml::de::Error| fail(e.message().into()))?;
             if declaration.role.is_none() && declaration.state.is_none() {
                 return Err(fail("a rule needs role or state".into()));
             }
@@ -130,21 +129,32 @@ fn template(value: &str, captures: &BTreeMap<String, String>, strict: bool) -> R
 }
 
 /// Add-on files override bundled files by id. No command-name inference occurs.
-pub fn addon_directory() -> PathBuf {
-    if let Some(path) = std::env::var_os("CLEAT_RECOGNIZERS_DIR") {
-        return PathBuf::from(path);
+pub fn addon_directory() -> Result<Option<PathBuf>, String> {
+    resolve_addon_directory(cfg!(windows), |key| std::env::var_os(key))
+}
+fn resolve_addon_directory(windows: bool, lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<Option<PathBuf>, String> {
+    let path = if let Some(path) = lookup("CLEAT_RECOGNIZERS_DIR") {
+        Some(PathBuf::from(path))
+    } else if windows {
+        lookup("APPDATA").map(|base| PathBuf::from(base).join("cleat/recognizers"))
+    } else if let Some(base) = lookup("XDG_CONFIG_HOME") {
+        Some(PathBuf::from(base).join("cleat/recognizers"))
+    } else {
+        lookup("HOME").map(|base| PathBuf::from(base).join(".config/cleat/recognizers"))
+    };
+    if path.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err("recognizer configuration directory must be absolute".into());
     }
-    if cfg!(windows) {
-        if let Some(base) = std::env::var_os("APPDATA") {
-            return PathBuf::from(base).join("cleat/recognizers");
-        }
-    }
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        std::env::var_os(if cfg!(windows) { "APPDATA" } else { "HOME" }).map(PathBuf::from).unwrap_or_default().join(".config")
-    });
-    base.join("cleat/recognizers")
+    Ok(path)
 }
 pub fn load_selected(tags: &[String]) -> Result<Option<Rules>, String> {
+    // Resolve configuration only for selected sessions.
+    if !tags.iter().any(|tag| tag.starts_with("recognizer:")) {
+        return Ok(None);
+    }
+    load_selected_in(tags, addon_directory()?.as_deref())
+}
+fn load_selected_in(tags: &[String], directory: Option<&Path>) -> Result<Option<Rules>, String> {
     let ids: Vec<_> = tags.iter().filter_map(|t| t.strip_prefix("recognizer:")).collect();
     if ids.len() > 1 {
         return Err("select exactly one recognizer".into());
@@ -155,13 +165,18 @@ pub fn load_selected(tags: &[String]) -> Result<Option<Rules>, String> {
     if !valid_id(id) {
         return Err("invalid recognizer id".into());
     }
-    let addon = addon_directory().join(format!("{id}.toml"));
-    let rules = if addon.exists() {
+    let addon = directory.map(|directory| directory.join(format!("{id}.toml")));
+    let rules = if let Some(addon) = addon.filter(|path| path.exists()) {
         Rules::load(&addon)?
     } else {
         match *id {
             "synthetic" => Rules::parse(Path::new("recognizers/synthetic.toml"), include_str!("../../../recognizers/synthetic.toml"))?,
-            _ => return Err(format!("recognizer {id} not found in {}", addon_directory().display())),
+            _ => {
+                return Err(format!(
+                    "recognizer {id} not found in {}",
+                    directory.map(|path| path.display().to_string()).unwrap_or_else(|| "bundled recognizers (add-ons disabled)".into())
+                ))
+            }
         }
     };
     if rules.id != *id {
@@ -226,8 +241,9 @@ impl Recognizer for Rules {
         self.revision
     }
     fn evaluate(&mut self, tree: &ScreenTree, title: Option<&str>) -> Result<Observation, String> {
-        let mut input = tree.clone();
+        let mut input = std::borrow::Cow::Borrowed(tree);
         if let Some(title) = title {
+            let input = input.to_mut();
             let bounds = input.node(input.root()).unwrap().bounds;
             let mut node = Node::new("title", bounds, title);
             node.attributes.insert("provenance".into(), "title".into());
@@ -285,6 +301,23 @@ pub struct Inspect {
     pub error: Option<String>,
     pub observation: Observation,
 }
+#[cfg(any(unix, test))]
+struct Unavailable {
+    id: String,
+    error: String,
+}
+#[cfg(any(unix, test))]
+impl Recognizer for Unavailable {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn revision(&self) -> u64 {
+        0
+    }
+    fn evaluate(&mut self, _: &ScreenTree, _: Option<&str>) -> Result<Observation, String> {
+        Err(self.error.clone())
+    }
+}
 /// One instance per session. Time is injected as monotonic milliseconds.
 pub struct Engine {
     recognizer: Box<dyn Recognizer>,
@@ -296,6 +329,29 @@ pub struct Engine {
     candidate: Observation,
 }
 impl Engine {
+    #[cfg(unix)]
+    pub(crate) fn load_for_adoption(tags: &[String]) -> Option<Self> {
+        Self::from_adoption_result(tags, load_selected(tags))
+    }
+    #[cfg(any(unix, test))]
+    fn from_adoption_result(tags: &[String], loaded: Result<Option<Rules>, String>) -> Option<Self> {
+        match loaded {
+            Ok(rules) => rules.map(|rules| Self::new(Box::new(rules))),
+            Err(error) => {
+                let id = tags.iter().find_map(|tag| tag.strip_prefix("recognizer:")).unwrap_or("unknown").into();
+                let mut engine = Self::new(Box::new(Unavailable { id, error: error.clone() }));
+                engine.observation_error(error);
+                Some(engine)
+            }
+        }
+    }
+    pub(crate) fn observation_error(&mut self, error: String) {
+        self.inspect.error = Some(error);
+        self.candidate = Observation::default();
+        self.inspect.observation = Observation::default();
+        self.pending = None;
+        self.last_status = None;
+    }
     pub fn new(recognizer: Box<dyn Recognizer>) -> Self {
         let inspect =
             Inspect { id: recognizer.id().into(), revision: recognizer.revision(), error: None, observation: Observation::default() };
@@ -342,10 +398,10 @@ impl Engine {
             node.attributes.insert("value".into(), role.value.clone());
             node.attributes.insert("provenance".into(), role.provenance.clone());
             if let Some(state) = role.state {
-                node.attributes.insert("state".into(), format!("{state:?}").to_lowercase());
+                node.attributes.insert("state".into(), state.as_str().into());
             }
             if let Some(kind) = role.kind {
-                node.attributes.insert("kind".into(), format!("{kind:?}").to_lowercase());
+                node.attributes.insert("kind".into(), kind.as_str().into());
             }
             if let Err(error) = tree.add_node(tree.root(), node) {
                 self.inspect.error = Some(error.to_string());
@@ -353,6 +409,13 @@ impl Engine {
         }
         self.inspect.observation = observation.clone();
         let next = observation.state;
+        if next.is_none() {
+            // The session clears inferred records; retain the last confirmed state
+            // so a temporary observation gap cannot bypass working-to-idle debounce.
+            self.pending = None;
+            self.last_status = None;
+            return None;
+        }
         if next != Some(ProgramState::Idle) || self.state != Some(ProgramState::Working) || observation.visible {
             self.pending = None;
         } else {
@@ -387,14 +450,23 @@ impl Engine {
 }
 
 /// Convert the shared render contract without importing a VT backend.
-pub fn screen_grid(update: &crate::provider::TerminalRenderUpdate, generation: u64) -> terminal_screen::ScreenGrid {
+pub fn screen_grid(update: &crate::provider::TerminalRenderUpdate, generation: u64) -> Result<terminal_screen::ScreenGrid, String> {
     use terminal_screen::*;
 
     use crate::provider::{TerminalCellFlags as Flags, TerminalCellWidth, TerminalCursorStyle};
+    if update.cols == 0 || update.rows == 0 {
+        return Err("recognizer screen dimensions must be nonzero".into());
+    }
     let mut cells = vec![Cell::default(); usize::from(update.cols) * usize::from(update.rows)];
     let mut metadata = vec![RowMetadata::default(); usize::from(update.rows)];
     for row in update.ops.iter().flat_map(|op| &op.rows) {
-        metadata[usize::from(row.row)] = RowMetadata {
+        let metadata = metadata.get_mut(usize::from(row.row)).ok_or("recognizer render row lies outside screen")?;
+        let start = usize::from(row.row) * usize::from(update.cols);
+        if row.cells.len() > usize::from(update.cols) {
+            return Err("recognizer render row exceeds screen columns".into());
+        }
+        let targets = cells.get_mut(start..start + row.cells.len()).ok_or("recognizer render cells lie outside screen")?;
+        *metadata = RowMetadata {
             soft_wrap: row.wrap,
             wrap_continuation: row.wrap_continuation,
             semantic_prompt: match row.semantic_prompt {
@@ -403,10 +475,10 @@ pub fn screen_grid(update: &crate::provider::TerminalRenderUpdate, generation: u
                 _ => SemanticPrompt::None,
             },
         };
-        for (col, cell) in row.cells.iter().enumerate() {
+        for (target, cell) in targets.iter_mut().zip(&row.cells) {
             let style = &cell.style;
             let flags = style.flags;
-            cells[usize::from(row.row) * usize::from(update.cols) + col] = Cell {
+            *target = Cell {
                 grapheme: cell.graphemes.iter().filter_map(|cp| char::from_u32(*cp)).collect(),
                 width: match style.width {
                     TerminalCellWidth::Narrow => CellWidth::Narrow,
@@ -460,7 +532,7 @@ pub fn screen_grid(update: &crate::provider::TerminalRenderUpdate, generation: u
         },
         generation,
     )
-    .expect("VT snapshot has rectangular geometry")
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,6 +618,8 @@ pub fn check_fixture(
                     .iter()
                     .map(|r| ExpectedRole { role: r.role.clone(), value: r.value.clone() })
                     .collect::<Vec<_>>();
+                // Marker states compare the last confirmed, debounced engine state.
+                // The observation may carry a newer candidate while idle is pending.
                 if actual != expected.role
                     || expected.state.is_some_and(|state| Some(state) != recognizer.state)
                     || expected.source.is_some_and(|source| Some(source) != recognizer.inspect.observation.source)
@@ -728,6 +802,97 @@ mod tests {
             )
             .is_err());
         }
+    }
+    // Header-shaped text in comments and strings cannot renumber semantic errors.
+    #[test]
+    fn rule_diagnostics_use_spans_instead_of_header_substrings() {
+        let source = "id='test'\nrevision=1\nmin_engine='0.1.0'\nverified=[]\n# [[rule]]\n[[rule]]\nselect='row'\nrole='status'\nvalue='[[rule]]'\n[[rule]]\nselect='row'\nrole='composer'\nunknown=true\n";
+        let error = Rules::parse(Path::new("located.toml"), source).err().unwrap();
+        assert!(error.contains("located.toml:10: rule 2:"), "{error}");
+    }
+
+    // Generate missing, relative and absolute directory inputs for both platform
+    // policies. Missing ambient configuration disables add-ons instead of using CWD.
+    #[test]
+    fn addon_directories_never_implicitly_use_the_working_directory() {
+        let base = std::env::temp_dir().join("recognizer-config");
+        for windows in [false, true] {
+            assert_eq!(resolve_addon_directory(windows, |_| None).unwrap(), None);
+            let configured = |key: &str| (key == "CLEAT_RECOGNIZERS_DIR").then(|| base.clone().into_os_string());
+            assert_eq!(resolve_addon_directory(windows, configured).unwrap(), Some(base.clone()));
+            assert!(resolve_addon_directory(windows, |key| (key == "CLEAT_RECOGNIZERS_DIR").then(|| "relative".into())).is_err());
+            let key = if windows { "APPDATA" } else { "HOME" };
+            assert!(resolve_addon_directory(windows, |candidate| (candidate == key).then(|| "relative".into())).is_err());
+            let expected = base.join(if windows { "cleat/recognizers" } else { ".config/cleat/recognizers" });
+            assert_eq!(
+                resolve_addon_directory(windows, |candidate| (candidate == key).then(|| base.clone().into_os_string())).unwrap(),
+                Some(expected)
+            );
+        }
+        assert_eq!(load_selected_in(&["recognizer:synthetic".into()], None).unwrap().unwrap().revision, 1);
+    }
+
+    // An id-matched add-on overrides the embedded file. A vanished add-on is
+    // rejected for new launches but becomes an inspectable error on adoption.
+    #[test]
+    fn addon_override_and_failed_adoption_are_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("synthetic.toml");
+        std::fs::write(&path, "id='synthetic'\nrevision=42\nmin_engine='0.1.0'\nverified=[]\n").unwrap();
+        assert_eq!(load_selected_in(&["recognizer:synthetic".into()], Some(temp.path())).unwrap().unwrap().revision, 42);
+        let tags = vec!["recognizer:addon".into()];
+        let path = temp.path().join("addon.toml");
+        std::fs::write(&path, "id='addon'\nrevision=2\nmin_engine='0.1.0'\nverified=[]\n").unwrap();
+        assert_eq!(load_selected_in(&tags, Some(temp.path())).unwrap().unwrap().revision, 2);
+        std::fs::remove_file(path).unwrap();
+        let failed = load_selected_in(&tags, Some(temp.path()));
+        assert!(failed.is_err());
+        let mut adopted = Engine::from_adoption_result(&tags, failed).unwrap();
+        assert_eq!(adopted.inspect.id, "addon");
+        assert!(adopted.inspect.error.is_some());
+        assert!(adopted.evaluate(&mut tree(1), None, 0).is_none());
+        assert!(adopted.inspect.error.is_some());
+    }
+
+    // Losing evidence clears the observation but cannot erase the last confirmed
+    // working state and permit a subsequent title-idle to bypass debounce.
+    #[test]
+    fn observation_gaps_preserve_working_to_idle_debounce() {
+        for error in [false, true] {
+            let mut engine = Engine::new(Box::new(rules("[[rule]]\nselect='title:has-text(\"busy\")'\nstate='working'\n[[rule]]\nselect='title:has-text(\"idle\")'\nstate='idle'\n[[rule]]\nselect='row:matches(/(?P<missing>x)?/)'\nrole='composer'\nvalue='{missing}'")));
+            assert_eq!(engine.evaluate(&mut tree(1), Some("busy"), 0).unwrap().state, ProgramState::Working);
+            let mut gap = tree(2);
+            if error {
+                line(&mut gap, "", "graph");
+            }
+            assert!(engine.evaluate(&mut gap, None, 10).is_none());
+            assert!(engine.inspect.observation.state.is_none());
+            assert_eq!(engine.inspect.error.is_some(), error);
+            assert!(engine.evaluate(&mut tree(3), Some("idle"), 20).is_none());
+            assert!(engine.evaluate(&mut tree(3), Some("idle"), 120).is_none());
+            assert_eq!(engine.evaluate(&mut tree(3), Some("idle"), 220).unwrap().state, ProgramState::Idle);
+        }
+    }
+
+    // Invalid render dimensions and row/column boundaries return errors rather
+    // than indexing panics. The valid one-cell boundary remains observable.
+    #[test]
+    fn malformed_render_updates_are_fallible() {
+        use crate::provider::{TerminalRenderCell, TerminalRenderRow, TerminalRenderUpdate, TerminalRenderUpdateOp};
+        for (cols, rows, row, count) in [(0, 1, 0, 0), (1, 0, 0, 0), (1, 1, 1, 1), (1, 1, u16::MAX, 0), (1, 1, 0, 2)] {
+            let update = TerminalRenderUpdate {
+                cols,
+                rows,
+                ops: vec![TerminalRenderUpdateOp {
+                    rows: vec![TerminalRenderRow { row, cells: vec![TerminalRenderCell::default(); count], ..Default::default() }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(screen_grid(&update, 0).is_err());
+        }
+        let update = TerminalRenderUpdate { cols: 1, rows: 1, ..Default::default() };
+        assert_eq!(screen_grid(&update, 9).unwrap().generation, 9);
     }
 }
 

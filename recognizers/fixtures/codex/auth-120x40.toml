@@ -1,0 +1,30 @@
+# Expectations stub for #352; local fixture schema, not recognizer rules.
+cast = "auth-120x40.cast"
+harness = "codex-cli 0.162.1"
+
+[[expect]]
+marker = "empty"
+roles = ["composer"]
+composer.value = ""
+
+[[expect]]
+marker = "draft"
+roles = ["composer"]
+composer.value = "Describe the throwaway file."
+
+[[expect]]
+marker = "working"
+roles = ["composer", "status"]
+composer.value = ""
+status.state = "working"
+
+[[expect]]
+marker = "done"
+roles = ["composer"]
+composer.value = ""
+
+[[expect]]
+marker = "approval"
+roles = ["dialog"]
+dialog.kind = "approval"
+absent = ["composer"]

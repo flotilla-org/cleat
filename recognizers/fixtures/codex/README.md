@@ -6,8 +6,9 @@ Recorded 2026-10-19 on macOS with **codex-cli 0.162.1** (`codex --version`)
 and cleat 0.1.0 (`d2f1f82925f0`, Ghostty VT). Recording is enabled by default
 ([ADR 0002](../../../docs/adr/0002-recording-on-by-default.md)).
 At recording time, #350's PR #354 was unmerged and recorded Codex 0.160.0.
-No requested state was skipped: these are different-version recordings,
-including the same-version `empty` and `draft` anchors for #352.
+No requested state was skipped. These casts record 0.162.1; #354 records
+0.160.0. The `empty` and `draft` markers anchor the turn-dependent states
+to 0.162.1 for #352.
 
 | Cast | Terminal size | Expectation stub |
 | --- | --- | --- |
@@ -100,7 +101,8 @@ release-notes URL remain.
 Equal-width redactions replace the host's four-character hostname with
 `host` throughout both recordings, and replace the two-digit weekly
 account-usage percentage with `--%` in the 120×40 footer (it never appears
-at 80×24). The scratch path has no account name and remains as recorded.
+at 80×24). Recognizers must not depend on the replacement `host` or `--%`
+text. The scratch path has no account name and remains as recorded.
 Recordings stop at the final marker. No event order, delta timing,
 terminal size, marker, SGR or cursor control before that point is changed.
 Original host recordings are not committed.

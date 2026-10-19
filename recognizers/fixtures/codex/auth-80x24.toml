@@ -20,6 +20,7 @@ status.state = "working"
 
 [[expect]]
 marker = "done"
+# Intentionally minimal: completed reply text is documented in README.md.
 roles = ["composer"]
 composer.value = ""
 

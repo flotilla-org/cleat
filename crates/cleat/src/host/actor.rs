@@ -481,6 +481,9 @@ pub(crate) enum SessionCommand {
         full: bool,
         reply: mpsc::Sender<Result<Option<crate::image_delivery::RenderBundle>, String>>,
     },
+    ScreenTree {
+        reply: mpsc::Sender<Result<terminal_screen::ScreenTree, String>>,
+    },
     FullSnapshot {
         reply: mpsc::Sender<Result<TerminalSnapshot, String>>,
     },
@@ -1113,6 +1116,10 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::ReplayPayload { capabilities, reply })
     }
 
+    pub(crate) fn screen_tree(&self) -> Result<terminal_screen::ScreenTree, String> {
+        self.request_result(|reply| SessionCommand::ScreenTree { reply })
+    }
+
     pub(crate) fn full_snapshot(&self) -> Result<TerminalSnapshot, String> {
         self.request_result(|reply| SessionCommand::FullSnapshot { reply })
     }
@@ -1720,6 +1727,22 @@ fn session_actor_handle_command(
                 // of when each attachment acknowledges its delivered view.
                 state.observation.mark_observed(bundle.packet.update.render_generation);
             }
+            let _ = reply.send(result);
+        }
+        SessionCommand::ScreenTree { reply } => {
+            session_actor_pump(runtime, state, wake);
+            let result = runtime.render_update(DirtyState::Full).and_then(|mut update| {
+                // Reading the VT consumes its row damage. Keep unpublished damage
+                // as a full render request without inventing a new generation.
+                if state.observation.pending_dirty() != DirtyState::Clean {
+                    state.observation.dirty = DirtyState::Full;
+                    state.observation.dirty_rows.clear();
+                    state.observation.publish_mirror();
+                }
+                // Query snapshots retain every row, even after packet publication.
+                update.render_generation = state.observation.render_generation;
+                crate::screen_query::grid_from_update(update).map(|grid| terminal_screen::analyze(&grid))
+            });
             let _ = reply.send(result);
         }
         SessionCommand::FullSnapshot { reply } => {
@@ -2404,6 +2427,24 @@ mod synchronized_output_tests {
         )
         .unwrap();
         (temp, actor, wakes)
+    }
+
+    // A read-only screen query must not consume unpublished packet row damage.
+    // Real PTY output between two packet renders exercises that interleaving.
+    #[test]
+    fn screen_query_preserves_pending_packet_rows() {
+        let (_temp, actor, _wakes) =
+            spawn("query-damage", "stty raw -echo; printf old; dd bs=1 count=1 >/dev/null 2>&1; printf new; sleep 10");
+        wait_until("initial output", Duration::from_secs(5), || actor.capture_text().unwrap().contains("old"));
+        actor.packet_render(true).unwrap().unwrap();
+        actor.write_input(b"x".to_vec()).unwrap();
+        wait_until("new output", Duration::from_secs(5), || actor.capture_text().unwrap().contains("new"));
+        let generation = actor.observation().render_generation();
+        let tree = actor.screen_tree().unwrap();
+        assert_eq!(tree.generation, generation);
+        let packet = actor.packet_render(false).unwrap().unwrap();
+        assert!(text(&packet.packet.update).contains("new"), "query consumed packet row damage");
+        assert_eq!(packet.packet.update.render_generation, generation, "reads must not create generations");
     }
 
     fn wait_until(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {

@@ -30,6 +30,7 @@ pub mod recreate;
 pub mod replay;
 pub mod runtime;
 mod screen_activity;
+pub mod screen_query;
 pub mod server;
 pub mod session;
 mod session_runtime;

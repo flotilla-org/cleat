@@ -1288,6 +1288,19 @@ impl SessionService {
         Ok((client, directory, activity))
     }
 
+    pub fn screen_query(&self, id: &str, select: Option<&str>, producer: &str, text_only: bool) -> Result<serde_json::Value, String> {
+        let query = if text_only {
+            String::new()
+        } else {
+            let mut query = format!("?tree=1&producer={}", crate::screen_query::encode(producer));
+            if let Some(select) = select {
+                query.push_str(&format!("&select={}", crate::screen_query::encode(select)));
+            }
+            query
+        };
+        self.http_json(id, Method::GET, &format!("/sessions/{id}/screen{query}"), &())
+    }
+
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
@@ -1367,6 +1380,15 @@ impl SessionService {
         conditions: Vec<crate::protocol::WaitCondition>,
         timeout_ms: u64,
     ) -> Result<(crate::protocol::WaitStatus, u64), String> {
+        self.wait_with_condition(id, conditions, timeout_ms).map(|(status, elapsed, _)| (status, elapsed))
+    }
+
+    pub fn wait_with_condition(
+        &self,
+        id: &str,
+        conditions: Vec<crate::protocol::WaitCondition>,
+        timeout_ms: u64,
+    ) -> Result<(crate::protocol::WaitStatus, u64, Option<serde_json::Value>), String> {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
@@ -1375,10 +1397,14 @@ impl SessionService {
             id,
             Method::POST,
             &format!("/sessions/{id}/wait"),
-            &http_uds::WaitRequest { conditions, timeout_ms },
+            &http_uds::WaitRequest { conditions, select: None, timeout_ms },
             Duration::from_millis(timeout_ms.saturating_add(5000)),
         )?;
-        Ok((wait_status_from_http(response.status), response.elapsed_ms))
+        Ok((
+            wait_status_from_http(response.status),
+            response.elapsed_ms,
+            response.condition.map(|condition| serde_json::to_value(condition).expect("wait condition")),
+        ))
     }
 
     pub fn expect(&self, id: &str, text: &str, since_offset: u64, timeout_ms: u64) -> Result<(crate::protocol::WaitStatus, u64), String> {
@@ -1622,8 +1648,9 @@ fn signal_target_to_http(target: crate::protocol::SignalTarget) -> http_uds::Sig
     }
 }
 
-fn wait_condition_to_http(condition: crate::protocol::WaitCondition) -> http_uds::WaitConditionRequest {
+pub(crate) fn wait_condition_to_http(condition: crate::protocol::WaitCondition) -> http_uds::WaitConditionRequest {
     match condition {
+        crate::protocol::WaitCondition::Select { select } => http_uds::WaitConditionRequest::Select { select },
         crate::protocol::WaitCondition::ProgramState { states } => http_uds::WaitConditionRequest::ProgramState { states },
         crate::protocol::WaitCondition::OutputIdle { quiet_ms } => http_uds::WaitConditionRequest::OutputIdle { quiet_ms },
         crate::protocol::WaitCondition::TextMatch { text } => http_uds::WaitConditionRequest::TextMatch { text },
@@ -1641,6 +1668,9 @@ fn wait_status_from_http(status: http_uds::WaitStatusResponse) -> crate::protoco
 
 fn http_error_message(response: http_uds::HttpResponse) -> String {
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body) {
+        if value.get("error").is_some_and(|error| error.is_object()) {
+            return value.to_string();
+        }
         if let Some(message) = value.get("error").and_then(|value| value.as_str()) {
             return message.to_string();
         }

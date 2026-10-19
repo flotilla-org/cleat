@@ -274,7 +274,10 @@ pub(crate) struct ResolveNextMarkerResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct WaitRequest {
+    #[serde(default)]
     pub conditions: Vec<WaitConditionRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub select: Option<String>,
     pub timeout_ms: u64,
 }
 
@@ -285,6 +288,7 @@ pub(crate) enum WaitConditionRequest {
     OutputIdle { quiet_ms: u64 },
     TextMatch { text: String },
     ScreenStable { stable_ms: u64 },
+    Select { select: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -296,6 +300,8 @@ pub(crate) struct ExpectRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct WaitResultResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<WaitConditionRequest>,
     pub status: WaitStatusResponse,
     pub elapsed_ms: u64,
 }

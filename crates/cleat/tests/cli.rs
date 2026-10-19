@@ -503,7 +503,7 @@ fn send_keys_command_rejects_zero_repeat() {
 #[test]
 fn inspect_parses_session_id() {
     let cli = Cli::try_parse_from(["cleat", "inspect", "alpha"]).expect("parse inspect");
-    assert!(matches!(cli.command, Command::Inspect { ref id, json: false } if id == "alpha"));
+    assert!(matches!(cli.command, Command::Inspect { ref id, json: false, .. } if id == "alpha"));
 }
 
 #[test]
@@ -915,7 +915,7 @@ fn wait_execute_rejects_no_conditions() {
     let result = execute(cli, &service);
     match result {
         ExecResult::Exit { code: 2, message: Some(msg), .. } => {
-            assert!(msg.contains("at least one of --idle-time, --text, --screen-stable, or --state"));
+            assert!(msg.contains("at least one of --idle-time, --text, --screen-stable, --select, or --state"));
         }
         other => panic!("wait without conditions should exit 2, got: {other:?}"),
     }

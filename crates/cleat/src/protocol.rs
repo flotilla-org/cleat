@@ -253,6 +253,7 @@ pub enum WaitCondition {
     OutputIdle { quiet_ms: u64 },
     TextMatch { text: String },
     ScreenStable { stable_ms: u64 },
+    Select { select: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

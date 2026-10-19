@@ -2,7 +2,7 @@
 
 Pure, owned terminal snapshots, switchable region producers and selectors. There
 is no VT parser, daemon state, application recognizer or identity across frames.
-**Selector syntax is experimental until #24 lands.**
+**Selector syntax is stable for version 1 of the screen query API.**
 
 ```rust
 use terminal_screen::{analyze, Cell, Cursor, RowMetadata, ScreenGrid};

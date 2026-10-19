@@ -425,6 +425,14 @@ resolved through the live daemon socket. \n\
         id: String,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(long, help = "Inspect the screen region tree (stable selector syntax v1)")]
+        screen: bool,
+        #[arg(long, requires = "screen", conflicts_with = "text_only")]
+        select: Option<String>,
+        #[arg(long, requires = "screen", conflicts_with = "json")]
+        text_only: bool,
+        #[arg(long, requires = "screen", default_value = "graph", value_parser = ["graph"])]
+        producer: String,
     },
     /// Send an OS signal to the session process
     Signal {
@@ -492,6 +500,8 @@ resolved through the live daemon socket. \n\
                            \x20 --text STR     Wait until STR appears on the VT screen\n\
                            \x20 --screen-stable N  Wait until the rendered screen is stable for N (e.g., 500ms, 2s)\n\
                            \n\
+                           \x20 --select SEL   Wait until a selector matches the current screen (stable v1)\n\
+                           \n\
                            At least one condition is required.\n\
                            \n\
                            NOTE: --text matches against the current VT screen state. If the\n\
@@ -514,6 +524,8 @@ resolved through the live daemon socket. \n\
         idle_time: Option<std::time::Duration>,
         #[arg(long, help = "Wait until this text appears on screen")]
         text: Option<String>,
+        #[arg(long, help = "Wait for a screen selector (stable v1); advisory, use an atomic guard before dependent writes")]
+        select: Option<String>,
         /// Wait until the rendered screen is stable for this duration (e.g., 500ms, 2s, or plain seconds).
         #[arg(long, value_parser = crate::duration_parser::parse_humantime_or_seconds)]
         screen_stable: Option<std::time::Duration>,
@@ -1172,7 +1184,14 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 }
             }
         }
-        Command::Inspect { id, json } => {
+        Command::Inspect { id, json, screen, select, text_only, producer } => {
+            if screen {
+                return match service.screen_query(&id, select.as_deref(), &producer, text_only) {
+                    Ok(value) if text_only => ExecResult::Ok(Some(value["text"].as_str().unwrap_or("").to_string())),
+                    Ok(value) => ExecResult::Ok(Some(serde_json::to_string_pretty(&value).expect("JSON value"))),
+                    Err(err) => ExecResult::Err(err),
+                };
+            }
             let result = match service.inspect(&id) {
                 Ok(v) => v,
                 Err(e) => return ExecResult::Err(e),
@@ -1257,8 +1276,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
         },
-        Command::Wait { id, idle_time, text, screen_stable, state, timeout, json } => {
-            execute_wait(service, id, WaitOptions { idle_time, text, screen_stable, states: state, timeout, json })
+        Command::Wait { id, idle_time, text, select, screen_stable, state, timeout, json } => {
+            execute_wait(service, id, WaitOptions { idle_time, text, select, screen_stable, states: state, timeout, json })
         }
         Command::Expect { id, text, since, since_marker, timeout, json } => {
             execute_expect(service, id, text, since, since_marker, timeout, json)
@@ -1337,6 +1356,7 @@ pub fn resolve_daemon_target(
 }
 
 struct WaitOptions {
+    select: Option<String>,
     idle_time: Option<std::time::Duration>,
     text: Option<String>,
     screen_stable: Option<std::time::Duration>,
@@ -1346,11 +1366,11 @@ struct WaitOptions {
 }
 
 fn execute_wait(service: &SessionService, id: String, options: WaitOptions) -> ExecResult {
-    let WaitOptions { idle_time, text, screen_stable, states, timeout, json } = options;
-    if idle_time.is_none() && text.is_none() && screen_stable.is_none() && states.is_empty() {
+    let WaitOptions { idle_time, text, select, screen_stable, states, timeout, json } = options;
+    if select.is_none() && idle_time.is_none() && text.is_none() && screen_stable.is_none() && states.is_empty() {
         return ExecResult::Exit {
             code: 2,
-            message: Some("wait requires at least one of --idle-time, --text, --screen-stable, or --state".to_string()),
+            message: Some("wait requires at least one of --idle-time, --text, --screen-stable, --select, or --state".to_string()),
             output: None,
         };
     }
@@ -1380,9 +1400,12 @@ fn execute_wait(service: &SessionService, id: String, options: WaitOptions) -> E
         }
         conditions.push(WaitCondition::ScreenStable { stable_ms: (secs * 1000.0) as u64 });
     }
+    if let Some(select) = select {
+        conditions.push(WaitCondition::Select { select });
+    }
     let timeout_ms = (timeout * 1000.0) as u64;
 
-    let (status, elapsed_ms) = match service.wait(&id, conditions, timeout_ms) {
+    let (status, elapsed_ms, condition) = match service.wait_with_condition(&id, conditions, timeout_ms) {
         Ok(v) => v,
         Err(e) => {
             return ExecResult::Exit { code: 2, message: Some(e), output: None };
@@ -1392,7 +1415,7 @@ fn execute_wait(service: &SessionService, id: String, options: WaitOptions) -> E
     match status {
         WaitStatus::Ready => {
             if json {
-                ExecResult::Ok(Some(format!(r#"{{"status":"ready","elapsed_ms":{elapsed_ms}}}"#)))
+                ExecResult::Ok(Some(serde_json::json!({"status":"ready","elapsed_ms":elapsed_ms,"condition":condition}).to_string()))
             } else {
                 ExecResult::Ok(None)
             }

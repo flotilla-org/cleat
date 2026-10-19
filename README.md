@@ -147,6 +147,8 @@ A daemon is the process boundary for one named session set. The default daemon i
 
 **Sibling sessions.** `cleat launch [ID] --from SOURCE` resolves the daemon that owns `SOURCE` and applies the normal launch behavior there. The new session shares that daemon's initial execution context, not the source session's current cwd or exported variables. `--from` and `--server` are mutually exclusive; use `--server` directly when the same source ID exists in more than one daemon.
 
+**Screen queries.** `cleat inspect ID --screen --json` exposes the region tree; add `--select 'region:has(cursor):last-match'` to return matching nodes with cell coordinates and named regex captures. `--text-only` prints physical rows. `cleat wait ID --select SEL` waits until the current screen matches, alongside the existing OR conditions. Selector syntax is stable for version 1; waits are advisory. See [screen queries and the shared CLI/HTTP schema](docs/screen-queries.md).
+
 **Tags.** Sessions may carry flat, opaque tags. Add them at launch with repeated `--tag TAG`, mutate them with `cleat tag <id> +TAG -TAG`, and filter directory reads with repeated `--selector TAG`. Selectors are exact whole-tag matches and are ANDed when repeated. `key=value` is only a client convention; cleat does not interpret tag keys, values, hierarchy, or globs.
 
 **State directory.** The daemon registration, control socket, session state, and recordings share one root, discovered in priority order:

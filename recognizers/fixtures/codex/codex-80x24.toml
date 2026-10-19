@@ -58,4 +58,3 @@ composer.value = ""
 marker = "resize"
 roles = ["composer"]
 composer.value = ""
-

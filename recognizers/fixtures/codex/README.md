@@ -28,7 +28,8 @@ The nested harness uses existing provisioned credentials without copying or
 printing them. Approval is explicitly `on-request`, sandbox `read-only`;
 the crew's bypass mode is not inherited. No files were read or created by
 the nested harness. The harmless command prints only `fixture complete`.
-The startup PATH-alias warning is real and left visible.
+The startup PATH-alias warning is real and left visible. It is startup
+output, not a status or composer node; #352 must exclude it.
 
 Drive drafts with `cleat send ID --no-enter TEXT`, clear with
 `cleat send-keys ID C-c`, move to the start with `Home`, and mark after
@@ -76,7 +77,12 @@ identifies a cast marker, lists expected roles, and gives dotted role
 properties. `absent` lists roles that must not be inferred. Only evidenced
 properties are asserted: idle points do not invent a status node. #352 can
 adapt the stub layout to the engine's fixture API while preserving these
-values, including spaces and the literal newline.
+values, including spaces and the literal newline. When adapting the stubs
+for #352, also assert the completed `Worked for` footer and that historical
+prompt markers after resize do not produce extra composer nodes. Keep the
+expectations shared across both sizes once the engine supports that, so the
+identical role/value contracts cannot drift. These are adaptation requirements,
+not invented role names in the current stubs.
 
 ### Measured style evidence (extends #313 revision)
 

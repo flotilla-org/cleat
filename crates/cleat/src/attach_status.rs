@@ -69,6 +69,8 @@ impl Probe {
         }
         // Empty input is the terminal read loop's idle tick. Release an
         // isolated Escape promptly; keep longer OSC prefixes for late replies.
+        // A reply split immediately after ESC across an idle tick is indistinguishable
+        // from a user key: prioritize input latency, forwarding that ESC and its tail.
         if bytes.is_empty() && self.pending.len() == 1 && self.pending.front() == Some(&0x1b) {
             return self.pending.drain(..).collect();
         }

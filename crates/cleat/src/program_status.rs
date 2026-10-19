@@ -55,7 +55,7 @@ impl ProgramStatusStore {
     pub fn replace(&mut self, mut record: ProgramStatusRecord) {
         record.msg = strip_invisible_formatting(&record.msg);
         record.title = strip_invisible_formatting(&record.title);
-        self.records.retain(|old| old.id != record.id);
+        self.records.retain(|old| old.id != record.id || old.source != record.source);
         // Insertion order breaks timestamp ties and remains stable if the wall clock moves.
         if self.records.len() == 256 {
             self.records.remove(0);
@@ -90,6 +90,7 @@ pub struct ProgramStatusTracker(std::sync::Arc<std::sync::Mutex<TrackedProgramSt
 struct TrackedProgramStatus {
     store: ProgramStatusStore,
     generation: u64,
+    program_reported: bool,
 }
 impl ProgramStatusTracker {
     fn read<T>(&self, f: impl FnOnce(&TrackedProgramStatus) -> T) -> T {
@@ -114,7 +115,31 @@ impl ProgramStatusTracker {
     pub fn matches_states(&self, states: &[ProgramState]) -> bool {
         self.read(|state| state.store.records().iter().any(|record| states.contains(&record.state)))
     }
+    pub fn reset(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.store.clear("");
+        state.program_reported = false;
+        state.generation = state.generation.wrapping_add(1);
+    }
+    pub fn report_received(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.program_reported {
+            state.program_reported = true;
+            state.generation = state.generation.wrapping_add(1);
+        }
+    }
+    pub fn program_reported(&self) -> bool {
+        self.read(|state| state.program_reported)
+    }
+    pub fn snapshot_since(&self, generation: Option<u64>) -> Option<(u64, Vec<ProgramStatusRecord>, bool)> {
+        self.read(|state| {
+            (generation != Some(state.generation)).then(|| (state.generation, state.store.records().to_vec(), state.program_reported))
+        })
+    }
     pub fn replace(&self, record: ProgramStatusRecord) {
+        if record.source == ProgramStatusSource::Osc7501 {
+            self.report_received();
+        }
         self.update(|store| {
             store.replace(record);
             true
@@ -124,7 +149,12 @@ impl ProgramStatusTracker {
         self.update(|store| store.clear(id));
     }
     pub fn program_ended(&self) {
-        self.update(ProgramStatusStore::program_ended);
+        let mut state = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = state.store.program_ended() || state.program_reported;
+        state.program_reported = false;
+        if changed {
+            state.generation = state.generation.wrapping_add(1);
+        }
     }
     pub fn acknowledge(&self) {
         self.update(ProgramStatusStore::acknowledge);
@@ -215,7 +245,8 @@ mod tests {
         }
     }
 
-    // Unchanged snapshots are omitted; mutations advance an atomic generation and no-op removals preserve it.
+    // Unchanged observations are omitted; record or ownership changes advance the atomic generation.
+    // Prompt/exit resets ownership even when a retained done/error record is unchanged.
     // Generate replacement, clear, prompt/exit and acknowledgement sequences over every state.
     #[test]
     fn tracker_generations_and_read_predicates() {
@@ -246,7 +277,7 @@ mod tests {
                 }
                 let terminal = matches!(state, ProgramState::Done | ProgramState::Error);
                 let changed = match operation {
-                    1 => !terminal,
+                    1 => true,
                     2 => terminal,
                     _ => true,
                 };

@@ -639,6 +639,7 @@ impl VtEngine for GhosttyVtEngine {
         options.extra.palette = matches!(capabilities.color_level, ColorLevel::Ansi256 | ColorLevel::TrueColor);
 
         let payload = ghostty_ffi::format_terminal_alloc(self.terminal.raw(), options)?;
+        let payload = crate::status_output::StatusOutputFilter::default().push(&payload);
         Ok((!payload.is_empty()).then_some(payload))
     }
 

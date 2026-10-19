@@ -553,6 +553,7 @@ pub enum GhosttyTerminalOption {
     ModeDefault = 33,
     Mode = 34,
     SemanticPrompt = 42,
+    Reset = 43,
     ProgramStatus = 46,
 }
 
@@ -1197,6 +1198,7 @@ unsafe extern "C" fn program_status_trampoline(
     // sanitizing them after validation could collapse distinct record identities.
     let id = unsafe { copy_status_string(report.id) };
     if report.state == 5 {
+        effects.program_status.report_received();
         effects.program_status.clear(&id);
         return;
     }
@@ -1239,6 +1241,11 @@ unsafe extern "C" fn semantic_prompt_trampoline(
     }
     if prompt.kind == 1 {
         unsafe { &mut *(userdata as *mut TerminalEffects) }.program_status.program_ended();
+    }
+}
+unsafe extern "C" fn status_reset_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void) {
+    if !userdata.is_null() {
+        unsafe { &mut *(userdata as *mut TerminalEffects) }.program_status.reset();
     }
 }
 unsafe extern "C" fn title_changed_trampoline(_terminal: GhosttyTerminal, userdata: *mut c_void) {
@@ -1572,6 +1579,7 @@ impl TerminalHandle {
         for (option, callback) in [
             (GhosttyTerminalOption::ProgramStatus, program_status_trampoline as *const c_void),
             (GhosttyTerminalOption::SemanticPrompt, semantic_prompt_trampoline as *const c_void),
+            (GhosttyTerminalOption::Reset, status_reset_trampoline as *const c_void),
             (GhosttyTerminalOption::TitleChanged, title_changed_trampoline as *const c_void),
         ] {
             let result = unsafe { ghostty_terminal_set(raw, option, callback) };

@@ -743,6 +743,7 @@ fn prepare_outgoing(
         recording_paused: source.recording_paused,
         controller_input_history: source.controller_input_history,
         program_status: source.program_status,
+        program_reported: source.program_reported,
     };
     let Some(decisions) = &transfer.decisions else {
         let _ = hosted.actor.abort_transfer();
@@ -911,6 +912,7 @@ fn adopt_session(
         recording_paused: manifest.recording_paused,
         controller_input_history: manifest.controller_input_history,
         program_status: manifest.program_status,
+        program_reported: manifest.program_reported,
         pty_child,
         recording: descriptors.recording,
     };

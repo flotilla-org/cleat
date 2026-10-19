@@ -22,6 +22,9 @@ as in `write_replay_snapshot`. It represents the current screen, not scrollback.
 plus one, which the source writes to `<session directory>/epoch` when it commits.
 Optional `markers` (name to cast offset) and `recording_paused` carry recording
 state the adopter needs for marker-relative capture and `cleat record`.
+Optional `program_status` carries source-tagged records; `program_reported`
+(default false) preserves ownership after the current program has reported,
+even if its records have since been cleared or acknowledged.
 
 | Role | Descriptor contract |
 | --- | --- |

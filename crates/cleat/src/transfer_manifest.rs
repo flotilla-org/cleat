@@ -60,12 +60,14 @@ pub struct FdTransferManifest {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub markers: std::collections::HashMap<String, u64>,
     /// The recording is paused (`cleat record` off) rather than absent.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub recording_paused: bool,
     #[serde(default, skip_serializing_if = "crate::protocol::ControllerInputHistory::is_empty")]
     pub controller_input_history: crate::protocol::ControllerInputHistory,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub program_reported: bool,
 }
 
 #[derive(Deserialize)]
@@ -83,4 +85,8 @@ impl VersionHeader {
         }
         Ok(())
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }

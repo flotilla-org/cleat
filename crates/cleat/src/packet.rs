@@ -40,6 +40,8 @@ pub const MSG_SESSION_IMAGE_FILE_RESULT: u8 = 26;
 pub const MSG_SESSION_CLIPBOARD: u8 = 27;
 pub const MSG_SESSION_CLIPBOARD_LOSS: u8 = 28;
 pub const MSG_SESSION_RENDER_VIRTUAL: u8 = 29;
+/// Client: boolean opt-in on an admitted channel. Server: attach_status::StatusSnapshot.
+pub const MSG_SESSION_PROGRAM_STATUS: u8 = 30;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ClipboardLoss {
     /// Cumulative observed drops for the current host actor; a new/restarted actor resets the total.

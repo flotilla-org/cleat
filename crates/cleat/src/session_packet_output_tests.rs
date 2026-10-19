@@ -27,6 +27,8 @@ fn channel(id: u32, image: Image) -> PacketSessionChannel {
     let mut resident = HashSet::new();
     let transfer = ImageTransfer::new(id, RenderBundle::live(update, vec![image]), &mut resident).unwrap().local_files(false);
     PacketSessionChannel {
+        program_status: false,
+        status_generation: None,
         _output_lease: None,
         session_id: "benchmark".into(),
         role: ChannelRole::Watcher,

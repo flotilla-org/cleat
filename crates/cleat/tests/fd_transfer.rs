@@ -54,6 +54,7 @@ fn manifest() -> FdTransferManifest {
         recording_paused: false,
         controller_input_history: Default::default(),
         program_status: Vec::new(),
+        program_reported: false,
     }
 }
 fn pair() -> (UnixStream, UnixStream) {
@@ -74,6 +75,8 @@ fn is_open(fd: i32) -> bool {
 fn round_trip_all_roles_cloexec_and_shared_flags() {
     let (mut sender, mut receiver) = pair();
     let mut expected = manifest();
+    // Ownership survives transfer even when the program has cleared its last record.
+    expected.program_reported = true;
     // The live transfer must preserve controller generation and partial echo evidence.
     expected.controller_input_history = cleat::protocol::ControllerInputHistory {
         generation: 7,

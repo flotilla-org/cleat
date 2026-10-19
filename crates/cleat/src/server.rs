@@ -1043,7 +1043,19 @@ impl SessionService {
 
         let events = crate::cast_reader::read_output_between(&cast_path, start_offset, end_offset)?;
         let output: String = events.iter().map(|e| e.data.as_str()).collect();
+        // Historical raw output is presentation, not a second status terminal.
+        let header = crate::cast_reader::read_header(&cast_path)?;
+        let output = if header.cleat.is_some_and(|meta| meta.engine == "passthrough") {
+            output
+        } else {
+            String::from_utf8_lossy(&crate::status_output::StatusOutputFilter::default().push(output.as_bytes())).into_owned()
+        };
         Ok((output, SliceOutcome { start_offset, end_offset, end_status }))
+    }
+
+    /// Acknowledge retained done/error results for a focus-aware client.
+    pub fn acknowledge_program_status(&self, id: &str) -> Result<(), String> {
+        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/input"), &http_uds::InputRequest::AcknowledgeProgramStatus)
     }
 
     pub fn send_keys(&self, id: &str, bytes: &[u8]) -> Result<(), String> {

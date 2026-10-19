@@ -111,9 +111,17 @@ impl ForegroundAttach {
     /// already be caught, or the process dies with default disposition
     /// (observed as a test race once the daemon got fast enough).
     pub fn relay_stdio_with_handlers(self, signal_handlers: AttachSignalHandlers) -> Result<(), String> {
+        self.relay_stdio_with_program_status(signal_handlers, crate::attach_status::ProgramStatusMode::Auto)
+    }
+
+    pub fn relay_stdio_with_program_status(
+        self,
+        signal_handlers: AttachSignalHandlers,
+        mode: crate::attach_status::ProgramStatusMode,
+    ) -> Result<(), String> {
         match self.transport {
             ForegroundTransport::Legacy(stream) => relay_legacy_stdio(stream, signal_handlers),
-            ForegroundTransport::Packet(packet) => relay_packet_stdio(*packet, signal_handlers),
+            ForegroundTransport::Packet(packet) => relay_packet_stdio(*packet, signal_handlers, mode),
         }
     }
 }
@@ -226,6 +234,11 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
 }
 
 struct AttachChrome {
+    status: Option<crate::attach_status::StatusSnapshot>,
+    status_enabled: bool,
+    status_dirty: bool,
+    status_active: bool,
+    status_emitter: Arc<Mutex<crate::attach_status::StatusEmitter>>,
     session_name: String,
     nested_in: Option<String>,
     renderer: PacketTerminalRenderer,
@@ -238,6 +251,23 @@ struct AttachChrome {
 }
 
 impl AttachChrome {
+    fn emit_status(&mut self, writer: &mut impl Write) -> Result<(), String> {
+        let live = self.view.status == crate::provider::ViewStatus::Live;
+        let active = self.status_enabled && live && self.status.as_ref().is_some_and(|status| status.available);
+        if !self.status_dirty && self.status_active == active {
+            return Ok(());
+        }
+        let mut emitter = self.status_emitter.lock().map_err(|_| "status emitter poisoned")?;
+        let bytes = match &self.status {
+            Some(status) => emitter.update(&status.records, status.program_reported, active),
+            None => emitter.clear(),
+        };
+        writer.write_all(&bytes).map_err(|e| e.to_string())?;
+        self.status_active = active;
+        self.status_dirty = false;
+        Ok(())
+    }
+
     fn paint(&mut self, writer: &mut impl Write, update: Option<&TerminalRenderUpdate>) -> Result<(), String> {
         self.paint_at_size(writer, update, current_terminal_size())
     }
@@ -257,7 +287,8 @@ impl AttachChrome {
         } else {
             self.renderer.repaint(writer)?;
         }
-        self.render_at_size(writer, size)
+        self.render_at_size(writer, size)?;
+        self.emit_status(writer)
     }
 
     fn content_size(&self) -> (u16, u16) {
@@ -347,7 +378,11 @@ impl AttachChrome {
     }
 }
 
-fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSignalHandlers) -> Result<(), String> {
+fn relay_packet_stdio(
+    packet: PacketForegroundAttach,
+    signal_handlers: AttachSignalHandlers,
+    mode: crate::attach_status::ProgramStatusMode,
+) -> Result<(), String> {
     use crate::attach_input::{Action, Command, InputDecoder};
     let _signal_handlers = signal_handlers;
     let mut cleanup = AttachCleanupGuard::stdout();
@@ -365,7 +400,21 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
     } else {
         crate::runtime::ambient_session_coordinates()?.map(|source| format!("{}/{}", source.daemon_name(), source.session_id()))
     };
+    let status_emitter = Arc::new(Mutex::new(crate::attach_status::StatusEmitter::default()));
+    cleanup.status = Some(status_emitter.clone());
+    let mut probe = crate::attach_status::Probe::new(mode);
+    let probe_started = Instant::now();
+    {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(probe.query()).map_err(|e| e.to_string())?;
+        stdout.flush().map_err(|e| e.to_string())?;
+    }
     let chrome = Arc::new(Mutex::new(AttachChrome {
+        status: None,
+        status_enabled: probe.enabled,
+        status_dirty: true,
+        status_active: false,
+        status_emitter,
         session_name: packet.session_name,
         renderer,
         panning: false,
@@ -410,6 +459,7 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             &write_stream,
             PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: initial_update.render_generation }),
         )?;
+        write_packet_relay_frame(&detach_out, &write_stream, PacketFrame::new(channel, crate::packet::MSG_SESSION_PROGRAM_STATUS, &true))?;
         loop {
             let frame = match PacketFrame::read(&mut read_stream) {
                 Ok(frame) => frame,
@@ -440,6 +490,13 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                 }
                 (id, crate::packet::MSG_SESSION_IMAGE) if id == channel => {
                     images.chunk(frame.decode().map_err(|e| e.to_string())?)?;
+                }
+                (id, crate::packet::MSG_SESSION_PROGRAM_STATUS) if id == channel => {
+                    let status = frame.decode::<crate::attach_status::StatusSnapshot>().map_err(|e| e.to_string())?;
+                    let mut chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
+                    chrome.status = Some(status);
+                    chrome.status_dirty = true;
+                    chrome.emit_status(&mut stdout)?;
                 }
                 (id, MSG_SESSION_RENDER) if id == channel => {
                     let mut packet = frame.decode::<RenderPacket>().map_err(|e| e.to_string())?;
@@ -515,8 +572,18 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
                         *write_stream.lock().map_err(|_| "packet stream poisoned")? = stream;
                         followed = true;
                         images = opened.images;
+                        write_packet_relay_frame(
+                            &detach_out,
+                            &write_stream,
+                            PacketFrame::new(channel, crate::packet::MSG_SESSION_PROGRAM_STATUS, &true),
+                        )?;
                         controller_out.store(opened.role.role == ChannelRole::Controller, Ordering::SeqCst);
                         let mut chrome = chrome_out.lock().map_err(|_| "chrome poisoned")?;
+                        stdout
+                            .write_all(&chrome.status_emitter.lock().map_err(|_| "status emitter poisoned")?.clear())
+                            .map_err(|e| e.to_string())?;
+                        chrome.status = None;
+                        chrome.status_dirty = true;
                         chrome.role = opened.role;
                         chrome.hint = Some((format!("cleat: session moved to {}", moved.address), Instant::now() + Duration::from_secs(5)));
                         chrome.renderer.needs_full_repaint = true;
@@ -616,10 +683,23 @@ fn relay_packet_stdio(packet: PacketForegroundAttach, signal_handlers: AttachSig
             stdout.flush().map_err(|e| e.to_string())?;
         }
         decoder.set_driving(controller.load(Ordering::SeqCst));
-        let actions = match terminal.read_input(Duration::from_millis(100), &mut buf) {
-            Ok(None) => decoder.idle(),
+        let actions = match terminal.read_input(crate::attach_status::INPUT_IDLE_TICK, &mut buf) {
+            Ok(None) => {
+                let bytes = probe.feed(&[], probe_started.elapsed());
+                let mut actions = decoder.feed(&bytes);
+                actions.extend(decoder.idle());
+                actions
+            }
             Ok(Some(0)) => break Ok(()),
-            Ok(Some(n)) => decoder.feed(&buf[..n]),
+            Ok(Some(n)) => {
+                let bytes = probe.feed(&buf[..n], probe_started.elapsed());
+                let mut stdout = std::io::stdout().lock();
+                let mut chrome = chrome.lock().map_err(|_| "chrome poisoned")?;
+                chrome.status_enabled = probe.enabled;
+                chrome.emit_status(&mut stdout)?;
+                stdout.flush().map_err(|e| e.to_string())?;
+                decoder.feed(&bytes)
+            }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) if matches!(err.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe) => break Ok(()),
             Err(err) => break Err(err.to_string()),
@@ -1263,6 +1343,7 @@ enum AttachCleanupTarget {
 
 struct AttachCleanupGuard {
     keyboard: Option<Arc<Mutex<crate::attach_keyboard::KeyboardMode>>>,
+    status: Option<Arc<Mutex<crate::attach_status::StatusEmitter>>>,
     target: AttachCleanupTarget,
     enabled: bool,
     emitted: bool,
@@ -1270,39 +1351,51 @@ struct AttachCleanupGuard {
 
 impl AttachCleanupGuard {
     fn stdout() -> Self {
-        Self { keyboard: None, target: AttachCleanupTarget::Stdout, enabled: stdout_is_tty().unwrap_or(false), emitted: false }
+        Self {
+            keyboard: None,
+            status: None,
+            target: AttachCleanupTarget::Stdout,
+            enabled: stdout_is_tty().unwrap_or(false),
+            emitted: false,
+        }
     }
 
     #[cfg(test)]
     fn test_buffer(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
-        Self { keyboard: None, target: AttachCleanupTarget::Buffer(buffer), enabled: true, emitted: false }
+        Self { keyboard: None, status: None, target: AttachCleanupTarget::Buffer(buffer), enabled: true, emitted: false }
     }
 
     #[cfg(test)]
     fn test_buffer_disabled(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
-        Self { keyboard: None, target: AttachCleanupTarget::Buffer(buffer), enabled: false, emitted: false }
+        Self { keyboard: None, status: None, target: AttachCleanupTarget::Buffer(buffer), enabled: false, emitted: false }
     }
 
     fn restore_keyboard(&self, writer: &mut impl Write) -> Result<(), String> {
-        if let Some(keyboard) = &self.keyboard {
-            keyboard.lock().map_err(|_| "keyboard mode poisoned")?.close(writer).map_err(|e| e.to_string())?;
+        if let Some(status) = &self.status {
+            writer.write_all(&status.lock().map_err(|_| "status emitter poisoned")?.clear()).map_err(|e| e.to_string())?;
+        }
+        if self.enabled {
+            if let Some(keyboard) = &self.keyboard {
+                keyboard.lock().map_err(|_| "keyboard mode poisoned")?.close(writer).map_err(|e| e.to_string())?;
+            }
+            write_detach_cleanup(writer)?;
         }
         Ok(())
     }
 
     fn emit(&mut self) -> Result<(), String> {
-        if !self.enabled || self.emitted {
+        if self.emitted {
             return Ok(());
         }
         let result = match &self.target {
             AttachCleanupTarget::Stdout => {
                 let mut stdout = std::io::stdout().lock();
-                self.restore_keyboard(&mut stdout).and_then(|_| write_detach_cleanup(&mut stdout))
+                self.restore_keyboard(&mut stdout)
             }
             #[cfg(test)]
             AttachCleanupTarget::Buffer(buffer) => {
                 if let Ok(mut buffer) = buffer.lock() {
-                    self.restore_keyboard(&mut *buffer).and_then(|_| write_detach_cleanup(&mut *buffer))
+                    self.restore_keyboard(&mut *buffer)
                 } else {
                     Err("cleanup buffer lock poisoned".to_string())
                 }
@@ -2793,6 +2886,30 @@ fn service_activity_subscriptions(
         if client.dead {
             continue;
         }
+        let mut status_frames = Vec::new();
+        for (channel, session) in &mut client.channels {
+            if !session.program_status {
+                continue;
+            }
+            if let Some(hosted) = sessions.get(&session.session_id) {
+                if let Some((generation, available, records, program_reported)) =
+                    hosted.actor.program_status_since(session.status_generation)
+                {
+                    session.status_generation = Some(generation);
+                    status_frames.push(
+                        PacketFrame::new(*channel, crate::packet::MSG_SESSION_PROGRAM_STATUS, &crate::attach_status::StatusSnapshot {
+                            available,
+                            records,
+                            program_reported,
+                        })
+                        .map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+        }
+        for frame in status_frames {
+            client.enqueue_frame(&frame)?;
+        }
         if client.program_status {
             let selected = matching_activity_sessions(sessions, &client.selectors, 500);
             if let Err(message) = client.admit_activity(layout, &selected) {
@@ -2813,7 +2930,7 @@ fn service_activity_subscriptions(
                 let generation = prior
                     .filter(|known| known.tags == selected.tags)
                     .and_then(|_| client.known_program_status_generation.get(&selected.session_id).copied());
-                let Some((generation, available, records)) = hosted.actor.program_status_since(generation) else {
+                let Some((generation, available, records, _)) = hosted.actor.program_status_since(generation) else {
                     continue;
                 };
                 client.known_program_status_generation.insert(selected.session_id.clone(), generation);
@@ -3960,7 +4077,7 @@ fn handle_http_request(
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
-                http_uds::InputRequest::Send { text, submit, no_enter, controller_idle_ms, marker_name } => {
+                http_uds::InputRequest::Send { text, submit, no_enter, controller_idle_ms, marker_name, acknowledge } => {
                     if submit && no_enter {
                         return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "submit and no_enter are mutually exclusive")
                             .map_err(|error| format!("write send validation error: {error}"));
@@ -3973,9 +4090,13 @@ fn handle_http_request(
                         crate::host::actor::SendPreconditions { controller_idle: controller_idle_ms.map(Duration::from_millis) },
                         marker_name,
                     )?;
+                    if acknowledge {
+                        hosted.actor.acknowledge_program_status();
+                    }
                     hosted.pending_sends.push(PendingSend { stream: pending_stream, result });
                     return Ok(());
                 }
+                http_uds::InputRequest::AcknowledgeProgramStatus => hosted.actor.acknowledge_program_status(),
                 http_uds::InputRequest::Text { text } => {
                     hosted.actor.write_input(text.into_bytes())?;
                 }
@@ -4449,6 +4570,8 @@ struct PacketClient {
 }
 
 struct PacketSessionChannel {
+    program_status: bool,
+    status_generation: Option<u64>,
     _output_lease: Option<crate::output_admission::OutputLease>,
     session_id: String,
     role: ChannelRole,
@@ -4922,6 +5045,13 @@ fn handle_packet_frame(
                 }
             }
         }
+        (channel, crate::packet::MSG_SESSION_PROGRAM_STATUS) if channel != CHANNEL_CONTROL => {
+            let enabled = frame.decode::<bool>().map_err(|e| e.to_string())?;
+            if let Some(session) = packet_clients[index].channels.get_mut(&channel) {
+                session.program_status = enabled;
+                session.status_generation = None;
+            }
+        }
         (channel, MSG_SESSION_INPUT) if channel != CHANNEL_CONTROL => {
             let input = frame.decode::<Input>().map_err(|err| format!("decode input packet: {err}"))?;
             if let Some(session) = packet_clients[index].channels.get(&channel) {
@@ -5228,6 +5358,8 @@ fn open_packet_channel(
         hosted.packet_render_cache.store(update.clone());
     }
     packet_clients[index].channels.insert(open.channel, PacketSessionChannel {
+        program_status: false,
+        status_generation: None,
         _output_lease: output_lease,
         session_id: session_id.clone(),
         role: granted,
@@ -6443,6 +6575,11 @@ mod tests {
             provider::{TerminalModifiers, TerminalMouseButtons, TerminalMouseEvent, TerminalMouseEventKind},
         };
         let mut chrome = super::AttachChrome {
+            status: None,
+            status_enabled: false,
+            status_dirty: true,
+            status_active: false,
+            status_emitter: Default::default(),
             session_name: "whatever3".to_owned(),
             nested_in: None,
             renderer: PacketTerminalRenderer::new(120, 40),

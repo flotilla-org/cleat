@@ -335,6 +335,13 @@ fn read_events_since(path: &Path, offset: u64, filter: Option<EventCode>) -> Res
     Ok(events)
 }
 
+/// Read recording metadata without requiring a running session daemon.
+pub fn read_header(path: &Path) -> Result<crate::asciicast::Header, String> {
+    let mut header = String::new();
+    BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?).read_line(&mut header).map_err(|e| e.to_string())?;
+    crate::asciicast::decode_header(header.trim())
+}
+
 #[cfg(test)]
 mod tests_between_and_idle {
     use std::io::Write;

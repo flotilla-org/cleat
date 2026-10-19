@@ -258,7 +258,7 @@ session; invisible formatting is removed from `msg`/`title` before exposure.
 Ghostty validates `id`/`app` as ASCII names, so they cannot contain bidi or
 invisible formatting and their identities remain unchanged.
 
-Each report replaces its record. Clear removes that id and its descendants;
+Each report replaces its record from the same source. Clear removes that id and its descendants;
 clear without an id removes everything. The store holds up to 256 records,
 evicting the least recently updated. Prompt start and process exit remove live
 states; unacknowledged `done`/`error` results keep an exited session inspectable.
@@ -272,7 +272,45 @@ session id, tags, availability, and whole record list, initially and when change
 An empty list represents a clear. `SessionService::connect_program_status`
 provides the same subscription to Rust clients. Peers without the opt-in keep
 their existing hello (12, or 13 with virtual declarations) and activity layouts.
-Acknowledgement is internal for now; attach/send/provider input wiring is #328.
+`cleat attach` and `cleat watch` accept `--program-status=auto|on|off`
+(default `auto`). Auto sends one OSC 7501 support query on the existing terminal
+input read path. A complete reply received within **200 ms** enables re-emission;
+late replies are consumed for **3 seconds from probe startup** and never enable
+it. An isolated Esc is released on the first **100 ms input idle tick**, using
+the existing decoder's idle handling. A reply fragmented immediately after its
+leading Esc across an idle tick is indistinguishable from that key and is
+forwarded as input; longer identified OSC prefixes remain buffered.
+First paint does not wait for the probe. `on` enables without probing; `off`
+disables re-emission. A passthrough session forwards queries and reports unchanged
+in both directions, keeps no records, and neither probes nor clears on detach.
+
+Every enabled live attachment, including watchers, replays current records,
+sends whole replacements on changes, and clears dropped records. History views
+emit no program status; returning to live replays the current records. Detach or
+session end clears every id the attachment emitted. Ids pass through unchanged,
+including under nested cleat. Re-emission rebuilds validated reports within the
+4096-byte sequence, 2048-byte message and 192-byte title limits, stripping bidi
+and invisible formatting. Raw VT output streams, replay snapshots and transcript
+views strip OSC 7501 so the session VT alone answers program queries.
+Re-emission omits invalid or over-limit records rather than truncating fields or
+changing ids; `inspect --json` exposes stored records for diagnosis.
+
+Recognizer/title fallback uses the root id until the program's first report;
+program reports then win until process exit or OSC 133 A. The store retains
+sources independently, and attach arbitrates. Clears and acknowledgement do not
+restore fallback early. Host transfer preserves this ownership.
+
+Typing through a controlling live attachment acknowledges `done`/`error` results,
+and every attachment receives their removal. Watcher input and focus alone do
+not acknowledge. `SessionService::acknowledge_program_status(id)` lets clients
+acknowledge explicitly, using the `acknowledge_program_status` input request.
+`cleat send --ack` opts into acknowledgement; plain `send` preserves results.
+
+Foreground packet clients opt in per admitted channel by sending message 30
+(`MSG_SESSION_PROGRAM_STATUS`) with a postcard boolean. The same message returns
+whole snapshots (`available`, `records`, `program_reported`) initially and when
+the store generation changes, independently of render acknowledgements. Clients
+that do not request this message receive no additional frames.
 Window title delivery in render updates remains #297.
 
 Retention has no timeout: discarding unacknowledged `done`/`error` results would

@@ -1044,10 +1044,12 @@ impl SessionActor {
     pub(crate) fn program_status_since(
         &self,
         generation: Option<u64>,
-    ) -> Option<(u64, bool, Vec<crate::program_status::ProgramStatusRecord>)> {
+    ) -> Option<(u64, bool, Vec<crate::program_status::ProgramStatusRecord>, bool)> {
         match &self.program_status {
-            Some(tracker) => tracker.records_since(generation).map(|(generation, records)| (generation, true, records)),
-            None => (generation != Some(0)).then(|| (0, false, Vec::new())),
+            Some(tracker) => {
+                tracker.snapshot_since(generation).map(|(generation, records, reported)| (generation, true, records, reported))
+            }
+            None => (generation != Some(0)).then(|| (0, false, Vec::new(), false)),
         }
     }
 
@@ -1557,6 +1559,11 @@ fn session_actor_handle_command(
                 return false;
             }
             let active = controller_event_is_activity(&event);
+            if active {
+                if let Some(tracker) = runtime.program_status_tracker() {
+                    tracker.acknowledge();
+                }
+            }
             let result = if state.submission.is_some() {
                 let result = state.controller_queue.push(QueuedControllerInput::Event { source, event });
                 if result.is_ok() && active {

@@ -1,0 +1,45 @@
+id = "claude-code"
+revision = 1
+min_engine = "0.1.0"
+verified = ["claude-code =2.1.287", "claude-code =2.1.303"]
+
+# Original rules derived from the adjacent recordings, not a herdr translation.
+# A composer is the cursor-bearing region between horizontal rules. The footer's
+# shortcut hint distinguishes the rotating placeholder from typed placeholder words.
+[[rule]]
+select = 'screen > region:matches(/^─+$/) + region:has(cursor):matches(/^❯/):has(+ region:matches(/^─+$/) + region:has-text("? for shortcuts"))'
+role = "composer"
+value = ""
+state = "idle"
+
+[[rule]]
+select = 'screen > region:matches(/^─+$/) + region:has(cursor):matches(/^(?P<input>❯[^\n]*(?:\n[^\n]*)*)$/):not(:has(+ region:matches(/^─+$/) + region:has-text("? for shortcuts")))'
+role = "composer"
+value = { capture = "input", skip = 2, trim_padding = true }
+state = "idle"
+
+# The active footer overrides composer-idle. A completed-turn timing line
+# establishes done only while the empty-composer shortcut hint is present.
+[[rule]]
+select = 'screen > region:matches(/^─+$/) + region:has(cursor) + region:matches(/^─+$/) + region row:has-text("esc to interrupt"):last-match'
+role = "status"
+value = ""
+state = "working"
+
+[[rule]]
+select = 'screen:has(> region:matches(/^─+$/) + region:has(cursor) + region:matches(/^─+$/) + region:has-text("? for shortcuts")) row:matches(/done \d+:\d+ [AP]M/):last-match'
+state = "done"
+
+[[rule]]
+select = 'screen > region:has-text("Do you want to proceed?"):has-text("Esc to cancel")'
+role = "dialog"
+value = ""
+state = "blocked"
+kind = "approval"
+
+[[rule]]
+select = 'screen > region:has-text("Type something."):has(+ region:matches(/^─+$/) + region:has-text("Enter to select"))'
+role = "dialog"
+value = ""
+state = "blocked"
+kind = "question"

@@ -30,8 +30,84 @@ struct Declaration {
     select: String,
     role: Option<String>,
     state: Option<ProgramState>,
-    kind: Option<ProgramKind>,
-    value: Option<String>,
+    kind: Option<RoleKind>,
+    value: Option<Value>,
+}
+/// A dialog's UI kind can be approval while OSC 7501 calls it permission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoleKind {
+    Approval,
+    Permission,
+    Question,
+    Auth,
+}
+impl RoleKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Auth => "auth",
+        }
+    }
+    fn program_kind(self) -> ProgramKind {
+        match self {
+            Self::Approval | Self::Permission => ProgramKind::Permission,
+            Self::Question => ProgramKind::Question,
+            Self::Auth => ProgramKind::Auth,
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Value {
+    Template(String),
+    Capture(CaptureValue),
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureValue {
+    capture: String,
+    /// Drop this many Unicode scalar values from each captured line.
+    #[serde(default)]
+    skip: usize,
+    /// Remove screen padding, preserving blanks before a visible cursor.
+    #[serde(default)]
+    trim_padding: bool,
+}
+fn capture_value(spec: &CaptureValue, captures: &BTreeMap<String, String>, node: &Node, tree: &ScreenTree) -> Result<String, String> {
+    let captured = captures.get(&spec.capture).ok_or_else(|| format!("capture {} is absent", spec.capture))?;
+    if spec.trim_padding && captured != &node.text {
+        return Err("trim_padding requires a capture of the whole matched node".into());
+    }
+    let first_row = node.bounds.row as usize;
+    let cursors = tree.select("cursor").map_err(|e| e.to_string())?;
+    let mut lines = Vec::new();
+    for (index, line) in captured.split('\n').enumerate() {
+        let mut text = line.chars().skip(spec.skip).collect::<String>();
+        if spec.trim_padding {
+            text.truncate(text.trim_end_matches(' ').len());
+            if let Some(cursor) = cursors.iter().find(|c| {
+                c.bounds.row as usize == first_row + index
+                    && c.bounds.col >= node.bounds.col
+                    && u32::from(c.bounds.col) < u32::from(node.bounds.col) + u32::from(node.bounds.width)
+            }) {
+                // Padding is indistinguishable from typed trailing blanks after the
+                // cursor. Before the cursor it is observable input, even on an empty row.
+                let skipped = line.chars().take(spec.skip).collect::<String>();
+                let start_col = node.bounds.col as usize;
+                let minimum =
+                    (cursor.bounds.col as usize).saturating_sub(start_col + unicode_width::UnicodeWidthStr::width(skipped.as_str()));
+                let count = unicode_width::UnicodeWidthStr::width(text.as_str());
+                if minimum > count {
+                    text.extend(std::iter::repeat_n(' ', minimum - count));
+                }
+            }
+        }
+        lines.push(text);
+    }
+    Ok(lines.join("\n"))
 }
 struct Rule {
     selector: Selector,
@@ -84,13 +160,21 @@ impl Rules {
             if declaration.kind.is_some() && declaration.state != Some(ProgramState::Blocked) {
                 return Err(fail("kind requires blocked state".into()));
             }
-            if let Some(value) = &declaration.value {
+            if let Some(Value::Template(value)) = &declaration.value {
                 template(value, &BTreeMap::new(), false).map_err(&fail)?;
             }
             let selector = Selector::parse(&declaration.select).map_err(|e| fail(e.to_string()))?;
             if let Some(value) = &declaration.value {
                 let names = selector.capture_names().into_iter().map(|name| (name, String::new())).collect();
-                template(value, &names, true).map_err(&fail)?;
+                match value {
+                    Value::Template(value) => {
+                        template(value, &names, true).map_err(&fail)?;
+                    }
+                    Value::Capture(value) if !names.contains_key(&value.capture) => {
+                        return Err(fail(format!("capture {} is absent", value.capture)))
+                    }
+                    Value::Capture(_) => {}
+                }
             }
             rules.push(Rule { selector, declaration });
         }
@@ -186,6 +270,9 @@ fn load_selected_in(tags: &[String], directory: Option<&Path>) -> Result<Option<
         Rules::load(&addon)?
     } else {
         match id {
+            "claude-code" => {
+                Rules::parse(Path::new("recognizers/claude-code.toml"), include_str!("../../../recognizers/claude-code.toml"))?
+            }
             "synthetic" => Rules::parse(Path::new("recognizers/synthetic.toml"), include_str!("../../../recognizers/synthetic.toml"))?,
             _ => {
                 return Err(format!(
@@ -211,7 +298,7 @@ pub struct Role {
     pub height: u16,
     pub provenance: String,
     pub state: Option<ProgramState>,
-    pub kind: Option<ProgramKind>,
+    pub kind: Option<RoleKind>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Explanation {
@@ -280,7 +367,8 @@ impl Recognizer for Rules {
                 let node = input.node(matched.node).unwrap();
                 let source = provenance(&input, matched.node);
                 let value = match &rule.declaration.value {
-                    Some(value) => template(value, &matched.captures, true)?,
+                    Some(Value::Template(value)) => template(value, &matched.captures, true)?,
+                    Some(Value::Capture(value)) => capture_value(value, &matched.captures, node, &input)?,
                     None => node.text.clone(),
                 };
                 if let Some(role) = &rule.declaration.role {
@@ -299,7 +387,7 @@ impl Recognizer for Rules {
                 }
                 if let Some(state) = rule.declaration.state {
                     observation.state = Some(state);
-                    observation.kind = rule.declaration.kind;
+                    observation.kind = rule.declaration.kind.map(RoleKind::program_kind);
                     observation.source =
                         Some(if node.element == "title" { ProgramStatusSource::Title } else { ProgramStatusSource::Recognizer });
                     observation.visible = node.element != "title";
@@ -311,6 +399,28 @@ impl Recognizer for Rules {
         }
         Ok(observation)
     }
+}
+
+/// Attach already evaluated roles to a fresh structural query snapshot.
+pub(crate) fn attach_roles(tree: &mut ScreenTree, roles: &[Role]) -> Result<(), String> {
+    for role in roles {
+        let mut node = Node::new(
+            &role.role,
+            terminal_screen::Rect { col: role.col, row: role.row, width: role.width, height: role.height },
+            &role.value,
+        );
+        node.roles.insert(role.role.clone());
+        node.attributes.insert("value".into(), role.value.clone());
+        node.attributes.insert("provenance".into(), role.provenance.clone());
+        if let Some(state) = role.state {
+            node.attributes.insert("state".into(), state.as_str().into());
+        }
+        if let Some(kind) = role.kind {
+            node.attributes.insert("kind".into(), kind.as_str().into());
+        }
+        tree.add_node(tree.root(), node).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,24 +521,8 @@ impl Engine {
             // Retry attachment errors on cached observations without clearing evaluation errors.
             self.inspect.error = None;
         }
-        for role in &observation.roles {
-            let mut node = Node::new(
-                &role.role,
-                terminal_screen::Rect { col: role.col, row: role.row, width: role.width, height: role.height },
-                &role.value,
-            );
-            node.roles.insert(role.role.clone());
-            node.attributes.insert("value".into(), role.value.clone());
-            node.attributes.insert("provenance".into(), role.provenance.clone());
-            if let Some(state) = role.state {
-                node.attributes.insert("state".into(), state.as_str().into());
-            }
-            if let Some(kind) = role.kind {
-                node.attributes.insert("kind".into(), kind.as_str().into());
-            }
-            if let Err(error) = tree.add_node(tree.root(), node) {
-                self.inspect.error = Some(error.to_string());
-            }
+        if let Err(error) = attach_roles(tree, &observation.roles) {
+            self.inspect.error = Some(error);
         }
         self.inspect.observation = observation.clone();
         let next = observation.state;
@@ -572,12 +666,15 @@ pub struct MarkerExpectation {
     pub role: Vec<ExpectedRole>,
     pub state: Option<ProgramState>,
     pub source: Option<ProgramStatusSource>,
+    #[serde(default)]
+    pub agree_osc: bool,
 }
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedRole {
     pub role: String,
     pub value: String,
+    pub kind: Option<RoleKind>,
 }
 
 /// Library equivalent of replay: use the real VT parser with no pacing or side effects.
@@ -633,28 +730,39 @@ pub fn check_fixture(
             return Err(format!("{}: {error}", cast.display()));
         }
         if event.code == EventCode::Marker {
-            if let Some(expected) = pending.remove(&event.data) {
-                let actual = recognizer
-                    .inspect
-                    .observation
-                    .roles
-                    .iter()
-                    .map(|r| ExpectedRole { role: r.role.clone(), value: r.value.clone() })
-                    .collect::<Vec<_>>();
-                // Marker states compare the last confirmed, debounced engine state.
-                // The observation may carry a newer candidate while idle is pending.
-                if actual != expected.role
-                    || expected.state.is_some_and(|state| Some(state) != recognizer.state)
-                    || expected.source.is_some_and(|source| Some(source) != recognizer.inspect.observation.source)
-                {
+            let expected = pending.remove(&event.data).ok_or_else(|| format!("{}: unexpected marker {}", cast.display(), event.data))?;
+            let actual = recognizer
+                .inspect
+                .observation
+                .roles
+                .iter()
+                .map(|r| ExpectedRole { role: r.role.clone(), value: r.value.clone(), kind: r.kind })
+                .collect::<Vec<_>>();
+            // Marker states compare the last confirmed, debounced engine state.
+            // The observation may carry a newer candidate while idle is pending.
+            if expected.agree_osc {
+                let reports = engine.program_status().ok_or("VT does not expose program reports")?;
+                let report = reports.iter().find(|r| r.app == recognizer.inspect.id).ok_or("missing matching OSC report")?;
+                if Some(report.state) != recognizer.state || report.kind != recognizer.inspect.observation.kind {
                     return Err(format!(
-                        "{} marker {}: expected {expected:?}, got {actual:?}, state {:?}, source {:?}",
+                        "{} marker {}: OSC disagreement: {report:?}, inferred {:?}",
                         cast.display(),
                         event.data,
-                        recognizer.state,
-                        recognizer.inspect.observation.source
+                        recognizer.inspect.observation
                     ));
                 }
+            }
+            if actual != expected.role
+                || expected.state.is_some_and(|state| Some(state) != recognizer.state)
+                || expected.source.is_some_and(|source| Some(source) != recognizer.inspect.observation.source)
+            {
+                return Err(format!(
+                    "{} marker {}: expected {expected:?}, got {actual:?}, state {:?}, source {:?}",
+                    cast.display(),
+                    event.data,
+                    recognizer.state,
+                    recognizer.inspect.observation.source
+                ));
             }
         }
     }
@@ -711,6 +819,8 @@ mod tests {
             "[[rule]]\nselect='row'\nrole='bad role'",
             "[[rule]]\nselect='row'\nrole='composer'\nvalue='{unclosed'",
             "[[rule]]\nselect='row'\nrole='composer'\nunknown=true",
+            "[[rule]]\nselect='row'\nrole='composer'\nvalue={capture='missing'}",
+            "[[rule]]\nselect='row:matches(/(?P<input>.*)/)'\nrole='composer'\nvalue={capture='input', typo=true}",
         ] {
             let error = Rules::parse(Path::new("broken.toml"), &format!("{valid}{body}")).err().unwrap();
             assert!(error.contains("broken.toml:") && error.contains("rule"), "{error}");
@@ -844,6 +954,41 @@ mod tests {
                 Box::new(Rules::load(&root.join("synthetic.toml")).unwrap())
             )
             .is_err());
+        }
+    }
+    // Capture extraction removes terminal padding without losing blanks before
+    // the cursor or text after it. Cases span empty, Unicode, multiline and left movement.
+    #[test]
+    fn capture_values_preserve_observable_input() {
+        for (input, cursor_row, cursor_col, expected) in [
+            ("❯  ", 0, 2, ""),
+            ("❯     ", 0, 5, "   "),
+            ("❯ abc def   ", 0, 6, "abc def"),
+            ("❯ 界e\u{301}   ", 0, 5, "界e\u{301}"),
+            ("❯ one   \n  two    ", 1, 7, "one\ntwo  "),
+        ] {
+            let mut tree = ScreenTree::from_root(0, Node::new("screen", Rect { col: 0, row: 0, width: 80, height: 2 }, input));
+            tree.add_node(tree.root(), Node::new("cursor", Rect { col: cursor_col, row: cursor_row, width: 1, height: 1 }, "")).unwrap();
+            let spec = CaptureValue { capture: "input".into(), skip: 2, trim_padding: true };
+            let captures = BTreeMap::from([("input".into(), input.into())]);
+            assert_eq!(capture_value(&spec, &captures, tree.node(tree.root()).unwrap(), &tree).unwrap(), expected);
+        }
+    }
+    // Recorded scenarios cover empty, placeholder-word, multiline, space-only,
+    // cursor-left, resize, working, done, approval and question at both sizes.
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn claude_code_cast_fixtures() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recognizers");
+        for stem in ["claude-code-80x24", "claude-code-120x40", "auth-80x24", "auth-120x40"] {
+            let mut vt = crate::vt::ghostty::GhosttyVtEngine::new(80, 24);
+            check_fixture(
+                &root.join(format!("fixtures/claude-code/{stem}.cast")),
+                &root.join(format!("fixtures/claude-code/{stem}.toml")),
+                &mut vt,
+                Box::new(load_selected_in(&["recognizer:claude-code".into()], None).unwrap().unwrap()),
+            )
+            .unwrap();
         }
     }
     // Header-shaped text in comments and strings cannot renumber semantic errors.

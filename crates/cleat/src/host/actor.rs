@@ -1755,7 +1755,10 @@ fn session_actor_handle_command(
                 }
                 // Query snapshots retain every row, even after packet publication.
                 update.render_generation = state.observation.render_generation;
-                crate::screen_query::grid_from_update(update).map(|grid| terminal_screen::analyze(&grid))
+                let grid = crate::screen_query::grid_from_update(update)?;
+                let mut tree = terminal_screen::analyze(&grid);
+                runtime.attach_recognizer_roles(&mut tree)?;
+                Ok(tree)
             });
             let _ = reply.send(result);
         }

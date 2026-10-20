@@ -194,6 +194,7 @@ dependencies = [
  "tempfile",
  "terminal-screen",
  "toml",
+ "unicode-width",
  "uuid",
  "windows-sys",
 ]

@@ -31,6 +31,7 @@ serde_json = { workspace = true }
 sysinfo = "0.38"
 terminal-screen = { path = "../terminal-screen" }
 toml = "0.8"
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]

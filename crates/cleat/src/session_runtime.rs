@@ -954,6 +954,13 @@ impl SessionRuntime {
         self.recognizer.as_ref()?.deadline().map(|ms| self.epoch + Duration::from_millis(ms))
     }
 
+    pub(crate) fn attach_recognizer_roles(&self, tree: &mut terminal_screen::ScreenTree) -> Result<(), String> {
+        if let Some(engine) = &self.recognizer {
+            crate::recognizer::attach_roles(tree, &engine.inspect.observation.roles)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn recognize(&mut self) {
         let Some(engine) = &mut self.recognizer else {
             return;

@@ -18,7 +18,9 @@ formatting are diagnostic and may change.
 
 Bundled sources live in `recognizers/<id>.toml`. They are embedded in the binary
 so installation does not depend on the build checkout. The shipped `synthetic`
-recognizer is an engine demonstration, not a Codex or Claude Code recognizer.
+recognizer is an engine demonstration. `claude-code` covers the recorded
+Claude Code 2.1.287 composer scenarios and 2.1.303 composer, working, completed,
+approval and question scenarios. Select it explicitly with `--recognizer claude-code`.
 
 An existing add-on overrides the bundled file with the same id. Malformed or
 unreadable overrides, including broken symlinks, fail loading; they do not fall back to bundled rules.
@@ -68,12 +70,27 @@ captures with `{name}`; literal text around captures is preserved. Unknown
 capture names fail loading; absent optional captures cause an evaluation error. An evaluation error discards the entire observation for that frame, including otherwise successful rules, and is reported in inspect.
 Without `value`, a role retains the matched node's text, including spaces.
 
+A capture can also be extracted line by line:
+
+```toml
+value = { capture = "input", skip = 2, trim_padding = true }
+```
+
+`skip` drops Unicode scalar values from the start of each captured line (for
+example, a prompt marker and its following space, or continuation indentation).
+`trim_padding` requires the capture to span the whole matched node. It removes
+trailing ASCII screen spaces, retaining spaces before a visible hardware cursor. Display width, including wide and combining characters,
+is used when padding to the cursor. Text after a cursor moved left is retained.
+Spaces after the cursor cannot be distinguished from screen padding; this mode
+does not claim to recover them. Missing captures fail evaluation as templates do.
+
 `role` is an ASCII identifier (letters, digits, `_`, `-`). Each match produces a
 node of that name in the same screen tree, carrying its role, value, state,
 kind and provenance attributes, and the matched rectangle. States use OSC 7501's
 `idle`, `working`, `done`, `blocked`, `error`. `kind` requires `blocked` and is
-`permission`, `question` or `auth`. Rules evaluate against the input tree, not
-each other's output. When a rule matches declared and inferred regions, only
+`approval`, `permission`, `question` or `auth`. `approval` is a dialog UI kind;
+its program status uses OSC 7501's `permission` kind. Rules evaluate against the
+input tree, not each other's output. When a rule matches declared and inferred regions, only
 declared matches are used. Rules run in file order and matches in document
 order; the last matching state declaration wins. `title` is a synthetic node
 whose text is the latest observed terminal title, including a known empty title.
@@ -132,10 +149,14 @@ name = "cleared"
 role = []
 ```
 
+Role entries optionally include `kind`, which is compared exactly (omitting it
+expects no kind). `agree_osc = true` on a marker also requires a program report
+whose `app` matches the recognizer id and compares its state and kind with the
+recognizer's own result. The report never supplies the inferred answer.
 Role lists are exact, ordered observations; omitted `role` means empty. Optional
 state and source constrain those fields. State assertions compare the last
 confirmed, debounced engine state rather than the current candidate. Duplicate
-expectations, missing
+expectations, unexpected or missing
 markers, evaluation errors and mismatches fail the harness. See the synthetic
 fixture and `synthetic_cast_fixture` test. The harness never forwards recorded
 terminal replies or clipboard effects.
@@ -148,5 +169,6 @@ cargo test --release -p cleat recognizer_adversarial_plus_budget -- --ignored --
 
 It reports recognition time including frame cloning and checks the 5 ms budget.
 The segmentation budget remains independently measured by terminal-screen's
-`adversarial_plus_budget` test. No herdr rules are translated in this slice;
-future translations must carry attribution notices with their rule files.
+`adversarial_plus_budget` test. The Claude rules are original rules derived
+from the recorded casts; no herdr rules are translated. Future translations must carry attribution notices with
+their rule files.

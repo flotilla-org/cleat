@@ -246,3 +246,44 @@ fn selector_wait_on_retained_exit_is_session_gone() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(serde_json::from_slice::<Value>(&output.stdout).unwrap()["status"], "session_gone");
 }
+
+// The bundled Claude recognizer reaches the public CLI screen selector after
+// replaying a real draft; the PTY child is the recorded application boundary.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn claude_composer_inspect_end_to_end() {
+    let f = Fixture::new();
+    let cast = include_str!("../../../recognizers/fixtures/claude-code/auth-80x24.cast");
+    let mut output = String::new();
+    for line in cast.lines().skip(1) {
+        let event: Value = serde_json::from_str(line).unwrap();
+        if event[1] == "m" && event[2] == "draft" {
+            break;
+        }
+        if event[1] == "o" {
+            output.push_str(event[2].as_str().unwrap());
+        }
+    }
+    let path = f.temp.path().join("output");
+    std::fs::write(&path, output).unwrap();
+    f.service
+        .create_with_options(
+            Some("screen".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some(format!("stty raw -echo; cat {}; sleep 120", path.display())),
+            cleat::session::SessionStartOptions {
+                initial_size: TerminalSize { cols: 80, rows: 24 },
+                tags: vec!["recognizer:claude-code".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ready = f.cli(&["wait", "screen", "--select", "composer[value='Describe the throwaway file.']", "--timeout", "10"]);
+    assert!(ready.status.success(), "{:?}\n{:?}", f.service.inspect("screen"), f.service.capture("screen"));
+    let result = f.cli(&["inspect", "screen", "--screen", "--select", "composer"]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let result: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(result["nodes"][0]["attributes"]["value"], "Describe the throwaway file.");
+}

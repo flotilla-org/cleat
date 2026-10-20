@@ -31,7 +31,7 @@ When testing from inside a Cleat session, isolate the tests from the enclosing
 session's routing metadata:
 
 ```bash
-env -u CLEAT_SESSION -u CLEAT_DAEMON -u CLEAT_RUNTIME_DIR cargo test --workspace --locked
+env -u CLEAT_SESSION -u CLEAT_DAEMON -u CLEAT_OUTPUT_DAEMON -u CLEAT_RUNTIME_DIR cargo test --workspace --locked
 ```
 
 An older enclosing daemon can otherwise cause attach tests to fail with
@@ -52,7 +52,7 @@ For Linux containers whose PID 1 does not reap orphans, install
 and wrap the entire Cargo invocation:
 
 ```bash
-tini -s -- env -u CLEAT_SESSION -u CLEAT_DAEMON -u CLEAT_RUNTIME_DIR cargo test --workspace --locked
+tini -s -- env -u CLEAT_SESSION -u CLEAT_DAEMON -u CLEAT_OUTPUT_DAEMON -u CLEAT_RUNTIME_DIR cargo test --workspace --locked
 ```
 
 `-s` registers Tini with `PR_SET_CHILD_SUBREAPER` even when it is not PID 1.

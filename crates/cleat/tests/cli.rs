@@ -210,6 +210,7 @@ fn attach_command_rejects_strict_with_take() {
 fn launch_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--cmd", "bash"]).expect("launch parses");
     assert_eq!(cli.command, Command::Launch {
+        recognizer: None,
         id: None,
         from: None,
         json: false,
@@ -273,6 +274,7 @@ fn launch_command_rejects_invalid_size() {
 fn launch_command_parses_positional_name() {
     let cli = Cli::try_parse_from(["cleat", "launch", "demo", "--cmd", "bash"]).expect("launch positional parses");
     assert_eq!(cli.command, Command::Launch {
+        recognizer: None,
         id: Some("demo".into()),
         from: None,
         json: false,
@@ -325,6 +327,7 @@ fn launch_command_rejects_reserved_environment_entry() {
 fn launch_command_parses_json() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--json", "demo"]).expect("launch --json parses");
     assert_eq!(cli.command, Command::Launch {
+        recognizer: None,
         id: Some("demo".into()),
         from: None,
         json: true,
@@ -343,6 +346,7 @@ fn launch_command_parses_json() {
 fn launch_command_parses_vt() {
     let cli = Cli::try_parse_from(["cleat", "launch", "--vt", "ghostty", "demo"]).expect("launch --vt parses");
     assert_eq!(cli.command, Command::Launch {
+        recognizer: None,
         id: Some("demo".into()),
         from: None,
         json: false,
@@ -361,6 +365,7 @@ fn launch_command_parses_vt() {
 fn create_alias_still_parses_as_launch() {
     let cli = Cli::try_parse_from(["cleat", "create", "--cmd", "bash"]).expect("create alias parses");
     assert_eq!(cli.command, Command::Launch {
+        recognizer: None,
         id: None,
         from: None,
         json: false,
@@ -511,7 +516,7 @@ fn send_keys_command_rejects_zero_repeat() {
 #[test]
 fn inspect_parses_session_id() {
     let cli = Cli::try_parse_from(["cleat", "inspect", "alpha"]).expect("parse inspect");
-    assert!(matches!(cli.command, Command::Inspect { ref id, json: false, .. } if id == "alpha"));
+    assert!(matches!(cli.command, Command::Inspect { ref id, json: false, explain: false, .. } if id == "alpha"));
 }
 
 #[test]
@@ -1203,4 +1208,26 @@ fn wait_program_states_parse_and_reject_unknown_states() {
     for value in ["clear", "busy", "", "idle,unknown"] {
         assert!(Cli::try_parse_from(["cleat", "wait", "sess", "--state", value]).is_err(), "{value:?}");
     }
+}
+
+// Explicit selection and explain flags are accepted without command-name inference.
+#[test]
+fn recognizer_and_explain_flags() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "--recognizer", "synthetic"]).unwrap();
+    assert!(matches!(cli.command, Command::Launch { recognizer: Some(ref id), .. } if id == "synthetic"));
+    let cli = Cli::try_parse_from(["cleat", "inspect", "alpha", "--explain"]).unwrap();
+    assert!(matches!(cli.command, Command::Inspect { explain: true, .. }));
+}
+
+// Conflicting explicit recognizer selections are rejected by the CLI before
+// it starts a daemon or creates any session files.
+#[test]
+fn conflicting_recognizer_selections_do_not_start_a_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
+    let cli =
+        Cli::try_parse_from(["cleat", "--server", "default", "launch", "--recognizer", "synthetic", "--tag", "recognizer:other"]).unwrap();
+    let error = execute(cli, &service).expect_err("conflicting recognizers");
+    assert!(error.contains("select exactly one recognizer"), "{error}");
+    assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none(), "CLI validation must precede daemon startup");
 }

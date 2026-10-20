@@ -82,6 +82,20 @@ impl Selector {
         }
         Ok(selector)
     }
+    /// Names that positive regex predicates can capture on the selected node.
+    /// Predicate-only captures inside :has and :not are deliberately excluded.
+    pub fn capture_names(&self) -> BTreeSet<String> {
+        self.groups
+            .iter()
+            .filter_map(|group| group.last())
+            .flat_map(|segment| &segment.filters)
+            .filter_map(|filter| match filter {
+                Filter::Matches(regex) => Some(regex),
+                _ => None,
+            })
+            .flat_map(|regex| regex.capture_names().flatten().map(str::to_owned))
+            .collect()
+    }
     /// Match results include named regex groups on the selected node.
     pub fn evaluate_with_captures(&self, tree: &ScreenTree) -> Vec<SelectorMatch> {
         let mut evaluation = Evaluation::new(tree);

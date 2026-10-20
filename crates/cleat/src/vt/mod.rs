@@ -383,6 +383,11 @@ pub trait VtEngine {
         self.replay_payload(&ClientCapabilities::new(ColorLevel::TrueColor, true))
     }
     fn screen_text(&self) -> Result<String, String>;
+    /// Observe for recognition without consuming renderer damage.
+    fn recognition_tree(&mut self, _generation: u64) -> Result<terminal_screen::ScreenTree, String> {
+        Err("recognizers require a functional VT engine".into())
+    }
+
     fn screen_grid(&mut self) -> Result<ScreenGrid, String>;
     fn render_update(&mut self, dirty: DirtyState) -> Result<TerminalRenderUpdate, String> {
         let snapshot = TerminalSnapshot::from_screen_grid(self.screen_grid()?, dirty);

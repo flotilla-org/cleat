@@ -21,6 +21,40 @@ struct OldDaemon {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+// Exercise the actual executable before testing detached successor orchestration.
+// Capture early process failures instead of reducing them to a missing socket.
+#[cfg(windows)]
+#[test]
+fn daemon_executable_reaches_health_check() {
+    use std::process::{Command, Stdio};
+
+    let temp = tempfile::tempdir().unwrap();
+    let layout = RuntimeLayout::new(temp.path().to_path_buf()).with_daemon("startup-test".into()).unwrap();
+    let service = SessionService::new(layout.clone());
+    let mut child = Command::new(crate::platform::daemon::resolve_cleat_executable().unwrap())
+        .arg("--runtime-root")
+        .arg(temp.path())
+        .args(["--server", "startup-test", "serve"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let healthy = loop {
+        if service.daemon_status_at("/healthz").is_ok() {
+            break true;
+        }
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    assert!(healthy, "daemon exited with {}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+}
+
 impl OldDaemon {
     fn start(layout: &RuntimeLayout, supports_drain: bool) -> Self {
         let lifetime = layout.try_lock_daemon_lifetime().unwrap().unwrap();

@@ -115,6 +115,8 @@ impl ControllerInputHistory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResult {
     #[serde(default)]
+    pub recognizer: Option<crate::recognizer::Inspect>,
+    #[serde(default)]
     pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
     #[serde(default)]
     pub program_status_available: bool,

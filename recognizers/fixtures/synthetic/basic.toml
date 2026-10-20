@@ -1,0 +1,17 @@
+[[marker]]
+name = "draft"
+state = "working"
+source = "title"
+role = [{ role = "composer", value = "hello" }]
+
+[[marker]]
+name = "permission"
+state = "blocked"
+source = "recognizer"
+role = [{ role = "composer", value = "hello" }, { role = "dialog", value = "Permission required" }]
+
+[[marker]]
+name = "ready"
+state = "idle"
+source = "recognizer"
+role = []

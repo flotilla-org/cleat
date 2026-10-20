@@ -340,3 +340,5 @@ for lookup, platform and compatibility details.
 - **Non-Ghostty builds return errors** for `capture` and other VT-dependent operations. The `passthrough` engine is a test seam, not a real VT. A functional binary requires `--features ghostty-vt`.
 
 Controller activity and `send --controller-idle` are documented in [Controller input and daemon submission](docs/controller-input-and-submit.md).
+
+Application recognition is opt-in; see [recognizer rules and fixtures](docs/recognizers.md).

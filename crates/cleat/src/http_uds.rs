@@ -356,6 +356,8 @@ pub(crate) struct SessionListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct PacketSubscribeRequest {
+    #[serde(default)]
+    pub recognizer_roles: bool,
     /// Opt in to session-attributed ProgramStatusChanged activity events (protocol 14).
     #[serde(default)]
     pub program_status: bool,

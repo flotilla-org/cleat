@@ -867,6 +867,7 @@ fn connect_packet_endpoint_with_declarations(
 ) -> Result<(SessionStream, DirectorySnapshot), String> {
     let mut stream = try_connect_session_stream(socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
     let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest {
+        recognizer_roles: false,
         program_status: false,
         selectors: selectors.to_vec(),
         screen_activity_stable_ms: None,

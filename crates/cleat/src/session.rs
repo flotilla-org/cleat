@@ -2892,7 +2892,7 @@ fn service_activity_subscriptions(
                 continue;
             }
             if let Some(hosted) = sessions.get(&session.session_id) {
-                if let Some((generation, available, records, program_reported)) =
+                if let Some((generation, available, records, _, program_reported)) =
                     hosted.actor.program_status_since(session.status_generation)
                 {
                     session.status_generation = Some(generation);
@@ -2927,13 +2927,23 @@ fn service_activity_subscriptions(
                 let hosted = &sessions[&selected.session_id];
                 current_ids.insert(selected.session_id.clone());
                 let prior = client.known_program_status.get(&selected.session_id);
+                let attribution_changed = prior.is_none_or(|known| known.tags != selected.tags);
                 let generation = prior
                     .filter(|known| known.tags == selected.tags)
                     .and_then(|_| client.known_program_status_generation.get(&selected.session_id).copied());
-                let Some((generation, available, records, _)) = hosted.actor.program_status_since(generation) else {
+                let Some((generation, available, records, roles, _)) = hosted.actor.program_status_since(generation) else {
                     continue;
                 };
                 client.known_program_status_generation.insert(selected.session_id.clone(), generation);
+                if client.recognizer_roles && (attribution_changed || client.known_roles.get(&selected.session_id) != Some(&roles)) {
+                    client.known_roles.insert(selected.session_id.clone(), roles.clone());
+                    client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::RolesChanged {
+                        session_id: selected.session_id.clone(),
+                        tags: selected.tags.clone(),
+                        roles,
+                        changed_at_unix_ms: unix_time_ms(),
+                    })?;
+                }
                 let session =
                     crate::packet::ProgramStatusSession { session_id: selected.session_id, tags: selected.tags, available, records };
                 if client.known_program_status.get(&session.session_id) != Some(&session) {
@@ -2947,6 +2957,14 @@ fn service_activity_subscriptions(
             let removed = client.known_program_status.keys().filter(|id| !current_ids.contains(*id)).cloned().collect::<Vec<_>>();
             for id in removed {
                 client.known_program_status_generation.remove(&id);
+                if client.recognizer_roles && client.known_roles.remove(&id).is_some() {
+                    client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::RolesChanged {
+                        session_id: id.clone(),
+                        tags: client.known_program_status.get(&id).map(|known| known.tags.clone()).unwrap_or_default(),
+                        roles: Vec::new(),
+                        changed_at_unix_ms: unix_time_ms(),
+                    })?;
+                }
                 if let Some(mut session) = client.known_program_status.remove(&id) {
                     session.records.clear();
                     client.enqueue_control(MSG_CONTROL_ACTIVITY_EVENT, &ActivityEvent::ProgramStatusChanged {
@@ -3812,14 +3830,18 @@ fn handle_http_request(
                 output_context.expect("validated packet output context"),
             )?;
             client.virtual_placements = subscribe.virtual_placements;
-            client.program_status = subscribe.program_status;
+            client.program_status = subscribe.program_status || subscribe.recognizer_roles;
+            client.recognizer_roles = subscribe.recognizer_roles;
             if let Some(activity) = &activity {
                 if let Err(message) = client.admit_activity(state.layout, &activity.sessions) {
                     return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
                         .map_err(|err| format!("write activity admission error: {err}"));
                 }
             }
-            client.enqueue_control(MSG_CONTROL_HELLO, &hello_for_subscription(client.virtual_placements, client.program_status))?;
+            client.enqueue_control(
+                MSG_CONTROL_HELLO,
+                &hello_for_subscription(client.virtual_placements, client.program_status, client.recognizer_roles),
+            )?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
             if let Some(activity) = activity {
                 client.enqueue_control(MSG_CONTROL_ACTIVITY_SNAPSHOT, &activity)?;
@@ -4477,9 +4499,12 @@ fn advertised_hello() -> ControlHello {
     ControlHello::current()
 }
 
-fn hello_for_subscription(virtual_placements: bool, program_status: bool) -> ControlHello {
+fn hello_for_subscription(virtual_placements: bool, program_status: bool, recognizer_roles: bool) -> ControlHello {
     let hello = advertised_hello();
-    if !program_status && hello == ControlHello::current() {
+    if !recognizer_roles && program_status && hello == ControlHello::current() {
+        return ControlHello { version: 14, min_supported_version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION };
+    }
+    if !recognizer_roles && !program_status && hello == ControlHello::current() {
         // Some protocol-12 clients compare the maximum version directly.
         // Preserve their original hello as well as their render payloads.
         ControlHello {
@@ -4546,6 +4571,8 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 }
 
 struct PacketClient {
+    recognizer_roles: bool,
+    known_roles: HashMap<String, Vec<crate::recognizer::Role>>,
     program_status: bool,
     known_program_status: HashMap<String, crate::packet::ProgramStatusSession>,
     known_program_status_generation: HashMap<String, u64>,
@@ -4710,6 +4737,8 @@ impl PacketClient {
             pending_output: PendingOutput::new(),
             image_output_cursor: 0,
             virtual_placements: false,
+            recognizer_roles: false,
+            known_roles: HashMap::new(),
             program_status: false,
             known_program_status: HashMap::new(),
             known_program_status_generation: HashMap::new(),

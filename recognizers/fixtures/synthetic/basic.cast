@@ -1,0 +1,7 @@
+{"version":3,"term":{"cols":40,"rows":5}}
+[0,"o","\u001b]2;Working\u0007Draft: hello"]
+[0,"m","draft"]
+[100,"o","\r\nPermission required"]
+[0,"m","permission"]
+[100,"o","\u001b[2J\u001b[HReady"]
+[0,"m","ready"]

@@ -10,7 +10,7 @@ use crate::{
 
 /// Version 14 adds opt-in program-status activity events; 13 adds virtual-declaration render envelopes. Protocol 12
 /// remains supported with byte-for-byte unchanged legacy render layouts.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 12;
 pub const CHANNEL_CONTROL: u32 = 0;
 
@@ -181,6 +181,13 @@ pub enum ActivityEvent {
     /// Opt-in only: whole session store snapshot, including clears as an empty list.
     ProgramStatusChanged {
         session: ProgramStatusSession,
+        changed_at_unix_ms: u64,
+    },
+    /// Protocol 15, explicitly requested with recognizer_roles.
+    RolesChanged {
+        session_id: String,
+        tags: Vec<String>,
+        roles: Vec<crate::recognizer::Role>,
         changed_at_unix_ms: u64,
     },
 }
@@ -614,7 +621,7 @@ mod tests {
 
     #[test]
     fn clipboard_effects_require_protocol_version_twelve() {
-        assert_eq!(PROTOCOL_VERSION, 14);
+        assert_eq!(PROTOCOL_VERSION, 15);
         assert!(ControlHello::current().accepts(12));
         assert!(!ControlHello::current().accepts(11));
     }

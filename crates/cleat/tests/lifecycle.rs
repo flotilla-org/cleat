@@ -5105,3 +5105,94 @@ fn passthrough_program_status_is_byte_for_byte() {
     assert!(inspect.program_status.is_empty());
     service.kill("status").unwrap();
 }
+
+// Recognition is explicit at launch, status and roles arrive on ActivityEvent,
+// and unguarded sends continue to reach the child when recognition fails.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn recognizer_selection_publication_and_failure_isolation() {
+    use cleat::program_status::{ProgramState, ProgramStatusSource};
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let addons = temp.path().join("recognizers");
+    std::fs::create_dir(&addons).unwrap();
+    std::fs::write(addons.join("fault.toml"), "id='fault'\nrevision=7\nmin_engine='0.1.0'\nverified=[]\n[[rule]]\nselect='row:matches(/(?P<missing>x)?/)'\nrole='composer'\nvalue='{missing}'").unwrap();
+    // Process boundary: the daemon inherits its add-on directory at spawn.
+    let addon_directory = EnvVarGuard::set("CLEAT_RECOGNIZERS_DIR", addons.to_str().unwrap());
+    let service = service_for(temp.path());
+    let options = cleat::session::SessionStartOptions { tags: vec!["recognizer:synthetic".into()], ..Default::default() };
+    service.create_with_options(Some("recognized".into()), Some(VtEngineKind::Ghostty), None,
+        Some("sh -c 'stty -echo; printf \"\\033]2;Working\\007Draft: hello\"; read line; printf \"\\r\\nPermission required\"; read line; printf \"\\033[2J\\033[HReady\"; read line; printf \"\\033]2;unknown\\007\\033[2J\\033[HUnknown\"; read line; printf \"\\033]2;Working\\007\\033[2J\\033[HDraft: again\"; sleep 30'".into()), options).unwrap();
+    drop(addon_directory);
+    wait_until("recognized title", || {
+        service.inspect("recognized").unwrap().program_status.iter().any(|r| r.source == ProgramStatusSource::Title)
+    });
+    let inspect = service.inspect("recognized").unwrap();
+    assert_eq!(inspect.recognizer.as_ref().unwrap().id, "synthetic");
+    assert_eq!(inspect.recognizer.as_ref().unwrap().revision, 1);
+    let mut subscriber = service.connect_recognizer(&[]).unwrap();
+    let ActivityEvent::RolesChanged { roles, .. } = subscriber.read_activity_event().unwrap() else { panic!("initial roles") };
+    assert_eq!(roles[0].role, "composer");
+    assert_eq!(roles[0].value, "hello");
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("initial status") };
+    assert_eq!(session.records[0].state, ProgramState::Working);
+    service.update_tags("recognized", vec!["observation-tag".into()], vec![]).unwrap();
+    let ActivityEvent::RolesChanged { tags, roles, .. } = subscriber.read_activity_event().unwrap() else { panic!("retagged roles") };
+    assert!(tags.contains(&"observation-tag".into()));
+    assert_eq!(roles[0].value, "hello");
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("retagged status") };
+    assert!(session.tags.contains(&"observation-tag".into()));
+    service.send_keys("recognized", b"\n").unwrap();
+    let ActivityEvent::RolesChanged { roles, .. } = subscriber.read_activity_event().unwrap() else { panic!("dialog roles") };
+    assert!(roles.iter().any(|r| r.role == "dialog"));
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("blocked status") };
+    assert_eq!(session.records[0].state, ProgramState::Blocked);
+    assert_eq!(session.records[0].source, ProgramStatusSource::Recognizer);
+    service.send_keys("recognized", b"\n").unwrap();
+    let ActivityEvent::RolesChanged { roles, .. } = subscriber.read_activity_event().unwrap() else { panic!("cleared roles") };
+    assert!(roles.is_empty());
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else { panic!("idle status") };
+    assert_eq!(session.records[0].state, ProgramState::Idle);
+    service.send_keys("recognized", b"\n").unwrap();
+    let ActivityEvent::ProgramStatusChanged { session, .. } = subscriber.read_activity_event().unwrap() else {
+        panic!("unmatched state clears")
+    };
+    assert!(session.records.is_empty());
+    service.send_keys("recognized", b"\n").unwrap();
+    let ActivityEvent::RolesChanged { roles, .. } = subscriber.read_activity_event().unwrap() else { panic!("restored roles") };
+    assert_eq!(roles[0].value, "again");
+    let ActivityEvent::ProgramStatusChanged { .. } = subscriber.read_activity_event().unwrap() else { panic!("restored working state") };
+    service.kill("recognized").unwrap();
+    // Process-end status clearing may precede the directory removal's role clear.
+    let (mut removed_roles, mut removed_status) = (false, false);
+    while !removed_roles || !removed_status {
+        match subscriber.read_activity_event().unwrap() {
+            ActivityEvent::RolesChanged { session_id, tags, roles, .. } => {
+                assert_eq!(session_id, "recognized");
+                assert!(tags.contains(&"observation-tag".into()));
+                assert!(roles.is_empty());
+                removed_roles = true;
+            }
+            ActivityEvent::ProgramStatusChanged { session, .. } => {
+                assert!(session.records.is_empty());
+                removed_status = true;
+            }
+            event => panic!("unexpected removal event: {event:?}"),
+        }
+    }
+    let options = cleat::session::SessionStartOptions { tags: vec!["recognizer:fault".into()], ..Default::default() };
+    service
+        .create_with_options(
+            Some("fault".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some("sh -c 'printf READY; read line; printf RECEIVED; sleep 30'".into()),
+            options,
+        )
+        .unwrap();
+    wait_until("recognizer error", || service.inspect("fault").unwrap().recognizer.unwrap().error.is_some());
+    service.send_keys("fault", b"\n").unwrap();
+    wait_until("unguarded send with failed recognizer", || service.capture("fault").unwrap().contains("RECEIVED"));
+    assert!(service.inspect("fault").unwrap().recognizer.unwrap().error.is_some());
+    service.kill("fault").unwrap();
+}

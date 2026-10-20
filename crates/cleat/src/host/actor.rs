@@ -2691,12 +2691,14 @@ pub(crate) mod submission_tests {
         tags: Vec<String>,
         before_subscribe: impl FnOnce(&SessionActor, &std::path::Path),
     ) -> (tempfile::TempDir, SessionActor, RawOutputTap) {
-        let temp = tempfile::tempdir().unwrap();
+        // Exercise shell quoting even when the system temp directory is simple.
+        let temp = tempfile::Builder::new().prefix("submission's-").tempdir().unwrap();
         let dir = temp.path().to_path_buf();
         let waiting = dir.join("startup-waiting");
         // This shell is the subprocess boundary. Canonical input queues the
         // release even if the child has not reached read yet; echo stays off.
-        let command = format!("stty -echo; : > '{}'; read cleat_test_start; {command}", waiting.display());
+        let waiting_quoted = waiting.to_string_lossy().replace('\'', "'\\''");
+        let command = format!("stty -echo; : > '{waiting_quoted}'; read cleat_test_start; {command}");
         let actor = SessionActor::spawn(24, Arc::new(|| {}), move || {
             let session = crate::runtime::SessionMetadata {
                 id: "submission-test".into(),
@@ -2743,7 +2745,7 @@ pub(crate) mod submission_tests {
     fn startup_output_waits_for_raw_subscription() {
         let (_temp, _actor, tap) = spawn_before_subscribe("printf READY; sleep 10", vt::VtEngineKind::Passthrough, vec![], |actor, dir| {
             actor.flush_recording().unwrap();
-            let recorded = std::fs::read_to_string(dir.join("session.cast")).unwrap();
+            let recorded = std::fs::read_to_string(dir.join(crate::recording::CAST_FILE_NAME)).unwrap();
             assert!(!recorded.contains("READY"), "child ran before subscription: {recorded}");
         });
         let mut output = Vec::new();

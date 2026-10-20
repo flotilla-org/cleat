@@ -159,7 +159,9 @@ older daemon before using guarded sends. Unguarded transactions retain `send`.
 `state` is `clear` (no unobserved input or settling interval), `pending`
 (written input is awaiting its expected PTY echo), `unverifiable` (echo cannot
 be verified), or `settling` (echo matched, within the 100 ms settling interval).
-`since` is Unix milliseconds when that state began; it is null for an initial
+`since` is Unix milliseconds when that state began. For `clear` after echo, it
+is derived from the echo-match timestamp plus the 100 ms settling interval,
+even if no inspect request occurred at that instant. It is null for an initial
 `clear` fence. `settles_at` appears only while settling. An unverifiable fence
 instead includes `cause`: `no-known-text` for input without known echo text,
 or `oversized` when pending echo evidence exceeds 64 KiB. These diagnostics

@@ -30,7 +30,7 @@ use nix::{
 
 #[cfg(all(test, unix))]
 use super::submission::CONTROLLER_QUEUE_BYTES;
-pub(crate) use super::submission::{SendError, SendPreconditions};
+pub(crate) use super::submission::{ControllerRefusalCause, SendError, SendPreconditions};
 use super::{
     presentation::{GateTransition, PresentationGate},
     submission::{
@@ -1605,7 +1605,7 @@ fn session_actor_handle_command(
             session_actor_pump(runtime, state, wake);
             let result = (|| {
                 if state.submission.is_some() {
-                    return Err(SendError::controller("busy", "submission busy"));
+                    return Err(SendError::controller(ControllerRefusalCause::Busy, "submission busy"));
                 }
                 if state.pty_paused || state.exited {
                     return Err("session unavailable".into());
@@ -2773,7 +2773,7 @@ pub(crate) mod submission_tests {
             actor.controller_input(2, TerminalInputEvent::Paste(TerminalPasteEvent { text: "paste".into() })).unwrap();
             let second = actor.begin_send(b"BAD".to_vec(), true, false, Default::default(), None).unwrap();
             let error = second.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
-            assert_eq!(error.controller.unwrap().cause, "busy");
+            assert_eq!(error.controller.unwrap().cause, ControllerRefusalCause::Busy);
             assert!(error.error.contains("busy"));
             assert!(actor.write_input(b"BAD".to_vec()).unwrap_err().contains("busy"));
             assert_eq!(submit.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(), None);

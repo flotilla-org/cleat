@@ -51,8 +51,10 @@ pub(super) struct ControllerActivity {
 
 impl ControllerActivity {
     pub(super) fn from_history(history: crate::protocol::ControllerInputHistory) -> Self {
-        let now = Instant::now();
-        let unix_now = unix_ms();
+        Self::from_history_at(history, Instant::now(), unix_ms())
+    }
+
+    fn from_history_at(history: crate::protocol::ControllerInputHistory, now: Instant, unix_now: u64) -> Self {
         let mut activity = Self {
             generation: history.generation,
             unix_ms: history.last_input_at,
@@ -197,15 +199,23 @@ impl ControllerActivity {
         if preconditions.guarded() {
             if self.pending_output {
                 return Err(SendError::controller(
-                    if self.expected_echo.is_some() { "fence-pending" } else { "fence-unverifiable" },
+                    if self.expected_echo.is_some() {
+                        ControllerRefusalCause::FencePending
+                    } else {
+                        ControllerRefusalCause::FenceUnverifiable
+                    },
                     "controller input has not yet produced a verifiable PTY echo",
                 ));
             }
             if self.generation > 0 && self.observed_output_at.is_some_and(|at| now.saturating_duration_since(at) < SUBMIT_ENTER_DELAY) {
-                return Err(SendError::controller("fence-settling", "controller input output fence is still settling"));
+                return Err(SendError::controller(
+                    ControllerRefusalCause::FenceSettling,
+                    "controller input output fence is still settling",
+                ));
             }
         }
-        preconditions.evaluate(self, now).map_err(|error| SendError::controller("quiet-time", error))
+        // evaluate currently checks only controller_idle; add a distinct cause here if another predicate is introduced.
+        preconditions.evaluate(self, now).map_err(|error| SendError::controller(ControllerRefusalCause::QuietTime, error))
     }
 }
 
@@ -372,7 +382,7 @@ mod controller_fence_properties {
                 let error = activity.check(&guard, time).unwrap_err();
                 assert_eq!(error.status, 409);
                 assert_eq!(error.reason, "controller-active");
-                assert_eq!(error.controller.as_ref().unwrap().cause, cause);
+                assert_eq!(error.controller.as_ref().unwrap().cause.as_str(), cause);
                 for public in [serde_json::to_string(&fence).unwrap(), serde_json::to_string(&error).unwrap(), error.to_string()] {
                     assert!(!public.contains(secret));
                     assert!(!public.contains("echo_matched"));
@@ -404,14 +414,15 @@ mod controller_fence_properties {
             assert_public(&activity, now, ControllerFenceState::Settling, Some("fence-settling"));
             let settling = activity.fence(now);
             assert_eq!(settling.settles_at, settling.since.map(|at| at + 100));
-            let transferred = ControllerActivity::from_history(activity.history());
-            assert_eq!(transferred.fence(Instant::now()), settling);
+            // Inject both clock readings so loaded runners cannot expire this settling assertion.
+            let transferred = ControllerActivity::from_history_at(activity.history(), now, settling.since.unwrap());
+            assert_eq!(transferred.fence(now), settling);
             assert_public(&activity, now + SUBMIT_ENTER_DELAY, ControllerFenceState::Clear, None);
             assert_eq!(activity.fence(now + SUBMIT_ENTER_DELAY).since, settling.settles_at);
             let mut history = activity.history();
             history.observed_output_at = Some(unix_ms().saturating_sub(1000));
-            let transferred = ControllerActivity::from_history(history);
-            assert_public(&transferred, Instant::now(), ControllerFenceState::Clear, None);
+            let transferred = ControllerActivity::from_history_at(history, now, unix_ms());
+            assert_public(&transferred, now, ControllerFenceState::Clear, None);
         }
         for (expected, cause) in
             [(None, ControllerFenceCause::NoKnownText), (Some(vec![b'x'; CONTROLLER_QUEUE_BYTES + 1]), ControllerFenceCause::Oversized)]
@@ -433,8 +444,8 @@ mod controller_fence_properties {
         let mut activity = ControllerActivity::default();
         activity.accepted(now);
         let quiet = SendPreconditions { controller_idle: Some(Duration::from_secs(1)), ..Default::default() };
-        assert_eq!(activity.check(&quiet, now).unwrap_err().controller.unwrap().cause, "quiet-time");
-        assert_eq!(SendError::controller("busy", "submission busy").controller.unwrap().cause, "busy");
+        assert_eq!(activity.check(&quiet, now).unwrap_err().controller.unwrap().cause, ControllerRefusalCause::QuietTime);
+        assert_eq!(SendError::controller(ControllerRefusalCause::Busy, "submission busy").controller.unwrap().cause.as_str(), "busy");
         // The inclusive evidence limit is still verifiable; the next byte closes it irreversibly.
         activity.written(Some(vec![b'x'; CONTROLLER_QUEUE_BYTES]));
         assert_eq!(activity.fence(now).state, ControllerFenceState::Pending);
@@ -490,12 +501,34 @@ pub(crate) struct SendError {
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ControllerRefusal {
-    pub(crate) cause: String,
+    pub(crate) cause: ControllerRefusalCause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ControllerRefusalCause {
+    FencePending,
+    FenceUnverifiable,
+    FenceSettling,
+    QuietTime,
+    Busy,
+}
+
+impl ControllerRefusalCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FencePending => "fence-pending",
+            Self::FenceUnverifiable => "fence-unverifiable",
+            Self::FenceSettling => "fence-settling",
+            Self::QuietTime => "quiet-time",
+            Self::Busy => "busy",
+        }
+    }
 }
 impl SendError {
-    pub(crate) fn controller(cause: &str, error: impl Into<String>) -> Self {
+    pub(crate) fn controller(cause: ControllerRefusalCause, error: impl Into<String>) -> Self {
         let mut result = Self::refused("controller-active", error);
-        result.controller = Some(ControllerRefusal { cause: cause.into() });
+        result.controller = Some(ControllerRefusal { cause });
         result
     }
     pub(crate) fn new(status: u16, reason: &str, error: impl Into<String>) -> Self {
@@ -522,7 +555,7 @@ impl std::fmt::Display for SendError {
         } else {
             write!(f, "{}: {}", self.reason, self.error)?;
             if let Some(controller) = &self.controller {
-                write!(f, " (controller.cause={})", controller.cause)?;
+                write!(f, " (controller.cause={})", controller.cause.as_str())?;
             }
             Ok(())
         }

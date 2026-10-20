@@ -72,10 +72,10 @@ Each cast contains these markers in order:
 | `approval` | Bash permission dialog for `touch`; selected `❯ 1. Yes` is a dialog option. |
 | `question` | `Which throwaway color should I use?`, with Blue, Green and free-text options. |
 
-Adjacent TOML files use the local `[[expect]]` stub format from #350:
-marker, expected roles, dotted role values, and `absent` roles. They are
-inputs for #353, not executable recognizer rules. Dialogs must not be
-mistaken for composers even though both use `❯`.
+Adjacent TOML files use the executable `[[marker]]` fixture schema from
+[`docs/recognizers.md`](../../../docs/recognizers.md). They check exact roles, values, dialog kinds and state
+at every recorded marker, plus OSC agreement at authenticated markers. Dialogs
+must not be mistaken for composers even though both use `❯`.
 
 ### Style and OSC 7501 evidence
 
@@ -126,7 +126,7 @@ marker coverage and dimensions, and replays each marker through an
 independent terminal emulator to inspect composer text, reply/dialog text
 and cursor visibility. Raw SGR and OSC payloads were checked separately;
 unsupported terminal capability queries in that emulator are not treated
-as visible style evidence. No recognizer behavior is claimed by the stubs.
+as visible style evidence. The executable expectations now run through the recognizer fixture harness.
 
 ## No-login Linux recordings (#351, partial)
 
@@ -210,3 +210,23 @@ Both casts were read in full (every output and input event, decoded) before comm
 - Repeatable check for later re-records (should print nothing):
   `grep -a -o -i -E 'sk-[A-Za-z0-9_-]+|[a-z0-9._-]+@[a-z0-9.-]+|https?://[^"\\ ]+|/home/[^"\\ ]*' *.cast`
 - The unauthenticated state means no account identity is shown at all.
+
+## Executable recognizer coverage (#353)
+
+Run `cargo test -p cleat --lib claude_code_cast_fixtures` with the prepared
+Ghostty VT backend. All 28 markers are checked. The rule file declares only the
+two exact recorded versions; the 2.1.287 claim covers composer scenarios, not
+unrecorded authenticated states.
+
+The empty rule uses the shortcut hint in the adjacent footer, not faint styling
+or a particular randomized placeholder. Typing anything removes that hint in
+these recordings. The composer must contain the cursor and lie between two
+horizontal rules, so transcript prompts and dialog options do not qualify.
+Draft extraction drops the two-character marker/indent and trims screen padding,
+retaining spaces before the cursor and visible text after it. This recovers the
+space-only and cursor-left drafts without pretending the cursor marks the end
+of all input. Trailing blanks after a cursor moved left remain unobservable.
+
+The authenticated casts have 12 state/kind agreement assertions. The no-login
+casts contain no OSC reports or hook records, so no agreement assertion is
+possible there. The original cast bytes are unchanged.

@@ -954,6 +954,19 @@ impl SessionRuntime {
         self.recognizer.as_ref()?.deadline().map(|ms| self.epoch + Duration::from_millis(ms))
     }
 
+    /// Queries expose the last evaluated roles. The actor pumps output before
+    /// querying; each changed recognition generation is evaluated immediately.
+    /// Only title-derived idle status is debounced, not role evaluation. Render
+    /// and recognition generations use different counters and cannot be compared.
+    pub(crate) fn attach_recognizer_roles(&mut self, tree: &mut terminal_screen::ScreenTree) {
+        if let Some(engine) = &mut self.recognizer {
+            if let Err(error) = crate::recognizer::attach_roles(tree, &engine.inspect.observation.roles) {
+                // Recognition failure must leave the plain structural query usable.
+                engine.inspect.error = Some(error);
+            }
+        }
+    }
+
     pub(crate) fn recognize(&mut self) {
         let Some(engine) = &mut self.recognizer else {
             return;

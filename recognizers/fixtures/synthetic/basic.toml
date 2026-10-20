@@ -8,7 +8,7 @@ role = [{ role = "composer", value = "hello" }]
 name = "permission"
 state = "blocked"
 source = "recognizer"
-role = [{ role = "composer", value = "hello" }, { role = "dialog", value = "Permission required" }]
+role = [{ role = "composer", value = "hello" }, { role = "dialog", value = "Permission required", kind = "permission" }]
 
 [[marker]]
 name = "ready"

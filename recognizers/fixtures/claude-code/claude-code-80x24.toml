@@ -1,103 +1,66 @@
-# Expectations stub for #353; local fixture schema, not recognizer rules.
-# Rows and columns are 1-indexed screen coordinates. composer.placeholder is
-# documentation only (random per launch): recognizers must not match on it.
-cast = "claude-code-80x24.cast"
-harness = "Claude Code 2.1.287"
-composer.placeholder = "Try \"create a util logging.py that...\""
+# Executable expectations for every recorded marker.
+# Recorded harness: Claude Code 2.1.287
 
-[[expect]]
-marker = "empty"
-screen = "80x24"
-roles = ["composer"]
-composer.value = ""
-composer.placeholder_visible = true
-composer.first_row = 22
-composer.row_count = 1
-composer.cursor.row = 22
-composer.cursor.col = 3
-composer.cursor.offset = 0
+[[marker]]
+# Screen 80x24; composer first row 22, rows 1; cursor row 22, col 3, offset 0 (1-indexed screen).
+name = "empty"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = ""
 
-[[expect]]
-marker = "draft"
-screen = "80x24"
-roles = ["composer"]
-composer.value = "list the files here"
-composer.placeholder_visible = false
-composer.first_row = 22
-composer.row_count = 1
-composer.cursor.row = 22
-composer.cursor.col = 22
-composer.cursor.offset = 19
+[[marker]]
+# Screen 80x24; composer first row 22, rows 1; cursor row 22, col 22, offset 19 (1-indexed screen).
+name = "draft"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "list the files here"
 
-[[expect]]
-marker = "draft-placeholder-words"
-screen = "80x24"
-roles = ["composer"]
-composer.value = "Try \"create a util logging.py that...\" in this file"
-composer.placeholder_visible = false
-composer.first_row = 22
-composer.row_count = 1
-composer.cursor.row = 22
-composer.cursor.col = 54
-composer.cursor.offset = 51
+[[marker]]
+# Screen 80x24; composer first row 22, rows 1; cursor row 22, col 54, offset 51 (1-indexed screen).
+name = "draft-placeholder-words"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "Try \"create a util logging.py that...\" in this file"
 
-[[expect]]
-marker = "draft-multiline"
-screen = "80x24"
-roles = ["composer"]
-composer.value = "line one\nline two"
-composer.placeholder_visible = false
-composer.first_row = 21
-composer.row_count = 2
-composer.cursor.row = 22
-composer.cursor.col = 11
-composer.cursor.offset = 8
+[[marker]]
+# Screen 80x24; composer first row 21, rows 2; cursor row 22, col 11, offset 8 (1-indexed screen).
+name = "draft-multiline"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "line one\nline two"
 
-[[expect]]
-marker = "draft-space"
-screen = "80x24"
-roles = ["composer"]
-composer.value = "   "
-composer.placeholder_visible = false
-composer.first_row = 22
-composer.row_count = 1
-composer.cursor.row = 22
-composer.cursor.col = 6
-composer.cursor.offset = 3
+[[marker]]
+# Screen 80x24; composer first row 22, rows 1; cursor row 22, col 6, offset 3 (1-indexed screen).
+name = "draft-space"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "   "
 
-[[expect]]
-marker = "draft-cursor-left"
-screen = "80x24"
-roles = ["composer"]
-composer.value = "abc def"
-composer.placeholder_visible = false
-composer.first_row = 22
-composer.row_count = 1
-composer.cursor.row = 22
-composer.cursor.col = 7
-composer.cursor.offset = 4
+[[marker]]
+# Screen 80x24; composer first row 22, rows 1; cursor row 22, col 7, offset 4 (1-indexed screen).
+name = "draft-cursor-left"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "abc def"
 
-[[expect]]
-marker = "resize-shrunk"
-screen = "50x15"
-roles = ["composer"]
-composer.value = "abc def"
-composer.placeholder_visible = false
-composer.first_row = 13
-composer.row_count = 1
-composer.cursor.row = 13
-composer.cursor.col = 7
-composer.cursor.offset = 4
+[[marker]]
+# Screen 50x15; composer first row 13, rows 1; cursor row 13, col 7, offset 4 (1-indexed screen).
+name = "resize-shrunk"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "abc def"
 
-[[expect]]
-marker = "resize"
-screen = "80x24"
-roles = ["composer"]
-composer.value = "abc def"
-composer.placeholder_visible = false
-composer.first_row = 22
-composer.row_count = 1
-composer.cursor.row = 22
-composer.cursor.col = 7
-composer.cursor.offset = 4
-
+[[marker]]
+# Screen 80x24; composer first row 22, rows 1; cursor row 22, col 7, offset 4 (1-indexed screen).
+name = "resize"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "abc def"

@@ -1,36 +1,55 @@
-# Expectations stub for #353; local fixture schema, not recognizer rules.
-cast = "auth-120x40.cast"
-harness = "Claude Code 2.1.303"
+# Executable expectations for every recorded marker.
+# Recorded harness: Claude Code 2.1.303
 
-[[expect]]
-marker = "empty"
-roles = ["composer"]
-composer.value = ""
+[[marker]]
+name = "empty"
+state = "idle"
+agree_osc = true
+[[marker.role]]
+role = "composer"
+value = ""
 
-[[expect]]
-marker = "draft"
-roles = ["composer"]
-composer.value = "Describe the throwaway file."
+[[marker]]
+name = "draft"
+state = "idle"
+agree_osc = true
+[[marker.role]]
+role = "composer"
+value = "Describe the throwaway file."
 
-[[expect]]
-marker = "working"
-roles = ["composer", "status"]
-composer.value = ""
-status.state = "working"
+[[marker]]
+name = "working"
+state = "working"
+agree_osc = true
+[[marker.role]]
+role = "composer"
+value = ""
+[[marker.role]]
+role = "status"
+value = ""
 
-[[expect]]
-marker = "done"
-roles = ["composer"]
-composer.value = ""
+[[marker]]
+name = "done"
+state = "done"
+agree_osc = true
+[[marker.role]]
+role = "composer"
+value = ""
 
-[[expect]]
-marker = "approval"
-roles = ["dialog"]
-dialog.kind = "approval"
-absent = ["composer"]
+[[marker]]
+name = "approval"
+state = "blocked"
+agree_osc = true
+[[marker.role]]
+role = "dialog"
+value = ""
+kind = "approval"
 
-[[expect]]
-marker = "question"
-roles = ["dialog"]
-dialog.kind = "question"
-absent = ["composer"]
+[[marker]]
+name = "question"
+state = "blocked"
+agree_osc = true
+[[marker.role]]
+role = "dialog"
+value = ""
+kind = "question"

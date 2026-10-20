@@ -2682,9 +2682,21 @@ pub(crate) mod submission_tests {
     }
 
     fn spawn_with(command: &str, kind: vt::VtEngineKind, tags: Vec<String>) -> (tempfile::TempDir, SessionActor, RawOutputTap) {
+        spawn_before_subscribe(command, kind, tags, |_, _| {})
+    }
+
+    fn spawn_before_subscribe(
+        command: &str,
+        kind: vt::VtEngineKind,
+        tags: Vec<String>,
+        before_subscribe: impl FnOnce(&SessionActor, &std::path::Path),
+    ) -> (tempfile::TempDir, SessionActor, RawOutputTap) {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
-        let command = command.to_string();
+        let waiting = dir.join("startup-waiting");
+        // This shell is the subprocess boundary. Canonical input queues the
+        // release even if the child has not reached read yet; echo stays off.
+        let command = format!("stty -echo; : > '{}'; read cleat_test_start; {command}", waiting.display());
         let actor = SessionActor::spawn(24, Arc::new(|| {}), move || {
             let session = crate::runtime::SessionMetadata {
                 id: "submission-test".into(),
@@ -2701,7 +2713,16 @@ pub(crate) mod submission_tests {
             SessionRuntime::spawn(dir, &session, vt::make_vt_engine_with_colors(kind, 80, 24, Default::default()).unwrap())
         })
         .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !waiting.exists() {
+            assert!(Instant::now() < deadline, "child did not reach startup barrier");
+            thread::sleep(Duration::from_millis(2));
+        }
+        before_subscribe(&actor, temp.path());
         let tap = actor.subscribe_raw_output().unwrap();
+        // The raw tap is live-only. Release the child only after subscription,
+        // rather than hoping the caller is scheduled within a startup sleep.
+        actor.write_input(b"\n".to_vec()).unwrap();
         (temp, actor, tap)
     }
 
@@ -2716,6 +2737,20 @@ pub(crate) mod submission_tests {
         }
     }
 
+    // Startup output must reach a live-only tap even when the child gets to
+    // its startup barrier before the subscribing caller is scheduled.
+    #[test]
+    fn startup_output_waits_for_raw_subscription() {
+        let (_temp, _actor, tap) = spawn_before_subscribe("printf READY; sleep 10", vt::VtEngineKind::Passthrough, vec![], |actor, dir| {
+            actor.flush_recording().unwrap();
+            let recorded = std::fs::read_to_string(dir.join("session.cast")).unwrap();
+            assert!(!recorded.contains("READY"), "child ran before subscription: {recorded}");
+        });
+        let mut output = Vec::new();
+        collect_until(&tap, &mut output, b"READY");
+        assert_eq!(output, b"READY", "startup handshake must not leak into probe output");
+    }
+
     // The actor must replay controller input after paste+Enter, byte-for-byte, and reject competing automation.
     // A real PTY child is the process boundary; its hex dump observes exactly the bytes delivered.
     #[test]
@@ -2723,8 +2758,7 @@ pub(crate) mod submission_tests {
         // Explicit generator: empty, ASCII, UTF-8, binary, LF and CR controller payloads.
         for payload in [vec![], b"x".to_vec(), "λ".as_bytes().to_vec(), vec![0, 255, b'\n', b'\r']] {
             let count = 12 + payload.len();
-            let command =
-                format!("stty raw -echo; sleep 0.05; printf READY; dd bs=1 count={count} 2>/dev/null | od -An -tx1; printf DONE; sleep 10");
+            let command = format!("stty raw -echo; printf READY; dd bs=1 count={count} 2>/dev/null | od -An -tx1; printf DONE; sleep 10");
             let (_temp, actor, tap) = spawn(&command);
             let mut output = Vec::new();
             collect_until(&tap, &mut output, b"READY");
@@ -2759,8 +2793,9 @@ pub(crate) mod submission_tests {
             TerminalInputEvent::Text(TerminalTextEvent { text: "x".into() }),
             TerminalInputEvent::Paste(TerminalPasteEvent { text: "x".into() }),
         ] {
-            let (_temp, actor, tap) =
-                spawn("stty raw -echo; sleep 0.05; printf READY; dd bs=1 count=1 of=/dev/null 2>/dev/null; printf NOISE; sleep 0.4; printf xECHO; sleep 10");
+            let (_temp, actor, tap) = spawn(
+                "stty raw -echo; printf READY; dd bs=1 count=1 of=/dev/null 2>/dev/null; printf NOISE; sleep 0.4; printf xECHO; sleep 10",
+            );
             let mut output = Vec::new();
             collect_until(&tap, &mut output, b"READY");
             actor.controller_input(0, event).unwrap();
@@ -2847,7 +2882,7 @@ pub(crate) mod submission_tests {
             (vec![], "screen:has(row:has-text('Draft: abandoned'))", None),
         ] {
             let (_temp, actor, tap) = spawn_with(
-                "stty raw -echo; sleep 0.05; printf 'Draft: abandoned'; dd bs=1 count=6 2>/dev/null | od -An -tx1; printf PROBED; sleep 10",
+                "stty raw -echo; printf 'Draft: abandoned'; dd bs=1 count=6 2>/dev/null | od -An -tx1; printf PROBED; sleep 10",
                 vt::VtEngineKind::Ghostty,
                 tags,
             );
@@ -2880,7 +2915,7 @@ pub(crate) mod submission_tests {
     #[test]
     fn atomic_selector_controller_interleavings() {
         let (_temp, actor, tap) = spawn_with(
-            "stty raw -echo; sleep 0.05; printf READY; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf DONE; sleep 10",
+            "stty raw -echo; printf READY; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf DONE; sleep 10",
             vt::VtEngineKind::Ghostty,
             vec![],
         );

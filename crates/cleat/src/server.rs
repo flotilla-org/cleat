@@ -1078,11 +1078,23 @@ impl SessionService {
         Ok(response.offset)
     }
 
-    pub(crate) fn send_transaction(&self, id: &str, input: &http_uds::InputRequest) -> Result<Option<u64>, String> {
+    pub(crate) fn send_transaction(
+        &self,
+        id: &str,
+        input: &http_uds::InputRequest,
+    ) -> Result<Option<u64>, crate::host::submission::SendError> {
+        use crate::host::submission::SendError;
         if !self.layout.session_dir(id).exists() {
-            return Err(format!("missing session {id}"));
+            return Err(format!("missing session {id}").into());
         }
-        let response: http_uds::SendResponse = self.http_json(id, Method::POST, &format!("/sessions/{id}/input"), input)?;
+        let response = self.http_request(id, Method::POST, &format!("/sessions/{id}/input"), &input.transaction_body()?)?;
+        if !response.status.is_success() {
+            let status = response.status.as_u16();
+            let mut error = serde_json::from_slice::<SendError>(&response.body).unwrap_or_else(|_| http_error_message(response).into());
+            error.status = status;
+            return Err(error);
+        }
+        let response: http_uds::SendResponse = serde_json::from_slice(&response.body).map_err(|e| SendError::from(e.to_string()))?;
         Ok(response.marker_offset)
     }
 

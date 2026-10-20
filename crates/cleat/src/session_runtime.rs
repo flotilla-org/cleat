@@ -955,6 +955,31 @@ impl SessionRuntime {
         self.recognizer.as_ref()?.deadline().map(|ms| self.epoch + Duration::from_millis(ms))
     }
 
+    /// Validate source capabilities without consulting the current frame.
+    pub(crate) fn check_selector_support(&self, selector: &terminal_screen::Selector) -> Result<(), crate::host::submission::SendError> {
+        use crate::host::submission::{selector_roles, SendError};
+        if self.session.vt_engine == crate::vt::VtEngineKind::Passthrough {
+            return Err(SendError::new(422, "unsupported", "selector guards require a VT engine"));
+        }
+        let supported = self.recognizer.as_ref().map(|engine| engine.supported_roles()).unwrap_or_default();
+        if let Some(role) = selector_roles(selector).difference(&supported).next() {
+            return Err(SendError::new(422, "unsupported", format!("no active source produces role {role}")));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_selector(&mut self, selector: &terminal_screen::Selector) -> Result<(), crate::host::submission::SendError> {
+        use crate::host::submission::{evaluate_selector, SendError};
+        if let Some(error) = self.recognizer.as_ref().and_then(|engine| engine.inspect.error.as_ref()) {
+            return Err(SendError::new(500, "error", error.clone()));
+        }
+        let mut tree = self.vt_engine.recognition_tree(self.recognition_generation).map_err(SendError::from)?;
+        if let Some(engine) = &self.recognizer {
+            crate::recognizer::attach_roles(&mut tree, &engine.inspect.observation.roles).map_err(SendError::from)?;
+        }
+        evaluate_selector(selector, &tree)
+    }
+
     /// Queries expose the last evaluated roles. The actor pumps output before
     /// querying; each changed recognition generation is evaluated immediately.
     /// Only title-derived idle status is debounced, not role evaluation. Render
@@ -1175,6 +1200,36 @@ mod tests {
 
         assert_eq!(engine.screen_grid().expect("screen grid"), grid);
         assert_eq!(engine.screen_text().expect("screen text"), "A");
+    }
+
+    // Recognition failures are errors, never evidence of emptiness, even for
+    // a matching structural predicate. The runtime keeps unguarded input usable.
+    #[cfg(all(unix, feature = "ghostty-vt"))]
+    #[test]
+    fn selector_recognition_errors_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let colors = crate::vt::TerminalColors::default();
+        let session = SessionMetadata {
+            id: "guard-error".into(),
+            vt_engine: VtEngineKind::Ghostty,
+            cwd: None,
+            cmd: Some("sleep 30".into()),
+            tags: vec!["recognizer:synthetic".into()],
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
+            environment: vec![],
+            record: true,
+            initial_size: Default::default(),
+            colors,
+        };
+        let vt = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).unwrap();
+        let mut runtime = SessionRuntime::spawn(temp.path().to_path_buf(), &session, vt).unwrap();
+        let selector = terminal_screen::Selector::parse("screen").unwrap();
+        runtime.check_selector_support(&selector).unwrap();
+        runtime.recognizer.as_mut().unwrap().observation_error("recognizer fixture error".into());
+        let error = runtime.check_selector(&selector).unwrap_err();
+        assert_eq!((error.status, error.reason.as_str()), (500, "error"));
+        assert_eq!(error.to_string(), "recognizer fixture error");
+        runtime.write_input(b"unguarded").unwrap();
     }
 
     #[cfg(unix)]

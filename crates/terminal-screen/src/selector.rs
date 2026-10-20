@@ -82,6 +82,21 @@ impl Selector {
         }
         Ok(selector)
     }
+    /// Every element/role name referenced by this selector, including nested predicates.
+    /// This is syntax-only: capability checks must not infer support from a frame.
+    pub fn referenced_elements(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for segment in self.groups.iter().flatten() {
+            names.extend(segment.element.iter().cloned());
+            for filter in &segment.filters {
+                match filter {
+                    Filter::Not(s) | Filter::Has(s) | Filter::NthChild(_, Some(s)) => names.extend(s.referenced_elements()),
+                    _ => {}
+                }
+            }
+        }
+        names
+    }
     /// Names that positive regex predicates can capture on the selected node.
     /// Predicate-only captures inside :has and :not are deliberately excluded.
     pub fn capture_names(&self) -> BTreeSet<String> {

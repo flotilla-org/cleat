@@ -5,6 +5,11 @@ use std::{
 
 use crate::{Cell, Rect, ScreenGrid, Selector, SelectorError, SemanticContent};
 
+/// Element and region-role names produced by structural analysis, independent of
+/// recognizers. Keep this inventory alongside the producers when adding node kinds.
+pub const STRUCTURAL_ELEMENTS: &[&str] =
+    &["screen", "region", "row", "span", "cursor", "frame", "enclosure", "zone", "group", "block", "gap", "row-slice"];
+
 /// Identity within one tree only; never an identity across generations.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct NodeId(pub usize);

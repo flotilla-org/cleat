@@ -11,4 +11,4 @@ mod tree;
 
 pub use grid::*;
 pub use selector::{Selector, SelectorError, SelectorMatch};
-pub use tree::{analyze, Node, NodeAnnotations, NodeId, ScreenTree, TreeError};
+pub use tree::{analyze, Node, NodeAnnotations, NodeId, ScreenTree, TreeError, STRUCTURAL_ELEMENTS};

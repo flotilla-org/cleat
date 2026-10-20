@@ -5209,7 +5209,7 @@ fn atomic_guard_http_and_cli_outcomes() {
     service.create(Some("guard".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).unwrap();
     for (selector, status, reason) in [("screen", 422, "unsupported"), ("[", 400, "error")] {
         let body =
-            serde_json::json!({"kind":"send", "text":"BAD", "submit":true, "no_enter":false, "if":selector, "marker_name":"refused"})
+            serde_json::json!({"kind":"guarded_send", "text":"BAD", "submit":true, "no_enter":false, "if":selector, "marker_name":"refused"})
                 .to_string();
         let response = http_session_request(
             temp.path(),

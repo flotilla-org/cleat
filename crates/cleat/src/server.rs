@@ -1087,7 +1087,7 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}").into());
         }
-        let response = self.http_request(id, Method::POST, &format!("/sessions/{id}/input"), input)?;
+        let response = self.http_request(id, Method::POST, &format!("/sessions/{id}/input"), &input.transaction_body()?)?;
         if !response.status.is_success() {
             let status = response.status.as_u16();
             let mut error = serde_json::from_slice::<SendError>(&response.body).unwrap_or_else(|_| http_error_message(response).into());

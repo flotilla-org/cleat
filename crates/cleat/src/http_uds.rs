@@ -147,6 +147,7 @@ pub(crate) struct SessionTransferRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum InputRequest {
+    #[serde(alias = "guarded_send")]
     Send {
         text: String,
         submit: bool,
@@ -179,6 +180,18 @@ pub(crate) enum InputRequest {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+impl InputRequest {
+    /// Older daemons ignore new fields on `send`; a new kind forces rejection
+    /// before any write instead of silently dropping a selector guard.
+    pub(crate) fn transaction_body(&self) -> Result<serde_json::Value, String> {
+        let mut body = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        if matches!(self, Self::Send { selector: Some(_), .. }) {
+            body["kind"] = "guarded_send".into();
+        }
+        Ok(body)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1117,5 +1130,40 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert!(response.contains("content-length: 0\r\n"));
         assert!(!response.contains("content-type:"));
+    }
+}
+
+#[cfg(test)]
+mod guarded_send_compatibility {
+    use super::*;
+
+    // The old daemon's tag dispatch rejects guarded writes even though it would
+    // ignore unknown fields on a normal send. Unguarded wire requests stay compatible.
+    #[test]
+    fn guarded_send_uses_a_kind_older_daemons_cannot_execute() {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum LegacyInput {
+            Send { text: String },
+        }
+        for selector in [None, Some("screen".to_string()), Some("composer[value='']".to_string())] {
+            let request = InputRequest::Send {
+                text: "message".into(),
+                submit: true,
+                no_enter: false,
+                controller_idle_ms: None,
+                selector: selector.clone(),
+                marker_name: None,
+                acknowledge: false,
+            };
+            let body = request.transaction_body().unwrap();
+            assert_eq!(serde_json::from_value::<InputRequest>(body.clone()).unwrap(), request);
+            let old = serde_json::from_value::<LegacyInput>(body);
+            if selector.is_some() {
+                assert!(old.is_err());
+            } else {
+                assert!(matches!(old, Ok(LegacyInput::Send { text }) if text == "message"));
+            }
+        }
     }
 }

@@ -134,5 +134,10 @@ padding. A draft consisting only of spaces with the cursor moved to its start
 can read as empty. This limitation does not permit removal of draft content.
 
 ```json
-{"kind":"send","text":"message","submit":true,"no_enter":false,"if":"composer[value='']","controller_idle_ms":3000,"marker_name":null}
+{"kind":"guarded_send","text":"message","submit":true,"no_enter":false,"if":"composer[value='']","controller_idle_ms":3000,"marker_name":null}
 ```
+
+Selector-guarded clients use the distinct `guarded_send` request kind. Older
+daemons reject that unknown kind before writing; adding an `if` field to their
+ordinary `send` request would otherwise be silently ignored. Upgrade/restart an
+older daemon before using guarded sends. Unguarded transactions retain `send`.

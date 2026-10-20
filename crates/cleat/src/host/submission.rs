@@ -324,6 +324,8 @@ mod controller_fence_properties {
 /// Stable send failure contract shared by the actor, HTTP transport and CLI.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SendError {
+    // HTTP is authoritative for status; the JSON body carries only reason and
+    // diagnostic. Clients restore status from the response, including legacy bodies.
     #[serde(skip)]
     pub(crate) status: u16,
     pub(crate) reason: String,

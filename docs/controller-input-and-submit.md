@@ -125,6 +125,10 @@ reading screen state. Structural elements and region kinds need no recognizer.
 Unknown roles, a missing recognizer for `composer`, and `prompt` without an OSC
 133 source are unsupported. OSC 133 prompt roles are not yet provided. A running
 recognizer that currently produces no composer instead returns `role-absent`.
+For a selector that does not match, `role-absent` means at least one referenced
+role is absent anywhere in the frame. With unions, nested negation, or mixed
+roles, this is a diagnostic hint rather than proof that the absent role alone
+caused the nonmatch; both `role-absent` and `not-matched` are retryable refusals.
 Recognition errors fail closed. Omitting `--if` preserves existing input behavior;
 `--controller-idle` alone still works without VT.
 

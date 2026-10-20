@@ -59,11 +59,19 @@ impl RoleKind {
         }
     }
 }
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum Value {
     Template(String),
     Capture(CaptureValue),
+}
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = toml::Value::deserialize(deserializer)?;
+        match value {
+            toml::Value::String(value) => Ok(Self::Template(value)),
+            toml::Value::Table(_) => value.try_into().map(Self::Capture).map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom("value must be a template string or capture table")),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +107,9 @@ fn capture_value(spec: &CaptureValue, captures: &BTreeMap<String, String>, node:
                 let start_col = node.bounds.col as usize;
                 let minimum =
                     (cursor.bounds.col as usize).saturating_sub(start_col + unicode_width::UnicodeWidthStr::width(skipped.as_str()));
+                // Unicode width tables can differ from the VT for ambiguous-width
+                // characters and emoji presentation selectors; exact cell widths
+                // would require retaining the source grid with each capture.
                 let count = unicode_width::UnicodeWidthStr::width(text.as_str());
                 if minimum > count {
                     text.extend(std::iter::repeat_n(' ', minimum - count));
@@ -403,6 +414,14 @@ impl Recognizer for Rules {
 
 /// Attach already evaluated roles to a fresh structural query snapshot.
 pub(crate) fn attach_roles(tree: &mut ScreenTree, roles: &[Role]) -> Result<(), String> {
+    let bounds = tree.node(tree.root()).unwrap().bounds;
+    // Validate every rectangle before attaching anything, without cloning the tree.
+    if roles
+        .iter()
+        .any(|role| !bounds.contains(terminal_screen::Rect { col: role.col, row: role.row, width: role.width, height: role.height }))
+    {
+        return Err("recognizer role lies outside query screen".into());
+    }
     for role in roles {
         let mut node = Node::new(
             &role.role,
@@ -973,6 +992,53 @@ mod tests {
             let captures = BTreeMap::from([("input".into(), input.into())]);
             assert_eq!(capture_value(&spec, &captures, tree.node(tree.root()).unwrap(), &tree).unwrap(), expected);
         }
+    }
+    // Pending title-idle confirmation delays state, while query roles already
+    // reflect the latest evaluated generation, including its new composer value.
+    #[test]
+    fn query_roles_update_while_title_idle_is_pending() {
+        let rules = rules(
+            r#"[[rule]]
+select='row:matches(/Draft: (?P<draft>.*)/)'
+role='composer'
+value='{draft}'
+[[rule]]
+select='title:has-text("busy")'
+state='working'
+[[rule]]
+select='title:has-text("ready")'
+state='idle'"#,
+        );
+        let mut engine = Engine::new(Box::new(rules));
+        let mut old = tree(0);
+        line(&mut old, "Draft: old", "graph");
+        engine.evaluate(&mut old, Some("busy"), 0);
+        let mut fresh = tree(1);
+        line(&mut fresh, "Draft: new", "graph");
+        engine.evaluate(&mut fresh.clone(), Some("ready"), 10);
+        assert_eq!(engine.state, Some(ProgramState::Working));
+        attach_roles(&mut fresh, &engine.inspect.observation.roles).unwrap();
+        assert_eq!(fresh.select("composer[value='new']").unwrap().len(), 1);
+    }
+    // A bad role must not hide the structural tree or leave partially attached roles.
+    #[test]
+    fn failed_role_attachment_keeps_the_plain_tree() {
+        let mut original = tree(0);
+        line(&mut original, "draft", "graph");
+        let mut recognizer = rules("[[rule]]\nselect='row'\nrole='composer'");
+        let mut roles = recognizer.evaluate(&original, None).unwrap().roles;
+        let mut invalid = roles[0].clone();
+        invalid.row = 99;
+        roles.push(invalid);
+        assert!(attach_roles(&mut original, &roles).is_err());
+        assert!(original.select("composer").unwrap().is_empty());
+        assert_eq!(original.select("row").unwrap()[0].text, "draft");
+    }
+    // Malformed capture tables identify the misspelled field for rule authors.
+    #[test]
+    fn capture_table_errors_name_the_invalid_field() {
+        let error = Rules::parse(Path::new("bad.toml"), "id='bad'\nrevision=1\nmin_engine='0.1.0'\nverified=[]\n[[rule]]\nselect='row'\nrole='composer'\nvalue={capture='input', typo=true}").err().unwrap();
+        assert!(error.contains("unknown field `typo`"), "{error}");
     }
     // Recorded scenarios cover empty, placeholder-word, multiline, space-only,
     // cursor-left, resize, working, done, approval and question at both sizes.

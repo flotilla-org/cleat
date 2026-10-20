@@ -80,7 +80,9 @@ value = { capture = "input", skip = 2, trim_padding = true }
 example, a prompt marker and its following space, or continuation indentation).
 `trim_padding` requires the capture to span the whole matched node. It removes
 trailing ASCII screen spaces, retaining spaces before a visible hardware cursor. Display width, including wide and combining characters,
-is used when padding to the cursor. Text after a cursor moved left is retained.
+is used when padding to the cursor. Unicode width tables can differ from the
+VT for ambiguous-width characters and emoji variation selectors. Text after a
+cursor moved left is retained.
 Spaces after the cursor cannot be distinguished from screen padding; this mode
 does not claim to recover them. Missing captures fail evaluation as templates do.
 

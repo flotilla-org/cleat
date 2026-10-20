@@ -4797,7 +4797,12 @@ fn controller_activity_raw_path_without_vt() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let service = service_for(temp.path());
-    service.create(Some("controller-raw".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).unwrap();
+    let ready = temp.path().join("masked-ready");
+    // Real PTY boundary: disable echo before accepting controller input.
+    let command = format!("stty -echo; touch '{}'; sleep 30", ready.display());
+    service.create(Some("controller-raw".into()), Some(VtEngineKind::Passthrough), None, Some(command), true).unwrap();
+    wait_until("masked input ready", || ready.exists());
+    let secret = "DISTINCTIVE-private-controller-315";
     let mut controller = http_attach_stream(temp.path(), "controller-raw", 80, 24, ClientCapabilities::conservative_fallback());
     let mut watcher = http_watch_stream(temp.path(), "controller-raw", 80, 24, ClientCapabilities::conservative_fallback());
     Frame::Input(b"ignored".to_vec()).write(&mut watcher).unwrap();
@@ -4805,16 +4810,47 @@ fn controller_activity_raw_path_without_vt() {
     service.send_keys("controller-raw", b"automation").unwrap();
     assert_eq!(service.inspect("controller-raw").unwrap().controller_input_generation, 0);
     for generation in 1..=2 {
-        Frame::Input(b"human".to_vec()).write(&mut controller).unwrap();
+        Frame::Input(secret.as_bytes().to_vec()).write(&mut controller).unwrap();
         wait_until("raw controller input counted", || service.inspect("controller-raw").unwrap().controller_input_generation == generation);
     }
     let inspect = service.inspect("controller-raw").unwrap();
     assert!(inspect.last_controller_input_at.is_some());
+    assert_eq!(inspect.controller_fence.state, cleat::protocol::ControllerFenceState::Pending);
+    assert!(!serde_json::to_string(&inspect).unwrap().contains(secret));
+    let response = http_session_request(temp.path(), "controller-raw", "GET /sessions/controller-raw HTTP/1.1\r\nHost: cleat\r\n\r\n");
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(!response.contains(secret));
+    let body: serde_json::Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["controller_fence"]["state"], "pending");
+    let request = serde_json::json!({"kind":"send","text":"BAD","submit":true,"no_enter":false,"controller_idle_ms":0,"marker_name":null})
+        .to_string();
+    let response = http_session_request(
+        temp.path(),
+        "controller-raw",
+        &format!(
+            "POST /sessions/controller-raw/input HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            request.len(),
+            request
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 409"));
+    assert!(!response.contains(secret));
+    let body: serde_json::Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["reason"], "controller-active");
+    assert_eq!(body["controller"]["cause"], "fence-pending");
     let cli =
         Cli::try_parse_from(["cleat", "send", "controller-raw", "BAD", "--submit", "--controller-idle", "0", "--mark-before", "refused"])
             .unwrap();
-    assert!(matches!(cli::execute(cli, &service), ExecResult::Err(message) if message.contains("controller input")));
+    assert!(
+        matches!(cli::execute(cli, &service), ExecResult::Err(message) if message.contains("controller.cause=fence-pending") && !message.contains(secret))
+    );
     assert!(!service.inspect("controller-raw").unwrap().recording.markers.contains_key("refused"));
+    service.kill("controller-raw").unwrap();
+    // A replacement child activation starts with no controller evidence or timestamps.
+    service.create(Some("controller-raw".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).unwrap();
+    let fresh = service.inspect("controller-raw").unwrap();
+    assert_eq!(fresh.controller_fence, cleat::protocol::ControllerFence::default());
+    assert_eq!(fresh.controller_input_generation, 0);
     service.kill("controller-raw").unwrap();
 }
 

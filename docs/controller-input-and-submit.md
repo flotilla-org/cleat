@@ -147,3 +147,41 @@ Selector-guarded clients use the distinct `guarded_send` request kind. Older
 daemons reject that unknown kind before writing; adding an `if` field to their
 ordinary `send` request would otherwise be silently ignored. Upgrade/restart an
 older daemon before using guarded sends. Unguarded transactions retain `send`.
+
+## Controller fence diagnostics
+
+`inspect --json` and `GET /sessions/{id}` include `controller_fence`:
+
+```json
+{"state":"settling","since":1760918400000,"settles_at":1760918400100}
+```
+
+`state` is `clear` (no unobserved input or settling interval), `pending`
+(written input is awaiting its expected PTY echo), `unverifiable` (echo cannot
+be verified), or `settling` (echo matched, within the 100 ms settling interval).
+`since` is Unix milliseconds when that state began. For `clear` after echo, it
+is derived from the echo-match timestamp plus the 100 ms settling interval,
+even if no inspect request occurred at that instant. It is null for an initial
+`clear` fence. `settles_at` appears only while settling. An unverifiable fence
+instead includes `cause`: `no-known-text` for input without known echo text,
+or `oversized` when pending echo evidence exceeds 64 KiB. These diagnostics
+survive live host transfer and reset to initial `clear` on a new child activation.
+The existing controller generation and last-input timestamp remain unchanged.
+
+A `controller-active` refusal includes an additive `controller` object:
+
+```json
+{"reason":"controller-active","controller":{"cause":"fence-unverifiable"},"error":"controller input has not yet produced a verifiable PTY echo"}
+```
+
+The causes are `fence-pending`, `fence-unverifiable`, `fence-settling`,
+`quiet-time` (the requested quiet interval has not elapsed), and `busy`
+(another submission owns the PTY). CLI diagnostics include `controller.cause`.
+The reason, HTTP 409 status and CLI exit 1 are unchanged. Callers should not
+keep retrying `fence-unverifiable`: it stays closed until the child activation
+ends, so fall back and alert the operator. Pending masked input and transformed
+echo may also remain pending indefinitely; elapsed quiet time does not open them.
+
+Diagnostics expose no typed bytes, expected echo, partial-match progress or byte
+counts. This avoids disclosing even the length of masked input. The conservative
+guard and unguarded-send behavior are unchanged.

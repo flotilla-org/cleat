@@ -1757,6 +1757,8 @@ fn session_actor_handle_command(
                 update.render_generation = state.observation.render_generation;
                 let grid = crate::screen_query::grid_from_update(update)?;
                 let mut tree = terminal_screen::analyze(&grid);
+                // Attach the latest completed observation; a query must not
+                // force another recognition pass or advance its confirmations.
                 runtime.attach_recognizer_roles(&mut tree);
                 Ok(tree)
             });

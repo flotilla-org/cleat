@@ -47,8 +47,8 @@ fn composer(tree: &ScreenTree) -> Result<Option<Node>, String> {
     for row in start..block_end {
         let mut line = String::new();
         for span in spans.iter().filter(|n| n.bounds.row == row && n.attribute("faint") != Some("true")) {
-            // Column 0 is the marker, column 1 its separator. Spans may start
-            // before that boundary, so skip by terminal columns (not bytes).
+            // The fixed prefix is two single-width characters: the marker and
+            // its space separator. Skip only those characters, not draft bytes.
             let skip = 2u16.saturating_sub(span.bounds.col) as usize;
             line.extend(span.text.chars().skip(skip));
         }
@@ -58,12 +58,14 @@ fn composer(tree: &ScreenTree) -> Result<Option<Node>, String> {
         line = format!("{trimmed}{}", " ".repeat(padding));
         lines.push(line);
     }
+    let root = tree.node(tree.root()).ok_or("Codex input tree has no root")?;
+    let parent = marker.parent().ok_or("Codex marker has no producer parent")?;
     let mut node = Node::new(
         "codex-input",
-        terminal_screen::Rect { col: 0, row: start, width: tree.node(tree.root()).unwrap().bounds.width, height: block_end - start },
+        terminal_screen::Rect { col: 0, row: start, width: root.bounds.width, height: block_end - start },
         lines.join("\n"),
     );
-    node.attributes.insert("provenance".into(), provenance(tree, marker.parent().unwrap()));
+    node.attributes.insert("provenance".into(), provenance(tree, parent));
     Ok(Some(node))
 }
 

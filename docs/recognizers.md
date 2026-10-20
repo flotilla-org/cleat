@@ -108,6 +108,13 @@ The unfiltered subscription and inspect store allow consumers to arbitrate.
 
 ## Evaluation and publication
 
+Screen queries attach the latest completed recognition observation to their
+fresh structural tree. Annotation is read-only: a query does not force another
+evaluation or advance debounce confirmations. A just-changed screen can briefly
+precede the next recognition pass, so role attributes describe the latest
+completed observation rather than guaranteeing synchronous recognition of every
+cell in the query snapshot.
+
 Selectors run only on a changed screen generation or changed title. Timer
 confirmations use cached results. A working-to-idle title transition requires
 three confirmations spaced at least 100 ms apart, with a 700 ms deadline.
@@ -164,8 +171,8 @@ state and source constrain those fields. Optional role `state` constrains that
 attribute; marker `contains` requires recorded screen text such as the completed
 `Worked for` footer. State assertions compare the last
 confirmed, debounced engine state rather than the current candidate. Duplicate
-expectations, unexpected or missing
-markers, evaluation errors and mismatches fail the harness. See the synthetic
+expectations, unexpected or missing markers, evaluation errors and mismatches
+fail the harness. See the synthetic
 fixture and `synthetic_cast_fixture` test. The harness never forwards recorded
 terminal replies or clipboard effects.
 

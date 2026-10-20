@@ -22,6 +22,9 @@ recognizer is an engine demonstration. `claude-code` covers the recorded
 Claude Code 2.1.287 composer scenarios and 2.1.303 composer, working, completed,
 approval and question scenarios. Select it explicitly with `--recognizer claude-code`.
 
+`codex` is verified against the recorded 0.160.0 and 0.162.1 harnesses;
+see its fixture README for evidence and limits.
+
 An existing add-on overrides the bundled file with the same id. Malformed or
 unreadable overrides, including broken symlinks, fail loading; they do not fall back to bundled rules.
 
@@ -105,6 +108,13 @@ The unfiltered subscription and inspect store allow consumers to arbitrate.
 
 ## Evaluation and publication
 
+Screen queries attach the latest completed recognition observation to their
+fresh structural tree. Annotation is read-only: a query does not force another
+evaluation or advance debounce confirmations. A just-changed screen can briefly
+precede the next recognition pass, so role attributes describe the latest
+completed observation rather than guaranteeing synchronous recognition of every
+cell in the query snapshot.
+
 Selectors run only on a changed screen generation or changed title. Timer
 confirmations use cached results. A working-to-idle title transition requires
 three confirmations spaced at least 100 ms apart, with a 700 ms deadline.
@@ -126,7 +136,8 @@ removal as an empty list. HTTP `/connect` clients opt in with
 retain protocol 14 and the unchanged status payload. Legacy activity/render
 subscriptions retain their existing protocol and payloads.
 
-For applications that need Rust, implement `recognizer::Recognizer` and create
+For applications that need Rust, use `Rules::into_recognizer` when loading a
+stylesheet (this installs Codex's style/cursor adapter), or implement `recognizer::Recognizer` and create
 an `Engine`. Return an `Observation` with roles, state, source, and explanations.
 The engine installs the same nodes and contains errors/panics. The input tree
 is immutable to the implementation. A functional VT backend is required for
@@ -156,10 +167,12 @@ expects no kind). `agree_osc = true` on a marker also requires a program report
 whose `app` matches the recognizer id and compares its state and kind with the
 recognizer's own result. The report never supplies the inferred answer.
 Role lists are exact, ordered observations; omitted `role` means empty. Optional
-state and source constrain those fields. State assertions compare the last
+state and source constrain those fields. Optional role `state` constrains that
+attribute; marker `contains` requires recorded screen text such as the completed
+`Worked for` footer. State assertions compare the last
 confirmed, debounced engine state rather than the current candidate. Duplicate
-expectations, unexpected or missing
-markers, evaluation errors and mismatches fail the harness. See the synthetic
+expectations, unexpected or missing markers, evaluation errors and mismatches
+fail the harness. See the synthetic
 fixture and `synthetic_cast_fixture` test. The harness never forwards recorded
 terminal replies or clipboard effects.
 
@@ -172,5 +185,5 @@ cargo test --release -p cleat recognizer_adversarial_plus_budget -- --ignored --
 It reports recognition time including frame cloning and checks the 5 ms budget.
 The segmentation budget remains independently measured by terminal-screen's
 `adversarial_plus_budget` test. The Claude rules are original rules derived
-from the recorded casts; no herdr rules are translated. Future translations must carry attribution notices with
-their rule files.
+from the recorded casts. Codex translations carry attribution in
+`recognizers/fixtures/codex/README.md`; future translations must also carry notices.

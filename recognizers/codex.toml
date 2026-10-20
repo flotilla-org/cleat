@@ -1,0 +1,31 @@
+# Codex UI evidence adapter: bold marker, faint placeholder, visible cursor.
+# Working and approval cues follow flotilla's agent_adapter classifier and
+# herdrdev/herdr src/detect/manifests/codex.toml (Apache-2.0); see fixtures/codex/README.md.
+id = "codex"
+revision = 1
+min_engine = "0.1.0"
+verified = ["codex =0.160.0", "codex =0.162.1"]
+
+[[rule]]
+select = 'codex-input:matches(/(?s)^(?P<draft>.*)$/)'
+role = "composer"
+value = "{draft}"
+
+[[rule]]
+select = 'screen:not(:has(row:matches(/Working \(.*esc to interrupt/))) > codex-input'
+role = "status"
+value = ""
+state = "idle"
+
+[[rule]]
+select = 'row:matches(/Working \(.*esc to interrupt/):last-match'
+role = "status"
+value = ""
+state = "working"
+
+[[rule]]
+select = 'screen:not(:has(cursor)):has-text("Would you like to run the following command?")'
+role = "dialog"
+value = ""
+state = "blocked"
+kind = "approval"

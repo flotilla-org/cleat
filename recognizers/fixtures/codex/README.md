@@ -71,18 +71,11 @@ child dimensions.
 | `resize-shrunk` | Settled 60×16 screen, empty composer below reflowed history. |
 | `resize` | Restored original size; earlier submitted prompt returns to view above the current empty composer. |
 
-The adjacent TOML files are **expectations stubs**, not executable rules or
-a claim that the engine already supports their schema. Each `[[expect]]`
-identifies a cast marker, lists expected roles, and gives dotted role
-properties. `absent` lists roles that must not be inferred. Only evidenced
-properties are asserted: idle points do not invent a status node. #352 can
-adapt the stub layout to the engine's fixture API while preserving these
-values, including spaces and the literal newline. When adapting the stubs
-for #352, also assert the completed `Worked for` footer and that historical
-prompt markers after resize do not produce extra composer nodes. Keep the
-expectations shared across both sizes once the engine supports that, so the
-identical role/value contracts cannot drift. These are adaptation requirements,
-not invented role names in the current stubs.
+The adjacent TOML files are executable `[[marker]]` expectations. They check
+exact role lists and composer values, including spaces and literal newlines.
+Completed markers require the `Worked for` footer, and resize markers reject
+extra composers from historical prompts. The corpus test checks that both sizes
+have identical contracts. See the executable contract section below.
 
 ### Measured style evidence (extends #313 revision)
 
@@ -119,8 +112,7 @@ recordings are not committed.
 Validation parses every JSON event and both TOML stubs, checks exact marker
 coverage and resize dimensions, and replays output through an independent
 terminal emulator to inspect each marker's composer text and cursor. Style
-claims were checked directly against the recorded SGR sequences. No
-recognizer implementation or rules are included.
+claims were checked directly against the recorded SGR sequences. Rules and executable expectations are now included by #352.
 
 ## Authenticated macOS recordings (#355)
 
@@ -192,9 +184,7 @@ Each cast contains these markers in order:
 | `done` | `Done.` reply, command output and `Worked for` footer above the idle composer. |
 | `approval` | `Would you like to run the following command?`, printf command and Yes/No options. |
 
-Adjacent TOML files follow #350's local expectations-stub format:
-`[[expect]]` pairs a marker with roles, dotted role values and absent
-roles. These are inputs for #352, not executable recognizer rules.
+Adjacent TOML files now use the executable marker schema described below.
 The selected `› 1. Yes, proceed` in an approval dialog is not a composer.
 Claude Code alone has a `question` requirement in #355.
 
@@ -232,4 +222,66 @@ Original host recordings are not committed.
 Validation parses all asciicast v3 JSON events and TOML stubs, checks exact
 marker coverage and dimensions, replays every marker through an independent
 terminal emulator to inspect text and cursor visibility, and checks raw SGR
-for placeholder intensity. The fixtures add no recognizer implementation.
+for placeholder intensity. The recordings are consumed by the Codex recognizer tests below.
+
+## Executable recognizer contract (#352)
+
+The adjacent TOML files now use `recognizer::check_fixture`'s `[[marker]]`
+schema. Every marker in all four casts is required. Both sizes share identical
+contracts (the corpus test checks equality). Idle markers include an idle
+`status`; working markers include a working `status`; approval markers include
+only `dialog[kind=approval][state=blocked]`. Completed markers also require the
+recorded `Worked for` footer. Exact role lists reject historical composers
+exposed by resize. Recorded casts are unchanged.
+
+Run `cargo test -p cleat --lib codex` with the Ghostty feature and pinned VT
+installation. This also checks the final `draft probe` in both #312
+`osc133-codex-*.cast` recordings, adding a marker only to temporary copies.
+The CLI replay test is `codex_roles_inspect_and_wait_end_to_end` in
+`tests/screen_queries.rs`.
+
+### Extraction and attribution
+
+`recognizers/codex.toml` owns role/state declarations. Codex uses the Rust
+recognizer escape hatch for its `codex-input` evidence node: the latest bold
+left-edge marker preceding the visible hardware cursor anchors the input;
+faint spans are excluded without consulting placeholder wording. Span order
+is spatial, independent of region traversal order. Cursor position preserves
+space-only drafts, while text after a cursor at the start remains part of the
+value. The marker's producer provenance is retained. Add-on rules named `codex`
+receive the same evidence node through `Rules::into_recognizer`.
+
+The marker's producer block bounds multiline input, including lines after a
+cursor moved to an earlier row. Trailing blank padding has no input-length
+metadata: spaces beyond a moved-left cursor cannot be distinguished from unused
+cells. No broader verification claim is made.
+
+Working/approval cues are adapted from Robert Wittams's Flotilla classifier
+(`codex_composer_visible`, `codex_working_line`, `codex_screen_needs_input`), now
+in [flotilla-agent/src/adapter.rs](https://github.com/flotilla-org/flotilla/blob/b66568a1b0320df1f0e1b62243bf641e1ecc2f56/crates/flotilla-agent/src/adapter.rs)
+(MIT OR Apache-2.0), and herdr's
+[Codex manifest](https://github.com/herdrdev/herdr/blob/143bf5fd4781d164260c63fe28e7dc08054ad32f/src/detect/manifests/codex.toml)
+(Apache-2.0). These translations retain the visible working/approval cues;
+style/cursor evidence replaces Flotilla's placeholder vocabulary. Herdr's
+priority system, broad weak blockers and arbitrary nonempty-title idle fallback
+are not imported. Cleat's existing [Apache license](../../../LICENSE-APACHE)
+applies to the adaptation; upstream copyrights remain with their authors.
+
+`codex-2927/*.txt` are unchanged public plain-text regression captures from
+[Flotilla's #2927 corpus](https://github.com/flotilla-org/flotilla/tree/b66568a1b0320df1f0e1b62243bf641e1ecc2f56/crates/flotilla-agent/src/fixtures/codex-2927).
+They came from an operator-supplied 2026-10-08 recording; the original 10 MB cast
+was not published. The source README identifies 184×37 Ghostty captures.
+They lack style and cursor metadata, so the test checks working evidence and
+requires composer absence rather than guessing empty from placeholder wording.
+
+### Vendor API comparison follow-up
+
+The [official App Server documentation](https://developers.openai.com/codex/app-server)
+describes turn lifecycle notifications and approval requests. A future paired
+capture should compare `turn/started` to working, terminal `turn/completed`
+(completed/interrupted/failed) to the appropriate settled state, and
+`item/commandExecution/requestApproval` to approval. These casts contain no
+synchronized app-server stream; launching a separate server would create a
+different conversation, not prove agreement with the recorded TUI. This slice
+therefore leaves same-session API/UI agreement as a follow-up under #319.
+Vendor signals remain primary when available; the recognizer is a fallback.

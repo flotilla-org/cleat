@@ -1,31 +1,39 @@
-# Expectations stub for #352; local fixture schema, not recognizer rules.
-cast = "auth-120x40.cast"
-harness = "codex-cli 0.162.1"
+# Executable marker contract for codex-cli 0.162.1
 
-[[expect]]
-marker = "empty"
-roles = ["composer"]
-composer.value = ""
+[[marker]]
+name = "empty"
+state = "idle"
+role = [
+  { role = "composer", value = "" },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "draft"
-roles = ["composer"]
-composer.value = "Describe the throwaway file."
+[[marker]]
+name = "draft"
+state = "idle"
+role = [
+  { role = "composer", value = "Describe the throwaway file." },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "working"
-roles = ["composer", "status"]
-composer.value = ""
-status.state = "working"
+[[marker]]
+name = "working"
+state = "working"
+role = [
+  { role = "composer", value = "" },
+  { role = "status", value = "", state = "working" },
+]
 
-[[expect]]
-marker = "done"
-# Intentionally minimal: completed reply text is documented in README.md.
-roles = ["composer"]
-composer.value = ""
+[[marker]]
+name = "done"
+contains = ["Worked for"]
+state = "idle"
+role = [
+  { role = "composer", value = "" },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "approval"
-roles = ["dialog"]
-dialog.kind = "approval"
-absent = ["composer"]
+[[marker]]
+name = "approval"
+state = "blocked"
+role = [{ role = "dialog", value = "", kind = "approval", state = "blocked" }]

@@ -1608,7 +1608,7 @@ fn session_actor_handle_command(
                     return Err(SendError::refused("controller-active", "submission busy"));
                 }
                 if state.pty_paused || state.exited {
-                    return Err("submission busy or session unavailable".into());
+                    return Err("session unavailable".into());
                 }
                 // Output pump -> controller observation fence -> predicates -> first write.
                 state.controller.check(&preconditions, Instant::now()).map_err(|error| SendError::refused("controller-active", error))?;
@@ -2735,7 +2735,7 @@ pub(crate) mod submission_tests {
             actor.controller_input(1, TerminalInputEvent::Text(TerminalTextEvent { text: "txt".into() })).unwrap();
             actor.controller_input(2, TerminalInputEvent::Paste(TerminalPasteEvent { text: "paste".into() })).unwrap();
             let second = actor.begin_send(b"BAD".to_vec(), true, false, Default::default(), None).unwrap();
-            assert!(second.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().contains("busy"));
+            assert!(second.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().error.contains("busy"));
             assert!(actor.write_input(b"BAD".to_vec()).unwrap_err().contains("busy"));
             assert_eq!(submit.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(), None);
             collect_until(&tap, &mut output, b"DONE");
@@ -2780,7 +2780,7 @@ pub(crate) mod submission_tests {
                     None,
                 )
                 .unwrap();
-            assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().contains("PTY echo"));
+            assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().error.contains("PTY echo"));
             collect_until(&tap, &mut output, b"ECHO");
             thread::sleep(SUBMIT_ENTER_DELAY + Duration::from_millis(20));
             let result = actor

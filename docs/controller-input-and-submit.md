@@ -112,7 +112,9 @@ followed by a send cannot provide this guarantee. `--wait-if` is not implemented
 | Recognition, transport, PTY or session error | 2 | 500 | `error` |
 
 Failures return `{"reason":"not-matched","error":"selector did not match the current frame"}`
-with the appropriate reason and diagnostic. CLI diagnostics include the reason.
+with the appropriate reason and diagnostic. CLI refusals and unsupported
+diagnostics include the reason; generic errors retain their plain diagnostic. The exit-code table applies to
+`--if`; CLI transactions without it retain their existing error handling.
 Refusals and pre-write errors produce neither text nor a `--mark-before` marker.
 A later PTY/Enter/replay error can follow a write, so reconcile delivery before
 retrying such errors as described above.

@@ -4813,9 +4813,7 @@ fn controller_activity_raw_path_without_vt() {
     let cli =
         Cli::try_parse_from(["cleat", "send", "controller-raw", "BAD", "--submit", "--controller-idle", "0", "--mark-before", "refused"])
             .unwrap();
-    assert!(
-        matches!(cli::execute(cli, &service), ExecResult::Exit { code: 1, message: Some(message), .. } if message.contains("controller input"))
-    );
+    assert!(matches!(cli::execute(cli, &service), ExecResult::Err(message) if message.contains("controller input")));
     assert!(!service.inspect("controller-raw").unwrap().recording.markers.contains_key("refused"));
     service.kill("controller-raw").unwrap();
 }
@@ -5206,6 +5204,13 @@ fn atomic_guard_http_and_cli_outcomes() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let service = service_for(temp.path());
+    // Omitting --if preserves existing transaction errors; guarded failures use exit 2.
+    let plain = Cli::try_parse_from(["cleat", "send", "missing", "BAD", "--submit"]).unwrap();
+    assert!(matches!(cli::execute(plain, &service), ExecResult::Err(message) if message == "missing session missing"));
+    let guarded = Cli::try_parse_from(["cleat", "send", "missing", "BAD", "--submit", "--if", "screen"]).unwrap();
+    assert!(
+        matches!(cli::execute(guarded, &service), ExecResult::Exit { code: 2, message: Some(message), .. } if message == "missing session missing")
+    );
     service.create(Some("guard".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).unwrap();
     for (selector, status, reason) in [("screen", 422, "unsupported"), ("[", 400, "error")] {
         let body =

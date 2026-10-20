@@ -1288,6 +1288,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Some(Ok(ms)) => Some(ms),
                 None => None,
             };
+            let guarded = selector.is_some();
             match service.send_transaction(&id, &http_uds::InputRequest::Send {
                 text,
                 submit,
@@ -1298,9 +1299,10 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 acknowledge: ack,
             }) {
                 Ok(offset) => ExecResult::Ok(offset.map(|offset| offset.to_string())),
-                Err(error) => {
+                Err(error) if guarded => {
                     ExecResult::Exit { code: if error.status == 409 { 1 } else { 2 }, message: Some(error.to_string()), output: None }
                 }
+                Err(error) => ExecResult::Err(error.error),
             }
         }
         Command::Interrupt { id } => match service.send_keys(&id, &[0x03]) {

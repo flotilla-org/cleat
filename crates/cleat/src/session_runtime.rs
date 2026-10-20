@@ -1228,7 +1228,7 @@ mod tests {
         runtime.recognizer.as_mut().unwrap().observation_error("recognizer fixture error".into());
         let error = runtime.check_selector(&selector).unwrap_err();
         assert_eq!((error.status, error.reason.as_str()), (500, "error"));
-        assert!(error.error.contains("recognizer fixture error"));
+        assert_eq!(error.to_string(), "recognizer fixture error");
         runtime.write_input(b"unguarded").unwrap();
     }
 

@@ -3227,7 +3227,11 @@ fn service_pending_sends(sends: &mut Vec<PendingSend>) {
                 let _ = http_uds::write_json(&mut send.stream, StatusCode::OK, &http_uds::SendResponse { marker_offset });
             }
             Err(error) => {
-                let _ = http_uds::write_json(&mut send.stream, StatusCode::from_u16(error.status).unwrap(), &error);
+                let _ = http_uds::write_json(
+                    &mut send.stream,
+                    StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &error,
+                );
             }
         }
         false

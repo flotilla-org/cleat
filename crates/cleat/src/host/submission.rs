@@ -336,10 +336,6 @@ impl SendError {
     pub(crate) fn refused(reason: &str, error: impl Into<String>) -> Self {
         Self::new(409, reason, error)
     }
-    #[cfg(test)]
-    pub(crate) fn contains(&self, text: &str) -> bool {
-        self.error.contains(text)
-    }
 }
 impl From<String> for SendError {
     fn from(error: String) -> Self {
@@ -353,22 +349,17 @@ impl From<&str> for SendError {
 }
 impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.reason, self.error)
+        if self.reason == "error" {
+            f.write_str(&self.error)
+        } else {
+            write!(f, "{}: {}", self.reason, self.error)
+        }
     }
 }
 
 /// Structure needs no recognizer; all other names require a declared role source.
 pub(crate) fn selector_roles(selector: &terminal_screen::Selector) -> std::collections::BTreeSet<String> {
-    selector
-        .referenced_elements()
-        .into_iter()
-        .filter(|name| {
-            !matches!(
-                name.as_str(),
-                "screen" | "region" | "row" | "span" | "cursor" | "frame" | "enclosure" | "zone" | "group" | "block" | "gap" | "row-slice"
-            )
-        })
-        .collect()
+    selector.referenced_elements().into_iter().filter(|name| !terminal_screen::STRUCTURAL_ELEMENTS.contains(&name.as_str())).collect()
 }
 
 pub(crate) fn evaluate_selector(selector: &terminal_screen::Selector, tree: &terminal_screen::ScreenTree) -> Result<(), SendError> {

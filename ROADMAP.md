@@ -119,6 +119,13 @@ Agent and program status runs [#327](https://github.com/flotilla-org/cleat/issue
 [#326](https://github.com/flotilla-org/cleat/issues/326) (record store and exposure), then
 [#328](https://github.com/flotilla-org/cleat/issues/328) (re-emission through attach, decided in
 [ADR 0007](docs/adr/0007-program-status-through-attach.md)).
+Agent delivery for Flotilla ([flotilla-org/flotilla#2649](https://github.com/flotilla-org/flotilla/issues/2649)) runs through screen queries
+[#24](https://github.com/flotilla-org/cleat/issues/24) (done), the recognizer engine
+[#349](https://github.com/flotilla-org/cleat/issues/349) (done, decided in [ADR 0008](docs/adr/0008-recognizers.md)),
+the Codex recognizer [#352](https://github.com/flotilla-org/cleat/issues/352), then the guarded send
+[#310](https://github.com/flotilla-org/cleat/issues/310). The Claude Code recognizer
+[#353](https://github.com/flotilla-org/cleat/issues/353) is a fast follow, tracked under
+[#313](https://github.com/flotilla-org/cleat/issues/313).
 Session surfaces [#216](https://github.com/flotilla-org/cleat/issues/216) and the wider
 render-consumer direction [#198](https://github.com/flotilla-org/cleat/issues/198)
 remain design/backlog work, not prerequisites for the current queue.

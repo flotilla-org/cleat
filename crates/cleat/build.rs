@@ -10,7 +10,7 @@ fn main() {
     // Clap's generated debug command builder exceeds Windows' default 1 MiB
     // main-thread reserve. Match the usual Unix budget without adding a thread
     // (the daemon must retain its process/thread lifecycle semantics).
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") && env::var("CARGO_PKG_NAME").as_deref() == Ok("cleat") {
         match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
             Ok("msvc") => println!("cargo:rustc-link-arg-bin=cleat=/STACK:8388608"),
             Ok("gnu") => println!("cargo:rustc-link-arg-bin=cleat=-Wl,--stack,8388608"),

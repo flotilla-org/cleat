@@ -170,7 +170,8 @@ impl SessionRuntime {
             }
         }
 
-        let recognizer = crate::recognizer::load_selected(&session.tags)?.map(|rules| crate::recognizer::Engine::new(Box::new(rules)));
+        let recognizer =
+            crate::recognizer::load_selected(&session.tags)?.map(|rules| crate::recognizer::Engine::new(rules.into_recognizer()));
         let pty_child = PtyChild::spawn_with_ambient(session, coordinates)?;
         pty_child.set_nonblocking()?;
         let conpty_startup = pty_child.sends_startup_queries().then(ConptyStartup::new);

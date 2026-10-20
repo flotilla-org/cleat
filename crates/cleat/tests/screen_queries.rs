@@ -287,3 +287,51 @@ fn claude_composer_inspect_end_to_end() {
     assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(result["nodes"][0]["attributes"]["value"], "Describe the throwaway file.");
 }
+
+// #352: public CLI selectors observe the Codex composer in a replayed session,
+// and the empty-composer wait matches the recorded empty checkpoint.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn codex_roles_inspect_and_wait_end_to_end() {
+    let f = Fixture::new();
+    let cast = include_str!("../../../recognizers/fixtures/codex/codex-80x24.cast");
+    let mut output = String::new();
+    for line in cast.lines().skip(1) {
+        let event: Value = serde_json::from_str(line).unwrap();
+        if event[1] == "o" {
+            output.push_str(event[2].as_str().unwrap());
+        }
+        if event[1] == "m" && event[2] == "empty" {
+            break;
+        }
+    }
+    let path = f.temp.path().join("output");
+    std::fs::write(&path, output).unwrap();
+    f.service
+        .create_with_options(
+            Some("screen".into()),
+            Some(VtEngineKind::Ghostty),
+            None,
+            Some(format!("stty raw -echo; cat {}; sleep 120", path.display())),
+            cleat::session::SessionStartOptions {
+                initial_size: TerminalSize { cols: 80, rows: 24 },
+                tags: vec!["recognizer:codex".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let wait = f.cli(&["wait", "screen", "--select", "composer[value='']", "--timeout", "10", "--json"]);
+    assert!(
+        wait.status.success(),
+        "stdout={} stderr={} inspect={:?} capture={:?}",
+        String::from_utf8_lossy(&wait.stdout),
+        String::from_utf8_lossy(&wait.stderr),
+        f.service.inspect("screen"),
+        f.service.capture("screen")
+    );
+    let inspect = f.cli(&["inspect", "screen", "--screen", "--select", "composer"]);
+    assert!(inspect.status.success(), "{}", String::from_utf8_lossy(&inspect.stderr));
+    let screen: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(screen["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(screen["nodes"][0]["attributes"]["value"], "");
+}

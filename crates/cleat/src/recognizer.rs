@@ -8,6 +8,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use terminal_screen::{Node, NodeId, ScreenTree, Selector};
 
+mod codex;
+
 use crate::program_status::{ProgramKind, ProgramState, ProgramStatusRecord, ProgramStatusSource};
 
 pub const ENGINE_VERSION: &str = "0.1.0";
@@ -33,14 +35,15 @@ struct Declaration {
     kind: Option<RoleKind>,
     value: Option<Value>,
 }
-/// A dialog's UI kind can be approval while OSC 7501 calls it permission.
+/// Semantic dialog kinds; the first three variants retain ProgramKind wire order.
+/// Approval maps to OSC 7501 permission status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RoleKind {
-    Approval,
     Permission,
     Question,
     Auth,
+    Approval,
 }
 impl RoleKind {
     fn as_str(self) -> &'static str {
@@ -191,6 +194,13 @@ impl Rules {
         }
         Ok(Self { id: file.id, revision: file.revision, rules })
     }
+    pub fn into_recognizer(self) -> Box<dyn Recognizer> {
+        if self.id == "codex" {
+            Box::new(codex::Codex(self))
+        } else {
+            Box::new(self)
+        }
+    }
     pub fn load(path: &Path) -> Result<Self, String> {
         let source = std::fs::read_to_string(path).map_err(|e| format!("{}:1: rule file: {e}", path.display()))?;
         Self::parse(path, &source)
@@ -284,6 +294,7 @@ fn load_selected_in(tags: &[String], directory: Option<&Path>) -> Result<Option<
             "claude-code" => {
                 Rules::parse(Path::new("recognizers/claude-code.toml"), include_str!("../../../recognizers/claude-code.toml"))?
             }
+            "codex" => Rules::parse(Path::new("recognizers/codex.toml"), include_str!("../../../recognizers/codex.toml"))?,
             "synthetic" => Rules::parse(Path::new("recognizers/synthetic.toml"), include_str!("../../../recognizers/synthetic.toml"))?,
             _ => {
                 return Err(format!(
@@ -484,7 +495,7 @@ impl Engine {
     #[cfg(any(unix, test))]
     fn from_adoption_result(tags: &[String], loaded: Result<Option<Rules>, String>) -> Option<Self> {
         match loaded {
-            Ok(rules) => rules.map(|rules| Self::new(Box::new(rules))),
+            Ok(rules) => rules.map(|rules| Self::new(rules.into_recognizer())),
             Err(error) => {
                 let id = tags.iter().find_map(|tag| tag.strip_prefix("recognizer:")).unwrap_or("unknown").into();
                 let mut engine = Self::new(Box::new(Unavailable { id, error: error.clone() }));
@@ -687,12 +698,15 @@ pub struct MarkerExpectation {
     pub source: Option<ProgramStatusSource>,
     #[serde(default)]
     pub agree_osc: bool,
+    #[serde(default)]
+    pub contains: Vec<String>,
 }
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedRole {
     pub role: String,
     pub value: String,
+    pub state: Option<ProgramState>,
     pub kind: Option<RoleKind>,
 }
 
@@ -755,7 +769,7 @@ pub fn check_fixture(
                 .observation
                 .roles
                 .iter()
-                .map(|r| ExpectedRole { role: r.role.clone(), value: r.value.clone(), kind: r.kind })
+                .map(|r| ExpectedRole { role: r.role.clone(), value: r.value.clone(), state: r.state, kind: r.kind })
                 .collect::<Vec<_>>();
             // Marker states compare the last confirmed, debounced engine state.
             // The observation may carry a newer candidate while idle is pending.
@@ -771,7 +785,11 @@ pub fn check_fixture(
                     ));
                 }
             }
-            if actual != expected.role
+            if actual.len() != expected.role.len()
+                || actual.iter().zip(&expected.role).any(|(a, e)| {
+                    a.role != e.role || a.value != e.value || a.kind != e.kind || e.state.is_some_and(|state| a.state != Some(state))
+                })
+                || expected.contains.iter().any(|text| !annotated.node(annotated.root()).unwrap().text.contains(text))
                 || expected.state.is_some_and(|state| Some(state) != recognizer.state)
                 || expected.source.is_some_and(|source| Some(source) != recognizer.inspect.observation.source)
             {
@@ -940,6 +958,71 @@ mod tests {
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
             engine.evaluate(&mut tree(1), None, 0);
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+    // Protocol 15's existing permission/question/auth role payloads retain
+    // their postcard encoding; semantic approval maps to permission status.
+    #[test]
+    fn role_kind_preserves_existing_wire_variants() {
+        for (role, status) in [
+            (RoleKind::Permission, ProgramKind::Permission),
+            (RoleKind::Question, ProgramKind::Question),
+            (RoleKind::Auth, ProgramKind::Auth),
+        ] {
+            assert_eq!(postcard::to_allocvec(&role).unwrap(), postcard::to_allocvec(&status).unwrap());
+            assert_eq!(role.program_kind(), status);
+        }
+        assert_eq!(RoleKind::Approval.program_kind(), ProgramKind::Permission);
+        assert_eq!(serde_json::to_string(&RoleKind::Approval).unwrap(), "\"approval\"");
+    }
+    // #352: all recorded markers specify the same composer/value contract at
+    // both sizes, with working and approval roles and resize history exclusion.
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn codex_recorded_casts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recognizers");
+        for prefix in ["codex", "auth"] {
+            assert_eq!(
+                std::fs::read(root.join(format!("fixtures/codex/{prefix}-80x24.toml"))).unwrap(),
+                std::fs::read(root.join(format!("fixtures/codex/{prefix}-120x40.toml"))).unwrap()
+            );
+        }
+        for name in ["codex-80x24", "codex-120x40", "auth-80x24", "auth-120x40"] {
+            let mut vt = crate::vt::ghostty::GhosttyVtEngine::new(80, 24);
+            check_fixture(
+                &root.join(format!("fixtures/codex/{name}.cast")),
+                &root.join(format!("fixtures/codex/{name}.toml")),
+                &mut vt,
+                Rules::load(&root.join("codex.toml")).unwrap().into_recognizer(),
+            )
+            .unwrap();
+        }
+    }
+    // #312 recordings have no markers: append a checkpoint to temporary copies
+    // so their final plain draft is checked with the same VT replay contract.
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn codex_osc133_seed_casts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let temp = tempfile::tempdir().unwrap();
+        let expectations = temp.path().join("expected.toml");
+        std::fs::write(
+            &expectations,
+            r#"[[marker]]
+name = "final"
+state = "idle"
+role = [{ role = "composer", value = "draft probe" }, { role = "status", value = "", state = "idle" }]
+"#,
+        )
+        .unwrap();
+        for name in ["normal", "inline"] {
+            let source =
+                std::fs::read_to_string(root.join(format!("docs/design/semantic-prompt-evidence/osc133-codex-{name}.cast"))).unwrap();
+            let cast = temp.path().join("seed.cast");
+            std::fs::write(&cast, format!("{source}\n[0, \"m\", \"final\"]\n")).unwrap();
+            let mut vt = crate::vt::ghostty::GhosttyVtEngine::new(120, 40);
+            check_fixture(&cast, &expectations, &mut vt, Rules::load(&root.join("recognizers/codex.toml")).unwrap().into_recognizer())
+                .unwrap();
         }
     }
     // Replay uses the real VT parser, checking presence and absence at recording markers.

@@ -1,60 +1,87 @@
-# Expectations stub for #352; schema local to these fixtures, not recognizer rules.
-cast = "codex-120x40.cast"
-harness = "codex-cli 0.160.0"
+# Executable marker contract for codex-cli 0.160.0
 
-[[expect]]
-marker = "empty"
-roles = ["composer"]
-composer.value = ""
+[[marker]]
+name = "empty"
+state = "idle"
+role = [
+  { role = "composer", value = "" },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "draft"
-roles = ["composer"]
-composer.value = "Describe the throwaway file."
+[[marker]]
+name = "draft"
+state = "idle"
+role = [
+  { role = "composer", value = "Describe the throwaway file." },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "draft-placeholder-words"
-roles = ["composer"]
-composer.value = "Ask Codex to do anything with this draft"
+[[marker]]
+name = "draft-placeholder-words"
+state = "idle"
+role = [
+  { role = "composer", value = "Ask Codex to do anything with this draft" },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "draft-multiline"
-roles = ["composer"]
-composer.value = "First throwaway line\nSecond throwaway line"
+[[marker]]
+name = "draft-multiline"
+state = "idle"
+role = [
+  { role = "composer", value = "First throwaway line\nSecond throwaway line" },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "draft-space"
-roles = ["composer"]
-composer.value = "   "
+[[marker]]
+name = "draft-space"
+state = "idle"
+role = [
+  { role = "composer", value = "   " },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "draft-cursor-left"
-roles = ["composer"]
-composer.value = "Text after cursor"
+[[marker]]
+name = "draft-cursor-left"
+state = "idle"
+role = [
+  { role = "composer", value = "Text after cursor" },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "working"
-roles = ["composer", "status"]
-composer.value = ""
-status.state = "working"
+[[marker]]
+name = "working"
+state = "working"
+role = [
+  { role = "composer", value = "" },
+  { role = "status", value = "", state = "working" },
+]
 
-[[expect]]
-marker = "approval"
-roles = ["dialog"]
-dialog.kind = "approval"
-absent = ["composer"]
+[[marker]]
+name = "approval"
+state = "blocked"
+role = [{ role = "dialog", value = "", kind = "approval", state = "blocked" }]
 
-[[expect]]
-marker = "done"
-roles = ["composer"]
-composer.value = ""
+[[marker]]
+name = "done"
+contains = ["Worked for"]
+state = "idle"
+role = [
+  { role = "composer", value = "" },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "resize-shrunk"
-roles = ["composer"]
-composer.value = ""
+[[marker]]
+name = "resize-shrunk"
+state = "idle"
+role = [
+  { role = "composer", value = "" },
+  { role = "status", value = "", state = "idle" },
+]
 
-[[expect]]
-marker = "resize"
-roles = ["composer"]
-composer.value = ""
+[[marker]]
+name = "resize"
+state = "idle"
+role = [
+  { role = "composer", value = "" },
+  { role = "status", value = "", state = "idle" },
+]

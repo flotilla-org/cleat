@@ -1302,7 +1302,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(error) if guarded => {
                     ExecResult::Exit { code: if error.status == 409 { 1 } else { 2 }, message: Some(error.to_string()), output: None }
                 }
-                Err(error) => ExecResult::Err(error.error),
+                Err(error) => ExecResult::Err(error.to_string()),
             }
         }
         Command::Interrupt { id } => match service.send_keys(&id, &[0x03]) {

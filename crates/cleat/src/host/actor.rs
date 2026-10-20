@@ -1605,13 +1605,13 @@ fn session_actor_handle_command(
             session_actor_pump(runtime, state, wake);
             let result = (|| {
                 if state.submission.is_some() {
-                    return Err(SendError::refused("controller-active", "submission busy"));
+                    return Err(SendError::controller("busy", "submission busy"));
                 }
                 if state.pty_paused || state.exited {
                     return Err("session unavailable".into());
                 }
                 // Output pump -> controller observation fence -> predicates -> first write.
-                state.controller.check(&preconditions, Instant::now()).map_err(|error| SendError::refused("controller-active", error))?;
+                state.controller.check(&preconditions, Instant::now())?;
                 if let Some(selector) = &preconditions.selector {
                     runtime.check_selector(selector)?;
                 }
@@ -1788,6 +1788,7 @@ fn session_actor_handle_command(
             let mut inspect = runtime.inspect(has_controller, watcher_count);
             inspect.controller_input_generation = state.controller.generation;
             inspect.last_controller_input_at = state.controller.unix_ms;
+            inspect.controller_fence = state.controller.fence(Instant::now());
             let _ = reply.send(Ok(inspect));
         }
         SessionCommand::ApplyAttachState { cols, rows, capabilities, reply } => {
@@ -2771,7 +2772,9 @@ pub(crate) mod submission_tests {
             actor.controller_input(1, TerminalInputEvent::Text(TerminalTextEvent { text: "txt".into() })).unwrap();
             actor.controller_input(2, TerminalInputEvent::Paste(TerminalPasteEvent { text: "paste".into() })).unwrap();
             let second = actor.begin_send(b"BAD".to_vec(), true, false, Default::default(), None).unwrap();
-            assert!(second.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().error.contains("busy"));
+            let error = second.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+            assert_eq!(error.controller.unwrap().cause, "busy");
+            assert!(error.error.contains("busy"));
             assert!(actor.write_input(b"BAD".to_vec()).unwrap_err().contains("busy"));
             assert_eq!(submit.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(), None);
             collect_until(&tap, &mut output, b"DONE");

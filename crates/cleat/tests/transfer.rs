@@ -852,3 +852,85 @@ fn transfer_survives_a_vanished_recognizer_addon() {
     wait_for_output(&root.cast("other@1", "moving"), "still-42");
     root.ok(&["kill", "moving"]);
 }
+
+// Real daemon/PTY boundaries: transfer every fence state without losing timestamps,
+// causes or refusal classification. Settling may naturally expire during transfer.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn controller_fence_states_survive_live_transfer() {
+    use cleat::{
+        protocol::{ControllerFenceCause, ControllerFenceState as State},
+        provider::{TerminalInputEvent as Event, TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalModifiers},
+    };
+    for (state, cause) in [
+        (State::Clear, None),
+        (State::Pending, None),
+        (State::Unverifiable, Some(ControllerFenceCause::NoKnownText)),
+        (State::Unverifiable, Some(ControllerFenceCause::Oversized)),
+        (State::Settling, None),
+    ] {
+        let root = Root::new();
+        root.start_source(&[]);
+        let service = SessionService::new(RuntimeLayout::new(root.path().to_path_buf()));
+        let ready = root.path().join("ready");
+        let command =
+            format!("stty raw -echo; touch '{}'; {}", ready.display(), if state == State::Settling { "cat" } else { "cat >/dev/null" });
+        service.create(Some("fence".into()), Some(VtEngineKind::Ghostty), None, Some(command), true).unwrap();
+        wait_until("child input mode", Duration::from_secs(5), || ready.exists());
+        let service = service.for_session("fence").unwrap();
+        let (mut client, _) = service.connect_packets("fence").unwrap();
+        client.get_ref().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        client.open_channel(1, "fence", cleat::packet::ChannelRole::Controller).unwrap();
+        let render = client.read_render(1).unwrap();
+        client.ack(1, render.update.render_generation).unwrap();
+        if state != State::Clear {
+            let event = if cause == Some(ControllerFenceCause::Oversized) {
+                Event::RawBytes(vec![b'x'; 64 * 1024 + 1])
+            } else if state == State::Unverifiable {
+                Event::Key(TerminalKeyEvent {
+                    key: TerminalKey::UnicodeScalar('a' as u32),
+                    action: TerminalKeyAction::Press,
+                    modifiers: TerminalModifiers::CTRL,
+                    consumed_modifiers: TerminalModifiers::empty(),
+                    generated_text: None,
+                    platform_keycode: 0,
+                    physical_key: None,
+                })
+            } else {
+                Event::RawBytes(b"private-transfer-input".to_vec())
+            };
+            client.input(1, event).unwrap();
+            wait_until("fence state", Duration::from_secs(5), || service.inspect("fence").unwrap().controller_fence.state == state);
+        }
+        let before = service.inspect("fence").unwrap();
+        assert_eq!(before.controller_fence.state, state);
+        if state == State::Unverifiable {
+            assert_eq!(before.controller_fence.cause, cause);
+        }
+        root.transfer("fence", "other", &[], &[]).unwrap();
+        let after = root.inspect(&["inspect", "fence"]);
+        assert_eq!(after.controller_input_generation, before.controller_input_generation);
+        assert_eq!(after.last_controller_input_at, before.last_controller_input_at);
+        if state == State::Settling && after.controller_fence.state == State::Clear {
+            assert_eq!(after.controller_fence.since, before.controller_fence.settles_at);
+        } else {
+            assert_eq!(after.controller_fence, before.controller_fence);
+        }
+        if state == State::Settling {
+            wait_until("settling expires", Duration::from_secs(5), || {
+                root.inspect(&["inspect", "fence"]).controller_fence.state == State::Clear
+            });
+        }
+        let output = root.run_with(&["send", "fence", "probe", "--no-enter", "--controller-idle", "0"], &[]);
+        match state {
+            State::Pending | State::Unverifiable => {
+                assert_eq!(output.status.code(), Some(1));
+                let diagnostic = String::from_utf8_lossy(&output.stderr);
+                assert!(diagnostic.contains(if state == State::Pending { "fence-pending" } else { "fence-unverifiable" }));
+                assert!(!diagnostic.contains("private-transfer-input"));
+            }
+            _ => assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr)),
+        }
+        root.ok(&["kill", "fence"]);
+    }
+}

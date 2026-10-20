@@ -721,6 +721,7 @@ impl SessionRuntime {
             last_output_at: activity.last_output_at,
             last_controller_input_at: None,
             controller_input_generation: 0,
+            controller_fence: Default::default(),
         }
     }
 

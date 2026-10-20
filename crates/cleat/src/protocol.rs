@@ -95,6 +95,34 @@ pub enum SessionStatus {
     Detached,
 }
 
+/// Public diagnostics contain no controller text, sizes or match progress.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerFence {
+    pub state: ControllerFenceState,
+    pub since: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settles_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<ControllerFenceCause>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ControllerFenceState {
+    #[default]
+    Clear,
+    Pending,
+    Unverifiable,
+    Settling,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ControllerFenceCause {
+    NoKnownText,
+    Oversized,
+}
+
 /// Controller history carried across live host transfers. A new child activation starts fresh.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerInputHistory {
@@ -104,6 +132,12 @@ pub struct ControllerInputHistory {
     pub expected_echo: Option<Vec<u8>>,
     #[serde(default)]
     pub echo_matched: usize,
+    #[serde(default)]
+    pub fence_since: Option<u64>,
+    #[serde(default)]
+    pub observed_output_at: Option<u64>,
+    #[serde(default)]
+    pub fence_cause: Option<ControllerFenceCause>,
 }
 
 impl ControllerInputHistory {
@@ -146,6 +180,8 @@ pub struct InspectResult {
     /// Monotonic within a child activation, including host transfers; automation and resize do not advance it.
     #[serde(default)]
     pub controller_input_generation: u64,
+    #[serde(default)]
+    pub controller_fence: ControllerFence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

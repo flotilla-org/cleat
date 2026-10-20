@@ -84,6 +84,7 @@ fn round_trip_all_roles_cloexec_and_shared_flags() {
         pending_output: true,
         expected_echo: Some(b"draft".to_vec()),
         echo_matched: 2,
+        ..Default::default()
     };
     let sent = expected.clone();
     let (read_end, write_end) = nix::unistd::pipe().unwrap();

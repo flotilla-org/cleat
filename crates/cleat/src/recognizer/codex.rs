@@ -7,6 +7,9 @@ use super::*;
 
 pub(super) struct Codex(pub Rules);
 impl Recognizer for Codex {
+    fn supported_roles(&self) -> std::collections::BTreeSet<String> {
+        self.0.supported_roles()
+    }
     fn id(&self) -> &str {
         &self.0.id
     }

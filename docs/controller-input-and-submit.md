@@ -24,9 +24,8 @@ A controller role is not proof of a human operator.
 ## Write transaction
 
 The actor pumps pending PTY output, fences unobserved controller input, evaluates
-`SendPreconditions`, and only then records the optional marker and writes. The
-precondition container and its evaluation step are the extension seam for a
-future selector `--if`; this change does not implement selectors.
+`SendPreconditions`, and only then records the optional marker and writes.
+Selector guards use this same precondition step (see below).
 
 For `--submit`, the actor encodes paste using the active engine, then holds
 transaction ownership for the existing 100ms delay and writes Enter. The HTTP
@@ -49,8 +48,8 @@ replay event to preserve controller input; the resulting draft state is uncertai
 
 Without the new guard, existing sends retain their byte behavior. `--submit`
 uses one daemon transaction instead of CLI paste/sleep/Enter requests. Ordinary
-unguarded send keeps its existing keys request. Both guarded send and submission
-work with the no-VT build; paste uses that engine's existing byte encoder.
+unguarded send keeps its existing keys request. Quiet-time guards and submission work with the no-VT build; selector guards
+require a functional VT engine. Paste uses the active engine's byte encoder.
 
 ## Conservative echo fence and limits
 
@@ -86,3 +85,54 @@ POST this to `/sessions/SESSION/input`. Successful HTTP 200 returns
 `submit` and `no_enter` together are HTTP 400. Existing input variants and marker
 endpoints retain their response shapes. Legacy automation endpoints also refuse
 writes during a submission; their existing error handling reports that refusal.
+
+## Atomic selector guard
+
+```sh
+cleat send crew-1 --submit --if "composer[value='']" --controller-idle 3s 'Review wake: ...'
+```
+
+`--if SELECTOR` is an immediate predicate evaluated by the daemon in the same
+actor transaction as the write. It uses the screen-query selector grammar,
+including unions and nested predicates. The daemon first validates syntax and
+source capabilities, then pumps pending output, requires the controller echo
+fence to be clear, evaluates the selector on the current structural tree with
+recognizer roles, and only then records the optional marker and writes. Ownership
+continues through delayed Enter and controller replay. A separate CLI query
+followed by a send cannot provide this guarantee. `--wait-if` is not implemented.
+
+| Outcome | CLI exit | HTTP | JSON `reason` |
+| --- | --- | --- | --- |
+| Sent | 0 | 200 | — |
+| Wrong value or no structural match | 1 | 409 | `not-matched` |
+| Supported role absent from this frame | 1 | 409 | `role-absent` |
+| Controller fence, quiet-time check, or submission busy | 1 | 409 | `controller-active` |
+| No VT, or role without an active source | 2 | 422 | `unsupported` |
+| Malformed selector | 2 | 400 | `error` |
+| Recognition, transport, PTY or session error | 2 | 500 | `error` |
+
+Failures return `{"reason":"not-matched","error":"selector did not match the current frame"}`
+with the appropriate reason and diagnostic. CLI diagnostics include the reason.
+Refusals and pre-write errors produce neither text nor a `--mark-before` marker.
+A later PTY/Enter/replay error can follow a write, so reconcile delivery before
+retrying such errors as described above.
+
+Role support is determined from the parsed selector (also inside `:not`, `:has`
+and `:nth-child`) and the selected recognizer's declared output roles, before
+reading screen state. Structural elements and region kinds need no recognizer.
+Unknown roles, a missing recognizer for `composer`, and `prompt` without an OSC
+133 source are unsupported. OSC 133 prompt roles are not yet provided. A running
+recognizer that currently produces no composer instead returns `role-absent`.
+Recognition errors fail closed. Omitting `--if` preserves existing input behavior;
+`--controller-idle` alone still works without VT.
+
+Composer checks preserve literal spaces, multiline content, placeholder-prefixed
+drafts and visible suffixes after a cursor moved left. They detect abandoned
+drafts even after a long quiet period. Both bundled recognizers have one known
+observation limit: spaces after the cursor are indistinguishable from terminal
+padding. A draft consisting only of spaces with the cursor moved to its start
+can read as empty. This limitation does not permit removal of draft content.
+
+```json
+{"kind":"send","text":"message","submit":true,"no_enter":false,"if":"composer[value='']","controller_idle_ms":3000,"marker_name":null}
+```

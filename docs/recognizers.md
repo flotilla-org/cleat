@@ -139,6 +139,10 @@ subscriptions retain their existing protocol and payloads.
 For applications that need Rust, use `Rules::into_recognizer` when loading a
 stylesheet (this installs Codex's style/cursor adapter), or implement `recognizer::Recognizer` and create
 an `Engine`. Return an `Observation` with roles, state, source, and explanations.
+Implement `supported_roles()` with every role the recognizer can produce,
+independently of the current frame. Atomic `send --if` guards use this declaration
+to distinguish unsupported sources from temporarily absent roles. Its default
+is an empty set; TOML rules and the Codex adapter declare their roles automatically.
 The engine installs the same nodes and contains errors/panics. The input tree
 is immutable to the implementation. A functional VT backend is required for
 live sessions and cast fixtures.

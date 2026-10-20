@@ -152,6 +152,8 @@ pub(crate) enum InputRequest {
         submit: bool,
         no_enter: bool,
         controller_idle_ms: Option<u64>,
+        #[serde(default, rename = "if", skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
         marker_name: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         acknowledge: bool,

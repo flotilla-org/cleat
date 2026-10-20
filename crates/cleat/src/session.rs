@@ -1811,7 +1811,7 @@ fn apply_attach_state(
 
 struct PendingSend {
     stream: SessionStream,
-    result: std::sync::mpsc::Receiver<Result<Option<u64>, String>>,
+    result: std::sync::mpsc::Receiver<Result<Option<u64>, crate::host::submission::SendError>>,
 }
 
 struct PendingWait {
@@ -3227,7 +3227,7 @@ fn service_pending_sends(sends: &mut Vec<PendingSend>) {
                 let _ = http_uds::write_json(&mut send.stream, StatusCode::OK, &http_uds::SendResponse { marker_offset });
             }
             Err(error) => {
-                let _ = http_uds::write_error(&mut send.stream, StatusCode::CONFLICT, &error);
+                let _ = http_uds::write_json(&mut send.stream, StatusCode::from_u16(error.status).unwrap(), &error);
             }
         }
         false
@@ -3386,7 +3386,11 @@ fn finish_exited_session(
     drain_raw_output_tap(layout, id, &hosted.actor, &mut hosted.raw_output_tap, &mut hosted.active_client, &mut hosted.watchers)?;
     service_pending_sends(&mut hosted.pending_sends);
     for mut send in hosted.pending_sends.drain(..) {
-        let _ = http_uds::write_error(&mut send.stream, StatusCode::CONFLICT, "session exited during submission");
+        let _ = http_uds::write_json(
+            &mut send.stream,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &crate::host::submission::SendError::new(500, "error", "session exited during submission"),
+        );
     }
     for mut wait in hosted.pending_waits.drain(..) {
         let elapsed_ms = wait.registered_at.elapsed().as_millis() as u64;
@@ -4099,17 +4103,28 @@ fn handle_http_request(
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
-                http_uds::InputRequest::Send { text, submit, no_enter, controller_idle_ms, marker_name, acknowledge } => {
+                http_uds::InputRequest::Send { text, submit, no_enter, controller_idle_ms, selector, marker_name, acknowledge } => {
                     if submit && no_enter {
                         return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "submit and no_enter are mutually exclusive")
                             .map_err(|error| format!("write send validation error: {error}"));
                     }
+                    let selector = match selector.map(|source| terminal_screen::Selector::parse(&source)).transpose() {
+                        Ok(selector) => selector,
+                        Err(error) => {
+                            return http_uds::write_json(
+                                stream,
+                                StatusCode::BAD_REQUEST,
+                                &crate::host::submission::SendError::new(400, "error", error.to_string()),
+                            )
+                            .map_err(|e| e.to_string())
+                        }
+                    };
                     let pending_stream = stream.try_clone().map_err(|err| format!("clone send response: {err}"))?;
                     let result = hosted.actor.begin_send(
                         text.into_bytes(),
                         submit,
                         no_enter,
-                        crate::host::actor::SendPreconditions { controller_idle: controller_idle_ms.map(Duration::from_millis) },
+                        crate::host::actor::SendPreconditions { controller_idle: controller_idle_ms.map(Duration::from_millis), selector },
                         marker_name,
                     )?;
                     if acknowledge {

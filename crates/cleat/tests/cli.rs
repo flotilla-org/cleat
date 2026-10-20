@@ -773,6 +773,7 @@ fn send_command_parses() {
         no_enter: false,
         submit: false,
         controller_idle: None,
+        selector: None,
         mark_before: None
     });
 }
@@ -787,6 +788,7 @@ fn send_command_parses_no_enter() {
         no_enter: true,
         submit: false,
         controller_idle: None,
+        selector: None,
         mark_before: None
     });
 }
@@ -801,6 +803,7 @@ fn send_command_parses_submit() {
         no_enter: false,
         submit: true,
         controller_idle: None,
+        selector: None,
         mark_before: None
     });
 }
@@ -1023,6 +1026,7 @@ fn send_mark_before_parses() {
         no_enter: false,
         submit: false,
         controller_idle: None,
+        selector: None,
         mark_before: Some("m1".into())
     });
 }
@@ -1230,4 +1234,11 @@ fn conflicting_recognizer_selections_do_not_start_a_daemon() {
     let error = execute(cli, &service).expect_err("conflicting recognizers");
     assert!(error.contains("select exactly one recognizer"), "{error}");
     assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none(), "CLI validation must precede daemon startup");
+}
+
+// The guard is passed intact; quoting and nested selectors belong to the daemon parser.
+#[test]
+fn send_command_parses_atomic_selector() {
+    let cli = Cli::try_parse_from(["cleat", "send", "demo", "--if", "composer[value='']", "--submit", "hello"]).unwrap();
+    assert!(matches!(cli.command, Command::Send { selector: Some(s), submit: true, .. } if s == "composer[value='']"));
 }

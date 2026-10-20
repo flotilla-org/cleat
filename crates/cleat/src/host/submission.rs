@@ -2,15 +2,16 @@
 //! These types are independent of a VT engine; the actor owns their PTY transaction.
 use std::time::{Duration, Instant};
 
-/// Future selector guards belong here and are evaluated at the same write seam.
+/// Predicates evaluated by the actor before any marker or PTY write.
 #[derive(Default)]
 pub(crate) struct SendPreconditions {
     pub(crate) controller_idle: Option<Duration>,
+    pub(crate) selector: Option<terminal_screen::Selector>,
 }
 
 impl SendPreconditions {
     pub(super) fn guarded(&self) -> bool {
-        self.controller_idle.is_some()
+        self.controller_idle.is_some() || self.selector.is_some()
     }
 
     pub(super) fn evaluate(&self, controller: &ControllerActivity, now: Instant) -> Result<(), String> {
@@ -260,7 +261,7 @@ mod controller_fence_properties {
                     assert_eq!(activity.pending_output, (index + 1) * chunk_size < expected.len());
                     assert_eq!(activity.generation, 1);
                 }
-                let guard = SendPreconditions { controller_idle: Some(Duration::ZERO) };
+                let guard = SendPreconditions { controller_idle: Some(Duration::ZERO), ..Default::default() };
                 assert!(activity.check(&guard, now).is_err()); // matched echo still needs its settling interval
                 assert!(activity.check(&guard, now + SUBMIT_ENTER_DELAY).is_ok());
                 activity.accepted(now);
@@ -280,7 +281,9 @@ mod controller_fence_properties {
             activity.observe_output(b"anything", now);
             activity.written(Some(b"known".to_vec()));
             activity.observe_output(b"known", now);
-            assert!(activity.check(&SendPreconditions { controller_idle: Some(Duration::ZERO) }, now + Duration::from_secs(100)).is_err());
+            assert!(activity
+                .check(&SendPreconditions { controller_idle: Some(Duration::ZERO), ..Default::default() }, now + Duration::from_secs(100))
+                .is_err());
         }
     }
 
@@ -315,5 +318,192 @@ mod controller_fence_properties {
             queue.push(QueuedControllerInput::Event { source: 0, event: crate::provider::TerminalInputEvent::RawBytes(vec![]) }).unwrap();
         }
         assert!(queue.push(QueuedControllerInput::Release(0)).unwrap_err().contains("refused"));
+    }
+}
+
+/// Stable send failure contract shared by the actor, HTTP transport and CLI.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SendError {
+    #[serde(skip)]
+    pub(crate) status: u16,
+    pub(crate) reason: String,
+    pub(crate) error: String,
+}
+impl SendError {
+    pub(crate) fn new(status: u16, reason: &str, error: impl Into<String>) -> Self {
+        Self { status, reason: reason.into(), error: error.into() }
+    }
+    pub(crate) fn refused(reason: &str, error: impl Into<String>) -> Self {
+        Self::new(409, reason, error)
+    }
+    #[cfg(test)]
+    pub(crate) fn contains(&self, text: &str) -> bool {
+        self.error.contains(text)
+    }
+}
+impl From<String> for SendError {
+    fn from(error: String) -> Self {
+        Self::new(500, "error", error)
+    }
+}
+impl From<&str> for SendError {
+    fn from(error: &str) -> Self {
+        error.to_string().into()
+    }
+}
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.error)
+    }
+}
+
+/// Structure needs no recognizer; all other names require a declared role source.
+pub(crate) fn selector_roles(selector: &terminal_screen::Selector) -> std::collections::BTreeSet<String> {
+    selector
+        .referenced_elements()
+        .into_iter()
+        .filter(|name| {
+            !matches!(
+                name.as_str(),
+                "screen" | "region" | "row" | "span" | "cursor" | "frame" | "enclosure" | "zone" | "group" | "block" | "gap" | "row-slice"
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn evaluate_selector(selector: &terminal_screen::Selector, tree: &terminal_screen::ScreenTree) -> Result<(), SendError> {
+    if !selector.evaluate(tree).is_empty() {
+        return Ok(());
+    }
+    let absent = selector_roles(selector).iter().any(|role| {
+        !tree.document_order().iter().filter_map(|id| tree.node(*id)).any(|node| node.element == *role || node.roles.contains(role))
+    });
+    Err(if absent {
+        SendError::refused("role-absent", "selector role is absent from the current frame")
+    } else {
+        SendError::refused("not-matched", "selector did not match the current frame")
+    })
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use terminal_screen::{Node, Rect, ScreenTree, Selector};
+
+    use super::*;
+
+    // Syntax capability discovery includes nested predicates, unions and nth-child filters,
+    // but never mistakes attribute values or regex text for role names.
+    #[test]
+    fn selector_capabilities_are_static_and_recursive() {
+        for (source, expected) in [
+            ("row:matches(/composer/)", vec![]),
+            ("screen:has(composer[value='dialog'])", vec!["composer"]),
+            ("row:not(dialog), span:nth-child(1 of composer)", vec!["composer", "dialog"]),
+            ("frame > row-slice", vec![]),
+        ] {
+            assert_eq!(selector_roles(&Selector::parse(source).unwrap()).into_iter().collect::<Vec<_>>(), expected);
+        }
+    }
+
+    // Unknown observations are absent; exact value equality preserves literal spaces and suffixes.
+    // Generate absent, empty, whitespace, multiline, Unicode and suffix-bearing draft values.
+    #[test]
+    fn selector_refusal_preserves_observation() {
+        let selector = Selector::parse("composer[value='']").unwrap();
+        for value in [None, Some(""), Some(" "), Some("draft"), Some("\n"), Some("λ suffix")] {
+            let mut tree = ScreenTree::from_root(0, Node::new("screen", Rect { col: 0, row: 0, width: 80, height: 24 }, ""));
+            if let Some(value) = value {
+                let mut node = Node::new("composer", Rect { col: 0, row: 0, width: 80, height: 1 }, value);
+                node.attributes.insert("value".into(), value.into());
+                tree.add_node(tree.root(), node).unwrap();
+            }
+            let before = tree.clone();
+            let result = evaluate_selector(&selector, &tree);
+            assert_eq!(result.is_ok(), value == Some(""));
+            if let Err(error) = result {
+                assert_eq!(error.status, 409);
+                assert_eq!(error.reason, if value.is_none() { "role-absent" } else { "not-matched" });
+            }
+            assert_eq!(tree, before);
+        }
+    }
+
+    // A selector alone activates the same conservative controller fence as a quiet-time guard.
+    // Delayed/fragmented echo and the settling boundary must refuse, however old the input is.
+    #[test]
+    fn selector_guard_fences_controller_echo_without_idle_option() {
+        let guard = SendPreconditions { selector: Some(Selector::parse("screen").unwrap()), ..Default::default() };
+        let now = Instant::now();
+        let mut controller = ControllerActivity::default();
+        controller.accepted(now);
+        controller.written(Some(b"draft".to_vec()));
+        assert!(controller.check(&guard, now + Duration::from_secs(3600)).is_err());
+        controller.observe_output(b"dra", now);
+        assert!(controller.check(&guard, now + Duration::from_secs(3600)).is_err());
+        controller.observe_output(b"ft", now);
+        assert!(controller.check(&guard, now + SUBMIT_ENTER_DELAY - Duration::from_nanos(1)).is_err());
+        assert!(controller.check(&guard, now + SUBMIT_ENTER_DELAY).is_ok());
+    }
+
+    // Replay both real harnesses at both recorded sizes. Every fixture marker is an
+    // independent empty/draft/absent oracle, including placeholders, spaces and cursor-left suffixes.
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn guarded_send_recorded_composers() {
+        use crate::{
+            asciicast::{decode_event, decode_header, EventCode},
+            recognizer::{Engine, Fixture, Rules},
+            vt::{ghostty::GhosttyVtEngine, VtEngine},
+        };
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let selector = Selector::parse("composer[value='']").unwrap();
+        for id in ["codex", "claude-code"] {
+            for size in ["80x24", "120x40"] {
+                let path = root.join(format!("recognizers/fixtures/{id}/{id}-{size}"));
+                let data = std::fs::read_to_string(path.with_extension("cast")).unwrap();
+                let fixture: Fixture = toml::from_str(&std::fs::read_to_string(path.with_extension("toml")).unwrap()).unwrap();
+                let mut lines = data.lines();
+                let header = decode_header(lines.next().unwrap()).unwrap();
+                let mut vt = GhosttyVtEngine::new(header.cols, header.rows);
+                let mut engine = Engine::new(Rules::load(&root.join(format!("recognizers/{id}.toml"))).unwrap().into_recognizer());
+                let mut time = Duration::ZERO;
+                for line in lines.filter(|line| !line.trim().is_empty()) {
+                    let event = decode_event(line, &mut time).unwrap();
+                    match event.code {
+                        EventCode::Output => vt.feed(event.data.as_bytes()).unwrap(),
+                        EventCode::Resize => {
+                            let (cols, rows) = event.data.split_once('x').unwrap();
+                            vt.resize(cols.parse().unwrap(), rows.parse().unwrap()).unwrap();
+                        }
+                        _ => {}
+                    }
+                    if event.code != EventCode::Marker {
+                        continue;
+                    }
+                    let mut tree = vt.recognition_tree(event.time.as_millis() as u64).unwrap();
+                    engine.evaluate(&mut tree, vt.title().as_deref(), event.time.as_millis() as u64);
+                    assert!(engine.inspect.error.is_none(), "{id} {size} {}: {:?}", event.data, engine.inspect.error);
+                    if event.code == EventCode::Marker {
+                        let expected = fixture.marker.iter().find(|m| m.name == event.data).unwrap();
+                        let composer = expected.role.iter().find(|r| r.role == "composer");
+                        let result = evaluate_selector(&selector, &tree);
+                        assert_eq!(result.is_ok(), composer.is_some_and(|r| r.value.is_empty()), "{id} {size} {}", event.data);
+                        if let Err(error) = result {
+                            assert_eq!(error.reason, if composer.is_none() { "role-absent" } else { "not-matched" });
+                        }
+                        // Known observation limit in both harnesses: spaces after a cursor
+                        // at the start are indistinguishable from terminal padding.
+                        if event.data == "draft-space" {
+                            let cursor = tree.select("cursor").unwrap()[0].bounds;
+                            vt.feed(format!("\x1b7\x1b[{};3H", cursor.row + 1).as_bytes()).unwrap();
+                            let mut left = vt.recognition_tree(event.time.as_millis() as u64 + 1).unwrap();
+                            engine.evaluate(&mut left, vt.title().as_deref(), event.time.as_millis() as u64 + 1);
+                            assert!(evaluate_selector(&selector, &left).is_ok(), "{id} {size} space-only cursor-left limit");
+                            vt.feed(b"\x1b8").unwrap();
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -344,6 +344,10 @@ pub struct Observation {
 pub trait Recognizer: Send {
     fn id(&self) -> &str;
     fn revision(&self) -> u64;
+    /// Statically declared output roles, independent of the current observation.
+    fn supported_roles(&self) -> std::collections::BTreeSet<String> {
+        Default::default()
+    }
     fn evaluate(&mut self, tree: &ScreenTree, title: Option<&str>) -> Result<Observation, String>;
 }
 fn provenance(tree: &ScreenTree, mut id: NodeId) -> String {
@@ -360,6 +364,9 @@ fn provenance(tree: &ScreenTree, mut id: NodeId) -> String {
     }
 }
 impl Recognizer for Rules {
+    fn supported_roles(&self) -> std::collections::BTreeSet<String> {
+        self.rules.iter().filter_map(|rule| rule.declaration.role.clone()).collect()
+    }
     fn id(&self) -> &str {
         &self.id
     }
@@ -515,6 +522,9 @@ impl Engine {
         let inspect =
             Inspect { id: recognizer.id().into(), revision: recognizer.revision(), error: None, observation: Observation::default() };
         Self { recognizer, key: None, inspect, pending: None, state: None, last_status: None, candidate: Observation::default() }
+    }
+    pub(crate) fn supported_roles(&self) -> std::collections::BTreeSet<String> {
+        self.recognizer.supported_roles()
     }
     pub fn stop_confirmations(&mut self) {
         self.pending = None;

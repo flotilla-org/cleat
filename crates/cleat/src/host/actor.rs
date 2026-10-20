@@ -28,9 +28,9 @@ use nix::{
     fcntl::{fcntl, FcntlArg, OFlag},
 };
 
-pub(crate) use super::submission::SendPreconditions;
 #[cfg(all(test, unix))]
 use super::submission::CONTROLLER_QUEUE_BYTES;
+pub(crate) use super::submission::{SendError, SendPreconditions};
 use super::{
     presentation::{GateTransition, PresentationGate},
     submission::{
@@ -444,7 +444,7 @@ pub(crate) enum SessionCommand {
         no_enter: bool,
         preconditions: SendPreconditions,
         marker_name: Option<String>,
-        reply: mpsc::Sender<Result<Option<u64>, String>>,
+        reply: mpsc::Sender<Result<Option<u64>, SendError>>,
     },
     WriteInput {
         bytes: Vec<u8>,
@@ -1080,7 +1080,7 @@ impl SessionActor {
         no_enter: bool,
         preconditions: SendPreconditions,
         marker_name: Option<String>,
-    ) -> Result<Receiver<Result<Option<u64>, String>>, String> {
+    ) -> Result<Receiver<Result<Option<u64>, SendError>>, String> {
         let (reply, rx) = mpsc::channel();
         self.tx
             .send(SessionCommand::Send { text, submit, no_enter, preconditions, marker_name, reply })
@@ -1289,7 +1289,7 @@ struct PumpResult {
 struct Submission {
     enter_at: Instant,
     marker_offset: Option<u64>,
-    reply: mpsc::Sender<Result<Option<u64>, String>>,
+    reply: mpsc::Sender<Result<Option<u64>, SendError>>,
 }
 
 struct SessionActorLoopState {
@@ -1596,13 +1596,25 @@ fn session_actor_handle_command(
             let _ = reply.send(result);
         }
         SessionCommand::Send { text, submit, no_enter, preconditions, marker_name, reply } => {
+            // Static capability validation precedes the output pump and any screen read.
+            let support = preconditions.selector.as_ref().map(|selector| runtime.check_selector_support(selector)).transpose();
+            if let Err(error) = support {
+                let _ = reply.send(Err(error));
+                return false;
+            }
             session_actor_pump(runtime, state, wake);
             let result = (|| {
-                if state.submission.is_some() || state.pty_paused || state.exited {
+                if state.submission.is_some() {
+                    return Err(SendError::refused("controller-active", "submission busy"));
+                }
+                if state.pty_paused || state.exited {
                     return Err("submission busy or session unavailable".into());
                 }
                 // Output pump -> controller observation fence -> predicates -> first write.
-                state.controller.check(&preconditions, Instant::now())?;
+                state.controller.check(&preconditions, Instant::now()).map_err(|error| SendError::refused("controller-active", error))?;
+                if let Some(selector) = &preconditions.selector {
+                    runtime.check_selector(selector)?;
+                }
                 let marker_offset = marker_name.map(|name| runtime.mark(Some(name))).transpose()?;
                 if submit {
                     route_paste_on_actor(runtime, &text)?;
@@ -2013,7 +2025,7 @@ fn finish_submission(runtime: &mut SessionRuntime, state: &mut SessionActorLoopS
         }
     }
     // An error may follow a successful Enter: callers must not infer that retrying is safe.
-    let _ = submission.reply.send(result.and(replay_result).map(|_| submission.marker_offset));
+    let _ = submission.reply.send(result.and(replay_result).map(|_| submission.marker_offset).map_err(SendError::from));
     wake();
 }
 
@@ -2666,27 +2678,27 @@ pub(crate) mod submission_tests {
     use crate::provider::{TerminalInputEvent, TerminalPasteEvent, TerminalTextEvent};
 
     pub(crate) fn spawn(command: &str) -> (tempfile::TempDir, SessionActor, RawOutputTap) {
+        spawn_with(command, vt::VtEngineKind::Passthrough, vec![])
+    }
+
+    fn spawn_with(command: &str, kind: vt::VtEngineKind, tags: Vec<String>) -> (tempfile::TempDir, SessionActor, RawOutputTap) {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
         let command = command.to_string();
-        let actor = SessionActor::spawn(3, Arc::new(|| {}), move || {
+        let actor = SessionActor::spawn(24, Arc::new(|| {}), move || {
             let session = crate::runtime::SessionMetadata {
                 id: "submission-test".into(),
-                vt_engine: vt::VtEngineKind::Passthrough,
+                vt_engine: kind,
                 cwd: None,
                 cmd: Some(command),
-                tags: vec![],
+                tags,
                 environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: vec![],
-                record: false,
+                record: true,
                 initial_size: Default::default(),
                 colors: Default::default(),
             };
-            SessionRuntime::spawn(
-                dir,
-                &session,
-                vt::make_vt_engine_with_colors(vt::VtEngineKind::Passthrough, 20, 3, Default::default()).unwrap(),
-            )
+            SessionRuntime::spawn(dir, &session, vt::make_vt_engine_with_colors(kind, 80, 24, Default::default()).unwrap())
         })
         .unwrap();
         let tap = actor.subscribe_raw_output().unwrap();
@@ -2753,18 +2765,33 @@ pub(crate) mod submission_tests {
             collect_until(&tap, &mut output, b"READY");
             actor.controller_input(0, event).unwrap();
             for idle in [Duration::ZERO, Duration::from_millis(1), Duration::from_secs(10)] {
-                let result =
-                    actor.begin_send(b"BAD".to_vec(), true, false, SendPreconditions { controller_idle: Some(idle) }, None).unwrap();
+                let result = actor
+                    .begin_send(b"BAD".to_vec(), true, false, SendPreconditions { controller_idle: Some(idle), ..Default::default() }, None)
+                    .unwrap();
                 assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
             }
             thread::sleep(Duration::from_millis(150));
-            let result =
-                actor.begin_send(b"BAD".to_vec(), true, false, SendPreconditions { controller_idle: Some(Duration::ZERO) }, None).unwrap();
+            let result = actor
+                .begin_send(
+                    b"BAD".to_vec(),
+                    true,
+                    false,
+                    SendPreconditions { controller_idle: Some(Duration::ZERO), ..Default::default() },
+                    None,
+                )
+                .unwrap();
             assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err().contains("PTY echo"));
             collect_until(&tap, &mut output, b"ECHO");
             thread::sleep(SUBMIT_ENTER_DELAY + Duration::from_millis(20));
-            let result =
-                actor.begin_send(b"ok".to_vec(), false, true, SendPreconditions { controller_idle: Some(Duration::ZERO) }, None).unwrap();
+            let result = actor
+                .begin_send(
+                    b"ok".to_vec(),
+                    false,
+                    true,
+                    SendPreconditions { controller_idle: Some(Duration::ZERO), ..Default::default() },
+                    None,
+                )
+                .unwrap();
             assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
             assert_eq!(actor.inspect(false, 0).unwrap().controller_input_generation, 1);
         }
@@ -2795,12 +2822,88 @@ pub(crate) mod submission_tests {
         assert!(send.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
     }
 
+    // Unsupported selectors write neither bytes nor markers, even on the no-VT path.
+    #[test]
+    fn selector_without_vt_is_unsupported_before_writing() {
+        let (_temp, actor, _tap) = spawn("stty raw -echo; sleep 10");
+        let guard = SendPreconditions { selector: Some(terminal_screen::Selector::parse("screen").unwrap()), ..Default::default() };
+        let error = actor.begin_send(b"BAD".to_vec(), true, false, guard, Some("refused".into())).unwrap().recv().unwrap().unwrap_err();
+        assert_eq!((error.status, error.reason.as_str()), (422, "unsupported"));
+        assert_eq!(actor.resolve_marker("refused".into()).unwrap(), None);
+    }
+
+    // At the actual actor seam a quiet old draft must refuse without changing its
+    // screen or marker store. Missing sources are statically unsupported; a running
+    // source with no composer is only temporarily absent. Plain structure needs no source.
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn atomic_selector_actor_outcomes_and_draft_conservation() {
+        for (tags, source, expected) in [
+            (vec!["recognizer:synthetic".into()], "composer[value='']", Some((409, "not-matched"))),
+            (vec!["recognizer:synthetic".into()], "dialog", Some((409, "role-absent"))),
+            (vec!["recognizer:synthetic".into()], "unknown-role", Some((422, "unsupported"))),
+            (vec![], "composer[value='']", Some((422, "unsupported"))),
+            (vec![], "prompt[phase=input]", Some((422, "unsupported"))),
+            (vec![], "screen:has(row:has-text('Draft: abandoned'))", None),
+        ] {
+            let (_temp, actor, tap) = spawn_with(
+                "stty raw -echo; sleep 0.05; printf 'Draft: abandoned'; dd bs=1 count=6 2>/dev/null | od -An -tx1; printf PROBED; sleep 10",
+                vt::VtEngineKind::Ghostty,
+                tags,
+            );
+            let mut output = Vec::new();
+            collect_until(&tap, &mut output, b"Draft: abandoned");
+            let before = actor.screen_tree().unwrap();
+            let guard = SendPreconditions {
+                controller_idle: Some(Duration::ZERO),
+                selector: Some(terminal_screen::Selector::parse(source).unwrap()),
+            };
+            let result = actor.begin_send(b"BAD".to_vec(), true, false, guard, Some("guarded".into())).unwrap().recv().unwrap();
+            if let Some((status, reason)) = expected {
+                let error = result.unwrap_err();
+                assert_eq!((error.status, error.reason.as_str()), (status, reason), "{source}");
+                assert_eq!(actor.resolve_marker("guarded".into()).unwrap(), None);
+                assert_eq!(actor.screen_tree().unwrap(), before);
+                actor.write_input(b"probe\r".to_vec()).unwrap();
+                collect_until(&tap, &mut output, b"PROBED");
+                assert!(String::from_utf8(output).unwrap().contains("70 72 6f 62 65 0d"));
+            } else {
+                assert!(result.unwrap().is_some());
+                assert!(actor.resolve_marker("guarded".into()).unwrap().is_some());
+            }
+        }
+    }
+
+    // Human bytes accepted between guarded paste and Enter are replayed after Enter.
+    // Before the check and throughout delayed echo, the same selector-only guard refuses.
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn atomic_selector_controller_interleavings() {
+        let (_temp, actor, tap) = spawn_with(
+            "stty raw -echo; sleep 0.05; printf READY; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf DONE; sleep 10",
+            vt::VtEngineKind::Ghostty,
+            vec![],
+        );
+        let mut output = Vec::new();
+        collect_until(&tap, &mut output, b"READY");
+        let guard = || SendPreconditions { selector: Some(terminal_screen::Selector::parse("screen").unwrap()), ..Default::default() };
+        let send = actor.begin_send(b"ok".to_vec(), true, false, guard(), None).unwrap();
+        actor.inspect(false, 0).unwrap(); // FIFO barrier after paste, before delayed Enter.
+        actor.controller_input(0, TerminalInputEvent::RawBytes(b"x".to_vec())).unwrap();
+        send.recv().unwrap().unwrap();
+        collect_until(&tap, &mut output, b"DONE");
+        assert!(String::from_utf8(output).unwrap().contains("6f 6b 0d 78"));
+        let error = actor.begin_send(b"BAD".to_vec(), true, false, guard(), Some("refused".into())).unwrap().recv().unwrap().unwrap_err();
+        assert_eq!((error.status, error.reason.as_str()), (409, "controller-active"));
+        assert_eq!(actor.resolve_marker("refused".into()).unwrap(), None);
+    }
+
     // Explicit sequence generator crosses zero, threshold-1, threshold, threshold+1 and pending-output states.
     // The quiet-time boundary is inclusive; unobserved accepted input always refuses, even after long quiet.
     #[test]
     fn controller_guard_boundaries_and_monotonicity() {
         let start = Instant::now();
-        let preconditions = SendPreconditions { controller_idle: Some(Duration::from_millis(10)) };
+        let preconditions = SendPreconditions { controller_idle: Some(Duration::from_millis(10)), ..Default::default() };
         let mut activity = ControllerActivity::default();
         assert!(activity.check(&preconditions, start).is_ok());
         for generation in 1..=4 {

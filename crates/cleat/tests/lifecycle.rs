@@ -4813,7 +4813,9 @@ fn controller_activity_raw_path_without_vt() {
     let cli =
         Cli::try_parse_from(["cleat", "send", "controller-raw", "BAD", "--submit", "--controller-idle", "0", "--mark-before", "refused"])
             .unwrap();
-    assert!(matches!(cli::execute(cli, &service), ExecResult::Err(message) if message.contains("controller input")));
+    assert!(
+        matches!(cli::execute(cli, &service), ExecResult::Exit { code: 1, message: Some(message), .. } if message.contains("controller input"))
+    );
     assert!(!service.inspect("controller-raw").unwrap().recording.markers.contains_key("refused"));
     service.kill("controller-raw").unwrap();
 }
@@ -5195,4 +5197,35 @@ fn recognizer_selection_publication_and_failure_isolation() {
     wait_until("unguarded send with failed recognizer", || service.capture("fault").unwrap().contains("RECEIVED"));
     assert!(service.inspect("fault").unwrap().recognizer.unwrap().error.is_some());
     service.kill("fault").unwrap();
+}
+
+// The public HTTP and CLI contracts distinguish unsupported, malformed and refused
+// guards, and every rejected request leaves the optional recording marker absent.
+#[test]
+fn atomic_guard_http_and_cli_outcomes() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service.create(Some("guard".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).unwrap();
+    for (selector, status, reason) in [("screen", 422, "unsupported"), ("[", 400, "error")] {
+        let body =
+            serde_json::json!({"kind":"send", "text":"BAD", "submit":true, "no_enter":false, "if":selector, "marker_name":"refused"})
+                .to_string();
+        let response = http_session_request(
+            temp.path(),
+            "guard",
+            &format!(
+                "POST /sessions/guard/input HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{response}");
+        let value: serde_json::Value = serde_json::from_str(http_body(&response)).unwrap();
+        assert_eq!(value["reason"], reason);
+        let cli = Cli::try_parse_from(["cleat", "send", "guard", "BAD", "--if", selector, "--mark-before", "refused"]).unwrap();
+        assert!(matches!(cli::execute(cli, &service), ExecResult::Exit { code: 2, .. }));
+        assert!(!service.inspect("guard").unwrap().recording.markers.contains_key("refused"));
+    }
+    service.kill("guard").unwrap();
 }

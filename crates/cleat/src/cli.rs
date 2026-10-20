@@ -501,6 +501,8 @@ resolved through the live daemon socket. \n\
         /// Refuse unless controller input has been quiet for this duration (heuristic; drafts may remain).
         #[arg(long, value_name = "DURATION", value_parser = crate::duration_parser::parse_humantime_or_seconds)]
         controller_idle: Option<Duration>,
+        #[arg(long = "if", value_name = "SELECTOR", help = "Refuse unless the screen selector matches atomically before writing")]
+        selector: Option<String>,
         #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
         mark_before: Option<String>,
     },
@@ -1262,8 +1264,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Send { id, text, no_enter, submit, controller_idle, mark_before, ack } => {
-            if !ack && !submit && controller_idle.is_none() {
+        Command::Send { id, text, no_enter, submit, controller_idle, selector, mark_before, ack } => {
+            if !ack && !submit && controller_idle.is_none() && selector.is_none() {
                 let mut bytes = text.into_bytes();
                 if !no_enter {
                     bytes.push(b'\r');
@@ -1291,11 +1293,14 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 submit,
                 no_enter,
                 controller_idle_ms,
+                selector,
                 marker_name: mark_before,
                 acknowledge: ack,
             }) {
                 Ok(offset) => ExecResult::Ok(offset.map(|offset| offset.to_string())),
-                Err(error) => ExecResult::Err(error),
+                Err(error) => {
+                    ExecResult::Exit { code: if error.status == 409 { 1 } else { 2 }, message: Some(error.to_string()), output: None }
+                }
             }
         }
         Command::Interrupt { id } => match service.send_keys(&id, &[0x03]) {

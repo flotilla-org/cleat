@@ -61,6 +61,41 @@ Unix sockets are supported on Unix platforms; `--socket` reports
 endpoints are not supported by this mode. Other commands retain local runtime
 targeting.
 
+### Proxy and provider transports
+
+`cleat proxy` bridges its stdin and stdout to a daemon's packet socket, so any
+command that carries stdio can reach a remote daemon:
+
+```bash
+ssh host cleat proxy [--daemon NAME] [--runtime-root PATH]
+```
+
+Proxy never starts a daemon. When the selected daemon is unreachable it exits
+non-zero with a one-line reason on stderr and writes nothing to stdout, which
+is the data channel.
+
+A provider host chooses its transport with `cleat_provider_open_transport`
+(daemon backend only):
+
+- `CLEAT_TRANSPORT_UNIX_SOCKET` connects to a socket path, such as a forwarded
+  socket. It reconnects with backoff, like the local runtime transport.
+- `CLEAT_TRANSPORT_COMMAND` runs an argv, such as `ssh host cleat proxy`, whose
+  stdio carries the packet stream. The command is the transport: when it exits,
+  the provider's sessions disconnect and it is not respawned. Its last stderr
+  line becomes the reported error.
+
+Both declare a remote output context. The admission warning goes to the
+provider's diagnostics, `cleat_provider_transport_state_json`, rather than to
+stderr or rendered content; the same JSON reports the transport kind, whether
+it is connected, the last error, and whether it is still retrying. Sessions over
+a remote transport report hosting as `remote:<kind>`. They cannot be created,
+ended or adopted, and transfer redirects are not followed.
+
+**Trust.** Cleat adds no authentication of its own. Whoever can run the command
+or reach the socket controls the sessions behind it: for `ssh host cleat proxy`,
+SSH is the authentication, and the remote account's access is the boundary.
+Both transports are Unix only.
+
 ## Terminal hyperlinks
 
 Render feeds carry frame-owned OSC 8 destinations, and packet attachment relays

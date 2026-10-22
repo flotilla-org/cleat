@@ -61,7 +61,8 @@ fn finish(session: &mut CleatSession, result: Result<(), String>) -> bool {
     }
 }
 
-/// Current hosting: `in_process` or `daemon:<name@generation>`.
+/// Current hosting: `in_process`, `daemon:<name@generation>`, or
+/// `remote:<transport kind>` (`unix_socket` or `command`).
 /// # Safety
 /// `session` and `out` must be valid. The borrowed string lasts until the next
 /// hosting query, transfer, adoption, or destruction of the session.
@@ -72,10 +73,13 @@ pub unsafe extern "C" fn cleat_session_hosting(session: *mut CleatSession, out: 
     };
     session.transfer.hosting = match &session.backend {
         SessionBackend::InProcess(_) => "in_process".into(),
-        SessionBackend::Daemon(daemon) => {
-            let layout = daemon.connection.channel_layout(daemon.channel);
-            format!("daemon:{}", layout.resolved().unwrap_or(layout).daemon_name())
-        }
+        SessionBackend::Daemon(daemon) => match daemon.connection.transport() {
+            crate::provider_daemon::Transport::Runtime => {
+                let layout = daemon.connection.channel_layout(daemon.channel);
+                format!("daemon:{}", layout.resolved().unwrap_or(layout).daemon_name())
+            }
+            transport => format!("remote:{}", transport.kind()),
+        },
         SessionBackend::Mock(_) => return false,
     };
     *out = CleatStr { ptr: session.transfer.hosting.as_ptr(), len: session.transfer.hosting.len() };
@@ -248,6 +252,9 @@ fn adopt_session(session: &mut CleatSession) -> Result<(), String> {
     let SessionBackend::Daemon(daemon) = &session.backend else {
         return Err("session is not daemon-backed".into());
     };
+    if daemon.connection.transport().is_remote() {
+        return Err("sessions cannot be adopted over a remote transport".into());
+    }
     let identity = daemon.slot.lock().map_err(|_| "session channel lock poisoned")?.identity.clone();
     let layout = daemon.connection.channel_layout(daemon.channel).resolved()?;
     let mut inspect_stream = stream(&layout)?;

@@ -68,6 +68,7 @@ fn help_lists_expected_subcommands() {
         "attach",
         "watch",
         "packets",
+        "proxy",
         "launch",
         "list",
         "server",

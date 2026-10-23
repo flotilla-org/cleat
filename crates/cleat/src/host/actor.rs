@@ -2887,7 +2887,7 @@ pub(crate) mod submission_tests {
             (vec![], "screen:has(row:has-text('Draft: abandoned'))", None),
         ] {
             let (_temp, actor, tap) = spawn_with(
-                "stty raw -echo; printf 'Draft: abandoned'; dd bs=1 count=6 2>/dev/null | od -An -tx1; printf PROBED; sleep 10",
+                "stty raw -echo; printf 'Draft: abandoned'; dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \\n'; printf PROBED; sleep 10",
                 vt::VtEngineKind::Ghostty,
                 tags,
             );
@@ -2906,7 +2906,7 @@ pub(crate) mod submission_tests {
                 assert_eq!(actor.screen_tree().unwrap(), before);
                 actor.write_input(b"probe\r".to_vec()).unwrap();
                 collect_until(&tap, &mut output, b"PROBED");
-                assert!(String::from_utf8(output).unwrap().contains("70 72 6f 62 65 0d"));
+                assert!(String::from_utf8(output).unwrap().contains("70726f62650d"));
             } else {
                 assert!(result.unwrap().is_some());
                 assert!(actor.resolve_marker("guarded".into()).unwrap().is_some());
@@ -2920,7 +2920,7 @@ pub(crate) mod submission_tests {
     #[test]
     fn atomic_selector_controller_interleavings() {
         let (_temp, actor, tap) = spawn_with(
-            "stty raw -echo; printf READY; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf DONE; sleep 10",
+            "stty raw -echo; printf READY; dd bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \\n'; printf DONE; sleep 10",
             vt::VtEngineKind::Ghostty,
             vec![],
         );
@@ -2932,7 +2932,7 @@ pub(crate) mod submission_tests {
         actor.controller_input(0, TerminalInputEvent::RawBytes(b"x".to_vec())).unwrap();
         send.recv().unwrap().unwrap();
         collect_until(&tap, &mut output, b"DONE");
-        assert!(String::from_utf8(output).unwrap().contains("6f 6b 0d 78"));
+        assert!(String::from_utf8(output).unwrap().contains("6f6b0d78"));
         let error = actor.begin_send(b"BAD".to_vec(), true, false, guard(), Some("refused".into())).unwrap().recv().unwrap().unwrap_err();
         assert_eq!((error.status, error.reason.as_str()), (409, "controller-active"));
         assert_eq!(actor.resolve_marker("refused".into()).unwrap(), None);

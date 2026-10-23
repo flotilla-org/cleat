@@ -43,9 +43,11 @@ impl Outer {
             command.args(["--no-create", "--no-record"]);
         }
         // SAFETY: child-only async-signal-safe syscalls establish its controlling terminal.
+        // `ioctl`'s request type differs by platform (c_ulong on macOS and
+        // glibc, c_int on musl) and TIOCSCTTY's doesn't always match it.
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())

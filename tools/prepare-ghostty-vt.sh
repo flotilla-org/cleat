@@ -92,6 +92,104 @@ git -C "$SOURCE_DIR" fetch --depth=1 origin "$ghostty_ref"
 git -C "$SOURCE_DIR" checkout --detach --force "$ghostty_ref"
 git -C "$SOURCE_DIR" reset --hard "$ghostty_ref"
 
+# Print the .hash declared in the dependency block that holds line $2 of $1.
+zon_dependency_hash() {
+  local file="$1"
+  local line="$2"
+  awk -v target="$line" '
+    NR <= target && /\.\{/ { start = NR }
+    { lines[NR] = $0 }
+    NR >= target && /\}/ { end = NR; exit }
+    END {
+      for (i = start; i <= end; i++) {
+        if (match(lines[i], /\.hash[[:space:]]*=[[:space:]]*"[^"]*"/)) {
+          value = substr(lines[i], RSTART, RLENGTH)
+          sub(/^[^"]*"/, "", value)
+          sub(/"$/, "", value)
+          print value
+          exit 0
+        }
+      }
+    }
+  ' "$file"
+}
+
+# Zig's HTTP client cannot fetch some package archives: GitHub's /archive/
+# redirect carries ~10 KB of headers (mostly content-security-policy), which
+# overflows its header buffer (HttpHeadersOversize). Download every package
+# with curl instead and add it with `zig fetch <file>`, which stores it in the
+# global package cache ($ZIG_GLOBAL_CACHE_DIR/p) where `zig build` finds it.
+#
+# The build script requests lazy dependencies (including those of lazy path
+# packages) while it configures, which `zig build --fetch` does not run. So the
+# needed set is discovered by repeating `zig build <options> -l`, which runs the
+# configure phase without building. Pointing Zig at an unreachable proxy makes
+# every missing package fail immediately with the build.zig.zon location of its
+# .url, without Zig making any HTTP request.
+prefetch_zig_packages() {
+  local download_dir output status file line url declared_hash fetched_hash archive
+  local attempted=" "
+  download_dir="$(mktemp -d)"
+  for _ in $(seq 1 20); do
+    status=0
+    # shellcheck disable=SC2086
+    output="$(cd "$SOURCE_DIR" && https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
+      http_proxy=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 no_proxy='' NO_PROXY='' \
+      "$zig" build $build_step -l 2>&1)" || status=$?
+    if [[ "$status" -eq 0 ]]; then
+      rm -rf "$download_dir"
+      return 0
+    fi
+
+    local missing round=" "
+    missing="$(printf '%s\n' "$output" | sed -n 's/^\(.*\.zon\):\([0-9][0-9]*\):[0-9][0-9]*: error: .*/\1:\2/p' | sort -u)"
+    if [[ -z "$missing" ]]; then
+      printf '%s\n' "$output" >&2
+      echo "zig build -l failed without a dependency location" >&2
+      exit 1
+    fi
+
+    while IFS= read -r location; do
+      file="${location%:*}"
+      line="${location##*:}"
+      [[ "$file" == /* ]] || file="$SOURCE_DIR/$file"
+      url="$(sed -n "${line}s/.*\.url[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file")"
+      declared_hash="$(zon_dependency_hash "$file" "$line")"
+      if [[ -z "$url" ]] || [[ -z "$declared_hash" ]]; then
+        printf '%s\n' "$output" >&2
+        echo "Could not read the dependency .url and .hash at $file:$line" >&2
+        exit 1
+      fi
+      case "$url" in
+        http://*|https://*) ;;
+        *) echo "Cannot prefetch non-HTTP Zig package $url ($file:$line)" >&2; exit 1 ;;
+      esac
+      [[ "$round" == *" $url "* ]] && continue
+      round+="$url "
+      if [[ "$attempted" == *" $url "* ]]; then
+        printf '%s\n' "$output" >&2
+        echo "Zig still cannot resolve $url after prefetching it" >&2
+        exit 1
+      fi
+      attempted+="$url "
+
+      archive="$download_dir/$(basename "${url%%\?*}")"
+      echo "Prefetching Zig package $declared_hash from $url" >&2
+      curl --fail --location --retry 3 --silent --show-error "$url" -o "$archive"
+      fetched_hash="$(cd "$SOURCE_DIR" && "$zig" fetch "$archive")"
+      rm -f "$archive"
+      if [[ "$fetched_hash" != "$declared_hash" ]]; then
+        printf 'Zig package hash mismatch for %s: declared %s, fetched %s\n' "$url" "$declared_hash" "$fetched_hash" >&2
+        exit 1
+      fi
+    done <<< "$missing"
+  done
+  echo "Zig package prefetch did not converge" >&2
+  exit 1
+}
+
+prefetch_zig_packages
+
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 

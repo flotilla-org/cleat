@@ -85,11 +85,28 @@ A provider host chooses its transport with `cleat_provider_open_transport`
   line becomes the reported error.
 
 Both declare a remote output context. The admission warning goes to the
-provider's diagnostics, `cleat_provider_transport_state_json`, rather than to
-stderr or rendered content; the same JSON reports the transport kind, whether
-it is connected, the last error, and whether it is still retrying. Sessions over
+provider's diagnostics rather than to stderr or rendered content.
+`cleat_provider_transport_state` reports it as fields, together with whether
+the transport is connected, the last error, and whether it is still retrying;
+`cleat_provider_transport_state_json` gives the same as JSON with the kind. Sessions over
 a remote transport report hosting as `remote:<kind>`. They cannot be created,
 ended or adopted, and transfer redirects are not followed.
+
+**Endpoints.** A session catalog such as Flotilla publishes where a daemon is
+as an endpoint: a transport (`local` or `ssh`), the ssh host, the runtime root,
+the daemon name, and optionally the path of the Cleat the host runs.
+`cleat_endpoint_check` validates one and gives its kind or the reason it is
+invalid; an unknown transport is invalid, never treated as local.
+`cleat_provider_open_endpoint` opens it. A `local` endpoint gets the ordinary
+daemon provider for its runtime root and daemon. An `ssh` endpoint gets a
+command transport running
+
+```bash
+ssh -T -o BatchMode=yes -- HOST cleat proxy [--daemon=NAME] [--runtime-root=PATH]
+```
+
+with each remote word quoted for the host's login shell. BatchMode makes ssh
+fail with a reason instead of prompting. Rust callers use `cleat::endpoint`.
 
 **Trust.** Cleat adds no authentication of its own. Whoever can run the command
 or reach the socket controls the sessions behind it: for `ssh host cleat proxy`,

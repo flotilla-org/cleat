@@ -10,6 +10,7 @@ pub mod cli;
 mod conpty_startup;
 pub mod da;
 pub mod duration_parser;
+pub mod endpoint;
 mod generation_recovery;
 mod host;
 mod http_uds;

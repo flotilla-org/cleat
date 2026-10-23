@@ -17,6 +17,11 @@ extern "C" {
 #define CLEAT_TRANSPORT_UNIX_SOCKET 1u
 #define CLEAT_TRANSPORT_COMMAND 2u
 
+/* Endpoint kinds (cleat_endpoint_check). */
+#define CLEAT_ENDPOINT_INVALID 0u
+#define CLEAT_ENDPOINT_LOCAL 1u
+#define CLEAT_ENDPOINT_SSH 2u
+
 #define CLEAT_PROVIDER_VT_DEFAULT 0u
 #define CLEAT_PROVIDER_VT_PASSTHROUGH 1u
 #define CLEAT_PROVIDER_VT_GHOSTTY 2u
@@ -198,6 +203,53 @@ typedef struct cleat_provider_transport {
     const cleat_str *argv;
     size_t argc;
 } cleat_provider_transport;
+
+/*
+ * A daemon endpoint as a session catalog publishes it (Flotilla's
+ * action.primary.direct.* facts). Set size to sizeof(cleat_endpoint); later
+ * versions may append fields. Empty strings are absent.
+ *
+ * transport is "local" or "ssh"; any other value is invalid, never treated as
+ * local. No field may contain control characters or start with '-'; host and
+ * daemon may not contain whitespace either. An ssh endpoint needs a host.
+ */
+typedef struct cleat_endpoint {
+    size_t size;
+    cleat_str transport;
+    /* ssh: the destination, which the user's ssh configuration resolves. */
+    cleat_str host;
+    /* The daemon's runtime root; empty for the one Cleat discovers. */
+    cleat_str runtime_root;
+    /* The daemon's name; empty for the default daemon. */
+    cleat_str daemon;
+    /*
+     * ssh: the path of the Cleat the host runs (a leading "~/" is the remote
+     * home); empty for cleat on its non-interactive PATH. A path, not a
+     * command line: arguments can't be added through it.
+     */
+    cleat_str cleat_command;
+} cleat_endpoint;
+
+/*
+ * A daemon provider's transport state (cleat_provider_transport_state). Set
+ * size to sizeof(cleat_transport_state) and lend the error and warning
+ * buffers; each *_len comes back as its text's length, cut at a character
+ * boundary to fit (0 when absent).
+ */
+typedef struct cleat_transport_state {
+    size_t size;
+    bool connected;
+    /* False once a command transport has failed: it is not respawned. */
+    bool retrying;
+    /* Why the transport is down (a command's own last stderr line). */
+    uint8_t *error;
+    size_t error_capacity;
+    size_t error_len;
+    /* The daemon's output-admission warning; never part of rendered content. */
+    uint8_t *warning;
+    size_t warning_capacity;
+    size_t warning_len;
+} cleat_transport_state;
 
 typedef struct cleat_session_desc {
     uint16_t cols;
@@ -581,6 +633,29 @@ cleat_provider *cleat_provider_open_transport(const cleat_provider_desc *desc, c
  * buffer queries the size. False for non-daemon providers.
  */
 bool cleat_provider_transport_state_json(const cleat_provider *provider, uint8_t *buffer, size_t capacity, size_t *out_len);
+/*
+ * The transport state as fields: connected, retrying, and the error and
+ * warning texts copied into the caller's buffers. False for non-daemon
+ * providers or a state->size too small for this ABI.
+ */
+bool cleat_provider_transport_state(const cleat_provider *provider, cleat_transport_state *state);
+/*
+ * An endpoint's kind (CLEAT_ENDPOINT_LOCAL or CLEAT_ENDPOINT_SSH), or
+ * CLEAT_ENDPOINT_INVALID with the reason copied into reason (cut at a
+ * character boundary to fit capacity; reason_len 0 when valid). reason and
+ * reason_len may be NULL.
+ */
+uint32_t cleat_endpoint_check(const cleat_endpoint *endpoint, uint8_t *reason, size_t capacity, size_t *reason_len);
+/*
+ * Daemon provider for an endpoint. local: the ordinary daemon provider for
+ * the endpoint's runtime root and daemon (desc's own are replaced). ssh: a
+ * command transport running
+ *   ssh -T -o BatchMode=yes -- <host> cleat proxy [--daemon=<d>] [--runtime-root=<r>]
+ * with the remote words quoted for a POSIX login shell, behaving as
+ * cleat_provider_open_transport. NULL for an invalid endpoint or a desc whose
+ * backend isn't CLEAT_PROVIDER_BACKEND_DAEMON.
+ */
+cleat_provider *cleat_provider_open_endpoint(const cleat_provider_desc *desc, const cleat_endpoint *endpoint);
 /*
  * Registers an edge-triggered provider wake callback. The callback is a
  * scheduling nudge, not a rendering callback: it may be invoked synchronously

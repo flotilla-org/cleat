@@ -606,7 +606,9 @@ fn assert_cli_clients_follow(handover: bool) {
             assert!(Instant::now() < deadline, "client did not exit");
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(status.success(), "{status:?}");
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert!(status.success(), "{status:?}: {stderr}");
     }
 }
 

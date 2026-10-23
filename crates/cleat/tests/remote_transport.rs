@@ -191,6 +191,7 @@ fn attaches_and_round_trips(daemon: &Daemon, provider: &Provider) {
     };
     assert!(created.is_null(), "a remote transport must not create sessions");
     assert!(!unsafe { cleat_session_end(session.0) }, "a remote transport must not end sessions");
+    assert!(!unsafe { cleat_session_adopt(session.0) }, "a remote transport must not adopt sessions");
     assert!(daemon.service.inspect("remote").is_ok());
 }
 
@@ -209,6 +210,65 @@ fn unix_socket_transport_behaves_identically() {
     let provider = Provider::open(Kind::Socket(&daemon.layout.socket_path()));
     attaches_and_round_trips(&daemon, &provider);
     assert_eq!(provider.state()["kind"], "unix_socket");
+}
+
+// A transfer moves the session to a daemon the transport cannot reach, so the
+// channel closes rather than reconnecting at the target.
+#[test]
+fn remote_transport_does_not_follow_transfer_redirect() {
+    let daemon = Daemon::new();
+    let target = daemon.service.with_daemon("target".into()).unwrap();
+    let argv = daemon.proxy_argv();
+    let provider = Provider::open(Kind::Command(&argv));
+    let session = provider.attach("remote");
+    eventually("streaming", || {
+        session.drain();
+        session.state() == CLEAT_SESSION_STREAMING
+    });
+    daemon.service.transfer("remote", &target, Default::default()).unwrap();
+    eventually("channel closed", || {
+        session.drain();
+        session.state() == CLEAT_SESSION_CLOSED
+    });
+    let attachments = target.inspect("remote").unwrap().attachments;
+    target.kill("remote").unwrap();
+    let target_layout = daemon.layout.clone().with_daemon("target".into()).unwrap();
+    if let Ok(pid) = fs::read_to_string(target_layout.daemon_pid_path()) {
+        unsafe { libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL) };
+    }
+    assert!(attachments.is_empty(), "a remote transport must not reconnect at the transfer target");
+}
+
+#[test]
+fn malformed_transports_are_rejected() {
+    let desc = CleatProviderDesc {
+        abi_version: CLEAT_PROVIDER_ABI_VERSION,
+        backend: CLEAT_PROVIDER_BACKEND_DAEMON,
+        ..CleatProviderDesc::default()
+    };
+    let program = "cleat".to_string();
+    let argv = [CleatStr { ptr: program.as_ptr(), len: program.len() }];
+    let empty = [CleatStr { ptr: program.as_ptr(), len: 0 }];
+    let socket = "/nonexistent.sock";
+    let valid = CleatProviderTransport { kind: CLEAT_TRANSPORT_COMMAND, argv: argv.as_ptr(), argc: 1, ..Default::default() };
+    let cases = [
+        ("short struct", CleatProviderTransport { size: 8, ..valid }),
+        ("unknown kind", CleatProviderTransport { kind: 99, ..valid }),
+        ("no argv", CleatProviderTransport { argc: 0, ..valid }),
+        ("empty program", CleatProviderTransport { argv: empty.as_ptr(), ..valid }),
+        ("no socket path", CleatProviderTransport { kind: CLEAT_TRANSPORT_UNIX_SOCKET, ..Default::default() }),
+    ];
+    for (what, transport) in cases {
+        assert!(unsafe { cleat_provider_open_transport(&desc, &transport) }.is_null(), "{what}");
+    }
+    let mock = CleatProviderDesc { backend: CLEAT_PROVIDER_BACKEND_MOCK, ..desc };
+    let socket = CleatProviderTransport {
+        kind: CLEAT_TRANSPORT_UNIX_SOCKET,
+        socket_path: socket.as_ptr(),
+        socket_path_len: socket.len(),
+        ..Default::default()
+    };
+    assert!(unsafe { cleat_provider_open_transport(&mock, &socket) }.is_null(), "only the daemon backend has transports");
 }
 
 // The command is the transport: when it dies, the view disconnects promptly,

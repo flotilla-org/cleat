@@ -6,16 +6,14 @@
 //! without interpreting them. It never starts, discovers beyond the runtime
 //! root, or recovers a daemon. SSH (or whatever runs it) is the
 //! authentication; the proxy adds none.
-use std::{
-    io::{Read, Write},
-    sync::mpsc,
-};
+#[cfg(unix)]
+use std::io::{Read, Write};
 
 use crate::runtime::RuntimeLayout;
 
-/// Connect to `layout`'s daemon socket and relay until either side closes.
-/// An unreachable daemon is an error naming the daemon and socket, so the
-/// near end can tell "no daemon" from a dropped connection.
+/// Connect to `layout`'s daemon socket and relay until the daemon side
+/// closes. An unreachable daemon is an error naming the daemon and socket, so
+/// the near end can tell "no daemon" from a dropped connection.
 #[cfg(unix)]
 pub fn run(layout: &RuntimeLayout) -> Result<(), String> {
     let socket = layout.socket_path();
@@ -23,20 +21,14 @@ pub fn run(layout: &RuntimeLayout) -> Result<(), String> {
         .map_err(|err| format!("daemon {} is not reachable at {}: {err}", layout.daemon_name(), socket.display()))?;
     let mut to_daemon = stream.try_clone().map_err(|err| format!("clone daemon socket: {err}"))?;
     let mut from_daemon = stream;
-    let (done, finished) = mpsc::channel();
-    let upstream = done.clone();
     std::thread::spawn(move || {
         let _ = relay(&mut std::io::stdin().lock(), &mut to_daemon);
         let _ = to_daemon.shutdown(std::net::Shutdown::Write);
-        let _ = upstream.send(());
     });
-    std::thread::spawn(move || {
-        let _ = relay(&mut from_daemon, &mut std::io::stdout().lock());
-        let _ = done.send(());
-    });
-    // Either direction ending ends the bridge: the near end is gone, or the
-    // daemon closed the connection.
-    let _ = finished.recv();
+    // Stdin closing only half-closes the socket: the daemon still answers what
+    // it already received, then closes, which ends this direction. A vanished
+    // near end ends it too, through that close or a failed stdout write.
+    let _ = relay(&mut from_daemon, &mut std::io::stdout().lock());
     Ok(())
 }
 
@@ -46,6 +38,7 @@ pub fn run(_layout: &RuntimeLayout) -> Result<(), String> {
 }
 
 /// Copy until EOF, flushing each chunk: the stream is interactive.
+#[cfg(unix)]
 fn relay(from: &mut impl Read, to: &mut impl Write) -> std::io::Result<()> {
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -60,7 +53,7 @@ fn relay(from: &mut impl Read, to: &mut impl Write) -> std::io::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

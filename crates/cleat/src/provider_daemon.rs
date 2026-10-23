@@ -271,10 +271,15 @@ struct CommandChild {
 }
 
 /// Keep the end of a command's stderr: enough for its last reason line.
+#[cfg(unix)]
 const COMMAND_STDERR_LIMIT: usize = 4096;
 /// How long a failed command gets to exit and finish its stderr before the
 /// reason is read.
 const COMMAND_EXIT_GRACE: Duration = Duration::from_secs(2);
+/// How long a stopped command's stderr gets to drain. A descendant such as an
+/// ssh ControlMaster can hold the pipe open indefinitely, so the reader is
+/// detached after this rather than joined.
+const COMMAND_STDERR_DRAIN: Duration = Duration::from_millis(200);
 
 impl CommandChild {
     #[cfg(unix)]
@@ -347,7 +352,13 @@ impl CommandChild {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(reader) = self.stderr_reader.take() {
-            let _ = reader.join();
+            let deadline = Instant::now() + COMMAND_STDERR_DRAIN;
+            while !reader.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(BACKOFF_POLL_STEP);
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
         }
     }
 }
@@ -736,6 +747,11 @@ impl DaemonConnection {
                     {
                         let mut status = recover_lock(&self.status);
                         status.error = None;
+                        // Local hosts have always seen admission warnings on
+                        // stderr; remote ones read them from the status.
+                        if let (Transport::Runtime, Some(warning)) = (&self.transport, &warning) {
+                            eprintln!("cleat: warning: {warning}");
+                        }
                         status.warning = warning;
                     }
                     if !self.install_connection(&stream, directory) {
@@ -1039,7 +1055,11 @@ impl DaemonConnection {
             let mut writer = recover_lock(&self.writer);
             *writer = None;
         }
-        recover_lock(&self.status).connected = false;
+        {
+            let mut status = recover_lock(&self.status);
+            status.connected = false;
+            status.error = Some("connection closed".into());
+        }
         {
             let mut state = recover_lock(&self.state);
             state.connected = false;

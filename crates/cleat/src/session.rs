@@ -434,7 +434,6 @@ fn relay_packet_stdio(
     let mut images = packet.images;
     let identity = packet.identity.clone();
     let connect_only = packet.connect_only;
-    let detach_out = Arc::clone(&detach_requested);
     let relay_out = thread::spawn(move || -> Result<(), String> {
         let mut read_stream = read_handle;
         // A transferred session announces its new address before closing the
@@ -454,12 +453,11 @@ fn relay_packet_stdio(
             }
             stdout.flush().map_err(|e| e.to_string())?;
         }
-        write_packet_relay_frame(
-            &detach_out,
+        write_packet_reader_frame(
             &write_stream,
             PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: initial_update.render_generation }),
         )?;
-        write_packet_relay_frame(&detach_out, &write_stream, PacketFrame::new(channel, crate::packet::MSG_SESSION_PROGRAM_STATUS, &true))?;
+        write_packet_reader_frame(&write_stream, PacketFrame::new(channel, crate::packet::MSG_SESSION_PROGRAM_STATUS, &true))?;
         loop {
             let frame = match PacketFrame::read(&mut read_stream) {
                 Ok(frame) => frame,
@@ -478,8 +476,7 @@ fn relay_packet_stdio(
                 (id, crate::packet::MSG_SESSION_IMAGE_FILE) if id == channel => {
                     let file = frame.decode::<crate::packet::ImageFile>().map_err(|e| e.to_string())?;
                     let acquired = !connect_only && images.file(&file);
-                    write_packet_relay_frame(
-                        &detach_out,
+                    write_packet_reader_frame(
                         &write_stream,
                         PacketFrame::new(channel, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT, &crate::packet::ImageFileResult {
                             image_id: file.image_id,
@@ -510,8 +507,7 @@ fn relay_packet_stdio(
                     chrome.view = packet.view;
                     chrome.renderer.images.set_assets(images.commit(&packet.update.image_resources)?);
                     chrome.paint(&mut stdout, Some(&packet.update))?;
-                    write_packet_relay_frame(
-                        &detach_out,
+                    write_packet_reader_frame(
                         &write_stream,
                         PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: packet.update.render_generation }),
                     )?;
@@ -572,8 +568,7 @@ fn relay_packet_stdio(
                         *write_stream.lock().map_err(|_| "packet stream poisoned")? = stream;
                         followed = true;
                         images = opened.images;
-                        write_packet_relay_frame(
-                            &detach_out,
+                        write_packet_reader_frame(
                             &write_stream,
                             PacketFrame::new(channel, crate::packet::MSG_SESSION_PROGRAM_STATUS, &true),
                         )?;
@@ -590,8 +585,7 @@ fn relay_packet_stdio(
                         chrome.renderer.images.set_assets(images.commit(&opened.update.image_resources)?);
                         chrome.paint(&mut stdout, Some(&opened.update))?;
                         drop(chrome);
-                        write_packet_relay_frame(
-                            &detach_out,
+                        write_packet_reader_frame(
                             &write_stream,
                             PacketFrame::new(channel, MSG_SESSION_ACK, &Ack { generation: opened.update.render_generation }),
                         )?;
@@ -880,6 +874,20 @@ fn write_packet_relay_frame(
     write_packet_frame_with_detach(stream, frame, Some(detach_requested))
 }
 
+/// A frame the output relay writes in answer to what it read (an ACK, an
+/// image result, the program-status opt-in). A socket shutdown here is left
+/// to the relay's next read: the daemon may close the channel right after a
+/// final render, when the session ends, and that read sees the clean close,
+/// or the transport loss, and decides the outcome.
+fn write_packet_reader_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
+    let frame = frame.map_err(|err| format!("encode packet attach frame: {err}"))?;
+    let mut stream = stream.lock().map_err(|_| "packet attach stream lock poisoned".to_string())?;
+    match frame.write(&mut *stream) {
+        Err(err) if is_graceful_socket_shutdown(&err) => Ok(()),
+        result => result.map_err(|err| format!("write packet attach frame: {err}")),
+    }
+}
+
 fn write_packet_frame_with_detach(
     stream: &Arc<Mutex<SessionStream>>,
     frame: std::io::Result<PacketFrame>,
@@ -916,6 +924,18 @@ mod packet_detach_tests {
         assert!(write_packet_relay_frame(&detach, &stream, frame()).is_ok());
         let invalid = Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid packet"));
         assert!(write_packet_relay_frame(&detach, &stream, invalid).unwrap_err().contains("encode packet attach frame"));
+    }
+
+    // The output relay's own writes leave a shut socket to its next read,
+    // without a detach; encoding errors still propagate.
+    #[test]
+    fn reader_writes_leave_a_shut_socket_to_the_next_read() {
+        let (stream, peer) = SessionStream::pair().unwrap();
+        drop(peer);
+        let stream = Arc::new(Mutex::new(stream));
+        assert!(write_packet_reader_frame(&stream, PacketFrame::new(1, MSG_SESSION_ACK, &Ack { generation: 1 })).is_ok());
+        let invalid = Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid packet"));
+        assert!(write_packet_reader_frame(&stream, invalid).unwrap_err().contains("encode packet attach frame"));
     }
 }
 

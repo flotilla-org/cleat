@@ -1355,6 +1355,9 @@ pub unsafe extern "C" fn cleat_provider_open_endpoint(
     };
     let opened = match endpoint.check() {
         Ok(EndpointKind::Local) => {
+            // An empty field is absent: open_provider reads a zero length as
+            // unset whatever the pointer, so the default daemon or discovered
+            // root applies (endpoint_ssh.rs opens one with no daemon).
             let requested = CleatProviderDesc {
                 runtime_root: endpoint.runtime_root.as_ptr(),
                 runtime_root_len: endpoint.runtime_root.len(),

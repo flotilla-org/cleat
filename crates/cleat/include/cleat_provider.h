@@ -643,7 +643,8 @@ bool cleat_provider_transport_state(const cleat_provider *provider, cleat_transp
  * An endpoint's kind (CLEAT_ENDPOINT_LOCAL or CLEAT_ENDPOINT_SSH), or
  * CLEAT_ENDPOINT_INVALID with the reason copied into reason (cut at a
  * character boundary to fit capacity; reason_len 0 when valid). reason and
- * reason_len may be NULL.
+ * reason_len may be NULL. Every field is checked, including ones the kind
+ * doesn't use, such as a local endpoint's host.
  */
 uint32_t cleat_endpoint_check(const cleat_endpoint *endpoint, uint8_t *reason, size_t capacity, size_t *reason_len);
 /*

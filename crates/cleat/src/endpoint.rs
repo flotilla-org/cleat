@@ -60,11 +60,13 @@ impl EndpointError {
 }
 
 impl Endpoint {
-    /// The endpoint's kind, once every field it uses is valid.
+    /// The endpoint's kind, once every field is valid.
     ///
     /// No field may contain control characters or start with `-`. The host and
     /// daemon may not contain whitespace either; a runtime root or Cleat path
-    /// may, since paths can. An `ssh` endpoint needs a host.
+    /// may, since paths can. An `ssh` endpoint needs a host. Fields a kind
+    /// doesn't use (a `local` endpoint's host or Cleat path) are checked too,
+    /// so a malformed catalog entry is refused rather than half-read.
     pub fn check(&self) -> Result<EndpointKind, EndpointError> {
         let kind = match self.transport.as_str() {
             "local" => EndpointKind::Local,

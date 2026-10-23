@@ -361,6 +361,7 @@ fn nested_local_attach_delivers_to_native_outer_provider() {
 #[test]
 fn slow_and_disconnected_consumers_stay_bounded_and_do_not_stall_output() {
     const COPIES: usize = 100;
+    const _: () = assert!(COPIES > cleat::clipboard::MAX_CLIPBOARD_EVENTS, "the copies must overflow the bound");
     let _isolation = fixture_lock();
     // A consumer that never drains effects is bounded in both hostings. A
     // disconnected daemon attachment loses effects instead of replaying them.

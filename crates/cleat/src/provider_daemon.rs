@@ -11,6 +11,13 @@
 //! with a full render), applies directory deltas, and parks incoming render
 //! updates in per-channel slots for the FFI caller to consume.
 //!
+//! The connection reaches its daemon over a [`Transport`]: the daemon socket
+//! under a local runtime layout, an explicit Unix socket (a forwarded or
+//! remote daemon), or a command whose stdio carries the packet stream, such
+//! as `ssh host cleat proxy --daemon work`. A command transport is never
+//! respawned: when it fails or exits, the disconnect and the command's reason
+//! are reported through [`TransportStatus`] and the connection stays down.
+//!
 //! A channel whose session is transferred to another daemon is redirected:
 //! the daemon sends the new address, then closes the channel. The connection
 //! re-homes the channel's slot on a follower connection to the new daemon,
@@ -20,12 +27,13 @@
 use std::{
     collections::HashMap,
     io::Write,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use http::StatusCode;
@@ -209,6 +217,153 @@ impl DirectoryState {
     }
 }
 
+/// How a [`DaemonConnection`] reaches its daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Transport {
+    /// The daemon socket under the connection's runtime layout. Reconnects
+    /// with backoff and follows transferred sessions to other local daemons.
+    Runtime,
+    /// An explicit Unix socket for a forwarded or remote daemon. Reconnects
+    /// with backoff; never discovers, starts or recovers a local daemon.
+    UnixSocket(PathBuf),
+    /// A command whose stdin and stdout carry the packet stream. It is
+    /// spawned once; a failure or exit is reported, not retried.
+    Command(Vec<String>),
+}
+
+impl Transport {
+    /// A transport to a daemon this process cannot manage: sessions can be
+    /// attached but not created, ended, transferred or followed.
+    pub(crate) fn is_remote(&self) -> bool {
+        !matches!(self, Transport::Runtime)
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Transport::Runtime => "runtime",
+            Transport::UnixSocket(_) => "unix_socket",
+            Transport::Command(_) => "command",
+        }
+    }
+}
+
+/// What the host can learn about the transport: whether it is up, why it is
+/// not, and the daemon's output-admission warning from the latest connect.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TransportStatus {
+    pub kind: &'static str,
+    pub connected: bool,
+    /// Why the transport is down: the connect error, or the command's own
+    /// reason (its last stderr line) when it exited.
+    pub error: Option<String>,
+    /// The daemon's output-admission warning, e.g. that cycle protection does
+    /// not cover remote relationships. Never part of the rendered content.
+    pub warning: Option<String>,
+    /// False once a command transport has failed: it is not respawned.
+    pub retrying: bool,
+}
+
+/// A spawned command transport and the stderr it has written so far.
+struct CommandChild {
+    child: std::process::Child,
+    stderr: Arc<Mutex<String>>,
+    stderr_reader: Option<JoinHandle<()>>,
+}
+
+/// Keep the end of a command's stderr: enough for its last reason line.
+#[cfg(unix)]
+const COMMAND_STDERR_LIMIT: usize = 4096;
+/// How long a failed command gets to exit and finish its stderr before the
+/// reason is read.
+const COMMAND_EXIT_GRACE: Duration = Duration::from_secs(2);
+/// How long a stopped command's stderr gets to drain. A descendant such as an
+/// ssh ControlMaster can hold the pipe open indefinitely, so the reader is
+/// detached after this rather than joined.
+const COMMAND_STDERR_DRAIN: Duration = Duration::from_millis(200);
+
+impl CommandChild {
+    #[cfg(unix)]
+    fn spawn(argv: &[String]) -> Result<(SessionStream, Self), String> {
+        use std::{io::Read, os::fd::OwnedFd, process::Stdio};
+        let (program, args) = argv.split_first().ok_or("command transport needs a program")?;
+        let (ours, theirs) = SessionStream::pair().map_err(|err| format!("create command transport socket: {err}"))?;
+        let stdin = OwnedFd::from(theirs.try_clone().map_err(|err| format!("create command transport socket: {err}"))?);
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(OwnedFd::from(theirs)))
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("spawn {program}: {err}"))?;
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let mut pipe = child.stderr.take().expect("piped stderr");
+        let sink = Arc::clone(&stderr);
+        let stderr_reader = std::thread::Builder::new()
+            .name("cleat-transport-stderr".into())
+            .spawn(move || {
+                let mut buffer = [0u8; 1024];
+                while let Ok(read) = pipe.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    let mut text = recover_lock(&sink);
+                    text.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                    if text.len() > COMMAND_STDERR_LIMIT {
+                        let mut cut = text.len() - COMMAND_STDERR_LIMIT;
+                        while !text.is_char_boundary(cut) {
+                            cut += 1;
+                        }
+                        text.drain(..cut);
+                    }
+                }
+            })
+            .map_err(|err| format!("spawn command transport stderr reader: {err}"))?;
+        Ok((ours, Self { child, stderr, stderr_reader: Some(stderr_reader) }))
+    }
+
+    #[cfg(not(unix))]
+    fn spawn(_argv: &[String]) -> Result<(SessionStream, Self), String> {
+        Err("command transports are unsupported on this platform".into())
+    }
+
+    /// Why the command stopped carrying the stream: its last stderr line, or
+    /// its exit status. Waits briefly for it to exit on its own, then kills it.
+    fn reason(&mut self) -> String {
+        let deadline = Instant::now() + COMMAND_EXIT_GRACE;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(BACKOFF_POLL_STEP),
+                Ok(None) => break Err("transport command stopped carrying the stream".to_string()),
+                Err(err) => break Err(format!("transport command status unavailable: {err}")),
+            }
+        };
+        self.stop();
+        let stderr = recover_lock(&self.stderr).clone();
+        if let Some(line) = stderr.lines().rev().map(str::trim).find(|line| !line.is_empty()) {
+            return line.to_string();
+        }
+        match status {
+            Ok(status) => format!("transport command exited ({status})"),
+            Err(reason) => reason,
+        }
+    }
+
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.stderr_reader.take() {
+            let deadline = Instant::now() + COMMAND_STDERR_DRAIN;
+            while !reader.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(BACKOFF_POLL_STEP);
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
+        }
+    }
+}
+
 struct ConnectionState {
     connected: bool,
     next_channel: u32,
@@ -229,6 +384,9 @@ struct ChannelRoute {
 /// session the provider opens against it.
 pub(crate) struct DaemonConnection {
     layout: RuntimeLayout,
+    transport: Transport,
+    status: Mutex<TransportStatus>,
+    command: Mutex<Option<CommandChild>>,
     selectors: Vec<String>,
     wake: WakeFn,
     stop: AtomicBool,
@@ -247,8 +405,18 @@ pub(crate) struct DaemonConnection {
 
 impl DaemonConnection {
     pub(crate) fn open(layout: RuntimeLayout, selectors: Vec<String>, wake: WakeFn) -> Arc<Self> {
+        Self::open_with_transport(layout, Transport::Runtime, selectors, wake)
+    }
+
+    /// Open a connection over `transport`. For a remote transport, `layout`
+    /// only names the connection; nothing is read from or started under it.
+    pub(crate) fn open_with_transport(layout: RuntimeLayout, transport: Transport, selectors: Vec<String>, wake: WakeFn) -> Arc<Self> {
+        let status = TransportStatus { kind: transport.kind(), retrying: true, ..TransportStatus::default() };
         let connection = Arc::new(Self {
             layout,
+            transport,
+            status: Mutex::new(status),
+            command: Mutex::new(None),
             selectors,
             wake,
             stop: AtomicBool::new(false),
@@ -276,6 +444,14 @@ impl DaemonConnection {
 
     pub(crate) fn layout(&self) -> &RuntimeLayout {
         &self.layout
+    }
+
+    pub(crate) fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
+    pub(crate) fn transport_status(&self) -> TransportStatus {
+        recover_lock(&self.status).clone()
     }
 
     pub(crate) fn is_connected(&self) -> bool {
@@ -374,6 +550,11 @@ impl DaemonConnection {
     /// Follow a transferred session: re-home the channel's slot on the new
     /// daemon, re-requesting the role it last held.
     fn follow_redirect(&self, channel: u32, slot: Arc<Mutex<ChannelSlot>>, redirect: SessionRedirect) {
+        if self.transport.is_remote() {
+            recover_lock(&slot).closed =
+                Some(format!("session {} moved to daemon {}; remote transports do not follow it", redirect.session_id, redirect.daemon));
+            return;
+        }
         if let Some(reason) = redirect.current_incompatibility() {
             recover_lock(&slot).closed = Some(reason);
             return;
@@ -545,30 +726,95 @@ impl DaemonConnection {
         if let Some(stream) = recover_lock(&self.writer).take() {
             shutdown_stream(&stream);
         }
+        if let Some(command) = recover_lock(&self.command).as_mut() {
+            // Unblocks a reader still waiting on the command's stream.
+            let _ = command.child.kill();
+        }
         let handle = recover_lock(&self.reader).take();
         if let Some(handle) = handle {
             let _ = handle.join();
+        }
+        if let Some(mut command) = recover_lock(&self.command).take() {
+            command.stop();
         }
     }
 
     fn reader_loop(self: Arc<Self>) {
         let mut backoff = RECONNECT_BACKOFF_START;
         while !self.stop.load(Ordering::SeqCst) {
-            match connect_declaration_stream(&self.layout, &self.selectors) {
-                Ok((mut stream, snapshot)) => {
+            match self.connect() {
+                Ok(Connected { mut stream, directory, warning }) => {
                     backoff = RECONNECT_BACKOFF_START;
-                    if !self.install_connection(&stream, snapshot) {
+                    {
+                        let mut status = recover_lock(&self.status);
+                        status.error = None;
+                        // Local hosts have always seen admission warnings on
+                        // stderr; remote ones read them from the status.
+                        if let (Transport::Runtime, Some(warning)) = (&self.transport, &warning) {
+                            eprintln!("cleat: warning: {warning}");
+                        }
+                        status.warning = warning;
+                    }
+                    if !self.install_connection(&stream, directory) {
                         continue;
                     }
                     self.read_until_disconnect(&mut stream);
                     self.teardown_connection();
+                    if let Transport::Command(_) = self.transport {
+                        let reason = self.command_reason().unwrap_or_else(|| "transport command closed the stream".into());
+                        self.give_up(reason);
+                        return;
+                    }
                 }
-                Err(_) => {
+                Err(err) => {
+                    if let Transport::Command(_) = self.transport {
+                        // The command's own explanation beats a generic EOF.
+                        let reason = self.command_reason().unwrap_or(err);
+                        self.give_up(reason);
+                        return;
+                    }
+                    recover_lock(&self.status).error = Some(err);
                     self.sleep_backoff(backoff);
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
                 }
             }
         }
+    }
+
+    fn connect(&self) -> Result<Connected, String> {
+        match &self.transport {
+            Transport::Runtime => connect_declared(
+                try_connect_session_stream(&self.layout.socket_path()),
+                &self.layout.socket_path().display().to_string(),
+                &self.selectors,
+                &crate::output_admission::client_header()?,
+            ),
+            Transport::UnixSocket(path) => connect_declared(
+                try_connect_session_stream(path),
+                &path.display().to_string(),
+                &self.selectors,
+                &crate::output_admission::remote_client_header()?,
+            ),
+            Transport::Command(argv) => {
+                let (stream, command) = CommandChild::spawn(argv)?;
+                *recover_lock(&self.command) = Some(command);
+                connect_declared(Ok(stream), &argv.join(" "), &self.selectors, &crate::output_admission::remote_client_header()?)
+            }
+        }
+    }
+
+    fn command_reason(&self) -> Option<String> {
+        recover_lock(&self.command).take().map(|mut command| command.reason())
+    }
+
+    /// A command transport failed: report why and stay disconnected.
+    fn give_up(&self, reason: String) {
+        {
+            let mut status = recover_lock(&self.status);
+            status.error = Some(reason);
+            status.retrying = false;
+        }
+        (self.wake)();
     }
 
     fn install_connection(&self, stream: &SessionStream, snapshot: DirectorySnapshot) -> bool {
@@ -580,6 +826,7 @@ impl DaemonConnection {
             let mut writer = recover_lock(&self.writer);
             *writer = Some(writer_stream);
         }
+        recover_lock(&self.status).connected = true;
         let reopen = {
             let mut state = recover_lock(&self.state);
             state.connected = true;
@@ -810,6 +1057,11 @@ impl DaemonConnection {
             *writer = None;
         }
         {
+            let mut status = recover_lock(&self.status);
+            status.connected = false;
+            status.error = Some("connection closed".into());
+        }
+        {
             let mut state = recover_lock(&self.state);
             state.connected = false;
             for slot in state.channels.values() {
@@ -840,32 +1092,57 @@ impl Drop for DaemonConnection {
     }
 }
 
+/// A packet stream after the upgrade, hello and first directory snapshot.
+struct Connected {
+    stream: SessionStream,
+    directory: DirectorySnapshot,
+    /// The daemon's output-admission warning, for the caller to surface.
+    warning: Option<String>,
+}
+
 /// Client half of the daemon-scoped `/connect` upgrade: HTTP upgrade dance,
 /// protocol hello, initial directory snapshot.
 pub(crate) fn connect_packet_stream(layout: &RuntimeLayout, selectors: &[String]) -> Result<(SessionStream, DirectorySnapshot), String> {
     connect_packet_endpoint(&layout.socket_path(), selectors, &crate::output_admission::client_header()?)
 }
 
-fn connect_declaration_stream(layout: &RuntimeLayout, selectors: &[String]) -> Result<(SessionStream, DirectorySnapshot), String> {
-    connect_packet_endpoint_with_declarations(&layout.socket_path(), selectors, &crate::output_admission::client_header()?, true)
-}
-
 /// Connect without runtime discovery, session metadata, startup, or recovery.
+/// A command-line client: the admission warning goes to stderr.
 pub(crate) fn connect_packet_endpoint(
     socket_path: &std::path::Path,
     selectors: &[String],
     output_context: &str,
 ) -> Result<(SessionStream, DirectorySnapshot), String> {
-    connect_packet_endpoint_with_declarations(socket_path, selectors, output_context, false)
+    let connected = upgrade_packet_stream(
+        try_connect_session_stream(socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?,
+        selectors,
+        output_context,
+        false,
+    )?;
+    if let Some(warning) = &connected.warning {
+        eprintln!("cleat: warning: {warning}");
+    }
+    Ok((connected.stream, connected.directory))
 }
 
-fn connect_packet_endpoint_with_declarations(
-    socket_path: &std::path::Path,
+/// Provider connections declare virtual placements and keep the admission
+/// warning for [`TransportStatus`] instead of printing it.
+fn connect_declared(
+    stream: std::io::Result<SessionStream>,
+    endpoint: &str,
+    selectors: &[String],
+    output_context: &str,
+) -> Result<Connected, String> {
+    let stream = stream.map_err(|err| format!("connect {endpoint}: {err}"))?;
+    upgrade_packet_stream(stream, selectors, output_context, true)
+}
+
+fn upgrade_packet_stream(
+    mut stream: SessionStream,
     selectors: &[String],
     output_context: &str,
     virtual_placements: bool,
-) -> Result<(SessionStream, DirectorySnapshot), String> {
-    let mut stream = try_connect_session_stream(socket_path).map_err(|err| format!("connect {}: {err}", socket_path.display()))?;
+) -> Result<Connected, String> {
     let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest {
         recognizer_roles: false,
         program_status: false,
@@ -883,7 +1160,7 @@ fn connect_packet_endpoint_with_declarations(
     if response.status != StatusCode::SWITCHING_PROTOCOLS {
         return Err(http_uds::upgrade_error(&mut stream, response.status));
     }
-    let _ = response.write_output_warning(&mut std::io::stderr());
+    let warning = response.output_warning.clone();
 
     let hello = PacketFrame::read(&mut stream).map_err(|err| format!("read packet hello: {err}"))?;
     if hello.channel != CHANNEL_CONTROL || hello.msg_type != MSG_CONTROL_HELLO {
@@ -902,7 +1179,7 @@ fn connect_packet_endpoint_with_declarations(
         return Err("packet stream did not send a directory snapshot after hello".to_string());
     }
     let directory = directory.decode::<DirectorySnapshot>().map_err(|err| format!("decode packet directory: {err}"))?;
-    Ok((stream, directory))
+    Ok(Connected { stream, directory, warning })
 }
 
 #[cfg(all(test, any(unix, windows)))]

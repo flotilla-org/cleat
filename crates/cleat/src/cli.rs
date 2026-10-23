@@ -66,6 +66,15 @@ impl Cli {
             )
             .with_cmd(&Self::command()));
         }
+        if let Command::Proxy { daemon, runtime_root } = &self.command {
+            if (daemon.is_some() && self.server.is_some()) || (runtime_root.is_some() && self.runtime_root.is_some()) {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "proxy takes its daemon and runtime root once: use --daemon and --runtime-root after `proxy`",
+                )
+                .with_cmd(&Self::command()));
+            }
+        }
         if self.has_conflicting_daemon_targets() {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
@@ -232,6 +241,20 @@ pub enum Command {
         socket: Option<PathBuf>,
         #[arg(long, default_value_t = 1, value_parser = parse_positive_usize, help = "Number of render packets to print")]
         count: usize,
+    },
+    /// Relay stdio to a daemon's packet socket (the far end of a remote attach)
+    #[command(after_long_help = "Connects to the daemon's socket and copies bytes between it and stdin/stdout\n\
+                           until either side closes, without interpreting them. A provider's command\n\
+                           transport runs it on the daemon's host, e.g. `ssh host cleat proxy --daemon work`.\n\
+                           It never starts or recovers a daemon: an unreachable daemon exits non-zero with\n\
+                           a one-line reason on stderr. SSH is the authentication; the proxy adds none.")]
+    Proxy {
+        /// Daemon to relay to (explicit > CLEAT_DAEMON > default)
+        #[arg(long, value_name = "NAME", value_parser = parse_daemon_name)]
+        daemon: Option<String>,
+        /// Runtime root holding the daemon (default: discovered)
+        #[arg(long, value_name = "PATH")]
+        runtime_root: Option<PathBuf>,
     },
     /// Create a new session
     #[command(
@@ -715,6 +738,24 @@ fn execute_socket(cli: &Cli) -> Option<ExecResult> {
             })()
             .map_or_else(ExecResult::Err, |lines| ExecResult::Ok(Some(lines.join("\n")))),
         ),
+        Command::Proxy { daemon, runtime_root } => Some(
+            (|| {
+                let root = runtime_root.clone().or_else(|| cli.runtime_root.clone());
+                let layout = match root {
+                    Some(root) => RuntimeLayout::new(root),
+                    None => RuntimeLayout::discover()?,
+                };
+                let ambient = std::env::var_os(AMBIENT_DAEMON_ENV)
+                    .map(|name| name.into_string().map_err(|_| format!("{AMBIENT_DAEMON_ENV} must be valid UTF-8")))
+                    .transpose()?;
+                let layout = match daemon.clone().or_else(|| cli.server.clone()).or(ambient) {
+                    Some(name) => layout.with_daemon(name)?,
+                    None => layout,
+                };
+                crate::proxy::run(&layout)
+            })()
+            .map_or_else(ExecResult::Err, |_| ExecResult::Ok(None)),
+        ),
         _ => None,
     }
 }
@@ -862,6 +903,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
+        // Relays without a local service; `execute_socket` runs it first.
+        Command::Proxy { .. } => unreachable!("proxy is dispatched before local service construction"),
         Command::Packets { id, count, socket: _ } => match run_packets_command(service, &id, count) {
             Ok(lines) if lines.is_empty() => ExecResult::Ok(None),
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),

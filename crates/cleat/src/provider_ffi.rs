@@ -18,7 +18,7 @@ use crate::{
         TerminalStyleColor, TerminalStyleColorTag, TerminalTextEvent, TerminalViewportKind, ViewportCommand, ViewportCommandOutcome,
         TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
     },
-    provider_daemon::{ChannelSlot, DaemonConnection},
+    provider_daemon::{ChannelSlot, DaemonConnection, Transport},
     runtime::{RuntimeLayout, TerminalSize},
     session::{ensure_session_started, SessionStartOptions},
     session_runtime::SessionRuntime,
@@ -29,6 +29,8 @@ pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 11;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
+pub const CLEAT_TRANSPORT_UNIX_SOCKET: u32 = 1;
+pub const CLEAT_TRANSPORT_COMMAND: u32 = 2;
 pub const CLEAT_PROVIDER_VT_DEFAULT: u32 = 0;
 pub const CLEAT_PROVIDER_VT_PASSTHROUGH: u32 = 1;
 pub const CLEAT_PROVIDER_VT_GHOSTTY: u32 = 2;
@@ -184,6 +186,27 @@ pub struct CleatProviderDesc {
     pub daemon_name_len: usize,
     pub directory_selectors: *const CleatStr,
     pub directory_selector_count: usize,
+}
+
+/// How a daemon provider reaches a daemon it does not manage. `size` is
+/// `sizeof(cleat_provider_transport)`; later versions may append fields.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleatProviderTransport {
+    pub size: usize,
+    pub kind: u32,
+    /// `CLEAT_TRANSPORT_UNIX_SOCKET`: the daemon socket (UTF-8 path).
+    pub socket_path: *const u8,
+    pub socket_path_len: usize,
+    /// `CLEAT_TRANSPORT_COMMAND`: the program and its arguments.
+    pub argv: *const CleatStr,
+    pub argc: usize,
+}
+
+impl Default for CleatProviderTransport {
+    fn default() -> Self {
+        Self { size: std::mem::size_of::<Self>(), kind: 0, socket_path: ptr::null(), socket_path_len: 0, argv: ptr::null(), argc: 0 }
+    }
 }
 
 #[repr(C)]
@@ -1129,31 +1152,78 @@ pub unsafe extern "C" fn cleat_provider_open(desc: *const CleatProviderDesc) -> 
         directory_selectors: ptr::null(),
         directory_selector_count: 0,
     });
-    if requested.abi_version != CLEAT_PROVIDER_ABI_VERSION {
+    open_provider(requested, None).map_or(ptr::null_mut(), |provider| Box::into_raw(Box::new(provider)))
+}
+
+/// Open a daemon provider over an explicit transport: a Unix socket for a
+/// forwarded or remote daemon, or a command whose stdio carries the packet
+/// stream (`ssh host cleat proxy --daemon work`). Nothing is discovered,
+/// started or recovered locally, and the declared output context is remote.
+/// Sessions can be attached; creating, ending, adopting and following
+/// transferred sessions fail. A command is spawned once and never respawned;
+/// see `cleat_provider_transport_state_json` for why it stopped.
+///
+/// `desc.backend` must be `CLEAT_PROVIDER_BACKEND_DAEMON`; its runtime root
+/// and daemon name only label the connection.
+///
+/// # Safety
+///
+/// `desc` and `transport` must point to valid structures. `transport.size`
+/// must cover the fields of this ABI version.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_provider_open_transport(
+    desc: *const CleatProviderDesc,
+    transport: *const CleatProviderTransport,
+) -> *mut CleatProvider {
+    let (Some(requested), Some(transport)) = (unsafe { desc.as_ref() }.copied(), unsafe { transport.as_ref() }) else {
         return ptr::null_mut();
+    };
+    if requested.backend != CLEAT_PROVIDER_BACKEND_DAEMON || transport.size < std::mem::size_of::<CleatProviderTransport>() {
+        return ptr::null_mut();
+    }
+    let Ok(transport) = transport_from_ffi(transport) else {
+        return ptr::null_mut();
+    };
+    open_provider(requested, Some(transport)).map_or(ptr::null_mut(), |provider| Box::into_raw(Box::new(provider)))
+}
+
+fn transport_from_ffi(transport: &CleatProviderTransport) -> Result<Transport, String> {
+    match transport.kind {
+        CLEAT_TRANSPORT_UNIX_SOCKET => read_optional_utf8(transport.socket_path, transport.socket_path_len)
+            .map_err(|err| err.to_string())?
+            .filter(|path| !path.is_empty())
+            .map(|path| Transport::UnixSocket(PathBuf::from(path)))
+            .ok_or_else(|| "unix socket transport needs a path".into()),
+        CLEAT_TRANSPORT_COMMAND => {
+            let argv = read_selector_strings(transport.argv, transport.argc).map_err(|err| err.to_string())?;
+            if argv.first().is_none_or(|program| program.is_empty()) {
+                return Err("command transport needs a program".into());
+            }
+            Ok(Transport::Command(argv))
+        }
+        other => Err(format!("unsupported transport kind {other}")),
+    }
+}
+
+/// `transport` is `None` for the runtime layout's own daemon socket.
+fn open_provider(requested: CleatProviderDesc, transport: Option<Transport>) -> Option<CleatProvider> {
+    if requested.abi_version != CLEAT_PROVIDER_ABI_VERSION {
+        return None;
     }
     let backend = match requested.backend {
         CLEAT_PROVIDER_BACKEND_MOCK => ProviderBackend::Mock,
         CLEAT_PROVIDER_BACKEND_IN_PROCESS => ProviderBackend::InProcess,
         CLEAT_PROVIDER_BACKEND_DAEMON => ProviderBackend::Daemon,
-        _ => return ptr::null_mut(),
+        _ => return None,
     };
-    let runtime_root = match read_optional_utf8(requested.runtime_root, requested.runtime_root_len) {
-        Ok(Some(path)) => PathBuf::from(path),
-        Ok(None) => match RuntimeLayout::discover() {
-            Ok(layout) => layout.root().to_path_buf(),
-            Err(_) => return ptr::null_mut(),
-        },
-        Err(_) => return ptr::null_mut(),
+    let runtime_root = match read_optional_utf8(requested.runtime_root, requested.runtime_root_len).ok()? {
+        Some(path) => PathBuf::from(path),
+        // A remote transport has no local runtime to discover.
+        None if transport.is_some() => PathBuf::new(),
+        None => RuntimeLayout::discover().ok()?.root().to_path_buf(),
     };
-    let daemon_name = match read_optional_utf8(requested.daemon_name, requested.daemon_name_len) {
-        Ok(name) => name,
-        Err(_) => return ptr::null_mut(),
-    };
-    let selectors = match read_selector_strings(requested.directory_selectors, requested.directory_selector_count) {
-        Ok(selectors) => selectors,
-        Err(_) => return ptr::null_mut(),
-    };
+    let daemon_name = read_optional_utf8(requested.daemon_name, requested.daemon_name_len).ok()?;
+    let selectors = read_selector_strings(requested.directory_selectors, requested.directory_selector_count).ok()?;
     let features = ProviderFeatures::from_bits_truncate(requested.requested_features)
         | ProviderFeatures::CELL_SNAPSHOTS
         | ProviderFeatures::STRUCTURED_MOUSE_INPUT
@@ -1162,17 +1232,55 @@ pub unsafe extern "C" fn cleat_provider_open(desc: *const CleatProviderDesc) -> 
     let daemon = if backend == ProviderBackend::Daemon {
         let mut layout = RuntimeLayout::new(runtime_root.clone());
         if let Some(name) = daemon_name {
-            layout = match layout.with_daemon(name) {
-                Ok(layout) => layout,
-                Err(_) => return ptr::null_mut(),
-            };
+            layout = layout.with_daemon(name).ok()?;
         }
         let wake_for_connection = Arc::clone(&wake);
-        Some(DaemonConnection::open(layout, selectors, Arc::new(move || notify_wake(&wake_for_connection))))
+        let wake = Arc::new(move || notify_wake(&wake_for_connection));
+        Some(DaemonConnection::open_with_transport(layout, transport.unwrap_or(Transport::Runtime), selectors, wake))
     } else {
         None
     };
-    Box::into_raw(Box::new(CleatProvider { features, backend, runtime_root, wake, daemon, last_directory: None }))
+    Some(CleatProvider { features, backend, runtime_root, wake, daemon, last_directory: None })
+}
+
+/// Copy the daemon transport's state as UTF-8 JSON (no NUL):
+/// `{"kind","connected","error","warning","retrying"}`. `error` says why the
+/// transport is down (a command transport's own last stderr line when it
+/// exits); `warning` is the daemon's output-admission warning; `retrying` is
+/// false once a command transport has failed. A null buffer queries the
+/// size. False for non-daemon providers.
+///
+/// # Safety
+///
+/// `provider` and `out_len` must be valid; a non-null buffer must hold
+/// `capacity` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_provider_transport_state_json(
+    provider: *const CleatProvider,
+    buffer: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> bool {
+    let (Some(provider), Some(out_len)) = (unsafe { provider.as_ref() }, unsafe { out_len.as_mut() }) else {
+        return false;
+    };
+    let Some(daemon) = &provider.daemon else {
+        return false;
+    };
+    let Ok(bytes) = serde_json::to_vec(&daemon.transport_status()) else {
+        return false;
+    };
+    *out_len = bytes.len();
+    if buffer.is_null() {
+        return true;
+    }
+    if capacity < bytes.len() {
+        return false;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+    }
+    true
 }
 
 /// Generation counter of the daemon directory subscription. Starts at 0
@@ -1463,6 +1571,9 @@ pub unsafe extern "C" fn cleat_session_end(session: *mut CleatSession) -> bool {
         Err(format!("session role {role_name} cannot end a session; controller role required"))
     } else {
         match &session.backend {
+            SessionBackend::Daemon(daemon) if daemon.connection.transport().is_remote() => {
+                Err("ending sessions over a remote transport is unsupported; end them on the daemon's host".into())
+            }
             SessionBackend::Daemon(daemon) => {
                 crate::server::SessionService::new(daemon.connection.channel_layout(daemon.channel)).request_end(&daemon.id)
             }
@@ -2589,6 +2700,9 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
 
 fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
     let connection = provider.daemon.as_ref().ok_or_else(|| "provider has no daemon connection".to_string())?;
+    if connection.transport().is_remote() {
+        return Err("sessions cannot be created over a remote transport; create them on the daemon's host".into());
+    }
     let vt_engine = vt_engine_from_tag(desc.vt_engine)?;
     let colors = session_colors_from_desc(desc);
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;

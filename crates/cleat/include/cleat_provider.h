@@ -13,6 +13,10 @@ extern "C" {
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
+/* Explicit daemon transports (cleat_provider_transport.kind). */
+#define CLEAT_TRANSPORT_UNIX_SOCKET 1u
+#define CLEAT_TRANSPORT_COMMAND 2u
+
 #define CLEAT_PROVIDER_VT_DEFAULT 0u
 #define CLEAT_PROVIDER_VT_PASSTHROUGH 1u
 #define CLEAT_PROVIDER_VT_GHOSTTY 2u
@@ -176,6 +180,24 @@ typedef struct cleat_provider_desc {
     const cleat_str *directory_selectors;
     size_t directory_selector_count;
 } cleat_provider_desc;
+
+/*
+ * How a daemon provider reaches a daemon it does not manage. Set size to
+ * sizeof(cleat_provider_transport); later versions may append fields.
+ */
+typedef struct cleat_provider_transport {
+    size_t size;
+    uint32_t kind;
+    /* CLEAT_TRANSPORT_UNIX_SOCKET: the daemon socket path (UTF-8). */
+    const uint8_t *socket_path;
+    size_t socket_path_len;
+    /*
+     * CLEAT_TRANSPORT_COMMAND: program and arguments whose stdin/stdout carry
+     * the packet stream, e.g. {"ssh", "host", "cleat", "proxy", "--daemon", "work"}.
+     */
+    const cleat_str *argv;
+    size_t argc;
+} cleat_provider_transport;
 
 typedef struct cleat_session_desc {
     uint16_t cols;
@@ -538,6 +560,27 @@ typedef struct cleat_viewport_command_result {
 uint32_t cleat_provider_abi_version(void);
 
 cleat_provider *cleat_provider_open(const cleat_provider_desc *desc);
+/*
+ * Daemon provider over an explicit transport. Nothing is discovered, started
+ * or recovered locally, and the output context declared to the daemon is
+ * remote. desc->backend must be CLEAT_PROVIDER_BACKEND_DAEMON; its runtime
+ * root and daemon name only label the connection. Sessions can be attached;
+ * cleat_session_create, cleat_session_end and cleat_session_adopt fail, and a
+ * session transferred to another daemon closes instead of being followed.
+ * A unix-socket transport reconnects with backoff. A command transport is
+ * spawned once: when it fails or exits, sessions report
+ * CLEAT_SESSION_DISCONNECTED and it is not respawned.
+ */
+cleat_provider *cleat_provider_open_transport(const cleat_provider_desc *desc, const cleat_provider_transport *transport);
+/*
+ * Transport state as UTF-8 JSON, no NUL:
+ * {"kind","connected","error","warning","retrying"}. error says why the
+ * transport is down (for a command, its last stderr line once it exits);
+ * warning is the daemon's output-admission warning, kept out of rendered
+ * content; retrying is false once a command transport has failed. NULL
+ * buffer queries the size. False for non-daemon providers.
+ */
+bool cleat_provider_transport_state_json(const cleat_provider *provider, uint8_t *buffer, size_t capacity, size_t *out_len);
 /*
  * Registers an edge-triggered provider wake callback. The callback is a
  * scheduling nudge, not a rendering callback: it may be invoked synchronously

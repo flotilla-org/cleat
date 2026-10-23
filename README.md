@@ -92,21 +92,21 @@ the transport is connected, the last error, and whether it is still retrying;
 a remote transport report hosting as `remote:<kind>`. They cannot be created,
 ended or adopted, and transfer redirects are not followed.
 
-**Endpoints.** A session catalog such as Flotilla publishes where a daemon is
-as an endpoint: a transport (`local` or `ssh`), the ssh host, the runtime root,
-the daemon name, and optionally the path of the Cleat the host runs.
-`cleat_endpoint_check` validates one and gives its kind or the reason it is
-invalid; an unknown transport is invalid, never treated as local.
-`cleat_provider_open_endpoint` opens it. A `local` endpoint gets the ordinary
-daemon provider for its runtime root and daemon. An `ssh` endpoint gets a
-command transport running
+**Routes.** Cleat chooses no route to a remote daemon. The client, or an
+orchestrator that knows the topology, arranges one (ssh, a jump host, an exec
+into a VM or container, a forwarded socket, a tunnel) and opens it with
+`cleat_provider_open_transport`: a Unix socket path, or a command argv whose far
+end runs `cleat proxy`. For routes that hand the far end a shell command,
+`cleat_proxy_command` gives that command with each word quoted for a POSIX
+shell, so a daemon name or runtime root is always one literal argument. An ssh
+route, for example, is the argv `ssh -T -- HOST <command>`, where the command
+is something like
 
 ```bash
-ssh -T -o BatchMode=yes -- HOST cleat proxy [--daemon=NAME] [--runtime-root=PATH]
+cleat proxy --daemon=work --runtime-root='/srv/my root'
 ```
 
-with each remote word quoted for the host's login shell. BatchMode makes ssh
-fail with a reason instead of prompting. Rust callers use `cleat::endpoint`.
+Rust callers use `cleat::proxy_command`.
 
 **Trust.** Cleat adds no authentication of its own. Whoever can run the command
 or reach the socket controls the sessions behind it: for `ssh host cleat proxy`,

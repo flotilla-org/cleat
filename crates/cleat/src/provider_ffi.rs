@@ -7,7 +7,6 @@ use std::{
 };
 
 use crate::{
-    endpoint::{Endpoint, EndpointError, EndpointKind},
     host::actor::{ObservationState, SessionActor, SessionCommand, SessionMouseEvent, SessionWheelEvent},
     keys,
     protocol::{AttachmentIdentity, AttachmentKind},
@@ -20,6 +19,7 @@ use crate::{
         TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
     },
     provider_daemon::{ChannelSlot, DaemonConnection, Transport},
+    proxy_command::ProxyTarget,
     runtime::{RuntimeLayout, TerminalSize},
     session::{ensure_session_started, SessionStartOptions},
     session_runtime::SessionRuntime,
@@ -32,9 +32,6 @@ pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
 pub const CLEAT_TRANSPORT_UNIX_SOCKET: u32 = 1;
 pub const CLEAT_TRANSPORT_COMMAND: u32 = 2;
-pub const CLEAT_ENDPOINT_INVALID: u32 = 0;
-pub const CLEAT_ENDPOINT_LOCAL: u32 = 1;
-pub const CLEAT_ENDPOINT_SSH: u32 = 2;
 pub const CLEAT_PROVIDER_VT_DEFAULT: u32 = 0;
 pub const CLEAT_PROVIDER_VT_PASSTHROUGH: u32 = 1;
 pub const CLEAT_PROVIDER_VT_GHOSTTY: u32 = 2;
@@ -213,34 +210,28 @@ impl Default for CleatProviderTransport {
     }
 }
 
-/// A daemon endpoint as a catalog publishes it (see [`crate::endpoint`]).
-/// `size` is `sizeof(cleat_endpoint)`; later versions may append fields.
-/// Empty strings are absent.
+/// Which daemon `cleat proxy` relays to and which Cleat runs it (see
+/// [`crate::proxy_command`]). `size` is `sizeof(cleat_proxy_target)`; later
+/// versions may append fields. Empty strings are absent.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CleatEndpoint {
+pub struct CleatProxyTarget {
     pub size: usize,
-    /// `local` or `ssh`.
-    pub transport: CleatStr,
-    /// The ssh destination.
-    pub host: CleatStr,
-    /// The daemon's runtime root; empty for the one Cleat discovers.
-    pub runtime_root: CleatStr,
+    /// The far end's Cleat, as one path; empty for `cleat` on its PATH.
+    pub cleat: CleatStr,
     /// The daemon's name; empty for the default daemon.
     pub daemon: CleatStr,
-    /// `ssh`: the path of the Cleat the host runs; empty for `cleat` on its PATH.
-    pub cleat_command: CleatStr,
+    /// The daemon's runtime root; empty for the one Cleat discovers.
+    pub runtime_root: CleatStr,
 }
 
-impl Default for CleatEndpoint {
+impl Default for CleatProxyTarget {
     fn default() -> Self {
         Self {
             size: std::mem::size_of::<Self>(),
-            transport: CleatStr::default(),
-            host: CleatStr::default(),
-            runtime_root: CleatStr::default(),
+            cleat: CleatStr::default(),
             daemon: CleatStr::default(),
-            cleat_command: CleatStr::default(),
+            runtime_root: CleatStr::default(),
         }
     }
 }
@@ -1278,102 +1269,48 @@ fn transport_from_ffi(transport: &CleatProviderTransport) -> Result<Transport, S
     }
 }
 
-fn endpoint_from_ffi(endpoint: &CleatEndpoint) -> Result<Endpoint, EndpointError> {
-    if endpoint.size < std::mem::size_of::<CleatEndpoint>() {
-        return Err(EndpointError::new("cleat_endpoint.size is too small for this ABI"));
+fn proxy_target_from_ffi(target: &CleatProxyTarget) -> Option<ProxyTarget> {
+    if target.size < std::mem::size_of::<CleatProxyTarget>() {
+        return None;
     }
-    let read = |field: CleatStr, name: &str| {
-        read_optional_utf8(field.ptr, field.len)
-            .map(Option::unwrap_or_default)
-            .map_err(|_| EndpointError::new(format!("endpoint {name} is not UTF-8")))
-    };
-    Ok(Endpoint {
-        transport: read(endpoint.transport, "transport")?,
-        host: read(endpoint.host, "host")?,
-        runtime_root: read(endpoint.runtime_root, "runtime root")?,
-        daemon: read(endpoint.daemon, "daemon")?,
-        cleat_command: read(endpoint.cleat_command, "cleat command")?,
-    })
+    let read = |field: CleatStr| read_optional_utf8(field.ptr, field.len).ok().map(Option::unwrap_or_default);
+    Some(ProxyTarget { cleat: read(target.cleat)?, daemon: read(target.daemon)?, runtime_root: read(target.runtime_root)? })
 }
 
-/// Check an endpoint: its kind (`CLEAT_ENDPOINT_LOCAL` or `CLEAT_ENDPOINT_SSH`),
-/// or `CLEAT_ENDPOINT_INVALID` with the reason. An unknown transport is
-/// invalid, never treated as local. The reason, when `reason` is non-null, is
-/// copied cut at a character boundary to fit `capacity`, and its length is
-/// stored in `reason_len` (0 when valid).
+/// The `cleat proxy` command line for `target`, quoted for a POSIX shell, as
+/// UTF-8 with no NUL: what a route's far end runs (`ssh host <command>`, an
+/// exec into a VM, …). Cleat chooses no route; the client builds its own argv
+/// around this and opens it with `cleat_provider_open_transport`. `out_len`
+/// receives the length; a null `buffer` queries it. False for a target that
+/// isn't UTF-8, holds a NUL or has a `size` too small for this ABI, or when
+/// `capacity` is too small.
 ///
 /// # Safety
 ///
-/// `endpoint` must point to a valid `CleatEndpoint`. A non-null `reason` must
-/// hold `capacity` bytes; `reason_len` may be null.
+/// `target` must point to a valid `CleatProxyTarget` and `out_len` to a
+/// `usize`. A non-null `buffer` must hold `capacity` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn cleat_endpoint_check(
-    endpoint: *const CleatEndpoint,
-    reason: *mut u8,
+pub unsafe extern "C" fn cleat_proxy_command(
+    target: *const CleatProxyTarget,
+    buffer: *mut u8,
     capacity: usize,
-    reason_len: *mut usize,
-) -> u32 {
-    let checked = match unsafe { endpoint.as_ref() } {
-        Some(endpoint) => endpoint_from_ffi(endpoint).and_then(|endpoint| endpoint.check()),
-        None => Err(EndpointError::new("no endpoint")),
+    out_len: *mut usize,
+) -> bool {
+    let (Some(target), Some(out_len)) = (unsafe { target.as_ref() }, unsafe { out_len.as_mut() }) else {
+        return false;
     };
-    let (kind, message) = match checked {
-        Ok(EndpointKind::Local) => (CLEAT_ENDPOINT_LOCAL, String::new()),
-        Ok(EndpointKind::Ssh) => (CLEAT_ENDPOINT_SSH, String::new()),
-        Err(err) => (CLEAT_ENDPOINT_INVALID, err.to_string()),
+    let Some(command) = proxy_target_from_ffi(target).and_then(|target| target.shell_command().ok()) else {
+        return false;
     };
-    let copied = unsafe { copy_text(&message, reason, capacity) };
-    if let Some(reason_len) = unsafe { reason_len.as_mut() } {
-        *reason_len = copied;
+    *out_len = command.len();
+    if buffer.is_null() {
+        return true;
     }
-    kind
-}
-
-/// Open a daemon provider for an endpoint. A `local` endpoint opens the
-/// ordinary daemon provider for its runtime root and daemon (`desc`'s own root
-/// and name are replaced). An `ssh` endpoint opens a command transport running
-/// `ssh -T -o BatchMode=yes -- <host> cleat proxy …`, as
-/// `cleat_provider_open_transport` does. NULL for an invalid endpoint (see
-/// `cleat_endpoint_check` for why) or a `desc` that isn't a daemon backend.
-///
-/// # Safety
-///
-/// `desc` and `endpoint` must point to valid structures.
-#[no_mangle]
-pub unsafe extern "C" fn cleat_provider_open_endpoint(
-    desc: *const CleatProviderDesc,
-    endpoint: *const CleatEndpoint,
-) -> *mut CleatProvider {
-    let (Some(requested), Some(endpoint)) = (unsafe { desc.as_ref() }.copied(), unsafe { endpoint.as_ref() }) else {
-        return ptr::null_mut();
-    };
-    if requested.backend != CLEAT_PROVIDER_BACKEND_DAEMON {
-        return ptr::null_mut();
+    if capacity < command.len() {
+        return false;
     }
-    let Ok(endpoint) = endpoint_from_ffi(endpoint) else {
-        return ptr::null_mut();
-    };
-    let opened = match endpoint.check() {
-        Ok(EndpointKind::Local) => {
-            // An empty field is absent: open_provider reads a zero length as
-            // unset whatever the pointer, so the default daemon or discovered
-            // root applies (endpoint_ssh.rs opens one with no daemon).
-            let requested = CleatProviderDesc {
-                runtime_root: endpoint.runtime_root.as_ptr(),
-                runtime_root_len: endpoint.runtime_root.len(),
-                daemon_name: endpoint.daemon.as_ptr(),
-                daemon_name_len: endpoint.daemon.len(),
-                ..requested
-            };
-            open_provider(requested, None)
-        }
-        Ok(EndpointKind::Ssh) => match endpoint.bridge_argv() {
-            Ok(argv) => open_provider(requested, Some(Transport::Command(argv))),
-            Err(_) => None,
-        },
-        Err(_) => None,
-    };
-    opened.map_or(ptr::null_mut(), |provider| Box::into_raw(Box::new(provider)))
+    unsafe { ptr::copy_nonoverlapping(command.as_ptr(), buffer, command.len()) };
+    true
 }
 
 /// Copy `text` into `buffer`, cut at a character boundary to fit `capacity`;

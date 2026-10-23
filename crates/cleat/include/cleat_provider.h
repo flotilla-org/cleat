@@ -17,11 +17,6 @@ extern "C" {
 #define CLEAT_TRANSPORT_UNIX_SOCKET 1u
 #define CLEAT_TRANSPORT_COMMAND 2u
 
-/* Endpoint kinds (cleat_endpoint_check). */
-#define CLEAT_ENDPOINT_INVALID 0u
-#define CLEAT_ENDPOINT_LOCAL 1u
-#define CLEAT_ENDPOINT_SSH 2u
-
 #define CLEAT_PROVIDER_VT_DEFAULT 0u
 #define CLEAT_PROVIDER_VT_PASSTHROUGH 1u
 #define CLEAT_PROVIDER_VT_GHOSTTY 2u
@@ -205,30 +200,23 @@ typedef struct cleat_provider_transport {
 } cleat_provider_transport;
 
 /*
- * A daemon endpoint as a session catalog publishes it (Flotilla's
- * action.primary.direct.* facts). Set size to sizeof(cleat_endpoint); later
+ * Which daemon `cleat proxy` relays to and which Cleat runs it
+ * (cleat_proxy_command). Set size to sizeof(cleat_proxy_target); later
  * versions may append fields. Empty strings are absent.
- *
- * transport is "local" or "ssh"; any other value is invalid, never treated as
- * local. No field may contain control characters or start with '-'; host and
- * daemon may not contain whitespace either. An ssh endpoint needs a host.
  */
-typedef struct cleat_endpoint {
+typedef struct cleat_proxy_target {
     size_t size;
-    cleat_str transport;
-    /* ssh: the destination, which the user's ssh configuration resolves. */
-    cleat_str host;
-    /* The daemon's runtime root; empty for the one Cleat discovers. */
-    cleat_str runtime_root;
+    /*
+     * The far end's Cleat, as one path (a leading "~/" is that end's home);
+     * empty for cleat on its PATH. A path, not a command line: a route that
+     * needs a wrapper puts it around the whole command.
+     */
+    cleat_str cleat;
     /* The daemon's name; empty for the default daemon. */
     cleat_str daemon;
-    /*
-     * ssh: the path of the Cleat the host runs (a leading "~/" is the remote
-     * home); empty for cleat on its non-interactive PATH. A path, not a
-     * command line: arguments can't be added through it.
-     */
-    cleat_str cleat_command;
-} cleat_endpoint;
+    /* The daemon's runtime root; empty for the one Cleat discovers. */
+    cleat_str runtime_root;
+} cleat_proxy_target;
 
 /*
  * A daemon provider's transport state (cleat_provider_transport_state). Set
@@ -640,23 +628,15 @@ bool cleat_provider_transport_state_json(const cleat_provider *provider, uint8_t
  */
 bool cleat_provider_transport_state(const cleat_provider *provider, cleat_transport_state *state);
 /*
- * An endpoint's kind (CLEAT_ENDPOINT_LOCAL or CLEAT_ENDPOINT_SSH), or
- * CLEAT_ENDPOINT_INVALID with the reason copied into reason (cut at a
- * character boundary to fit capacity; reason_len 0 when valid). reason and
- * reason_len may be NULL. Every field is checked, including ones the kind
- * doesn't use, such as a local endpoint's host.
+ * The `cleat proxy [--daemon=<d>] [--runtime-root=<r>]` command line for
+ * target, each word quoted for a POSIX shell, as UTF-8 with no NUL: what the
+ * far end of a route runs (ssh host <command>, an exec into a VM, ...). Cleat
+ * chooses no route: build the argv around this and pass it to
+ * cleat_provider_open_transport. NULL buffer queries the size. False for a
+ * target that isn't UTF-8, holds a NUL or has too small a size, or when
+ * capacity is too small.
  */
-uint32_t cleat_endpoint_check(const cleat_endpoint *endpoint, uint8_t *reason, size_t capacity, size_t *reason_len);
-/*
- * Daemon provider for an endpoint. local: the ordinary daemon provider for
- * the endpoint's runtime root and daemon (desc's own are replaced). ssh: a
- * command transport running
- *   ssh -T -o BatchMode=yes -- <host> cleat proxy [--daemon=<d>] [--runtime-root=<r>]
- * with the remote words quoted for a POSIX login shell, behaving as
- * cleat_provider_open_transport. NULL for an invalid endpoint or a desc whose
- * backend isn't CLEAT_PROVIDER_BACKEND_DAEMON.
- */
-cleat_provider *cleat_provider_open_endpoint(const cleat_provider_desc *desc, const cleat_endpoint *endpoint);
+bool cleat_proxy_command(const cleat_proxy_target *target, uint8_t *buffer, size_t capacity, size_t *out_len);
 /*
  * Registers an edge-triggered provider wake callback. The callback is a
  * scheduling nudge, not a rendering callback: it may be invoked synchronously

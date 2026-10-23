@@ -2340,7 +2340,14 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
     };
     set_listener_nonblocking(&listener, true)?;
     let daemon_pid = std::process::id().to_string();
-    fs::write(layout.daemon_pid_path(), &daemon_pid).map_err(|err| format!("write daemon pid: {err}"))?;
+    // Published by rename: a client reading the registration sees none or a
+    // whole pid, never the empty file a plain write leaves between truncating
+    // and writing, which reads as a dead daemon (and gets its socket removed).
+    let temporary = layout.daemon_dir().join(format!(".daemon.pid-{}", uuid::Uuid::new_v4()));
+    fs::write(&temporary, &daemon_pid).and_then(|()| fs::rename(&temporary, layout.daemon_pid_path())).map_err(|err| {
+        let _ = fs::remove_file(&temporary);
+        format!("write daemon pid: {err}")
+    })?;
 
     fs::write(
         layout.daemon_dir().join("build.json"),

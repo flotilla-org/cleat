@@ -154,3 +154,45 @@ fn recreation_rejects_path_components_before_mutating_the_layout() {
     }
     assert!(!root.exists());
 }
+
+// Behaviour: a starting daemon publishes its pid registration whole. A reader
+// racing the start sees no pid file or a complete pid, never an empty or
+// partial one, which `is_session_daemon_alive` reads as a dead daemon: a
+// client would then remove the live daemon's socket and start a second one.
+#[cfg(unix)]
+#[test]
+fn a_starting_daemon_publishes_its_pid_whole() {
+    for _ in 0..20 {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("default@1").join("daemon.pid");
+        let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_cleat"))
+            .arg("--runtime-root")
+            .arg(temp.path())
+            .env_remove("CLEAT_DAEMON")
+            .env_remove("CLEAT_SESSION")
+            .args(["--server", "default", "serve"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let registered = loop {
+            // A tight loop: the window between truncating and writing is short.
+            match std::fs::read_to_string(&pid_path) {
+                Ok(contents) => match contents.trim().parse::<u32>() {
+                    Ok(pid) => break pid,
+                    Err(_) => {
+                        let _ = daemon.kill();
+                        panic!("read a partial pid registration {contents:?}");
+                    }
+                },
+                Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "the daemon never registered");
+        };
+        assert_eq!(registered, daemon.id());
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+    }
+}

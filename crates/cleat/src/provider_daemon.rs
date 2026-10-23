@@ -332,9 +332,10 @@ impl CommandChild {
         let deadline = Instant::now() + COMMAND_EXIT_GRACE;
         let status = loop {
             match self.child.try_wait() {
-                Ok(Some(status)) => break Some(status),
+                Ok(Some(status)) => break Ok(status),
                 Ok(None) if Instant::now() < deadline => std::thread::sleep(BACKOFF_POLL_STEP),
-                _ => break None,
+                Ok(None) => break Err("transport command stopped carrying the stream".to_string()),
+                Err(err) => break Err(format!("transport command status unavailable: {err}")),
             }
         };
         self.stop();
@@ -343,8 +344,8 @@ impl CommandChild {
             return line.to_string();
         }
         match status {
-            Some(status) => format!("transport command exited ({status})"),
-            None => "transport command stopped carrying the stream".to_string(),
+            Ok(status) => format!("transport command exited ({status})"),
+            Err(reason) => reason,
         }
     }
 

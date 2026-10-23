@@ -314,6 +314,29 @@ fn missing_daemon_reports_the_proxy_reason() {
     assert!(!empty.path().join("default").exists(), "the proxy must not start a daemon");
 }
 
+// Closing stdin half-closes the daemon socket; the answer to what was already
+// sent still comes back before the proxy exits.
+#[test]
+fn proxy_delivers_replies_after_stdin_closes() {
+    use std::io::Write;
+    let daemon = Daemon::new();
+    let mut proxy = Command::new(env!("CARGO_BIN_EXE_cleat"))
+        .args(["proxy", "--runtime-root"])
+        .arg(daemon.root.path())
+        .env_remove("CLEAT_DAEMON")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = proxy.stdin.take().unwrap();
+    stdin.write_all(b"GET /healthz HTTP/1.1\r\nHost: cleat\r\nConnection: close\r\n\r\n").unwrap();
+    drop(stdin);
+    let output = proxy.wait_with_output().unwrap();
+    let reply = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+}
+
 #[test]
 fn proxy_cli_reports_an_unreachable_daemon_on_one_line() {
     let empty = tempfile::Builder::new().prefix("cleat-proxy-cli-").tempdir_in("/tmp").unwrap();

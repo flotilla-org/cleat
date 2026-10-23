@@ -21,15 +21,17 @@ pub fn run(layout: &RuntimeLayout) -> Result<(), String> {
         .map_err(|err| format!("daemon {} is not reachable at {}: {err}", layout.daemon_name(), socket.display()))?;
     let mut to_daemon = stream.try_clone().map_err(|err| format!("clone daemon socket: {err}"))?;
     let mut from_daemon = stream;
+    // Not joined: the process exits once the daemon direction ends, and a
+    // stdin read may still be blocked then.
     std::thread::spawn(move || {
         let _ = relay(&mut std::io::stdin().lock(), &mut to_daemon);
         let _ = to_daemon.shutdown(std::net::Shutdown::Write);
     });
     // Stdin closing only half-closes the socket: the daemon still answers what
     // it already received, then closes, which ends this direction. A vanished
-    // near end ends it too, through that close or a failed stdout write.
-    let _ = relay(&mut from_daemon, &mut std::io::stdout().lock());
-    Ok(())
+    // near end ends it too, through that close or a failed stdout write, which
+    // exits non-zero so the near end can tell it from a clean close.
+    relay(&mut from_daemon, &mut std::io::stdout().lock()).map_err(|err| format!("relay from daemon {}: {err}", layout.daemon_name()))
 }
 
 #[cfg(not(unix))]

@@ -360,6 +360,7 @@ fn nested_local_attach_delivers_to_native_outer_provider() {
 
 #[test]
 fn slow_and_disconnected_consumers_stay_bounded_and_do_not_stall_output() {
+    const COPIES: usize = 100;
     let _isolation = fixture_lock();
     // A consumer that never drains effects is bounded in both hostings. A
     // disconnected daemon attachment loses effects instead of replaying them.
@@ -367,9 +368,13 @@ fn slow_and_disconnected_consumers_stay_bounded_and_do_not_stall_output() {
         let mut f = Fixture::new(backend);
         let s = f.create(b"clip", COMMAND);
         f.ready(s, "clip");
-        send(s, &("copy\n".repeat(100) + "screen\n"));
+        send(s, &("copy\n".repeat(COPIES) + "screen\n"));
         wait(|| consume_render(s).contains("done"));
-        wait(|| unsafe { cleat_session_clipboard_dropped(s) > 0 });
+        // Every copy is either kept or counted as dropped. The render showing
+        // `done` can arrive before the last events do (the daemon drains
+        // effects and renders in separate actor requests), so wait until all
+        // are accounted for: then nothing is in flight while this drains.
+        wait(|| unsafe { cleat_session_clipboard_dropped(s) } == (COPIES - cleat::clipboard::MAX_CLIPBOARD_EVENTS) as u64);
         let mut count = 0;
         loop {
             let e = unsafe { cleat_session_acquire_clipboard_event(s) };
@@ -381,8 +386,7 @@ fn slow_and_disconnected_consumers_stay_bounded_and_do_not_stall_output() {
                 cleat_clipboard_event_release(e);
             }
         }
-        assert!(count <= cleat::clipboard::MAX_CLIPBOARD_EVENTS);
-        assert!(count > 0);
+        assert_eq!(count, cleat::clipboard::MAX_CLIPBOARD_EVENTS, "a consumer that never drains keeps exactly the bound");
         if backend == CLEAT_PROVIDER_BACKEND_DAEMON {
             unsafe {
                 cleat_session_destroy(s);

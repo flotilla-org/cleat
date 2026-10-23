@@ -27,6 +27,7 @@ pub mod provider;
 mod provider_daemon;
 pub mod provider_ffi;
 pub mod proxy;
+pub mod proxy_command;
 pub mod recording;
 pub mod recreate;
 pub mod replay;

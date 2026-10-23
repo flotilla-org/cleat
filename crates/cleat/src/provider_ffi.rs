@@ -19,6 +19,7 @@ use crate::{
         TERMINAL_IMAGE_PLACEMENT_VIRTUAL,
     },
     provider_daemon::{ChannelSlot, DaemonConnection, Transport},
+    proxy_command::ProxyTarget,
     runtime::{RuntimeLayout, TerminalSize},
     session::{ensure_session_started, SessionStartOptions},
     session_runtime::SessionRuntime,
@@ -206,6 +207,69 @@ pub struct CleatProviderTransport {
 impl Default for CleatProviderTransport {
     fn default() -> Self {
         Self { size: std::mem::size_of::<Self>(), kind: 0, socket_path: ptr::null(), socket_path_len: 0, argv: ptr::null(), argc: 0 }
+    }
+}
+
+/// Which daemon `cleat proxy` relays to and which Cleat runs it (see
+/// [`crate::proxy_command`]). `size` is `sizeof(cleat_proxy_target)`; later
+/// versions may append fields. Empty strings are absent.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleatProxyTarget {
+    pub size: usize,
+    /// The far end's Cleat, as one path; empty for `cleat` on its PATH.
+    pub cleat: CleatStr,
+    /// The daemon's name; empty for the default daemon.
+    pub daemon: CleatStr,
+    /// The daemon's runtime root; empty for the one Cleat discovers.
+    pub runtime_root: CleatStr,
+}
+
+impl Default for CleatProxyTarget {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            cleat: CleatStr::default(),
+            daemon: CleatStr::default(),
+            runtime_root: CleatStr::default(),
+        }
+    }
+}
+
+/// A daemon provider's transport state, filled by
+/// `cleat_provider_transport_state`. The caller sets `size` and lends the
+/// `error` and `warning` buffers; each `*_len` comes back as the text's length,
+/// cut at a character boundary to fit its buffer (0 when absent).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleatTransportState {
+    pub size: usize,
+    pub connected: bool,
+    /// False once a command transport has failed: it is not respawned.
+    pub retrying: bool,
+    /// Why the transport is down (a command's own last stderr line).
+    pub error: *mut u8,
+    pub error_capacity: usize,
+    pub error_len: usize,
+    /// The daemon's output-admission warning; never part of rendered content.
+    pub warning: *mut u8,
+    pub warning_capacity: usize,
+    pub warning_len: usize,
+}
+
+impl Default for CleatTransportState {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            connected: false,
+            retrying: false,
+            error: ptr::null_mut(),
+            error_capacity: 0,
+            error_len: 0,
+            warning: ptr::null_mut(),
+            warning_capacity: 0,
+            warning_len: 0,
+        }
     }
 }
 
@@ -1205,6 +1269,68 @@ fn transport_from_ffi(transport: &CleatProviderTransport) -> Result<Transport, S
     }
 }
 
+fn proxy_target_from_ffi(target: &CleatProxyTarget) -> Option<ProxyTarget> {
+    if target.size < std::mem::size_of::<CleatProxyTarget>() {
+        return None;
+    }
+    let read = |field: CleatStr| read_optional_utf8(field.ptr, field.len).ok().map(Option::unwrap_or_default);
+    Some(ProxyTarget { cleat: read(target.cleat)?, daemon: read(target.daemon)?, runtime_root: read(target.runtime_root)? })
+}
+
+/// The `cleat proxy` command line for `target`, quoted for a POSIX shell, as
+/// UTF-8 with no NUL: what a route's far end runs (`ssh host <command>`, an
+/// exec into a VM, …). Cleat chooses no route; the client builds its own argv
+/// around this and opens it with `cleat_provider_open_transport`. `out_len`
+/// receives the length; a null `buffer` queries it. False for a target that
+/// isn't UTF-8, holds a NUL or has a `size` too small for this ABI, or when
+/// `capacity` is too small.
+///
+/// # Safety
+///
+/// `target` must point to a valid `CleatProxyTarget` and `out_len` to a
+/// `usize`. A non-null `buffer` must hold `capacity` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_proxy_command(
+    target: *const CleatProxyTarget,
+    buffer: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> bool {
+    let (Some(target), Some(out_len)) = (unsafe { target.as_ref() }, unsafe { out_len.as_mut() }) else {
+        return false;
+    };
+    let Some(command) = proxy_target_from_ffi(target).and_then(|target| target.shell_command().ok()) else {
+        return false;
+    };
+    *out_len = command.len();
+    if buffer.is_null() {
+        return true;
+    }
+    if capacity < command.len() {
+        return false;
+    }
+    unsafe { ptr::copy_nonoverlapping(command.as_ptr(), buffer, command.len()) };
+    true
+}
+
+/// Copy `text` into `buffer`, cut at a character boundary to fit `capacity`;
+/// the number of bytes copied. A null buffer copies nothing.
+///
+/// # Safety
+///
+/// A non-null `buffer` must hold `capacity` bytes.
+unsafe fn copy_text(text: &str, buffer: *mut u8, capacity: usize) -> usize {
+    if buffer.is_null() {
+        return 0;
+    }
+    let mut len = text.len().min(capacity);
+    while !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    unsafe { ptr::copy_nonoverlapping(text.as_ptr(), buffer, len) };
+    len
+}
+
 /// `transport` is `None` for the runtime layout's own daemon socket.
 fn open_provider(requested: CleatProviderDesc, transport: Option<Transport>) -> Option<CleatProvider> {
     if requested.abi_version != CLEAT_PROVIDER_ABI_VERSION {
@@ -1280,6 +1406,35 @@ pub unsafe extern "C" fn cleat_provider_transport_state_json(
     unsafe {
         ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
     }
+    true
+}
+
+/// Fill `state` with the daemon transport's state: whether it is connected,
+/// whether it is still retrying (false once a command transport has failed),
+/// why it is down, and the daemon's output-admission warning. The texts are
+/// copied into the caller's buffers, cut at a character boundary to fit.
+/// False for non-daemon providers or a `state.size` too small for this ABI.
+///
+/// # Safety
+///
+/// `provider` and `state` must be valid. Each non-null text buffer must hold
+/// its capacity in bytes.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_provider_transport_state(provider: *const CleatProvider, state: *mut CleatTransportState) -> bool {
+    let (Some(provider), Some(state)) = (unsafe { provider.as_ref() }, unsafe { state.as_mut() }) else {
+        return false;
+    };
+    if state.size < std::mem::size_of::<CleatTransportState>() {
+        return false;
+    }
+    let Some(daemon) = &provider.daemon else {
+        return false;
+    };
+    let status = daemon.transport_status();
+    state.connected = status.connected;
+    state.retrying = status.retrying;
+    state.error_len = unsafe { copy_text(status.error.as_deref().unwrap_or_default(), state.error, state.error_capacity) };
+    state.warning_len = unsafe { copy_text(status.warning.as_deref().unwrap_or_default(), state.warning, state.warning_capacity) };
     true
 }
 

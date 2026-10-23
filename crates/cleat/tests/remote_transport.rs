@@ -12,7 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cleat::{provider::ProviderFeatures, provider_ffi::*, runtime::RuntimeLayout, server::SessionService, vt::VtEngineKind};
+use cleat::{
+    provider::ProviderFeatures, provider_ffi::*, proxy_command::shell_word, runtime::RuntimeLayout, server::SessionService,
+    vt::VtEngineKind,
+};
 
 struct Daemon {
     root: tempfile::TempDir,
@@ -102,6 +105,26 @@ impl Provider {
         serde_json::from_slice(&buffer[..len]).unwrap()
     }
 
+    /// The state as fields, with `capacity`-byte text buffers.
+    fn fields(&self, capacity: usize) -> Fields {
+        let (mut error, mut warning) = (vec![0u8; capacity], vec![0u8; capacity]);
+        let mut state = CleatTransportState {
+            error: error.as_mut_ptr(),
+            error_capacity: capacity,
+            warning: warning.as_mut_ptr(),
+            warning_capacity: capacity,
+            ..CleatTransportState::default()
+        };
+        assert!(unsafe { cleat_provider_transport_state(self.0, &mut state) });
+        let read = |buffer: &[u8], len: usize| String::from_utf8(buffer[..len].to_vec()).expect("cut at a character boundary");
+        Fields {
+            connected: state.connected,
+            retrying: state.retrying,
+            error: read(&error, state.error_len),
+            warning: read(&warning, state.warning_len),
+        }
+    }
+
     fn attach(&self, id: &str) -> Session {
         let session = unsafe {
             cleat_session_attach(self.0, &CleatSessionDesc {
@@ -120,6 +143,27 @@ impl Provider {
 impl Drop for Provider {
     fn drop(&mut self) {
         unsafe { cleat_provider_close(self.0) };
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct Fields {
+    connected: bool,
+    retrying: bool,
+    error: String,
+    warning: String,
+}
+
+impl Fields {
+    /// The same state as the JSON form reports, absent texts as empty.
+    fn of_json(state: &serde_json::Value) -> Self {
+        let text = |key: &str| state[key].as_str().unwrap_or_default().to_string();
+        Self {
+            connected: state["connected"].as_bool().unwrap(),
+            retrying: state["retrying"].as_bool().unwrap(),
+            error: text("error"),
+            warning: text("warning"),
+        }
     }
 }
 
@@ -351,4 +395,67 @@ fn proxy_cli_reports_an_unreachable_daemon_on_one_line() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.trim_end().lines().count(), 1, "{stderr}");
     assert!(stderr.contains("daemon work is not reachable"), "{stderr}");
+}
+
+/// The far end's command line from `cleat_proxy_command`.
+fn proxy_command(target: &CleatProxyTarget) -> String {
+    let mut len = 0;
+    assert!(unsafe { cleat_proxy_command(target, std::ptr::null_mut(), 0, &mut len) });
+    let mut buffer = vec![0u8; len];
+    assert!(unsafe { cleat_proxy_command(target, buffer.as_mut_ptr(), len, &mut len) });
+    String::from_utf8(buffer).unwrap()
+}
+
+// A client-arranged route (here a plain `sh -c`, where ssh or an exec would
+// hand the far end its command) works with the command line Cleat builds.
+// The fields form of the transport state agrees with the JSON form while
+// connected and after the command dies, and cuts its texts to the caller's
+// buffers; a state struct smaller than this ABI's is refused.
+#[test]
+fn transport_state_fields_follow_a_client_arranged_route() {
+    let daemon = Daemon::new();
+    let pidfile = daemon.root.path().join("proxy.pid");
+    let (cleat, root) = (env!("CARGO_BIN_EXE_cleat"), daemon.root.path().display().to_string());
+    let target = CleatProxyTarget {
+        cleat: CleatStr { ptr: cleat.as_ptr(), len: cleat.len() },
+        runtime_root: CleatStr { ptr: root.as_ptr(), len: root.len() },
+        ..CleatProxyTarget::default()
+    };
+    let route = format!("echo $$ > {}; exec {}", shell_word(&pidfile.display().to_string()), proxy_command(&target));
+    let argv = vec!["sh".into(), "-c".into(), route];
+    let provider = Provider::open(Kind::Command(&argv));
+    let session = provider.attach("remote");
+    eventually("streaming", || {
+        session.drain();
+        session.state() == CLEAT_SESSION_STREAMING
+    });
+
+    let up = provider.fields(256);
+    assert_eq!(up, Fields::of_json(&provider.state()));
+    assert!(up.connected && up.error.is_empty(), "{up:?}");
+    assert!(up.warning.contains("cycle protection does not cover remote relationships"), "{up:?}");
+    assert_eq!(provider.fields(5).warning, up.warning[..5], "the warning is cut to the caller's buffer");
+    let mut small = CleatTransportState { size: 8, ..CleatTransportState::default() };
+    assert!(!unsafe { cleat_provider_transport_state(provider.0, &mut small) });
+
+    let pid: i32 = fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    eventually("the transport gives up", || !provider.fields(256).retrying);
+    let down = provider.fields(256);
+    assert_eq!(down, Fields::of_json(&provider.state()));
+    assert!(!down.connected && !down.error.is_empty(), "{down:?}");
+}
+
+// A text cut to fit the caller's buffer never splits a character: the
+// error names a runtime root holding `é`, and a buffer ending inside its two
+// bytes gets the text up to it.
+#[test]
+fn transport_state_texts_are_cut_at_a_character_boundary() {
+    let empty = tempfile::Builder::new().prefix("cleat-remote-é-").tempdir_in("/tmp").unwrap();
+    let argv = proxy_argv(empty.path());
+    let provider = Provider::open(Kind::Command(&argv));
+    eventually("the transport gives up", || !provider.fields(512).retrying);
+    let error = provider.fields(512).error;
+    let accent = error.find('é').expect("the error names the root");
+    assert_eq!(provider.fields(accent + 1).error, error[..accent]);
 }

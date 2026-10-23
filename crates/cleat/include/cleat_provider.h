@@ -199,6 +199,46 @@ typedef struct cleat_provider_transport {
     size_t argc;
 } cleat_provider_transport;
 
+/*
+ * Which daemon `cleat proxy` relays to and which Cleat runs it
+ * (cleat_proxy_command). Set size to sizeof(cleat_proxy_target); later
+ * versions may append fields. Empty strings are absent.
+ */
+typedef struct cleat_proxy_target {
+    size_t size;
+    /*
+     * The far end's Cleat, as one path (a leading "~/" is that end's home);
+     * empty for cleat on its PATH. A path, not a command line: a route that
+     * needs a wrapper puts it around the whole command.
+     */
+    cleat_str cleat;
+    /* The daemon's name; empty for the default daemon. */
+    cleat_str daemon;
+    /* The daemon's runtime root; empty for the one Cleat discovers. */
+    cleat_str runtime_root;
+} cleat_proxy_target;
+
+/*
+ * A daemon provider's transport state (cleat_provider_transport_state). Set
+ * size to sizeof(cleat_transport_state) and lend the error and warning
+ * buffers; each *_len comes back as its text's length, cut at a character
+ * boundary to fit (0 when absent).
+ */
+typedef struct cleat_transport_state {
+    size_t size;
+    bool connected;
+    /* False once a command transport has failed: it is not respawned. */
+    bool retrying;
+    /* Why the transport is down (a command's own last stderr line). */
+    uint8_t *error;
+    size_t error_capacity;
+    size_t error_len;
+    /* The daemon's output-admission warning; never part of rendered content. */
+    uint8_t *warning;
+    size_t warning_capacity;
+    size_t warning_len;
+} cleat_transport_state;
+
 typedef struct cleat_session_desc {
     uint16_t cols;
     uint16_t rows;
@@ -581,6 +621,22 @@ cleat_provider *cleat_provider_open_transport(const cleat_provider_desc *desc, c
  * buffer queries the size. False for non-daemon providers.
  */
 bool cleat_provider_transport_state_json(const cleat_provider *provider, uint8_t *buffer, size_t capacity, size_t *out_len);
+/*
+ * The transport state as fields: connected, retrying, and the error and
+ * warning texts copied into the caller's buffers. False for non-daemon
+ * providers or a state->size too small for this ABI.
+ */
+bool cleat_provider_transport_state(const cleat_provider *provider, cleat_transport_state *state);
+/*
+ * The `cleat proxy [--daemon=<d>] [--runtime-root=<r>]` command line for
+ * target, each word quoted for a POSIX shell, as UTF-8 with no NUL: what the
+ * far end of a route runs (ssh host <command>, an exec into a VM, ...). Cleat
+ * chooses no route: build the argv around this and pass it to
+ * cleat_provider_open_transport. NULL buffer queries the size. False for a
+ * target that isn't UTF-8, holds a NUL or has too small a size, or when
+ * capacity is too small.
+ */
+bool cleat_proxy_command(const cleat_proxy_target *target, uint8_t *buffer, size_t capacity, size_t *out_len);
 /*
  * Registers an edge-triggered provider wake callback. The callback is a
  * scheduling nudge, not a rendering callback: it may be invoked synchronously

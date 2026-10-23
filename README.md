@@ -85,11 +85,28 @@ A provider host chooses its transport with `cleat_provider_open_transport`
   line becomes the reported error.
 
 Both declare a remote output context. The admission warning goes to the
-provider's diagnostics, `cleat_provider_transport_state_json`, rather than to
-stderr or rendered content; the same JSON reports the transport kind, whether
-it is connected, the last error, and whether it is still retrying. Sessions over
+provider's diagnostics rather than to stderr or rendered content.
+`cleat_provider_transport_state` reports it as fields, together with whether
+the transport is connected, the last error, and whether it is still retrying;
+`cleat_provider_transport_state_json` gives the same as JSON with the kind. Sessions over
 a remote transport report hosting as `remote:<kind>`. They cannot be created,
 ended or adopted, and transfer redirects are not followed.
+
+**Routes.** Cleat chooses no route to a remote daemon. The client, or an
+orchestrator that knows the topology, arranges one (ssh, a jump host, an exec
+into a VM or container, a forwarded socket, a tunnel) and opens it with
+`cleat_provider_open_transport`: a Unix socket path, or a command argv whose far
+end runs `cleat proxy`. For routes that hand the far end a shell command,
+`cleat_proxy_command` gives that command with each word quoted for a POSIX
+shell, so a daemon name or runtime root is always one literal argument. An ssh
+route, for example, is the argv `ssh -T -- HOST <command>`, where the command
+is something like
+
+```bash
+cleat proxy --daemon=work --runtime-root='/srv/my root'
+```
+
+Rust callers use `cleat::proxy_command`.
 
 **Trust.** Cleat adds no authentication of its own. Whoever can run the command
 or reach the socket controls the sessions behind it: for `ssh host cleat proxy`,

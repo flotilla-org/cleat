@@ -47,4 +47,5 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+hegeltest = "=0.48.1"
 tempfile = "3"

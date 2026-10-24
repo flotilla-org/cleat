@@ -56,6 +56,40 @@ fn service_for(path: &std::path::Path) -> SessionService {
     SessionService::new(RuntimeLayout::new(path.to_path_buf()))
 }
 
+// List fixtures must release their sessions and daemon even when an assertion panics.
+struct ListTestCleanup<'a> {
+    service: &'a SessionService,
+    sessions: &'a [&'a str],
+    daemon: std::process::Child,
+}
+
+impl<'a> ListTestCleanup<'a> {
+    fn start(root: &std::path::Path, service: &'a SessionService, sessions: &'a [&'a str]) -> Self {
+        let daemon = Command::new(env!("CARGO_BIN_EXE_cleat"))
+            .arg("--runtime-root")
+            .arg(root)
+            .args(["--server", DEFAULT_DAEMON_NAME, "serve"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start list test daemon");
+        let cleanup = Self { service, sessions, daemon };
+        wait_for_socket(&RuntimeLayout::new(root.to_path_buf()).socket_path());
+        cleanup
+    }
+}
+
+impl Drop for ListTestCleanup<'_> {
+    fn drop(&mut self) {
+        for id in self.sessions {
+            let _ = self.service.kill(id);
+        }
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -958,8 +992,9 @@ fn list_reports_existing_sessions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
+    let _cleanup = ListTestCleanup::start(temp.path(), &service, &["alpha", "beta"]);
     service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None, false).expect("create alpha");
-    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("zsh".into()), false).expect("create beta");
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
     let cli = Cli::try_parse_from(["cleat", "list"]).expect("parse list");
 
     let output = cli::execute(cli, &service).expect("execute list").expect("list output");
@@ -971,7 +1006,7 @@ fn list_reports_existing_sessions() {
             vt::default_vt_engine_kind().as_str(),
             vt::vt_engine_status(vt::default_vt_engine_kind())
         ),
-        format!("beta\tdetached\tpassthrough ({})\tzsh", vt::vt_engine_status(VtEngineKind::Passthrough)),
+        format!("beta\tdetached\tpassthrough ({})\tsleep 30", vt::vt_engine_status(VtEngineKind::Passthrough)),
     ]);
 }
 
@@ -980,8 +1015,9 @@ fn list_json_reports_existing_sessions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
+    let _cleanup = ListTestCleanup::start(temp.path(), &service, &["alpha", "beta"]);
     service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None, false).expect("create alpha");
-    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("zsh".into()), false).expect("create beta");
+    service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
     let cli = Cli::try_parse_from(["cleat", "list", "--json"]).expect("parse list");
 
     let output = cli::execute(cli, &service).expect("execute list").expect("list output");
@@ -1001,12 +1037,13 @@ fn list_and_inspect_report_opaque_tags() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
+    let _cleanup = ListTestCleanup::start(temp.path(), &service, &["alpha"]);
     service
         .create_with_options(
             Some("alpha".into()),
             Some(VtEngineKind::Passthrough),
             None,
-            Some("zsh".into()),
+            Some("sleep 30".into()),
             cleat::session::SessionStartOptions {
                 record: false,
                 initial_size: TerminalSize::default(),
@@ -1109,12 +1146,13 @@ fn list_selector_requires_exact_opaque_tag_matches() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
+    let _cleanup = ListTestCleanup::start(temp.path(), &service, &["alpha", "beta"]);
     service
         .create_with_options(
             Some("alpha".into()),
             Some(VtEngineKind::Passthrough),
             None,
-            Some("zsh".into()),
+            Some("sleep 30".into()),
             cleat::session::SessionStartOptions {
                 record: false,
                 initial_size: TerminalSize::default(),
@@ -1130,7 +1168,7 @@ fn list_selector_requires_exact_opaque_tag_matches() {
             Some("beta".into()),
             Some(VtEngineKind::Passthrough),
             None,
-            Some("zsh".into()),
+            Some("sleep 30".into()),
             cleat::session::SessionStartOptions {
                 record: false,
                 initial_size: TerminalSize::default(),

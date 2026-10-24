@@ -993,7 +993,7 @@ fn list_reports_existing_sessions() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let _cleanup = ListTestCleanup::start(temp.path(), &service, &["alpha", "beta"]);
-    service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None, false).expect("create alpha");
+    service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), Some("sleep 30".into()), false).expect("create alpha");
     service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
     let cli = Cli::try_parse_from(["cleat", "list"]).expect("parse list");
 
@@ -1016,7 +1016,7 @@ fn list_json_reports_existing_sessions() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = service_for(temp.path());
     let _cleanup = ListTestCleanup::start(temp.path(), &service, &["alpha", "beta"]);
-    service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), None, false).expect("create alpha");
+    service.create(Some("alpha".into()), None, Some(PathBuf::from("/repo")), Some("sleep 30".into()), false).expect("create alpha");
     service.create(Some("beta".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), false).expect("create beta");
     let cli = Cli::try_parse_from(["cleat", "list", "--json"]).expect("parse list");
 

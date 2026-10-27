@@ -1,5 +1,5 @@
 id = "claude-code"
-revision = 1
+revision = 2
 min_engine = "0.1.0"
 verified = ["claude-code =2.1.287", "claude-code =2.1.303"]
 
@@ -28,6 +28,13 @@ state = "working"
 
 [[rule]]
 select = 'screen:has(> region:matches(/^─+$/) + region:has(cursor) + region:matches(/^─+$/) + region:has-text("? for shortcuts")) row:matches(/done \d+:\d+ [AP]M/):last-match'
+state = "done"
+
+# Flotilla crews run with bypass permissions and no placeholder: their footer
+# lacks the shortcut hint, so an empty composer row (only the marker) and a
+# footer without the working hint establish done instead.
+[[rule]]
+select = 'screen:has(> region:matches(/^─+$/) + region:has(cursor):matches(/^❯\s*$/) + region:matches(/^─+$/) + region:not(:has-text("esc to interrupt"))) row:matches(/done \d+:\d+ [AP]M/):last-match'
 state = "done"
 
 [[rule]]

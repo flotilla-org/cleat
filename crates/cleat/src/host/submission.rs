@@ -641,7 +641,7 @@ mod selector_tests {
         assert!(controller.check(&guard, now + SUBMIT_ENTER_DELAY).is_ok());
     }
 
-    // Replay both real harnesses at both recorded sizes. Every fixture marker is an
+    // Replay both real harnesses (and Claude Code under crew settings) at both recorded sizes. Every fixture marker is an
     // independent empty/draft/absent oracle, including placeholders, spaces and cursor-left suffixes.
     #[cfg(feature = "ghostty-vt")]
     #[test]
@@ -653,9 +653,9 @@ mod selector_tests {
         };
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let selector = Selector::parse("composer[value='']").unwrap();
-        for id in ["codex", "claude-code"] {
+        for (id, prefix) in [("codex", "codex"), ("claude-code", "claude-code"), ("claude-code", "crew")] {
             for size in ["80x24", "120x40"] {
-                let path = root.join(format!("recognizers/fixtures/{id}/{id}-{size}"));
+                let path = root.join(format!("recognizers/fixtures/{id}/{prefix}-{size}"));
                 let data = std::fs::read_to_string(path.with_extension("cast")).unwrap();
                 let fixture: Fixture = toml::from_str(&std::fs::read_to_string(path.with_extension("toml")).unwrap()).unwrap();
                 let mut lines = data.lines();

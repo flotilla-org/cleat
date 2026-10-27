@@ -210,7 +210,11 @@ pub enum Command {
                            mode. Use --strict to refuse instead, or --take to demote other drivers and\n\
                            claim exclusive control. --identity and --identity-kind name the attachment.\n\
                            \n\
-                           Press Ctrl-] then d to detach this attachment. Ctrl-] shows other commands.")]
+                           Press Ctrl-] then d to detach this attachment. Ctrl-] shows other commands.\n\
+                           \n\
+                           Exit status: 0 for detach or a clean session end; 75 (EX_TEMPFAIL) when\n\
+                           the session may still be live and a fresh connect could recover it;\n\
+                           1 for refusals, connection failures, unknown sessions, or other errors.")]
     Attach {
         /// Outer terminal status support: auto probes once (200 ms; late replies discarded for 3 s).
         #[arg(long, value_enum, default_value = "auto")]
@@ -239,7 +243,10 @@ pub enum Command {
     },
     /// Watch a session read-only
     #[command(after_long_help = "Attaches as a read-only watcher. The session keeps its existing\n\
-                           controllers; watcher typing is discarded and its size does not affect the PTY.")]
+                           controllers; watcher typing is discarded and its size does not affect the PTY.\n\
+                           Exit status: 0 for detach or a clean session end; 75 (EX_TEMPFAIL) when\n\
+                           the session may still be live and a fresh connect could recover it;\n\
+                           1 for refusals, connection failures, unknown sessions, or other errors.")]
     Watch {
         #[arg(long, value_enum, default_value = "auto")]
         program_status: crate::attach_status::ProgramStatusMode,
@@ -755,6 +762,13 @@ fn check_foreground_nesting(
     Ok(())
 }
 
+fn attach_error_result(error: crate::session::AttachError) -> ExecResult {
+    match error {
+        crate::session::AttachError::Reconnect(message) => ExecResult::Exit { code: 75, message: Some(message), output: None },
+        crate::session::AttachError::Other(message) => ExecResult::Err(message),
+    }
+}
+
 /// Execute socket commands before constructing or discovering a local service.
 /// `None` means this command uses the ordinary local runtime.
 fn execute_socket(cli: &Cli) -> Option<ExecResult> {
@@ -767,7 +781,7 @@ fn execute_socket(cli: &Cli) -> Option<ExecResult> {
                 crate::socket_client::attach(socket, id, attachment.clone().resolve(), *strict, *take)?
                     .relay_stdio_with_program_status(handlers, *program_status)
             })()
-            .map_or_else(ExecResult::Err, |_| ExecResult::Ok(None)),
+            .map_or_else(attach_error_result, |_| ExecResult::Ok(None)),
         ),
         Command::Packets { socket: Some(socket), id, count } => Some(
             (|| {
@@ -928,7 +942,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             };
             match guard.relay_stdio_with_program_status(signal_handlers, program_status) {
                 Ok(()) => ExecResult::Ok(None),
-                Err(e) => ExecResult::Err(e),
+                Err(e) => attach_error_result(e),
             }
         }
         Command::Watch { id, attachment, program_status } => {
@@ -942,7 +956,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             };
             match guard.relay_stdio_with_program_status(signal_handlers, program_status) {
                 Ok(()) => ExecResult::Ok(None),
-                Err(e) => ExecResult::Err(e),
+                Err(e) => attach_error_result(e),
             }
         }
         // Relays without a local service; `execute_socket` runs it first.

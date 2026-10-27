@@ -99,8 +99,39 @@ pub struct SessionStartOptions {
     pub environment: Vec<(String, String)>,
 }
 
+/// An attachment relay failure, distinct from a failure to attach initially.
+#[derive(Debug)]
+pub enum AttachError {
+    /// The session may still be live; a fresh connection could recover it.
+    Reconnect(String),
+    /// A local, rendering, protocol, or other non-recoverable relay error.
+    Other(String),
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reconnect(message) | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AttachError {}
+
+impl From<String> for AttachError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for AttachError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
+    }
+}
+
 impl ForegroundAttach {
-    pub fn relay_stdio(self) -> Result<(), String> {
+    pub fn relay_stdio(self) -> Result<(), AttachError> {
         let signal_handlers = AttachSignalHandlers::install()?;
         self.relay_stdio_with_handlers(signal_handlers)
     }
@@ -110,7 +141,7 @@ impl ForegroundAttach {
     /// a signal delivered between that grant and the relay starting must
     /// already be caught, or the process dies with default disposition
     /// (observed as a test race once the daemon got fast enough).
-    pub fn relay_stdio_with_handlers(self, signal_handlers: AttachSignalHandlers) -> Result<(), String> {
+    pub fn relay_stdio_with_handlers(self, signal_handlers: AttachSignalHandlers) -> Result<(), AttachError> {
         self.relay_stdio_with_program_status(signal_handlers, crate::attach_status::ProgramStatusMode::Auto)
     }
 
@@ -118,7 +149,7 @@ impl ForegroundAttach {
         self,
         signal_handlers: AttachSignalHandlers,
         mode: crate::attach_status::ProgramStatusMode,
-    ) -> Result<(), String> {
+    ) -> Result<(), AttachError> {
         match self.transport {
             ForegroundTransport::Legacy(stream) => relay_legacy_stdio(stream, signal_handlers),
             ForegroundTransport::Packet(packet) => relay_packet_stdio(*packet, signal_handlers, mode),
@@ -126,7 +157,7 @@ impl ForegroundAttach {
     }
 }
 
-fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: AttachSignalHandlers) -> Result<(), String> {
+fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: AttachSignalHandlers) -> Result<(), AttachError> {
     let _signal_handlers = signal_handlers;
     let mut cleanup = AttachCleanupGuard::stdout();
     let mut terminal = ForegroundTerminal::enter()?;
@@ -139,7 +170,7 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
     let alive_out = Arc::clone(&alive);
     let nested_in =
         crate::runtime::ambient_session_coordinates()?.map(|source| format!("nested in {}/{}", source.daemon_name(), source.session_id()));
-    let relay_out = thread::spawn(move || -> Result<(), String> {
+    let relay_out = thread::spawn(move || -> Result<(), AttachError> {
         let mut stdout = std::io::stdout().lock();
         let mut watcher_state = None;
         if let Some(message) = &nested_in {
@@ -162,7 +193,12 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
                     if is_graceful_socket_shutdown(&err) {
                         return Ok(());
                     }
-                    return Err(format!("read attach frame: {err}"));
+                    let message = format!("read attach frame: {err}");
+                    return Err(if err.kind() == std::io::ErrorKind::InvalidData {
+                        AttachError::Other(message)
+                    } else {
+                        AttachError::Reconnect(message)
+                    });
                 }
             }
         }
@@ -170,14 +206,16 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
 
     let write_stream = Arc::clone(&stream);
     let alive_resize = Arc::clone(&alive);
-    let resize_loop = thread::spawn(move || -> Result<(), String> {
+    let resize_loop = thread::spawn(move || -> Result<(), AttachError> {
         let mut last = current_terminal_size();
         while alive_resize.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(100));
             let next = current_terminal_size();
             if next != last {
                 let mut stream = write_stream.lock().map_err(|_| "attach stream lock poisoned".to_string())?;
-                Frame::Resize { cols: next.0, rows: next.1 }.write(&mut *stream).map_err(|err| format!("write resize frame: {err}"))?;
+                Frame::Resize { cols: next.0, rows: next.1 }
+                    .write(&mut *stream)
+                    .map_err(|err| AttachError::Reconnect(format!("write resize frame: {err}")))?;
                 last = next;
             }
         }
@@ -185,7 +223,7 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
     });
 
     let mut buf = [0u8; 4096];
-    let stdin_result = loop {
+    let stdin_result: Result<(), AttachError> = loop {
         if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
             break Ok(());
         }
@@ -198,7 +236,7 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
                     if is_graceful_socket_shutdown(&err) {
                         break Ok(());
                     }
-                    break Err(format!("write input frame: {err}"));
+                    break Err(AttachError::Reconnect(format!("write input frame: {err}")));
                 }
             }
             Err(err)
@@ -213,7 +251,7 @@ fn relay_legacy_stdio(stream: Arc<Mutex<SessionStream>>, signal_handlers: Attach
                 break Ok(())
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => break Err(format!("read stdin: {err}")),
+            Err(err) => break Err(format!("read stdin: {err}").into()),
         }
     };
 
@@ -382,7 +420,7 @@ fn relay_packet_stdio(
     packet: PacketForegroundAttach,
     signal_handlers: AttachSignalHandlers,
     mode: crate::attach_status::ProgramStatusMode,
-) -> Result<(), String> {
+) -> Result<(), AttachError> {
     use crate::attach_input::{Action, Command, InputDecoder};
     let _signal_handlers = signal_handlers;
     let mut cleanup = AttachCleanupGuard::stdout();
@@ -434,7 +472,7 @@ fn relay_packet_stdio(
     let mut images = packet.images;
     let identity = packet.identity.clone();
     let connect_only = packet.connect_only;
-    let relay_out = thread::spawn(move || -> Result<(), String> {
+    let relay_out = thread::spawn(move || -> Result<(), AttachError> {
         let mut read_stream = read_handle;
         // A transferred session announces its new address before closing the
         // channel; the relay follows it once.
@@ -466,9 +504,15 @@ fn relay_packet_stdio(
                     // a still-live relay instead observed transport loss.
                     let was_alive = alive_out.swap(false, Ordering::SeqCst);
                     if connect_only && was_alive {
-                        return Err(format!("socket disconnected: {err}; recovery requires a fresh connect"));
+                        return Err(AttachError::Reconnect(format!("socket disconnected: {err}; recovery requires a fresh connect")));
                     }
-                    return if is_graceful_socket_shutdown(&err) { Ok(()) } else { Err(err.to_string()) };
+                    return if was_alive && err.kind() != std::io::ErrorKind::InvalidData {
+                        Err(AttachError::Reconnect(err.to_string()))
+                    } else if is_graceful_socket_shutdown(&err) {
+                        Ok(())
+                    } else {
+                        Err(err.to_string().into())
+                    };
                 }
             };
             let mut stdout = std::io::stdout().lock();
@@ -550,18 +594,25 @@ fn relay_packet_stdio(
                     if error.channel == channel {
                         if connect_only {
                             alive_out.store(false, Ordering::SeqCst);
-                            return Err(format!("socket channel closed: {}; recovery requires a fresh connect", error.message));
+                            return Err(AttachError::Reconnect(format!(
+                                "socket channel closed: {}; recovery requires a fresh connect",
+                                error.message
+                            )));
                         }
-                        let Some(moved) = redirect.take().filter(|_| !followed) else {
+                        let Some(moved) = redirect.take() else {
                             alive_out.store(false, Ordering::SeqCst);
                             return Ok(());
                         };
+                        if followed {
+                            alive_out.store(false, Ordering::SeqCst);
+                            return Err(AttachError::Reconnect(error.message));
+                        }
                         let role = if controller_out.load(Ordering::SeqCst) { ChannelRole::Controller } else { ChannelRole::Watcher };
                         let (stream, opened) = match follow_foreground_redirect(&moved, identity.clone(), role) {
                             Ok(followed) => followed,
                             Err(err) => {
                                 alive_out.store(false, Ordering::SeqCst);
-                                return Err(err);
+                                return Err(AttachError::Reconnect(err));
                             }
                         };
                         read_stream = stream.try_clone().map_err(|e| e.to_string())?;
@@ -600,7 +651,7 @@ fn relay_packet_stdio(
     let alive_resize = Arc::clone(&alive);
     let chrome_resize = Arc::clone(&chrome);
     let detach_resize = Arc::clone(&detach_requested);
-    let resize_loop = thread::spawn(move || -> Result<(), String> {
+    let resize_loop = thread::spawn(move || -> Result<(), AttachError> {
         let mut last = None;
         let mut cell_query = Instant::now();
         while alive_resize.load(Ordering::SeqCst) {
@@ -649,7 +700,7 @@ fn relay_packet_stdio(
         &std::env::var("TERM_PROGRAM").unwrap_or_default(),
     ));
     let mut buf = [0u8; 4096];
-    let stdin_result = 'input: loop {
+    let stdin_result: Result<(), AttachError> = 'input: loop {
         if !alive.load(Ordering::SeqCst) || attach_signal_exit_requested() {
             break Ok(());
         }
@@ -696,7 +747,7 @@ fn relay_packet_stdio(
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) if matches!(err.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe) => break Ok(()),
-            Err(err) => break Err(err.to_string()),
+            Err(err) => break Err(err.to_string().into()),
         };
         for action in actions {
             let mut event = None;
@@ -857,12 +908,12 @@ fn relay_packet_stdio(
     if signal_exit {
         return Ok(());
     }
-    stdin_result?;
     out_result?;
+    stdin_result?;
     resize_result
 }
 
-fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
+fn write_packet_frame(stream: &Arc<Mutex<SessionStream>>, frame: std::io::Result<PacketFrame>) -> Result<(), AttachError> {
     write_packet_frame_with_detach(stream, frame, None)
 }
 
@@ -870,7 +921,7 @@ fn write_packet_relay_frame(
     detach_requested: &AtomicBool,
     stream: &Arc<Mutex<SessionStream>>,
     frame: std::io::Result<PacketFrame>,
-) -> Result<(), String> {
+) -> Result<(), AttachError> {
     write_packet_frame_with_detach(stream, frame, Some(detach_requested))
 }
 
@@ -892,7 +943,7 @@ fn write_packet_frame_with_detach(
     stream: &Arc<Mutex<SessionStream>>,
     frame: std::io::Result<PacketFrame>,
     detach_requested: Option<&AtomicBool>,
-) -> Result<(), String> {
+) -> Result<(), AttachError> {
     let frame = frame.map_err(|err| format!("encode packet attach frame: {err}"))?;
     let mut stream = stream.lock().map_err(|_| "packet attach stream lock poisoned".to_string())?;
     match frame.write(&mut *stream) {
@@ -900,7 +951,7 @@ fn write_packet_frame_with_detach(
         // writes are in flight. Suppress only shutdown errors observed after
         // that request; earlier errors and non-socket failures still propagate.
         Err(err) if detach_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) && is_graceful_socket_shutdown(&err) => Ok(()),
-        result => result.map_err(|err| format!("write packet attach frame: {err}")),
+        result => result.map_err(|err| AttachError::Reconnect(format!("write packet attach frame: {err}"))),
     }
 }
 
@@ -923,7 +974,7 @@ mod packet_detach_tests {
         assert!(prior_error.is_err(), "detach cannot reinterpret a prior failure");
         assert!(write_packet_relay_frame(&detach, &stream, frame()).is_ok());
         let invalid = Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid packet"));
-        assert!(write_packet_relay_frame(&detach, &stream, invalid).unwrap_err().contains("encode packet attach frame"));
+        assert!(write_packet_relay_frame(&detach, &stream, invalid).unwrap_err().to_string().contains("encode packet attach frame"));
     }
 
     // The output relay's own writes leave a shut socket to its next read,

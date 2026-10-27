@@ -44,7 +44,7 @@ fn unavailable_socket_never_spawns_or_creates_runtime() {
                 command.env_remove("CLEAT_DAEMON").env_remove("CLEAT_SESSION").env_remove("CLEAT_OUTPUT_DAEMON");
             }
             let output = command.output().unwrap();
-            assert!(!output.status.success());
+            assert_eq!(output.status.code(), Some(1));
             no_local_state(directory.path());
             let error = String::from_utf8_lossy(&output.stderr);
             assert!(error.contains("connect") && error.contains("missing.sock"), "{error}");
@@ -170,12 +170,28 @@ mod live {
     }
 
     // Attach opens a controller, relays input and acknowledges output without
-    // local metadata. Daemon death is a clear error, with no reconnect/spawn.
+    // local metadata. Losing a forwarding relay returns 75 while the session lives.
     #[test]
     fn attach_from_empty_directory_relays_input_and_exits_on_disconnect() {
         let daemon = Daemon::new();
         let directory = tempfile::tempdir().unwrap();
-        let socket = daemon.expose(directory.path());
+        let socket = directory.path().join("relay.sock");
+        // A real forwarding socket is the network boundary owned by the caller.
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let upstream = daemon.layout.socket_path();
+        let (connected, connections) = std::sync::mpsc::channel();
+        let relay = thread::spawn(move || {
+            let (mut downstream, _) = listener.accept().unwrap();
+            let mut upstream = std::os::unix::net::UnixStream::connect(upstream).unwrap();
+            let mut downstream_read = downstream.try_clone().unwrap();
+            let mut upstream_write = upstream.try_clone().unwrap();
+            connected.send((downstream.try_clone().unwrap(), upstream.try_clone().unwrap())).unwrap();
+            let input = thread::spawn(move || {
+                let _ = std::io::copy(&mut downstream_read, &mut upstream_write);
+            });
+            let _ = std::io::copy(&mut upstream, &mut downstream);
+            input.join().unwrap();
+        });
         let stderr = directory.path().join("stderr");
         let stdout = directory.path().join("stdout");
         let mut child = Client(
@@ -208,8 +224,12 @@ mod live {
             }
             String::from_utf8_lossy(&text).contains("socket-input")
         });
-        daemon.stop();
-        assert!(!child.wait().success());
+        let (downstream, upstream) = connections.recv_timeout(Duration::from_secs(5)).unwrap();
+        downstream.shutdown(std::net::Shutdown::Both).unwrap();
+        upstream.shutdown(std::net::Shutdown::Both).unwrap();
+        relay.join().unwrap();
+        assert_eq!(child.wait().code(), Some(75));
+        daemon.service.inspect("remote").expect("session survives relay loss");
         let diagnostic = fs::read_to_string(stderr).unwrap();
         assert!(diagnostic.contains("socket disconnected"), "{diagnostic}");
         assert!(diagnostic.contains("fresh connect"), "{diagnostic}");
@@ -296,7 +316,7 @@ mod live {
         let target_layout = daemon.layout.clone().with_daemon("target".into()).unwrap();
         let pid: i32 = fs::read_to_string(target_layout.daemon_pid_path()).unwrap().trim().parse().unwrap();
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        assert!(!status.success());
+        assert_eq!(status.code(), Some(75));
         assert!(diagnostic.contains("socket channel closed") && diagnostic.contains("fresh connect"), "{diagnostic}");
         assert!(attachments.is_empty(), "socket-only client must not reconnect at the transfer target");
         no_local_state(directory.path());

@@ -641,8 +641,9 @@ mod selector_tests {
         assert!(controller.check(&guard, now + SUBMIT_ENTER_DELAY).is_ok());
     }
 
-    // Replay both real harnesses (and Claude Code under crew settings) at both recorded sizes. Every fixture marker is an
-    // independent empty/draft/absent oracle, including placeholders, spaces and cursor-left suffixes.
+    // Replay both real harnesses, and Claude Code under crew settings, at both recorded
+    // sizes. Every fixture marker is an independent empty/draft/absent oracle,
+    // including placeholders, spaces and cursor-left suffixes.
     #[cfg(feature = "ghostty-vt")]
     #[test]
     fn guarded_send_recorded_composers() {

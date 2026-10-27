@@ -22,7 +22,8 @@ recognizer is an engine demonstration. `claude-code` covers the recorded
 Claude Code 2.1.287 composer scenarios and 2.1.303 composer, working, completed,
 approval and question scenarios. It also covers 2.1.287 under flotilla crew
 settings, whose bypass-permissions footer has no `? for shortcuts` hint: an
-empty composer there is the marker alone with the cursor at the value start. Select it explicitly with `--recognizer claude-code`.
+empty composer there is the marker alone with the cursor at the value start.
+Select it explicitly with `--recognizer claude-code`.
 
 `codex` is verified against the recorded 0.160.0 and 0.162.1 harnesses;
 see its fixture README for evidence and limits.

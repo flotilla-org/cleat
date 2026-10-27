@@ -1284,8 +1284,9 @@ mod tests {
             runtime.read_available_output(false).unwrap();
             std::thread::sleep(Duration::from_millis(10));
         }
-        let draft = terminal_screen::Selector::parse("composer[value='hello']").unwrap();
-        assert_eq!(runtime.check_selector_support(&draft).unwrap_err().reason, "unsupported");
+        // Presence only: the drawn row, and so the value, differs on the Windows CI shell.
+        let composer = terminal_screen::Selector::parse("composer").unwrap();
+        assert_eq!(runtime.check_selector_support(&composer).unwrap_err().reason, "unsupported");
 
         assert!(runtime.set_recognizer("missing-recognizer").is_err());
         assert!(runtime.set_recognizer("bad id").is_err());
@@ -1295,7 +1296,7 @@ mod tests {
         let tags = runtime.set_recognizer("synthetic").unwrap();
         assert_eq!(tags, runtime.session.tags);
         assert_eq!(runtime.inspect(false, 0).recognizer.unwrap().id, "synthetic");
-        runtime.check_selector(&draft, false).unwrap();
+        runtime.check_selector(&composer, false).unwrap();
         // A failed replacement keeps the running recognizer and its tag.
         assert!(runtime.set_recognizer("missing-recognizer").is_err());
         assert_eq!(runtime.session.tags, tags);
@@ -1306,7 +1307,7 @@ mod tests {
         assert!(runtime.session.tags.contains(&"purpose=probe".to_string()));
         assert_eq!(crate::recognizer::load_selected(&runtime.session.tags).unwrap().unwrap().id, "claude-code");
         assert_eq!(runtime.inspect(false, 0).recognizer.unwrap().id, "claude-code");
-        assert_eq!(runtime.check_selector(&draft, false).unwrap_err().reason, "role-absent");
+        assert_eq!(runtime.check_selector(&composer, false).unwrap_err().reason, "role-absent");
     }
 
     #[cfg(unix)]

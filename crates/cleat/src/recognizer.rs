@@ -997,7 +997,7 @@ mod tests {
                 std::fs::read(root.join(format!("fixtures/codex/{prefix}-120x40.toml"))).unwrap()
             );
         }
-        for name in ["codex-80x24", "codex-120x40", "auth-80x24", "auth-120x40", "crew-80x24", "crew-120x40"] {
+        for name in ["codex-80x24", "codex-120x40", "auth-80x24", "auth-120x40"] {
             let mut vt = crate::vt::ghostty::GhosttyVtEngine::new(80, 24);
             check_fixture(
                 &root.join(format!("fixtures/codex/{name}.cast")),

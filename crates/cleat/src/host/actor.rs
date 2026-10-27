@@ -34,8 +34,8 @@ pub(crate) use super::submission::{ControllerRefusalCause, SendError, SendPrecon
 use super::{
     presentation::{GateTransition, PresentationGate},
     submission::{
-        controller_event_is_activity, controller_expected_echo, ControllerActivity, ControllerReplayQueue, QueuedControllerInput,
-        SUBMIT_ENTER_DELAY,
+        controller_event_is_activity, controller_expected_echo, guarded_write, ControllerActivity, ControllerReplayQueue,
+        QueuedControllerInput, SUBMIT_ENTER_DELAY,
     },
 };
 #[cfg(unix)]
@@ -551,6 +551,10 @@ pub(crate) enum SessionCommand {
     Mark {
         name: Option<String>,
         reply: mpsc::Sender<Result<u64, String>>,
+    },
+    SetRecognizer {
+        id: String,
+        reply: mpsc::Sender<Result<Vec<String>, String>>,
     },
     UpdateTags {
         add: Vec<String>,
@@ -1192,6 +1196,10 @@ impl SessionActor {
         self.request_result(|reply| SessionCommand::UpdateTags { add, remove, reply })
     }
 
+    pub(crate) fn set_recognizer(&self, id: String) -> Result<Vec<String>, String> {
+        self.request_result(|reply| SessionCommand::SetRecognizer { id, reply })
+    }
+
     pub(crate) fn resolve_marker(&self, name: String) -> Result<Option<u64>, String> {
         self.request_result(|reply| SessionCommand::ResolveMarker { name, reply })
     }
@@ -1611,21 +1619,26 @@ fn session_actor_handle_command(
                     return Err("session unavailable".into());
                 }
                 // Output pump -> controller observation fence -> predicates -> first write.
-                state.controller.check(&preconditions, Instant::now())?;
-                if let Some(selector) = &preconditions.selector {
-                    runtime.check_selector(selector)?;
-                }
-                let marker_offset = marker_name.map(|name| runtime.mark(Some(name))).transpose()?;
-                if submit {
-                    route_paste_on_actor(runtime, &text)?;
-                } else {
-                    let mut bytes = text;
-                    if !no_enter {
-                        bytes.push(b'\r');
-                    }
-                    runtime.write_input(&bytes)?;
-                }
-                Ok(marker_offset)
+                guarded_write(
+                    runtime,
+                    &mut state.controller,
+                    &preconditions,
+                    Instant::now(),
+                    |runtime, selector, require_roles| runtime.check_selector(selector, require_roles),
+                    |runtime| {
+                        let marker_offset = marker_name.map(|name| runtime.mark(Some(name))).transpose()?;
+                        if submit {
+                            route_paste_on_actor(runtime, &text)?;
+                        } else {
+                            let mut bytes = text;
+                            if !no_enter {
+                                bytes.push(b'\r');
+                            }
+                            runtime.write_input(&bytes)?;
+                        }
+                        Ok(marker_offset)
+                    },
+                )
             })();
             match result {
                 Ok(marker_offset) if submit => {
@@ -1863,6 +1876,9 @@ fn session_actor_handle_command(
         }
         SessionCommand::Mark { name, reply } => {
             let _ = reply.send(runtime.mark(name));
+        }
+        SessionCommand::SetRecognizer { id, reply } => {
+            let _ = reply.send(runtime.set_recognizer(&id));
         }
         SessionCommand::UpdateTags { add, remove, reply } => {
             let _ = reply.send(Ok(runtime.update_tags(add, remove)));
@@ -2910,6 +2926,60 @@ pub(crate) mod submission_tests {
             } else {
                 assert!(result.unwrap().is_some());
                 assert!(actor.resolve_marker("guarded".into()).unwrap().is_some());
+            }
+        }
+    }
+
+    // #393: a controller key with no predictable echo leaves the fence unverifiable,
+    // yet a guarded send whose recognizer selector matches the empty composer after
+    // the quiet interval writes atomically and inspect records the selector clearance.
+    // On a draft frame the same guard refuses and writes nothing. The frames use
+    // the flotilla crew footer, which has no `? for shortcuts` hint.
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn matched_composer_replaces_unverifiable_echo_fence() {
+        use crate::protocol::{ControllerFenceClearanceCause, ControllerFenceState};
+        for (draft, cursor_col) in [("", 3), ("draft", 8)] {
+            let (_temp, actor, tap) = spawn_with(
+                &format!(
+                    "stty raw -echo; rule=$(printf '%80s' '' | sed 's/ /─/g'); printf '\\033[2J\\033[H\\r\\n%s\\r\\n❯ {draft}\\r\\n%s\\r\\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\\r\\n\\r\\nREADY\\033[3;{cursor_col}H' \"$rule\" \"$rule\"; \
+                     dd bs=1 count=5 2>/dev/null | od -An -tx1 | tr -d ' \\n'; printf DONE; sleep 10"
+                ),
+                vt::VtEngineKind::Ghostty,
+                vec!["recognizer:claude-code".into()],
+            );
+            let mut output = Vec::new();
+            collect_until(&tap, &mut output, b"READY");
+            let left = crate::provider::TerminalKeyEvent {
+                key: crate::provider::TerminalKey::Named(crate::provider::TerminalNamedKey::ArrowLeft),
+                modifiers: Default::default(),
+                consumed_modifiers: Default::default(),
+                action: Default::default(),
+                generated_text: None,
+                platform_keycode: 0,
+                physical_key: None,
+            };
+            actor.controller_input(0, TerminalInputEvent::Key(left)).unwrap();
+            assert_eq!(actor.inspect(false, 0).unwrap().controller_fence.state, ControllerFenceState::Unverifiable);
+            let guard = SendPreconditions {
+                controller_idle: Some(Duration::ZERO),
+                selector: Some(terminal_screen::Selector::parse("composer[value='']").unwrap()),
+            };
+            let result = actor.begin_send(b"ok".to_vec(), false, true, guard, None).unwrap().recv().unwrap();
+            let fence = actor.inspect(false, 0).unwrap().controller_fence;
+            if draft.is_empty() {
+                result.unwrap();
+                assert_eq!(fence.state, ControllerFenceState::Clear);
+                let cleared = fence.cleared_by.unwrap();
+                assert_eq!((cleared.cause, cleared.generation), (ControllerFenceClearanceCause::Selector, 1));
+                collect_until(&tap, &mut output, b"DONE");
+                assert!(String::from_utf8(output).unwrap().contains("6f6bDONE"));
+            } else {
+                assert_eq!(result.unwrap_err().reason, "not-matched");
+                assert_eq!(fence.state, ControllerFenceState::Unverifiable);
+                actor.write_input(b"pr".to_vec()).unwrap();
+                collect_until(&tap, &mut output, b"DONE");
+                assert!(String::from_utf8(output).unwrap().contains("7072DONE"));
             }
         }
     }

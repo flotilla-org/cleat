@@ -2,7 +2,9 @@
 //! These types are independent of a VT engine; the actor owns their PTY transaction.
 use std::time::{Duration, Instant};
 
-use crate::protocol::{ControllerFence, ControllerFenceCause, ControllerFenceState};
+use crate::protocol::{
+    ControllerFence, ControllerFenceCause, ControllerFenceClearance, ControllerFenceClearanceCause, ControllerFenceState,
+};
 
 fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -20,12 +22,53 @@ impl SendPreconditions {
         self.controller_idle.is_some() || self.selector.is_some()
     }
 
+    /// A selector over recognizer roles, checked after a quiet interval, is screen
+    /// evidence that can replace a pending or unverifiable echo fence (#393).
+    /// Structural selectors say nothing about the application's input state.
+    fn selector_evidence(&self) -> bool {
+        self.controller_idle.is_some() && self.selector.as_ref().is_some_and(|selector| !selector_roles(selector).is_empty())
+    }
+
     pub(super) fn evaluate(&self, controller: &ControllerActivity, now: Instant) -> Result<(), String> {
         if self.controller_idle.is_some_and(|idle| controller.at.is_some_and(|at| now.saturating_duration_since(at) < idle)) {
             return Err("controller input is not idle".into());
         }
         Ok(())
     }
+}
+
+/// A guarded write, in transaction order: the echo fence, quiet time, the
+/// selector on the current frame, then `write`. A matched recognizer-role
+/// selector replaces a closed echo fence (#393). As evidence it must also find
+/// every role it references on the frame, so a negation cannot match an absent
+/// composer. The fence is recorded as cleared only after `write` succeeds.
+pub(super) fn guarded_write<C, T>(
+    context: &mut C,
+    controller: &mut ControllerActivity,
+    preconditions: &SendPreconditions,
+    now: Instant,
+    check_selector: impl FnOnce(&mut C, &terminal_screen::Selector, bool) -> Result<(), SendError>,
+    write: impl FnOnce(&mut C) -> Result<T, SendError>,
+) -> Result<T, SendError> {
+    let evidence = controller.check(preconditions, now)?;
+    if let Some(selector) = &preconditions.selector {
+        check_selector(context, selector, evidence == FenceEvidence::Selector)?;
+    }
+    let written = write(context)?;
+    if evidence == FenceEvidence::Selector {
+        controller.clear_by_selector();
+    }
+    Ok(written)
+}
+
+/// What [`guarded_write`] must still prove after [`ControllerActivity::check`] succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FenceEvidence {
+    /// Echo (or no controller input) already cleared the fence.
+    Echo,
+    /// The fence is open only if the selector matches in this transaction;
+    /// the actor then records the match with [`ControllerActivity::clear_by_selector`].
+    Selector,
 }
 
 // Preserve the existing composer delay while the actor holds submission ownership.
@@ -47,6 +90,7 @@ pub(super) struct ControllerActivity {
     fence_since: Option<u64>,
     observed_unix_ms: Option<u64>,
     fence_cause: Option<ControllerFenceCause>,
+    cleared_by: Option<ControllerFenceClearance>,
 }
 
 impl ControllerActivity {
@@ -66,6 +110,7 @@ impl ControllerActivity {
             observed_unix_ms: history.observed_output_at.or_else(|| (history.generation > 0).then_some(unix_now)),
             fence_since: history.fence_since,
             fence_cause: history.fence_cause,
+            cleared_by: history.fence_cleared_by,
             ..Default::default()
         };
         if history.pending_output {
@@ -89,6 +134,7 @@ impl ControllerActivity {
             fence_since: self.fence_since,
             observed_output_at: self.observed_unix_ms,
             fence_cause: self.fence_cause,
+            fence_cleared_by: self.cleared_by,
         }
     }
 
@@ -102,6 +148,7 @@ impl ControllerActivity {
         if !self.pending_output {
             self.expected_echo = Some(Vec::new());
             self.echo_matched = 0;
+            self.cleared_by = None;
         }
         let was_pending = self.pending_output;
         let was_unverifiable = was_pending && self.expected_echo.is_none();
@@ -169,6 +216,27 @@ impl ControllerActivity {
         }
     }
 
+    /// Record that a matched selector replaced echo evidence for all input so far.
+    /// No settling interval follows: the screen already showed the input's effect.
+    fn clear_by_selector(&mut self) {
+        if !self.pending_output {
+            return;
+        }
+        self.pending_output = false;
+        self.expected_echo = None;
+        self.echo_prefix.clear();
+        self.echo_matched = 0;
+        self.fence_cause = None;
+        self.fence_since = Some(unix_ms());
+        self.cleared_by = Some(ControllerFenceClearance { cause: ControllerFenceClearanceCause::Selector, generation: self.generation });
+    }
+
+    fn settling(&self, now: Instant) -> bool {
+        self.cleared_by.is_none()
+            && self.generation > 0
+            && self.observed_output_at.is_some_and(|at| now.saturating_duration_since(at) < SUBMIT_ENTER_DELAY)
+    }
+
     pub(super) fn fence(&self, now: Instant) -> ControllerFence {
         let (state, since, settles_at, cause) = if self.pending_output {
             (
@@ -177,7 +245,9 @@ impl ControllerActivity {
                 None,
                 self.fence_cause,
             )
-        } else if self.generation > 0 && self.observed_output_at.is_some_and(|at| now.saturating_duration_since(at) < SUBMIT_ENTER_DELAY) {
+        } else if self.cleared_by.is_some() {
+            (ControllerFenceState::Clear, self.fence_since, None, None)
+        } else if self.settling(now) {
             (
                 ControllerFenceState::Settling,
                 self.observed_unix_ms,
@@ -192,22 +262,26 @@ impl ControllerActivity {
                 None,
             )
         };
-        ControllerFence { state, since, settles_at, cause }
+        let cleared_by = self.cleared_by.filter(|_| state == ControllerFenceState::Clear);
+        ControllerFence { state, since, settles_at, cause, cleared_by }
     }
 
-    pub(super) fn check(&self, preconditions: &SendPreconditions, now: Instant) -> Result<(), SendError> {
+    pub(super) fn check(&self, preconditions: &SendPreconditions, now: Instant) -> Result<FenceEvidence, SendError> {
+        let mut evidence = FenceEvidence::Echo;
         if preconditions.guarded() {
             if self.pending_output {
-                return Err(SendError::controller(
-                    if self.expected_echo.is_some() {
-                        ControllerRefusalCause::FencePending
-                    } else {
-                        ControllerRefusalCause::FenceUnverifiable
-                    },
-                    "controller input has not yet produced a verifiable PTY echo",
-                ));
-            }
-            if self.generation > 0 && self.observed_output_at.is_some_and(|at| now.saturating_duration_since(at) < SUBMIT_ENTER_DELAY) {
+                if !preconditions.selector_evidence() {
+                    return Err(SendError::controller(
+                        if self.expected_echo.is_some() {
+                            ControllerRefusalCause::FencePending
+                        } else {
+                            ControllerRefusalCause::FenceUnverifiable
+                        },
+                        "controller input has not yet produced a verifiable PTY echo",
+                    ));
+                }
+                evidence = FenceEvidence::Selector;
+            } else if self.settling(now) {
                 return Err(SendError::controller(
                     ControllerRefusalCause::FenceSettling,
                     "controller input output fence is still settling",
@@ -215,7 +289,8 @@ impl ControllerActivity {
             }
         }
         // evaluate currently checks only controller_idle; add a distinct cause here if another predicate is introduced.
-        preconditions.evaluate(self, now).map_err(|error| SendError::controller(ControllerRefusalCause::QuietTime, error))
+        preconditions.evaluate(self, now).map_err(|error| SendError::controller(ControllerRefusalCause::QuietTime, error))?;
+        Ok(evidence)
     }
 }
 
@@ -344,25 +419,115 @@ mod controller_fence_properties {
         }
     }
 
-    // Unknown or oversized echo remains fail-closed; later unrelated output or input must not authorize a send.
-    #[test]
-    fn unverifiable_echo_stays_closed() {
-        for expected in [None, Some(vec![b'x'; CONTROLLER_QUEUE_BYTES + 1])] {
-            let now = Instant::now();
-            let mut activity = ControllerActivity::default();
-            activity.accepted(now);
-            activity.written(expected);
-            activity.observe_output(b"anything", now);
-            activity.written(Some(b"known".to_vec()));
-            activity.observe_output(b"known", now);
-            assert!(activity
-                .check(&SendPreconditions { controller_idle: Some(Duration::ZERO), ..Default::default() }, now + Duration::from_secs(100))
-                .is_err());
+    // #393: a guarded write happens only on a frame where its selector matches,
+    // so a composer guard never writes over a draft or without a composer. A
+    // recognizer-role selector with a quiet interval replaces a pending or
+    // unverifiable echo fence, but only on a frame that has every role it names
+    // (a negation cannot match an absent composer), and the fence records the
+    // clearance for inspect and transfer only once the write succeeded.
+    // Structural selectors and quiet time alone keep the conservative fence,
+    // and a settling fence still refuses. The generator spans every fence state
+    // (none, pending, both unverifiable causes, settling), absent, empty and
+    // draft composers (spaces, multiline, cursor-left suffix), positive,
+    // negated, structural and no selector, with and without a quiet floor
+    // crossing that floor, and a write that succeeds or fails.
+    #[hegel::test(test_cases = 500)]
+    fn guarded_write_requires_match_and_selector_replaces_closed_fence(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        use terminal_screen::{Node, Rect, ScreenTree, Selector};
+        const EMPTY: &str = "composer[value='']";
+        const NEGATED: &str = "screen:not(:has(composer[value='x']))";
+        let floor = Duration::from_secs(2);
+        let fence = tc.draw(gs::integers::<u8>().min_value(0).max_value(4));
+        let ms = Duration::from_millis(1);
+        let elapsed = tc.draw(gs::sampled_from(vec![Duration::ZERO, floor - ms, floor, floor + ms, Duration::from_secs(3600)]));
+        let composer =
+            tc.draw(gs::sampled_from(vec![None, Some(""), Some(" "), Some("draft"), Some("line one\nline two"), Some("abc def")]));
+        let selector = tc.draw(gs::sampled_from(vec![None, Some(EMPTY), Some(NEGATED), Some("screen")]));
+        let idle = tc.draw(gs::booleans()).then_some(floor);
+        let write_fails = tc.draw(gs::booleans());
+        let start = Instant::now();
+        let now = start + elapsed;
+        let mut activity = ControllerActivity::default();
+        if fence > 0 {
+            activity.accepted(start);
+            activity.written(match fence {
+                1 | 4 => Some(b"typed".to_vec()),
+                2 => None,
+                _ => Some(vec![b'x'; CONTROLLER_QUEUE_BYTES + 1]),
+            });
+        }
+        if fence == 4 {
+            activity.observe_output(b"typed", now);
+        }
+        let mut tree = ScreenTree::from_root(0, Node::new("screen", Rect { col: 0, row: 0, width: 80, height: 24 }, ""));
+        if let Some(value) = composer {
+            let mut node = Node::new("composer", Rect { col: 0, row: 0, width: 80, height: 2 }, value);
+            node.attributes.insert("value".into(), value.into());
+            tree.add_node(tree.root(), node).unwrap();
+        }
+        let preconditions = SendPreconditions { controller_idle: idle, selector: selector.map(|source| Selector::parse(source).unwrap()) };
+        let before = activity.fence(now);
+        let mut writes = 0;
+        let result = guarded_write(
+            &mut writes,
+            &mut activity,
+            &preconditions,
+            now,
+            |_, selector, require_roles| evaluate_selector(selector, &tree, require_roles),
+            |writes| {
+                *writes += 1;
+                if write_fails {
+                    Err(SendError::from("PTY write failed"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        let closed = matches!(fence, 1..=3);
+        let role = matches!(selector, Some(EMPTY | NEGATED));
+        let evidence = preconditions.guarded() && closed && role && idle.is_some();
+        let quiet = idle.is_none() || fence == 0 || elapsed >= floor;
+        let matched = (selector != Some(EMPTY) || composer == Some("")) && (!evidence || composer.is_some());
+        let authorized = !preconditions.guarded() || ((!closed || evidence) && fence != 4 && quiet && matched);
+        let context = format!("fence={fence} elapsed={elapsed:?} composer={composer:?} selector={selector:?} idle={idle:?}");
+        assert_eq!(writes, usize::from(authorized), "{context}");
+        if writes > 0 && selector == Some(EMPTY) {
+            assert_eq!(composer, Some(""), "a composer guard wrote over a draft or without a composer");
+        }
+        if writes > 0 && evidence {
+            assert!(composer.is_some(), "selector evidence without its role on the frame: {context}");
+        }
+        match result {
+            Ok(()) if evidence => {
+                let after = activity.fence(now);
+                assert_eq!(after.state, ControllerFenceState::Clear);
+                let cleared = ControllerFenceClearance { cause: ControllerFenceClearanceCause::Selector, generation: 1 };
+                assert_eq!(after.cleared_by, Some(cleared));
+                assert_eq!(ControllerActivity::from_history(activity.history()).fence(now), after);
+                // The next controller write needs new evidence.
+                activity.written(None);
+                assert_eq!((activity.fence(now).state, activity.fence(now).cleared_by), (ControllerFenceState::Unverifiable, None));
+            }
+            Ok(()) => {
+                assert!(!write_fails);
+                assert_eq!(activity.fence(now), before);
+            }
+            Err(error) => {
+                if authorized {
+                    assert!(write_fails, "{context}");
+                } else {
+                    assert_eq!(error.status, 409);
+                    assert!(["controller-active", "not-matched", "role-absent"].contains(&error.reason.as_str()));
+                }
+                assert_eq!(activity.fence(now), before, "a refusal or failed write must not change the fence");
+            }
         }
     }
 
     // The public contract exposes state, timestamps and causes but never text or matching progress.
-    // Generate every echo chunk size, masked/transformed output, both irreversible causes and transfer in every state.
+    // Generate every echo chunk size, masked/transformed output, both unverifiable causes and transfer in every state.
     #[test]
     fn diagnostic_states_causes_and_privacy() {
         let secret = "DISTINCTIVE-private-controller-λ";
@@ -437,7 +602,7 @@ mod controller_fence_properties {
             activity.observe_output(b"later", now);
             assert_eq!(activity.fence(now), before);
             assert_public(&activity, now, ControllerFenceState::Unverifiable, Some("fence-unverifiable"));
-            // New child activations use empty history, resetting even an irreversible fence.
+            // New child activations use empty history, resetting even an unverifiable fence.
             let fresh = ControllerActivity::from_history(Default::default());
             assert_eq!(fresh.fence(now), ControllerFence::default());
         }
@@ -446,7 +611,7 @@ mod controller_fence_properties {
         let quiet = SendPreconditions { controller_idle: Some(Duration::from_secs(1)), ..Default::default() };
         assert_eq!(activity.check(&quiet, now).unwrap_err().controller.unwrap().cause, ControllerRefusalCause::QuietTime);
         assert_eq!(SendError::controller(ControllerRefusalCause::Busy, "submission busy").controller.unwrap().cause.as_str(), "busy");
-        // The inclusive evidence limit is still verifiable; the next byte closes it irreversibly.
+        // The inclusive evidence limit is still verifiable; the next byte closes it beyond echo evidence.
         activity.written(Some(vec![b'x'; CONTROLLER_QUEUE_BYTES]));
         assert_eq!(activity.fence(now).state, ControllerFenceState::Pending);
         activity.written(Some(vec![b'x']));
@@ -562,18 +727,53 @@ impl std::fmt::Display for SendError {
     }
 }
 
+/// The guard and key bytes that delete exactly `draft` from a composer (#393).
+///
+/// The selector requires the composer's observed value to equal `draft`. For a
+/// draft of N characters the keys are N forward deletes then N backspaces, at
+/// least one key per character (a grapheme-deleting editor needs fewer). They
+/// empty the buffer from any cursor position provided the application, as
+/// Claude Code and Codex do, ignores Delete and Backspace at a buffer edge.
+/// Nothing outside the composer buffer is addressed, and no Escape or submit
+/// key is sent.
+pub(crate) fn composer_clear(draft: &str) -> Result<(terminal_screen::Selector, Vec<u8>), SendError> {
+    use crate::keys::{encode_named_key, Modifiers, NamedKey};
+    if draft.is_empty() {
+        return Err(SendError::new(400, "error", "guarded clear requires the nonempty draft that was read"));
+    }
+    let quoted = draft.replace('\\', "\\\\").replace('\'', "\\'");
+    let selector = terminal_screen::Selector::parse(&format!("composer[value='{quoted}']"))
+        .map_err(|error| SendError::new(400, "error", error.to_string()))?;
+    let count = draft.chars().count();
+    let delete = encode_named_key(NamedKey::Delete, Modifiers::default()).ok_or("delete key has no encoding")?;
+    let backspace = encode_named_key(NamedKey::Backspace, Modifiers::default()).ok_or("backspace key has no encoding")?;
+    let mut keys = delete.repeat(count);
+    keys.extend(backspace.repeat(count));
+    Ok((selector, keys))
+}
+
 /// Structure needs no recognizer; all other names require a declared role source.
 pub(crate) fn selector_roles(selector: &terminal_screen::Selector) -> std::collections::BTreeSet<String> {
     selector.referenced_elements().into_iter().filter(|name| !terminal_screen::STRUCTURAL_ELEMENTS.contains(&name.as_str())).collect()
 }
 
-pub(crate) fn evaluate_selector(selector: &terminal_screen::Selector, tree: &terminal_screen::ScreenTree) -> Result<(), SendError> {
+pub(crate) fn evaluate_selector(
+    selector: &terminal_screen::Selector,
+    tree: &terminal_screen::ScreenTree,
+    require_roles: bool,
+) -> Result<(), SendError> {
+    let absent = || {
+        selector_roles(selector).iter().any(|role| {
+            !tree.document_order().iter().filter_map(|id| tree.node(*id)).any(|node| node.element == *role || node.roles.contains(role))
+        })
+    };
+    if require_roles && absent() {
+        return Err(SendError::refused("role-absent", "selector role is absent from the current frame"));
+    }
     if !selector.evaluate(tree).is_empty() {
         return Ok(());
     }
-    let absent = selector_roles(selector).iter().any(|role| {
-        !tree.document_order().iter().filter_map(|id| tree.node(*id)).any(|node| node.element == *role || node.roles.contains(role))
-    });
+    let absent = absent();
     Err(if absent {
         SendError::refused("role-absent", "selector role is absent from the current frame")
     } else {
@@ -614,7 +814,7 @@ mod selector_tests {
                 tree.add_node(tree.root(), node).unwrap();
             }
             let before = tree.clone();
-            let result = evaluate_selector(&selector, &tree);
+            let result = evaluate_selector(&selector, &tree, false);
             assert_eq!(result.is_ok(), value == Some(""));
             if let Err(error) = result {
                 assert_eq!(error.status, 409);
@@ -622,6 +822,55 @@ mod selector_tests {
             }
             assert_eq!(tree, before);
         }
+    }
+
+    // #393 guarded clear: the guard matches exactly the draft that was read
+    // (quotes, backslashes, newlines and spaces included, never a longer or
+    // shorter value), and from any cursor position its keys empty a buffer that
+    // holds that draft. The generator draws drafts over an alphabet of selector
+    // metacharacters, whitespace and multibyte text, and every cursor position.
+    #[hegel::test(test_cases = 200)]
+    fn guarded_clear_matches_exact_draft_and_deletes_it(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let alphabet = vec!['a', ' ', '\'', '"', '\\', '\n', ']', '=', 'é', '日'];
+        let draft: String = tc.draw(gs::vecs(gs::sampled_from(alphabet)).max_size(12)).into_iter().collect();
+        let Ok((selector, keys)) = composer_clear(&draft) else {
+            assert!(draft.is_empty(), "only an empty draft is refused");
+            return;
+        };
+        let frame = |value: &str| {
+            let mut tree = ScreenTree::from_root(0, Node::new("screen", Rect { col: 0, row: 0, width: 80, height: 24 }, ""));
+            let mut node = Node::new("composer", Rect { col: 0, row: 0, width: 80, height: 2 }, value);
+            node.attributes.insert("value".into(), value.into());
+            tree.add_node(tree.root(), node).unwrap();
+            tree
+        };
+        assert!(evaluate_selector(&selector, &frame(&draft), false).is_ok());
+        let shorter: String = draft.chars().skip(1).collect();
+        for other in [format!("{draft}x"), format!(" {draft}"), shorter, String::new()] {
+            assert_eq!(evaluate_selector(&selector, &frame(&other), false).unwrap_err().reason, "not-matched", "{other:?}");
+        }
+        // Line-editor model of the composer buffer: Delete removes the character
+        // at the cursor, Backspace the one before it, each a no-op at an edge.
+        let mut buffer: Vec<char> = draft.chars().collect();
+        let mut cursor = tc.draw(gs::integers::<usize>().min_value(0).max_value(buffer.len()));
+        let mut rest = keys.as_slice();
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix(b"\x1b[3~") {
+                if cursor < buffer.len() {
+                    buffer.remove(cursor);
+                }
+                rest = after;
+            } else {
+                assert_eq!(rest[0], 0x7f, "only Delete and Backspace are sent");
+                if cursor > 0 {
+                    cursor -= 1;
+                    buffer.remove(cursor);
+                }
+                rest = &rest[1..];
+            }
+        }
+        assert!(buffer.is_empty());
     }
 
     // A selector alone activates the same conservative controller fence as a quiet-time guard.
@@ -683,7 +932,7 @@ mod selector_tests {
                     if event.code == EventCode::Marker {
                         let expected = fixture.marker.iter().find(|m| m.name == event.data).unwrap();
                         let composer = expected.role.iter().find(|r| r.role == "composer");
-                        let result = evaluate_selector(&selector, &tree);
+                        let result = evaluate_selector(&selector, &tree, false);
                         assert_eq!(result.is_ok(), composer.is_some_and(|r| r.value.is_empty()), "{id} {size} {}", event.data);
                         if let Err(error) = result {
                             assert_eq!(error.reason, if composer.is_none() { "role-absent" } else { "not-matched" });
@@ -695,7 +944,7 @@ mod selector_tests {
                             vt.feed(format!("\x1b7\x1b[{};3H", cursor.row + 1).as_bytes()).unwrap();
                             let mut left = vt.recognition_tree(event.time.as_millis() as u64 + 1).unwrap();
                             engine.evaluate(&mut left, vt.title().as_deref(), event.time.as_millis() as u64 + 1);
-                            assert!(evaluate_selector(&selector, &left).is_ok(), "{id} {size} space-only cursor-left limit");
+                            assert!(evaluate_selector(&selector, &left, false).is_ok(), "{id} {size} space-only cursor-left limit");
                             vt.feed(b"\x1b8").unwrap();
                         }
                     }

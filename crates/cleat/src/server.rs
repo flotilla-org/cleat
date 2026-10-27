@@ -1350,6 +1350,18 @@ impl SessionService {
         Ok(response.tags)
     }
 
+    /// Attach or replace the session's recognizer live; returns the new tags.
+    pub fn set_recognizer(&self, id: &str, recognizer: &str) -> Result<Vec<String>, String> {
+        if !self.layout.session_dir(id).exists() {
+            return Err(format!("missing session {id}"));
+        }
+        let response: http_uds::TagResponse =
+            self.http_json(id, Method::POST, &format!("/sessions/{id}/recognizer"), &http_uds::RecognizerRequest {
+                id: recognizer.into(),
+            })?;
+        Ok(response.tags)
+    }
+
     pub fn signal(&self, id: &str, signal: i32, target: crate::protocol::SignalTarget) -> Result<(), String> {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));

@@ -104,6 +104,23 @@ pub struct ControllerFence {
     pub settles_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<ControllerFenceCause>,
+    /// Present on `clear` when screen evidence, not echo, cleared the fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_by: Option<ControllerFenceClearance>,
+}
+
+/// Screen evidence that replaced echo for every controller input up to `generation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerFenceClearance {
+    pub cause: ControllerFenceClearanceCause,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ControllerFenceClearanceCause {
+    /// A recognizer-role `--if` selector matched after the `--controller-idle` quiet interval.
+    Selector,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +155,8 @@ pub struct ControllerInputHistory {
     pub observed_output_at: Option<u64>,
     #[serde(default)]
     pub fence_cause: Option<ControllerFenceCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_cleared_by: Option<ControllerFenceClearance>,
 }
 
 impl ControllerInputHistory {

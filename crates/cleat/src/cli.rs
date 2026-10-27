@@ -181,6 +181,22 @@ pub enum ServerCommand {
 }
 
 #[derive(Debug, Subcommand, PartialEq)]
+pub enum RecognizerCommand {
+    /// Load or replace the recognizer of a live session
+    #[command(after_long_help = "Loads ID (an add-on file or bundled rules, as for launch --recognizer) and \
+                           makes it the session's only recognizer, replacing any running one. The \
+                           recognizer:ID tag replaces the previous selection, so recreation and host \
+                           transfer keep it like a launch-time choice. Re-run after editing an add-on \
+                           file to reload it. A file that fails to load changes nothing.")]
+    Set {
+        #[arg(value_name = "SESSION")]
+        id: String,
+        #[arg(value_name = "ID")]
+        recognizer: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum Command {
     /// Attach to a session interactively
     #[command(after_long_help = "By default, creates a new session if the ID does not exist (equivalent\n\
@@ -324,6 +340,11 @@ pub enum Command {
         id: String,
         #[arg(value_name = "+TAG|-TAG", required = true, num_args = 1.., allow_hyphen_values = true)]
         mutations: Vec<String>,
+    },
+    /// Manage a running session's application recognizer
+    Recognizer {
+        #[command(subcommand)]
+        command: RecognizerCommand,
     },
     /// Capture terminal screen content
     #[command(after_long_help = "Returns the current rendered screen from the VT engine.\n\
@@ -527,6 +548,25 @@ resolved through the live daemon socket. \n\
         #[arg(long = "if", value_name = "SELECTOR", help = "Refuse unless the screen selector matches atomically before writing")]
         selector: Option<String>,
         #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
+        mark_before: Option<String>,
+    },
+    /// Delete an abandoned composer draft, only if it is still exactly the draft read
+    #[command(after_long_help = "Read the draft from `inspect --json` (the recognizer's composer value), \
+                           then pass it back with --draft. The daemon deletes it only while the \
+                           composer still shows exactly that value and controller input has been \
+                           quiet for --controller-idle, atomically with the write. Nothing else is \
+                           edited and nothing is submitted.\n\n\
+                           Exit codes: 0 cleared, 1 refused (retryable: not-matched, role-absent, \
+                           controller-active), 2 unsupported or error.")]
+    ClearComposer {
+        id: String,
+        /// The exact composer value that was read and is to be deleted.
+        #[arg(long, value_name = "TEXT")]
+        draft: String,
+        /// Refuse unless controller input has been quiet for this duration.
+        #[arg(long, value_name = "DURATION", value_parser = crate::duration_parser::parse_humantime_or_seconds)]
+        controller_idle: Duration,
+        #[arg(long, value_name = "NAME", help = "Set a named marker before clearing (requires recording)")]
         mark_before: Option<String>,
     },
     /// Send Ctrl-C to a session
@@ -813,6 +853,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
         Command::Watch { id, .. }
         | Command::Packets { id, .. }
         | Command::Tag { id, .. }
+        | Command::Recognizer { command: RecognizerCommand::Set { id, .. } }
         | Command::Capture { id }
         | Command::Transcript { id, .. }
         | Command::Detach { id }
@@ -823,6 +864,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
         | Command::Record { id }
         | Command::Mark { id, .. }
         | Command::Send { id, .. }
+        | Command::ClearComposer { id, .. }
         | Command::Escape { id }
         | Command::Interrupt { id }
         | Command::Wait { id, .. }
@@ -1225,6 +1267,10 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
+        Command::Recognizer { command: RecognizerCommand::Set { id, recognizer } } => match service.set_recognizer(&id, &recognizer) {
+            Ok(tags) => ExecResult::Ok(Some(tags.join("\n"))),
+            Err(e) => ExecResult::Err(e),
+        },
         Command::Detach { id } => match service.detach(&id) {
             Ok(()) => ExecResult::Ok(None),
             Err(e) => ExecResult::Err(e),
@@ -1324,10 +1370,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                     },
                 };
             }
-            let controller_idle_ms = match controller_idle
-                .map(|duration| u64::try_from(duration.as_millis() + u128::from(duration.subsec_nanos() % 1_000_000 != 0)))
-            {
-                Some(Err(_)) => return ExecResult::Err("controller idle duration is too large".into()),
+            let controller_idle_ms = match controller_idle.map(controller_idle_millis) {
+                Some(Err(error)) => return ExecResult::Err(error),
                 Some(Ok(ms)) => Some(ms),
                 None => None,
             };
@@ -1346,6 +1390,22 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                     ExecResult::Exit { code: if error.status == 409 { 1 } else { 2 }, message: Some(error.to_string()), output: None }
                 }
                 Err(error) => ExecResult::Err(error.to_string()),
+            }
+        }
+        Command::ClearComposer { id, draft, controller_idle, mark_before } => {
+            let controller_idle_ms = match controller_idle_millis(controller_idle) {
+                Ok(ms) => ms,
+                Err(error) => return ExecResult::Err(error),
+            };
+            match service.send_transaction(&id, &http_uds::InputRequest::GuardedClear {
+                draft,
+                controller_idle_ms,
+                marker_name: mark_before,
+            }) {
+                Ok(offset) => ExecResult::Ok(offset.map(|offset| offset.to_string())),
+                Err(error) => {
+                    ExecResult::Exit { code: if error.status == 409 { 1 } else { 2 }, message: Some(error.to_string()), output: None }
+                }
             }
         }
         Command::Interrupt { id } => match service.send_keys(&id, &[0x03]) {
@@ -1443,6 +1503,12 @@ struct WaitOptions {
     states: Vec<crate::program_status::ProgramState>,
     timeout: f64,
     json: bool,
+}
+
+/// Durations round up to whole milliseconds so a guard is never shorter than requested.
+fn controller_idle_millis(duration: Duration) -> Result<u64, String> {
+    u64::try_from(duration.as_millis() + u128::from(!duration.subsec_nanos().is_multiple_of(1_000_000)))
+        .map_err(|_| "controller idle duration is too large".to_string())
 }
 
 fn execute_wait(service: &SessionService, id: String, options: WaitOptions) -> ExecResult {

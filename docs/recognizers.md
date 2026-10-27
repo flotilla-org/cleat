@@ -4,8 +4,25 @@ Recognition is opt-in: `cleat launch --recognizer synthetic --cmd ...` is
 identical to adding `--tag recognizer:synthetic` at launch. Exactly one id may
 be selected. Conflicting `--recognizer` and `--tag recognizer:` ids are rejected
 by the CLI before daemon startup. Cleat never infers an id from the command.
-Selection persists in session metadata, including recreation and host transfer;
-changing tags after launch does not replace the active engine.
+Selection persists in session metadata, including recreation and host transfer.
+Changing tags with `cleat tag` does not replace the active engine; use
+`cleat recognizer set` (below).
+
+## Live attach and replace
+
+```sh
+cleat recognizer set SESSION codex
+```
+
+loads the id exactly as `--recognizer` does at launch (an add-on file, else the
+bundled rules) and makes it the session's only recognizer, replacing any running
+one. The `recognizer:<id>` tag replaces the previous selection tag, so
+recreation and host transfer keep the choice like a launch-time one. The new
+engine evaluates the current frame at once. An id or file that fails to load
+changes nothing (exit 1, HTTP 422). Re-run the command after editing an add-on
+file to reload it. The HTTP equivalent is `POST /sessions/SESSION/recognizer`
+with `{"id":"codex"}`, answered with `{"tags":[...]}`. One recognizer serves
+every attachment; per-attachment recognizers are not provided.
 
 `cleat inspect ID --explain` displays the active id, revision, error, and each
 rule's match, named captures, and region provenance. `inspect --json` includes
@@ -33,7 +50,8 @@ or otherwise `$XDG_CONFIG_HOME/cleat/recognizers` (default
 `$HOME/.config/cleat/recognizers`) on Unix and `%APPDATA%\cleat\recognizers` on
 Windows. If no platform configuration base is available, add-ons are disabled;
 bundled rules remain available. Configured paths must be absolute. Install
-`<id>.toml` there. Files are read once when a session starts. A missing or invalid file during
+`<id>.toml` there. Files are read when a session starts, on host adoption and
+on `recognizer set`. A missing or invalid file during
 host adoption leaves the PTY running and exposes an inspect error with the
 selected id and revision 0 (the revision could not be loaded).
 Invalid files reject launch before the child starts; diagnostics include the

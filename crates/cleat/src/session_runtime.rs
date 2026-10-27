@@ -756,6 +756,22 @@ impl SessionRuntime {
         self.session.tags.clone()
     }
 
+    /// Load `id` and make it the session's only recognizer, replacing any running
+    /// one. The selection tag changes with it, so recreation and host transfer
+    /// keep the choice exactly as a launch-time `--recognizer` (#393). A file
+    /// that fails to load changes nothing. The new engine evaluates the current
+    /// frame immediately.
+    pub(crate) fn set_recognizer(&mut self, id: &str) -> Result<Vec<String>, String> {
+        let mut tags: Vec<String> = self.session.tags.iter().filter(|tag| !tag.starts_with("recognizer:")).cloned().collect();
+        tags.push(format!("recognizer:{id}"));
+        let rules = crate::recognizer::load_selected(&tags)?.ok_or("select exactly one recognizer")?;
+        normalize_tags(&mut tags);
+        self.recognizer = Some(crate::recognizer::Engine::new(rules.into_recognizer()));
+        self.session.tags = tags;
+        self.recognize();
+        Ok(self.session.tags.clone())
+    }
+
     pub(crate) fn mark(&mut self, name: Option<String>) -> Result<u64, String> {
         let recorder = self.recorder.as_mut().ok_or_else(|| "recording not active".to_string())?;
         recorder.flush();
@@ -1231,6 +1247,56 @@ mod tests {
         assert_eq!((error.status, error.reason.as_str()), (500, "error"));
         assert_eq!(error.to_string(), "recognizer fixture error");
         runtime.write_input(b"unguarded").unwrap();
+    }
+
+    // #393 live recognizer attach and replace: a recognizer set on a running
+    // session evaluates the current frame at once, replaces any running one, and
+    // leaves exactly one selection tag, which recreation and host adoption load
+    // like a launch-time choice. An id that fails to load changes nothing.
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn live_recognizer_set_attaches_replaces_and_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let colors = crate::vt::TerminalColors::default();
+        let session = SessionMetadata {
+            id: "live-recognizer".into(),
+            vt_engine: VtEngineKind::Ghostty,
+            cwd: None,
+            cmd: Some("printf 'Draft: hello'; sleep 30".into()),
+            tags: vec!["purpose=probe".into()],
+            environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
+            environment: vec![],
+            record: false,
+            initial_size: Default::default(),
+            colors,
+        };
+        let vt = crate::vt::make_vt_engine_with_colors(VtEngineKind::Ghostty, 80, 24, colors).unwrap();
+        let mut runtime = SessionRuntime::spawn(temp.path().to_path_buf(), &session, vt).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !runtime.screen_contains("Draft: hello") {
+            assert!(std::time::Instant::now() < deadline, "child output never arrived");
+            runtime.read_available_output(false).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let draft = terminal_screen::Selector::parse("composer[value='hello']").unwrap();
+        assert_eq!(runtime.check_selector_support(&draft).unwrap_err().reason, "unsupported");
+
+        assert!(runtime.set_recognizer("missing-recognizer").is_err());
+        assert!(runtime.set_recognizer("bad id").is_err());
+        assert!(runtime.recognizer.is_none());
+        assert_eq!(runtime.session.tags, ["purpose=probe"]);
+
+        let tags = runtime.set_recognizer("synthetic").unwrap();
+        assert_eq!(tags, runtime.session.tags);
+        assert_eq!(runtime.inspect(false, 0).recognizer.unwrap().id, "synthetic");
+        runtime.check_selector(&draft).unwrap();
+
+        runtime.set_recognizer("claude-code").unwrap();
+        assert_eq!(runtime.session.tags.iter().filter(|tag| tag.starts_with("recognizer:")).count(), 1);
+        assert!(runtime.session.tags.contains(&"purpose=probe".to_string()));
+        assert_eq!(crate::recognizer::load_selected(&runtime.session.tags).unwrap().unwrap().id, "claude-code");
+        assert_eq!(runtime.inspect(false, 0).recognizer.unwrap().id, "claude-code");
+        assert_eq!(runtime.check_selector(&draft).unwrap_err().reason, "role-absent");
     }
 
     #[cfg(unix)]

@@ -53,6 +53,7 @@ pub(crate) enum Route {
     SessionSignal { id: String },
     SessionSnapshot { id: String },
     SessionTags { id: String },
+    SessionRecognizer { id: String },
     SessionWait { id: String },
     SessionTransfer { id: String },
     Transfer,
@@ -84,6 +85,7 @@ impl Route {
             | Route::SessionSignal { id }
             | Route::SessionSnapshot { id }
             | Route::SessionTags { id }
+            | Route::SessionRecognizer { id }
             | Route::SessionWait { id }
             | Route::SessionAdopt { id }
             | Route::SessionTransfer { id } => Some(id),
@@ -119,6 +121,7 @@ impl Route {
                 | Route::SessionResize { .. }
                 | Route::SessionSignal { .. }
                 | Route::SessionTags { .. }
+                | Route::SessionRecognizer { .. }
                 | Route::SessionAdopt { .. }
                 | Route::SessionTransfer { .. }
         )
@@ -158,6 +161,14 @@ pub(crate) enum InputRequest {
         marker_name: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         acknowledge: bool,
+    },
+    /// Delete exactly the observed composer draft, only while it still matches
+    /// and controller input has been quiet (#393). Older daemons reject the kind.
+    GuardedClear {
+        draft: String,
+        controller_idle_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        marker_name: Option<String>,
     },
     AcknowledgeProgramStatus,
     Text {
@@ -283,6 +294,11 @@ pub(crate) struct MarkRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MarkResponse {
     pub offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RecognizerRequest {
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -788,6 +804,7 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 (&Method::POST, Some("signal"), None) => Route::SessionSignal { id: id.to_string() },
                 (&Method::GET, Some("snapshot"), None) => Route::SessionSnapshot { id: id.to_string() },
                 (&Method::POST, Some("tags"), None) => Route::SessionTags { id: id.to_string() },
+                (&Method::POST, Some("recognizer"), None) => Route::SessionRecognizer { id: id.to_string() },
                 (&Method::POST, Some("wait"), None) => Route::SessionWait { id: id.to_string() },
                 (&Method::POST, Some("adopt"), None) => Route::SessionAdopt { id: id.to_string() },
                 (&Method::POST, Some("transfer"), None) => Route::SessionTransfer { id: id.to_string() },
@@ -1099,6 +1116,7 @@ mod tests {
             ("POST", "/sessions/alpha/signal", Route::SessionSignal { id: "alpha".to_string() }),
             ("GET", "/sessions/alpha/snapshot", Route::SessionSnapshot { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/tags", Route::SessionTags { id: "alpha".to_string() }),
+            ("POST", "/sessions/alpha/recognizer", Route::SessionRecognizer { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/wait", Route::SessionWait { id: "alpha".to_string() }),
         ];
 
@@ -1137,8 +1155,8 @@ mod tests {
 mod guarded_send_compatibility {
     use super::*;
 
-    // The old daemon's tag dispatch rejects guarded writes even though it would
-    // ignore unknown fields on a normal send. Unguarded wire requests stay compatible.
+    // The old daemon's tag dispatch rejects guarded writes and clears even though it
+    // would ignore unknown fields on a normal send. Unguarded wire requests stay compatible.
     #[test]
     fn guarded_send_uses_a_kind_older_daemons_cannot_execute() {
         #[derive(Deserialize)]
@@ -1165,5 +1183,10 @@ mod guarded_send_compatibility {
                 assert!(matches!(old, Ok(LegacyInput::Send { text }) if text == "message"));
             }
         }
+        // A guarded clear is likewise known-unsent on a daemon without it (#393).
+        let clear = InputRequest::GuardedClear { draft: "draft".into(), controller_idle_ms: 2000, marker_name: None };
+        let body = clear.transaction_body().unwrap();
+        assert_eq!(serde_json::from_value::<InputRequest>(body.clone()).unwrap(), clear);
+        assert!(serde_json::from_value::<LegacyInput>(body).is_err());
     }
 }

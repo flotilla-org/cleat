@@ -61,9 +61,11 @@ generated text or unmodified Unicode scalar; an encoded key with no known text
 has unverifiable echo. Pending echo evidence is bounded to 64KiB. Unknown,
 transformed, masked, non-echoed or oversized input remains fenced rather than
 being cleared by an arbitrary timeout. Further matching input cannot clear an
-already unverifiable fence. This may prevent guarded sends for the remainder of
-a child activation; unguarded sends remain available. Raw terminal responses
-can cause this conservative false refusal too.
+already unverifiable fence. Raw terminal responses can close the fence too.
+Elapsed time alone never opens it; a matched recognizer selector after a quiet
+interval can (see [Selector evidence replaces the echo fence](#selector-evidence-replaces-the-echo-fence)).
+Without that, the fence stays closed until the child activation ends;
+unguarded sends remain available.
 
 Echo matching is observational evidence, not an application acknowledgement:
 coincidentally identical output can match, and application redraw/encoding may
@@ -96,8 +98,9 @@ cleat send crew-1 --submit --if "composer[value='']" --controller-idle 3s 'Revie
 actor transaction as the write. It uses the screen-query selector grammar,
 including unions and nested predicates. The daemon first validates syntax and
 source capabilities, then pumps pending output, requires the controller echo
-fence to be clear, evaluates the selector on the current structural tree with
-recognizer roles, and only then records the optional marker and writes. Ownership
+fence to be clear (or to be replaced by this selector, below), evaluates the
+selector on the current structural tree with recognizer roles, and only then
+records the optional marker and writes. Ownership
 continues through delayed Enter and controller replay. A separate CLI query
 followed by a send cannot provide this guarantee. `--wait-if` is not implemented.
 
@@ -148,6 +151,75 @@ daemons reject that unknown kind before writing; adding an `if` field to their
 ordinary `send` request would otherwise be silently ignored. Upgrade/restart an
 older daemon before using guarded sends. Unguarded transactions retain `send`.
 
+## Selector evidence replaces the echo fence
+
+A controller keystroke with no predictable echo (an arrow, Escape, a Ctrl chord,
+Kitty-encoded Enter or a raw escape sequence) leaves the fence `pending` or
+`unverifiable`. A guarded send that carries both `--if` and `--controller-idle`,
+where the selector references a recognizer role, treats a match as evidence in
+place of the echo:
+
+```sh
+cleat send crew-1 --submit --if "composer[value='']" --controller-idle 2s 'Review wake: ...'
+```
+
+In the same actor transaction as the write, controller input must have been
+quiet for the requested duration, measured from the last accepted controller
+input, and the selector must match the current frame. The send then proceeds
+even though the fence was pending or unverifiable, and the fence is recorded as
+cleared by the selector (see `cleared_by` below). The next controller write
+closes it again and needs new echo or a new match.
+
+- A refusal is unchanged: `not-matched` or `role-absent` when the selector does
+  not match, and `controller-active` with cause `quiet-time` when input is not
+  yet quiet. Nothing is written. All three are retryable.
+- `--controller-idle` stays an immediate predicate on the last controller input;
+  it never starts or waits on a timer.
+- A `settling` fence (echo matched less than 100 ms ago) still refuses with
+  `fence-settling`; it opens on its own.
+- Guarded sends without `--if`, and selectors that reference no recognizer role
+  (such as `screen` or `row:has-text(...)`), keep the conservative fence. So does
+  `--if` without `--controller-idle`.
+
+The selector, not cleat, decides what the match proves. `composer[value='']`
+proves an empty composer on the recognizer's latest observation of the current
+frame. Under a negation such as `:not(composer[value='x'])` a missing composer
+matches too, so use a positive composer predicate for delivery.
+
+An older cleat refuses such a send with `controller-active`
+(`fence-unverifiable` or `fence-pending`) and writes nothing, so a caller can
+treat that refusal as known-unsent.
+
+## Guarded composer clear
+
+Flotilla stashes an abandoned draft and then clears it. Read the draft as the
+recognizer sees it from `inspect --json` (the `composer` role's `value` under
+`recognizer.observation.roles`), then:
+
+```sh
+cleat clear-composer crew-1 --draft "$DRAFT" --controller-idle 30s
+```
+
+The daemon builds the guard `composer[value='<draft>']`, with quotes and
+backslashes escaped, and checks it like a guarded send: quiet for the
+duration, the selector matching the current frame, and the same selector
+evidence for a pending or unverifiable fence. Only then does it write N forward
+deletes followed by N backspaces, where N is the draft's character count. From
+any cursor position these remove at most the N characters the guard observed;
+a key beyond a buffer edge does nothing there. No Escape, Enter or other key is
+sent, so nothing outside the composer buffer is edited. The CLI exit codes and
+refusal reasons are those of the selector-guard table. `--draft` must not be
+empty (exit 2, HTTP 400). Both bundled recognizers cannot observe spaces after
+the cursor; such trailing spaces can survive a clear.
+
+```json
+{"kind":"guarded_clear","draft":"abandoned draft","controller_idle_ms":30000,"marker_name":null}
+```
+
+POST this to `/sessions/SESSION/input`. The response is the guarded send's
+`{"marker_offset":null}`. Older daemons reject the unknown kind before writing,
+and an older CLI has no `clear-composer` command (exit 2): both are known-unsent.
+
 ## Controller fence diagnostics
 
 `inspect --json` and `GET /sessions/{id}` include `controller_fence`:
@@ -164,8 +236,17 @@ is derived from the echo-match timestamp plus the 100 ms settling interval,
 even if no inspect request occurred at that instant. It is null for an initial
 `clear` fence. `settles_at` appears only while settling. An unverifiable fence
 instead includes `cause`: `no-known-text` for input without known echo text,
-or `oversized` when pending echo evidence exceeds 64 KiB. These diagnostics
-survive live host transfer and reset to initial `clear` on a new child activation.
+or `oversized` when pending echo evidence exceeds 64 KiB. A `clear` fence that a
+matched selector opened instead includes `cleared_by`:
+
+```json
+{"state":"clear","since":1760918400000,"cleared_by":{"cause":"selector","generation":7}}
+```
+
+`since` is when the match cleared it, and `generation` is the controller input
+generation it covered. `cleared_by` disappears with the next controller write.
+These diagnostics survive live host transfer and reset to initial `clear` on a
+new child activation.
 The existing controller generation and last-input timestamp remain unchanged.
 
 A `controller-active` refusal includes an additive `controller` object:
@@ -177,10 +258,12 @@ A `controller-active` refusal includes an additive `controller` object:
 The causes are `fence-pending`, `fence-unverifiable`, `fence-settling`,
 `quiet-time` (the requested quiet interval has not elapsed), and `busy`
 (another submission owns the PTY). CLI diagnostics include `controller.cause`.
-The reason, HTTP 409 status and CLI exit 1 are unchanged. Callers should not
-keep retrying `fence-unverifiable`: it stays closed until the child activation
-ends, so fall back and alert the operator. Pending masked input and transformed
-echo may also remain pending indefinitely; elapsed quiet time does not open them.
+The reason, HTTP 409 status and CLI exit 1 are unchanged. A send without
+selector evidence should not keep retrying `fence-pending` or
+`fence-unverifiable`: such a fence opens only on echo, a matched recognizer
+selector with `--controller-idle`, or a new child activation. Pending masked input
+and transformed echo may also remain pending indefinitely; elapsed quiet time
+does not open them.
 
 Diagnostics expose no typed bytes, expected echo, partial-match progress or byte
 counts. This avoids disclosing even the length of masked input. The conservative

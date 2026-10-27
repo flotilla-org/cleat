@@ -4164,6 +4164,25 @@ fn handle_http_request(
                     hosted.pending_sends.push(PendingSend { stream: pending_stream, result });
                     return Ok(());
                 }
+                http_uds::InputRequest::GuardedClear { draft, controller_idle_ms, marker_name } => {
+                    let (selector, keys) = match crate::host::submission::composer_clear(&draft) {
+                        Ok(clear) => clear,
+                        Err(error) => return http_uds::write_json(stream, StatusCode::BAD_REQUEST, &error).map_err(|e| e.to_string()),
+                    };
+                    let pending_stream = stream.try_clone().map_err(|err| format!("clone clear response: {err}"))?;
+                    let result = hosted.actor.begin_send(
+                        keys,
+                        false,
+                        true,
+                        crate::host::actor::SendPreconditions {
+                            controller_idle: Some(Duration::from_millis(controller_idle_ms)),
+                            selector: Some(selector),
+                        },
+                        marker_name,
+                    )?;
+                    hosted.pending_sends.push(PendingSend { stream: pending_stream, result });
+                    return Ok(());
+                }
                 http_uds::InputRequest::AcknowledgeProgramStatus => hosted.actor.acknowledge_program_status(),
                 http_uds::InputRequest::Text { text } => {
                     hosted.actor.write_input(text.into_bytes())?;
@@ -4242,6 +4261,24 @@ fn handle_http_request(
             broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
             http_uds::write_json(stream, StatusCode::OK, &http_uds::TagResponse { tags })
                 .map_err(|err| format!("write HTTP tag response: {err}"))
+        }
+        http_uds::Route::SessionRecognizer { id } => {
+            let Some(hosted) = state.sessions.get_mut(&id) else {
+                return write_http_not_found(stream);
+            };
+            let body: http_uds::RecognizerRequest =
+                serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP recognizer request: {err}"))?;
+            let tags = match hosted.actor.set_recognizer(body.id) {
+                Ok(tags) => tags,
+                Err(error) => {
+                    return http_uds::write_error(stream, StatusCode::UNPROCESSABLE_ENTITY, &error)
+                        .map_err(|err| format!("write HTTP recognizer error: {err}"))
+                }
+            };
+            hosted.metadata.tags.clone_from(&tags);
+            broadcast_directory_upsert(directory_entry_for_session(state.layout, hosted, state.packet_clients)?, state.packet_clients)?;
+            http_uds::write_json(stream, StatusCode::OK, &http_uds::TagResponse { tags })
+                .map_err(|err| format!("write HTTP recognizer response: {err}"))
         }
         http_uds::Route::SessionMark { id } => {
             let Some(hosted) = state.sessions.get(&id) else {
@@ -4522,6 +4559,7 @@ fn route_waits_for_transfer(route: &http_uds::Route) -> bool {
             | Route::SessionResize { .. }
             | Route::SessionSignal { .. }
             | Route::SessionTags { .. }
+            | Route::SessionRecognizer { .. }
             | Route::SessionTransfer { .. }
     )
 }

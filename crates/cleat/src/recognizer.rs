@@ -1139,7 +1139,7 @@ state='idle'"#,
     #[test]
     fn claude_code_cast_fixtures() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recognizers");
-        for stem in ["claude-code-80x24", "claude-code-120x40", "auth-80x24", "auth-120x40"] {
+        for stem in ["claude-code-80x24", "claude-code-120x40", "auth-80x24", "auth-120x40", "crew-80x24", "crew-120x40"] {
             let mut vt = crate::vt::ghostty::GhosttyVtEngine::new(80, 24);
             check_fixture(
                 &root.join(format!("fixtures/claude-code/{stem}.cast")),

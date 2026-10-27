@@ -1,0 +1,77 @@
+# Executable expectations for every recorded marker.
+# Recorded harness: Claude Code 2.1.287 under flotilla crew settings
+# (bypass permissions footer, prompt suggestions off). No OSC 7501 is emitted.
+
+[[marker]]
+name = "empty"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = ""
+
+[[marker]]
+name = "draft"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "Describe the throwaway file."
+
+[[marker]]
+name = "draft-multiline"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "line one\nline two"
+
+[[marker]]
+name = "draft-space"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "   "
+
+[[marker]]
+name = "draft-cursor-left"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "abc def"
+
+[[marker]]
+name = "cleared"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = ""
+
+[[marker]]
+name = "working"
+state = "working"
+[[marker.role]]
+role = "composer"
+value = ""
+[[marker.role]]
+role = "status"
+value = ""
+
+[[marker]]
+name = "done"
+state = "done"
+[[marker.role]]
+role = "composer"
+value = ""
+
+[[marker]]
+name = "done-draft"
+state = "idle"
+[[marker.role]]
+role = "composer"
+value = "Draft after the turn"
+
+[[marker]]
+name = "question"
+state = "blocked"
+[[marker.role]]
+role = "dialog"
+value = ""
+kind = "question"

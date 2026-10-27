@@ -1,5 +1,91 @@
 # Claude Code recognizer fixtures
 
+## Flotilla crew settings (#376, #393)
+
+Recorded 2026-10-27 on Linux with **Claude Code 2.1.287** and cleat 0.1.0
+(`11246d090b34`, Ghostty VT), launched the way flotilla launches a Claude crew.
+These casts cover the bypass-permissions footer that crews show instead of
+`? for shortcuts`.
+
+| Cast | Terminal size | Expectations |
+| --- | --- | --- |
+| `crew-120x40.cast` | 120 columns × 40 rows | `crew-120x40.toml` |
+| `crew-80x24.cast` | 80 columns × 24 rows | `crew-80x24.toml` |
+
+### Reproduction
+
+Work in a `mktemp -d` scratch directory `$S` holding an empty `work/`, a fresh
+`config/.claude.json` that only marks onboarding complete and trusts
+`$S/work`, and a copy of the crew's `claude-settings.json` with its `hooks`
+removed (the hooks report to flotilla and do not change the screen). The kept
+settings are `promptSuggestionEnabled: false`,
+`skipDangerousModePermissionPrompt: true` and empty attribution. `run.sh`
+reads the crew's OAuth token file into `CLAUDE_CODE_OAUTH_TOKEN` at exec time,
+so the token is never part of the launch command or session metadata, then runs:
+
+```sh
+claude --dangerously-skip-permissions --settings "$S/claude-settings.json" --model claude-opus-5-5
+```
+
+```sh
+cleat --server fixture-376 launch crew-120x40 --size 120x40 --cwd "$S/work" \
+  --env-clear --env PATH=/usr/bin:/bin --env HOME="$S" --env CLAUDE_CONFIG_DIR="$S/config" \
+  --env CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false --env DISABLE_AUTOUPDATER=1 \
+  --env LANG=C.UTF-8 --cmd "$S/run.sh"
+```
+
+`--size 80x24` made the smaller cast. `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`
+matches the crew environment. `DISABLE_AUTOUPDATER=1` stops the scratch `HOME`
+from installing an update and drawing a restart notice; crews run a read-only
+harness install. Drafts went in with `cleat send --no-enter`, a newline with
+`\` then `Enter`, the cursor with `send-keys Left`, and each draft was cleared
+with repeated `C-u`. Prompts were submitted with `cleat send --submit`; the
+`working` prompt is the sleep/printf prompt from the authenticated recordings
+below and `question` uses the same AskUserQuestion prompt.
+Markers were placed after `cleat wait --screen-stable`.
+
+### Markers
+
+| Marker | Screen at marker |
+| --- | --- |
+| `empty` | `❯` and nothing else in the composer. No placeholder is drawn. Footer `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`. |
+| `draft` | `❯ Describe the throwaway file.`; the footer drops `· ← for agents`. |
+| `draft-multiline` | `❯ line one` and an indented `line two`. |
+| `draft-space` | Three typed spaces: nothing visible, cursor three cells right of the empty position. |
+| `draft-cursor-left` | `❯ abc def`, cursor before `def`. |
+| `cleared` | The empty composer again after `C-u`. |
+| `working` | Bash sleep running; footer adds `· esc to interrupt`. |
+| `done` | `Done.` reply, `✻ Worked for …s · done H:MM AM` and the empty composer. |
+| `done-draft` | `Draft after the turn` typed under the completed turn. |
+| `question` | AskUserQuestion dialog with Blue, Green and free-text options. |
+
+At 80×24 the footer is truncated (`· ← for ag…`), so the footer hint is not
+used as evidence. The composer is empty when the cursor-bearing row between the
+rules holds only `❯` and the cursor sits at the value start: the existing value
+extraction trims padding up to the cursor and reads `""`. A completed turn is
+`done` when that row holds only the marker and the footer lacks
+`esc to interrupt`. A space-only draft after a completed turn therefore reads as
+`done` rather than `idle`, though its composer value keeps the spaces.
+
+The harness emits no OSC 7501, so no marker asserts OSC agreement.
+
+### Prompt suggestions not recorded
+
+#376 also asks for a cast with a prompt suggestion showing. Two attempts with
+`promptSuggestionEnabled: true` (one with
+`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=true`) completed turns that end in a
+question, but 2.1.287 drew no suggestion in this environment, so how the
+harness styles suggestion text remains unmeasured. Flotilla crews turn
+suggestions off.
+
+### Privacy
+
+Every event of both casts was decoded and reviewed: input, OSC titles and
+output. Only throwaway text was typed. The banner shows the model and
+`Claude API`, not an account, plan or e-mail. The scratch path appears only
+as `~/work`. The OAuth token does not occur in either cast (checked by
+searching for a fragment of it). The casts end at the `question` marker.
+
 ## Authenticated macOS recordings (#355)
 
 Recorded 2026-10-19 on macOS with **Claude Code 2.1.303**
@@ -214,7 +300,7 @@ Both casts were read in full (every output and input event, decoded) before comm
 ## Executable recognizer coverage (#353)
 
 Run `cargo test -p cleat --lib claude_code_cast_fixtures` with the prepared
-Ghostty VT backend. All 28 markers are checked. The rule file declares only the
+Ghostty VT backend. All 48 markers are checked, including the 20 crew-settings markers. The rule file declares only the
 two exact recorded versions; the 2.1.287 claim covers composer scenarios, not
 unrecorded authenticated states.
 

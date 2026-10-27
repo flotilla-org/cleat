@@ -165,10 +165,16 @@ cleat send crew-1 --submit --if "composer[value='']" --controller-idle 2s 'Revie
 
 In the same actor transaction as the write, controller input must have been
 quiet for the requested duration, measured from the last accepted controller
-input, and the selector must match the current frame. The send then proceeds
-even though the fence was pending or unverifiable, and the fence is recorded as
-cleared by the selector (see `cleared_by` below). The next controller write
-closes it again and needs new echo or a new match.
+input, and the selector must match the current frame. Every role the selector
+names must also be present on that frame, so a negation such as
+`:not(:has(composer[value='x']))` cannot match a frame without a composer
+(`role-absent`). The send then proceeds even though the fence was pending or
+unverifiable. Once the write has succeeded, the fence is recorded as cleared by
+the selector (see `cleared_by` below); a failed write leaves it closed. The
+next controller write closes it again and needs new echo or a new match.
+No settling interval follows a selector clearance: the matched frame already
+showed the effect of the controller input, so a later guarded send does not
+wait for further redraws.
 
 - A refusal is unchanged: `not-matched` or `role-absent` when the selector does
   not match, and `controller-active` with cause `quiet-time` when input is not
@@ -183,8 +189,7 @@ closes it again and needs new echo or a new match.
 
 The selector, not cleat, decides what the match proves. `composer[value='']`
 proves an empty composer on the recognizer's latest observation of the current
-frame. Under a negation such as `:not(composer[value='x'])` a missing composer
-matches too, so use a positive composer predicate for delivery.
+frame; use such a positive composer predicate for delivery.
 
 An older cleat refuses such a send with `controller-active`
 (`fence-unverifiable` or `fence-pending`) and writes nothing, so a caller can
@@ -204,9 +209,10 @@ The daemon builds the guard `composer[value='<draft>']`, with quotes and
 backslashes escaped, and checks it like a guarded send: quiet for the
 duration, the selector matching the current frame, and the same selector
 evidence for a pending or unverifiable fence. Only then does it write N forward
-deletes followed by N backspaces, where N is the draft's character count. From
-any cursor position these remove at most the N characters the guard observed;
-a key beyond a buffer edge does nothing there. No Escape, Enter or other key is
+deletes followed by N backspaces, where N is the draft's character count (at
+least one key per character). From any cursor position they empty a buffer
+holding that draft, provided the application ignores Delete and Backspace at a
+buffer edge, as Claude Code and Codex do. No Escape, Enter or other key is
 sent, so nothing outside the composer buffer is edited. The CLI exit codes and
 refusal reasons are those of the selector-guard table. `--draft` must not be
 empty (exit 2, HTTP 400). Both bundled recognizers cannot observe spaces after

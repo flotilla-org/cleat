@@ -34,7 +34,7 @@ pub(crate) use super::submission::{ControllerRefusalCause, SendError, SendPrecon
 use super::{
     presentation::{GateTransition, PresentationGate},
     submission::{
-        authorize, controller_event_is_activity, controller_expected_echo, ControllerActivity, ControllerReplayQueue,
+        controller_event_is_activity, controller_expected_echo, guarded_write, ControllerActivity, ControllerReplayQueue,
         QueuedControllerInput, SUBMIT_ENTER_DELAY,
     },
 };
@@ -1619,18 +1619,26 @@ fn session_actor_handle_command(
                     return Err("session unavailable".into());
                 }
                 // Output pump -> controller observation fence -> predicates -> first write.
-                authorize(&mut state.controller, &preconditions, Instant::now(), |selector| runtime.check_selector(selector))?;
-                let marker_offset = marker_name.map(|name| runtime.mark(Some(name))).transpose()?;
-                if submit {
-                    route_paste_on_actor(runtime, &text)?;
-                } else {
-                    let mut bytes = text;
-                    if !no_enter {
-                        bytes.push(b'\r');
-                    }
-                    runtime.write_input(&bytes)?;
-                }
-                Ok(marker_offset)
+                guarded_write(
+                    runtime,
+                    &mut state.controller,
+                    &preconditions,
+                    Instant::now(),
+                    |runtime, selector, require_roles| runtime.check_selector(selector, require_roles),
+                    |runtime| {
+                        let marker_offset = marker_name.map(|name| runtime.mark(Some(name))).transpose()?;
+                        if submit {
+                            route_paste_on_actor(runtime, &text)?;
+                        } else {
+                            let mut bytes = text;
+                            if !no_enter {
+                                bytes.push(b'\r');
+                            }
+                            runtime.write_input(&bytes)?;
+                        }
+                        Ok(marker_offset)
+                    },
+                )
             })();
             match result {
                 Ok(marker_offset) if submit => {

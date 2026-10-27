@@ -985,7 +985,13 @@ impl SessionRuntime {
         Ok(())
     }
 
-    pub(crate) fn check_selector(&mut self, selector: &terminal_screen::Selector) -> Result<(), crate::host::submission::SendError> {
+    /// `require_roles` also refuses `role-absent` when any referenced role is missing,
+    /// even if the selector matched (for example through a negation).
+    pub(crate) fn check_selector(
+        &mut self,
+        selector: &terminal_screen::Selector,
+        require_roles: bool,
+    ) -> Result<(), crate::host::submission::SendError> {
         use crate::host::submission::{evaluate_selector, SendError};
         if let Some(error) = self.recognizer.as_ref().and_then(|engine| engine.inspect.error.as_ref()) {
             return Err(SendError::new(500, "error", error.clone()));
@@ -994,7 +1000,7 @@ impl SessionRuntime {
         if let Some(engine) = &self.recognizer {
             crate::recognizer::attach_roles(&mut tree, &engine.inspect.observation.roles).map_err(SendError::from)?;
         }
-        evaluate_selector(selector, &tree)
+        evaluate_selector(selector, &tree, require_roles)
     }
 
     /// Queries expose the last evaluated roles. The actor pumps output before
@@ -1243,7 +1249,7 @@ mod tests {
         let selector = terminal_screen::Selector::parse("screen").unwrap();
         runtime.check_selector_support(&selector).unwrap();
         runtime.recognizer.as_mut().unwrap().observation_error("recognizer fixture error".into());
-        let error = runtime.check_selector(&selector).unwrap_err();
+        let error = runtime.check_selector(&selector, false).unwrap_err();
         assert_eq!((error.status, error.reason.as_str()), (500, "error"));
         assert_eq!(error.to_string(), "recognizer fixture error");
         runtime.write_input(b"unguarded").unwrap();
@@ -1289,14 +1295,18 @@ mod tests {
         let tags = runtime.set_recognizer("synthetic").unwrap();
         assert_eq!(tags, runtime.session.tags);
         assert_eq!(runtime.inspect(false, 0).recognizer.unwrap().id, "synthetic");
-        runtime.check_selector(&draft).unwrap();
+        runtime.check_selector(&draft, false).unwrap();
+        // A failed replacement keeps the running recognizer and its tag.
+        assert!(runtime.set_recognizer("missing-recognizer").is_err());
+        assert_eq!(runtime.session.tags, tags);
+        assert_eq!(runtime.inspect(false, 0).recognizer.unwrap().id, "synthetic");
 
         runtime.set_recognizer("claude-code").unwrap();
         assert_eq!(runtime.session.tags.iter().filter(|tag| tag.starts_with("recognizer:")).count(), 1);
         assert!(runtime.session.tags.contains(&"purpose=probe".to_string()));
         assert_eq!(crate::recognizer::load_selected(&runtime.session.tags).unwrap().unwrap().id, "claude-code");
         assert_eq!(runtime.inspect(false, 0).recognizer.unwrap().id, "claude-code");
-        assert_eq!(runtime.check_selector(&draft).unwrap_err().reason, "role-absent");
+        assert_eq!(runtime.check_selector(&draft, false).unwrap_err().reason, "role-absent");
     }
 
     #[cfg(unix)]

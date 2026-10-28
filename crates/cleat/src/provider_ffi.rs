@@ -42,6 +42,8 @@ pub const CLEAT_SESSION_CLOSED: u32 = 3;
 pub const CLEAT_ROLE_UNKNOWN: u32 = 0;
 pub const CLEAT_ROLE_WATCHER: u32 = 1;
 pub const CLEAT_ROLE_CONTROLLER: u32 = 2;
+/// Session desc only: attach with no default view (see `cleat_session_open_view`).
+pub const CLEAT_ROLE_NO_VIEW: u32 = 3;
 pub const CLEAT_ATTACHMENT_PRINCIPAL: u32 = 0;
 pub const CLEAT_ATTACHMENT_SUPERVISOR: u32 = 1;
 pub const CLEAT_ATTACHMENT_TOOL: u32 = 2;
@@ -294,7 +296,8 @@ pub struct CleatSessionDesc {
     /// Requested attachment role for daemon sessions: CLEAT_ROLE_UNKNOWN /
     /// CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
     /// another controller holds exclusive control); CLEAT_ROLE_WATCHER attaches
-    /// read-only. Ignored by other backends.
+    /// read-only; CLEAT_ROLE_NO_VIEW attaches with no default view. Ignored by
+    /// other backends.
     pub role: u32,
     /// UTF-8 name used in seat status and watcher banners.
     pub attachment_name: *const u8,
@@ -2944,12 +2947,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
         environment: Vec::new(),
     })?;
-    let (channel, slot) = connection.open_session_channel(
-        metadata.id.clone(),
-        daemon_geometry_from_desc(desc),
-        channel_role_from_ffi(desc.role)?,
-        attachment_identity_from_desc(desc)?,
-    );
+    let (channel, slot) = open_daemon_channel(connection, metadata.id.clone(), desc)?;
     Ok(DaemonSession {
         dedicated_connection: false,
         id: metadata.id,
@@ -2962,17 +2960,27 @@ fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let id = read_optional_utf8(desc.id, desc.id_len)
         .map_err(|err| format!("id is not valid UTF-8: {err}"))?
         .ok_or_else(|| "attach requires a session id".to_string())?;
-    let (channel, slot) = connection.open_session_channel(
-        id.clone(),
-        daemon_geometry_from_desc(desc),
-        channel_role_from_ffi(desc.role)?,
-        attachment_identity_from_desc(desc)?,
-    );
+    let (channel, slot) = open_daemon_channel(connection, id.clone(), desc)?;
     Ok(DaemonSession {
         dedicated_connection: false,
         id,
         view: DaemonView::new(Arc::clone(connection), channel, crate::packet::DEFAULT_VIEW, slot),
     })
+}
+
+/// Open the attachment a session handle holds: with its default view, or with
+/// none when the desc asks for CLEAT_ROLE_NO_VIEW, which never falls back to a
+/// default view on a daemon that predates views.
+fn open_daemon_channel(
+    connection: &Arc<crate::provider_daemon::DaemonConnection>,
+    id: String,
+    desc: CleatSessionDesc,
+) -> Result<(u32, Arc<Mutex<crate::provider_daemon::ChannelSlot>>), String> {
+    let identity = attachment_identity_from_desc(desc)?;
+    if desc.role != CLEAT_ROLE_NO_VIEW {
+        return Ok(connection.open_session_channel(id, daemon_geometry_from_desc(desc), channel_role_from_ffi(desc.role)?, identity));
+    }
+    connection.open_attachment_channel(id, identity)
 }
 
 fn daemon_geometry_from_desc(desc: CleatSessionDesc) -> TerminalResizeEvent {

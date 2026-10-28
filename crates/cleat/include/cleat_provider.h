@@ -29,6 +29,8 @@ extern "C" {
 #define CLEAT_ROLE_UNKNOWN 0u
 #define CLEAT_ROLE_WATCHER 1u
 #define CLEAT_ROLE_CONTROLLER 2u
+/* cleat_session_desc.role only: attach with no default view. */
+#define CLEAT_ROLE_NO_VIEW 3u
 #define CLEAT_ATTACHMENT_PRINCIPAL 0u
 #define CLEAT_ATTACHMENT_SUPERVISOR 1u
 #define CLEAT_ATTACHMENT_TOOL 2u
@@ -269,6 +271,14 @@ typedef struct cleat_session_desc {
      * CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
      * another controller holds exclusive control); CLEAT_ROLE_WATCHER attaches
      * read-only. The granted role is reported by cleat_session_role.
+     * CLEAT_ROLE_NO_VIEW attaches with no default view: nothing renders and
+     * nothing votes until cleat_session_open_view, and the session handle's
+     * per-view calls fail as after cleat_session_close_default_view. It never
+     * falls back to a default view: against a daemon already known to predate
+     * views (protocol 16) the create or attach returns NULL; one not yet
+     * connected closes the attachment when it connects, so its views report
+     * CLOSED with the reason (cleat_view_close_reason) and later
+     * cleat_session_open_view calls return NULL.
      */
     uint32_t role;
     /*
@@ -847,7 +857,8 @@ void cleat_session_release_render_update(cleat_session *session, cleat_render_up
 /*
  * Views (daemon sessions, packet protocol 16). A session handle is one
  * attachment to its session and keeps a default view, on which every
- * per-view cleat_session_* call above acts. Each cleat_view is another place
+ * per-view cleat_session_* call above acts, unless it attached with
+ * CLEAT_ROLE_NO_VIEW. Each cleat_view is another place
  * showing the session, with its own role, window size, focus, history
  * position and render updates. Live views share the attachment's one update
  * stream. Grid size is the intersection over controller views across all

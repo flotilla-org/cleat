@@ -237,6 +237,13 @@ pub(crate) struct ConsumedRender {
 
 impl ChannelSlot {
     fn new(session_id: String, identity: AttachmentIdentity, geometry: TerminalResizeEvent, role: ChannelRole) -> Self {
+        let mut slot = Self::without_views(session_id, identity);
+        slot.views.insert(crate::packet::DEFAULT_VIEW, ViewSlot::new(geometry, role));
+        slot
+    }
+
+    /// An attachment that opens with no views; its first view opens later.
+    fn without_views(session_id: String, identity: AttachmentIdentity) -> Self {
         Self {
             session_id,
             clipboard: Default::default(),
@@ -247,7 +254,7 @@ impl ChannelSlot {
             views_protocol: false,
             live_pending: None,
             live: Default::default(),
-            views: BTreeMap::from([(crate::packet::DEFAULT_VIEW, ViewSlot::new(geometry, role))]),
+            views: BTreeMap::new(),
             next_view: crate::packet::DEFAULT_VIEW + 1,
         }
     }
@@ -578,6 +585,10 @@ struct ConnectionState {
     views: bool,
 }
 
+fn viewless_unsupported() -> String {
+    format!("the daemon predates views (protocol {}) and cannot attach without a default view", crate::packet::VIEWS_PROTOCOL_VERSION)
+}
+
 fn views_unsupported() -> String {
     format!("the daemon predates views (protocol {}); open another session handle instead", crate::packet::VIEWS_PROTOCOL_VERSION)
 }
@@ -715,6 +726,25 @@ impl DaemonConnection {
         let slot = Arc::new(Mutex::new(ChannelSlot::new(session_id, identity, geometry, role)));
         let channel = self.register_slot(Arc::clone(&slot));
         (channel, slot)
+    }
+
+    /// Register an attachment with no views (views protocol only). Fails on
+    /// a daemon known to predate views; one that connects later and predates
+    /// them closes the attachment with the same reason.
+    pub(crate) fn open_attachment_channel(
+        &self,
+        session_id: String,
+        identity: AttachmentIdentity,
+    ) -> Result<(u32, Arc<Mutex<ChannelSlot>>), String> {
+        {
+            let state = recover_lock(&self.state);
+            if state.connected && !state.views {
+                return Err(viewless_unsupported());
+            }
+        }
+        let slot = Arc::new(Mutex::new(ChannelSlot::without_views(session_id, identity)));
+        let channel = self.register_slot(Arc::clone(&slot));
+        Ok((channel, slot))
     }
 
     /// Give `slot` a channel on this connection and open it (now, or on the
@@ -951,7 +981,8 @@ impl DaemonConnection {
     }
 
     /// (Re)open a channel with its views. The default view opens with the
-    /// channel; a closed default view opens as a watcher and closes at once.
+    /// channel; without one the attachment opens with no views, which a
+    /// daemon that predates views cannot do.
     fn reopen_channel(&self, channel: u32, slot: &Arc<Mutex<ChannelSlot>>) {
         let views = recover_lock(&self.state).views;
         let (session_id, identity, default, others) = {
@@ -969,35 +1000,37 @@ impl DaemonConnection {
             }
             (slot.session_id.clone(), slot.identity.clone(), default, others)
         };
-        let role = default.map_or(ChannelRole::Watcher, |(_, role)| role);
-        let opened = self.send_frame_result(PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
-            channel,
-            session_id,
-            role,
-            take: false,
-            identity,
-        }));
+        let opened = match default {
+            Some((_, role)) => self.send_frame_result(PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
+                channel,
+                session_id,
+                role,
+                take: false,
+                identity,
+            })),
+            None if views => self.send_frame_result(PacketFrame::new(
+                CHANNEL_CONTROL,
+                crate::packet::MSG_CONTROL_OPEN_ATTACHMENT,
+                &crate::packet::OpenAttachment { channel, session_id, identity },
+            )),
+            None => {
+                recover_lock(slot).closed = Some(viewless_unsupported());
+                (self.wake)();
+                return;
+            }
+        };
         if opened.is_err() {
             return;
         }
-        match default {
-            // The daemon does not resize on channel open; assert the size this
-            // client wants so a session created detached comes up at view size.
-            // Watcher geometry is retained for promotion but does not size the PTY.
-            // Use the existing input event to carry pixels without a protocol bump.
-            Some((geometry, _)) => {
-                let _ = self.send_view_frame(
-                    crate::packet::DEFAULT_VIEW,
-                    PacketFrame::new(channel, MSG_SESSION_INPUT, &crate::packet::Input { event: TerminalInputEvent::Resize(geometry) }),
-                );
-            }
-            None if views => {
-                let _ =
-                    self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_CLOSE_VIEW, &crate::packet::CloseView {
-                        view: crate::packet::DEFAULT_VIEW,
-                    }));
-            }
-            None => {}
+        // The daemon does not resize on channel open; assert the size this
+        // client wants so a session created detached comes up at view size.
+        // Watcher geometry is retained for promotion but does not size the PTY.
+        // Use the existing input event to carry pixels without a protocol bump.
+        if let Some((geometry, _)) = default {
+            let _ = self.send_view_frame(
+                crate::packet::DEFAULT_VIEW,
+                PacketFrame::new(channel, MSG_SESSION_INPUT, &crate::packet::Input { event: TerminalInputEvent::Resize(geometry) }),
+            );
         }
         for (view, geometry, role) in others {
             let _ = self.send_open_view(channel, view, geometry, role);
@@ -2337,6 +2370,44 @@ mod tests {
             read_view_frame(&mut server),
             (None, PacketFrame::new(channel, MSG_SESSION_RESIZE, &crate::packet::Resize { cols: 100, rows: 30 }).unwrap())
         );
+        connection.shutdown();
+    }
+
+    #[test]
+    fn an_attachment_without_views_never_falls_back_to_a_default_view() {
+        // A daemon with views opens it with no views; views open on it later.
+        {
+            let (_temp, layout) = test_layout();
+            let daemon = views_daemon(&layout);
+            let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+            let mut server = daemon.accept(vec![directory_entry("alpha")]);
+            wait_until(|| connection.is_connected());
+            let (channel, slot) = connection.open_attachment_channel("alpha".into(), AttachmentIdentity::default()).unwrap();
+            let open = crate::packet::OpenAttachment { channel, session_id: "alpha".into(), identity: AttachmentIdentity::default() };
+            assert_eq!(
+                read_view_frame(&mut server),
+                (None, PacketFrame::new(CHANNEL_CONTROL, crate::packet::MSG_CONTROL_OPEN_ATTACHMENT, &open).unwrap())
+            );
+            let view = connection.open_view(channel, geometry(60, 20), ChannelRole::Watcher).expect("view handle");
+            let (_, frame) = read_view_frame(&mut server);
+            assert_eq!(frame.decode::<crate::packet::OpenView>().unwrap().view, view);
+            assert!(recover_lock(&slot).view(crate::packet::DEFAULT_VIEW).is_none());
+            connection.shutdown();
+        }
+        // A daemon before views closes it instead, and opens nothing for it.
+        let (_temp, layout) = test_layout();
+        let daemon = FakeDaemon::bind(&layout);
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+        let (_, slot) = connection.open_attachment_channel("alpha".into(), AttachmentIdentity::default()).unwrap();
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| recover_lock(&slot).closed.is_some());
+        assert!(recover_lock(&slot).closed.as_deref().is_some_and(|reason| reason.contains("without a default view")));
+        let refused = connection.open_attachment_channel("alpha".into(), AttachmentIdentity::default());
+        assert!(refused.err().is_some_and(|reason| reason.contains("without a default view")));
+        let (other, _) =
+            connection.open_session_channel("alpha".into(), geometry(80, 24), ChannelRole::Watcher, AttachmentIdentity::default());
+        let (_, frame) = read_view_frame(&mut server);
+        assert_eq!(frame.decode::<OpenChannel>().unwrap().channel, other, "the closed attachment was opened");
         connection.shutdown();
     }
 

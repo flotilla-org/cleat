@@ -2714,12 +2714,10 @@ fn packet_role_counts(session_id: &str, packet_clients: &[PacketClient]) -> (u32
     let mut controllers = 0u32;
     let mut watchers = 0u32;
     for client in packet_clients {
-        for session_channel in client.channels.values().filter(|channel| channel.session_id == session_id) {
-            for view in session_channel.views.values() {
-                match view.role {
-                    ChannelRole::Controller => controllers = controllers.saturating_add(1),
-                    ChannelRole::Watcher => watchers = watchers.saturating_add(1),
-                }
+        for session_channel in client.channels.values().filter(|channel| channel.present_in(session_id)) {
+            match session_channel.role() {
+                ChannelRole::Controller => controllers = controllers.saturating_add(1),
+                ChannelRole::Watcher => watchers = watchers.saturating_add(1),
             }
         }
     }
@@ -2793,13 +2791,8 @@ fn packet_presence(hosted: &HostedSession, clients: &[PacketClient]) -> (Vec<cra
         .iter()
         .filter(|client| !client.dead)
         .flat_map(|client| {
-            client.channels.iter().filter(|(_, channel)| channel.session_id == hosted.metadata.id).flat_map(move |(id, channel)| {
-                channel.views.values().map(move |view| crate::packet::Participant {
-                    connection: client.id,
-                    channel: *id,
-                    identity: channel.identity.clone(),
-                    role: view.role,
-                })
+            client.channels.iter().filter(|(_, channel)| channel.present_in(&hosted.metadata.id)).map(move |(id, channel)| {
+                crate::packet::Participant { connection: client.id, channel: *id, identity: channel.identity.clone(), role: channel.role() }
             })
         })
         .collect();
@@ -2900,16 +2893,16 @@ fn inspect_hosted_session(hosted: &HostedSession, packet_clients: &[PacketClient
         denial_reason: client.denial_reason,
     }));
     for client in packet_clients {
-        result.attachments.extend(client.channels.values().filter(|channel| channel.session_id == result.session.id).flat_map(|channel| {
-            channel.views.values().map(|view| crate::protocol::AttachmentInspect {
-                role: match view.role {
+        result.attachments.extend(client.channels.values().filter(|channel| channel.present_in(&result.session.id)).map(|channel| {
+            crate::protocol::AttachmentInspect {
+                role: match channel.role() {
                     ChannelRole::Controller => "controller",
                     ChannelRole::Watcher => "watcher",
                 }
                 .to_string(),
                 identity: channel.identity.clone(),
-                denial_reason: view.denial_reason,
-            })
+                denial_reason: channel.denial_reason(),
+            }
         }));
     }
     Ok(result)
@@ -4862,6 +4855,29 @@ impl PacketSessionChannel {
         self.views.values().any(|view| view.role == ChannelRole::Controller)
     }
 
+    /// Presence counts attachments that show the session in at least one view.
+    fn present_in(&self, session_id: &str) -> bool {
+        self.session_id == session_id && !self.views.is_empty()
+    }
+
+    /// Presence counts attachments: one drives while any of its views does.
+    fn role(&self) -> ChannelRole {
+        if self.has_controller() {
+            ChannelRole::Controller
+        } else {
+            ChannelRole::Watcher
+        }
+    }
+
+    /// A watching attachment reports why its views were refused control.
+    fn denial_reason(&self) -> Option<RoleDenialReason> {
+        if self.has_controller() {
+            None
+        } else {
+            self.views.values().find_map(|view| view.denial_reason)
+        }
+    }
+
     /// Address a per-view server message: wrapped on views channels, as-is on legacy ones.
     fn view_frame<T: serde::Serialize>(&self, channel: u32, view: u32, msg_type: u8, value: &T) -> Result<PacketFrame, String> {
         let frame = PacketFrame::new(channel, msg_type, value).map_err(|err| format!("encode view packet: {err}"))?;
@@ -5197,7 +5213,25 @@ fn handle_packet_frame(
     match (frame.channel, frame.msg_type) {
         (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL) => {
             let open = frame.decode::<OpenChannel>().map_err(|err| format!("decode open-channel packet: {err}"))?;
-            open_packet_channel(layout, sessions, packet_clients, index, open, &mut updates)?;
+            open_packet_channel(layout, sessions, packet_clients, index, open, true, &mut updates)?;
+        }
+        (CHANNEL_CONTROL, crate::packet::MSG_CONTROL_OPEN_ATTACHMENT) => {
+            let open = frame.decode::<crate::packet::OpenAttachment>().map_err(|err| format!("decode open-attachment packet: {err}"))?;
+            if !packet_clients[index].views {
+                packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+                    channel: open.channel,
+                    message: "an attachment without a default view needs the views protocol".to_string(),
+                })?;
+                return Ok(updates);
+            }
+            let open = OpenChannel {
+                channel: open.channel,
+                session_id: open.session_id,
+                role: ChannelRole::Watcher,
+                take: false,
+                identity: open.identity,
+            };
+            open_packet_channel(layout, sessions, packet_clients, index, open, false, &mut updates)?;
         }
         (CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL) => {
             let close = frame.decode::<CloseChannel>().map_err(|err| format!("decode close-channel packet: {err}"))?;
@@ -5498,6 +5532,7 @@ fn open_packet_channel(
     packet_clients: &mut [PacketClient],
     index: usize,
     open: OpenChannel,
+    default_view: bool,
     updates: &mut Vec<DirectoryEntry>,
 ) -> Result<(), String> {
     if open.channel == CHANNEL_CONTROL {
@@ -5564,6 +5599,29 @@ fn open_packet_channel(
             return Ok(());
         }
     };
+    if !default_view {
+        // No view, no reader: the attachment's live stream starts with a full
+        // frame when its first view opens.
+        if fresh {
+            hosted.packet_render_cache.store(update.clone());
+        }
+        packet_clients[index].channels.insert(open.channel, PacketSessionChannel {
+            program_status: false,
+            status_generation: None,
+            _output_lease: output_lease,
+            session_id: open.session_id,
+            identity: open.identity,
+            views_protocol: true,
+            views: BTreeMap::new(),
+            live: RenderCredit::new(None, 0),
+            last_sent_generation: update.packet.update.render_generation,
+            clipboard_loss: 0,
+            local_images: true,
+            image_resident: HashSet::new(),
+            image_transfers: VecDeque::new(),
+        });
+        return Ok(());
+    }
     let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
     // The channel opens with its default view.
     let requester = PacketChannelRef::new(packet_clients[index].id, open.channel, crate::packet::DEFAULT_VIEW);

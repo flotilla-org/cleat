@@ -13,8 +13,9 @@ use std::{
 
 use cleat::{
     packet::{
-        Ack, ChannelRole, CloseView, ControlHello, Input, OpenChannel, OpenView, PacketFrame, RenderPacket, Resize, RoleRequest, RoleState,
-        ViewFrame, Viewport, CHANNEL_CONTROL, MIN_SUPPORTED_PROTOCOL_VERSION, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_HELLO,
+        Ack, ChannelRole, CloseView, ControlError, ControlHello, DirectoryDelta, Input, OpenAttachment, OpenChannel, OpenView, PacketFrame,
+        RenderPacket, Resize, RoleRequest, RoleState, ViewFrame, Viewport, CHANNEL_CONTROL, MIN_SUPPORTED_PROTOCOL_VERSION,
+        MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_ATTACHMENT,
         MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_CLIPBOARD, MSG_SESSION_CLOSE_VIEW, MSG_SESSION_INPUT, MSG_SESSION_OPEN_VIEW,
         MSG_SESSION_RENDER, MSG_SESSION_RENDER_VIRTUAL, MSG_SESSION_RESIZE, MSG_SESSION_ROLE, MSG_SESSION_SIZE_POLICY, MSG_SESSION_VIEW,
         MSG_SESSION_VIEWPORT, MSG_SESSION_VIEW_STATE, PROTOCOL_VERSION, VIEWS_PROTOCOL_VERSION,
@@ -438,6 +439,51 @@ fn take_control_on_a_view_demotes_the_other_controller_views() {
     assert!(!fixture.capture("alpha").contains("demoted-view"));
 }
 
+/// Wait for a directory update giving `session` these controller and watcher counts.
+#[track_caller]
+fn expect_counts(peer: &mut Peer, session: &str, counts: (u32, u32)) {
+    peer.expect("directory counts", |seen| {
+        seen.channel == CHANNEL_CONTROL
+            && seen.frame.msg_type == MSG_CONTROL_DIRECTORY_DELTA
+            && seen
+                .frame
+                .decode::<DirectoryDelta>()
+                .unwrap()
+                .upserted
+                .iter()
+                .any(|entry| entry.session_id == session && (entry.controller_count, entry.watcher_count) == counts)
+    });
+}
+
+// Presence counts attachments, not views: an attachment drives while any of
+// its views does, and one with no views is not present.
+#[test]
+fn presence_counts_attachments_not_views() {
+    let _lock = fixture_lock();
+    let mut fixture = Fixture::new();
+    fixture.create("alpha", "cat");
+    let mut first = fixture.peer(true);
+    attach_views(&mut first, "alpha", ChannelRole::Controller, &[(1, ChannelRole::Watcher), (2, ChannelRole::Watcher)]);
+    let mut second = fixture.peer(true);
+    second.open_channel(1, "alpha", ChannelRole::Watcher);
+    let presence = second.expect_role(1, Some(0));
+    let roles: Vec<_> = presence.participants.iter().map(|participant| participant.role).collect();
+    assert_eq!(roles, [ChannelRole::Controller, ChannelRole::Watcher], "one participant per attachment");
+    let mut inspected: Vec<_> = fixture.service().inspect("alpha").unwrap().attachments.into_iter().map(|a| a.role).collect();
+    inspected.sort();
+    assert_eq!(inspected, ["controller", "watcher"]);
+    expect_counts(&mut second, "alpha", (1, 1));
+
+    // Closing the driving view leaves an attachment of watchers; closing the
+    // rest leaves it with no views and out of presence.
+    first.close_view(1, 0);
+    expect_counts(&mut second, "alpha", (0, 2));
+    first.close_view(1, 1);
+    first.close_view(1, 2);
+    expect_counts(&mut second, "alpha", (0, 1));
+    assert_eq!(fixture.service().inspect("alpha").unwrap().attachments.len(), 1);
+}
+
 const CLIPBOARD_COMMAND: &str =
     "sh -c 'stty -echo; while IFS= read -r line; do case \"$line\" in copy) printf \"\\033]52;c;aGVsbG8=\\007\";; esac; done'";
 
@@ -505,6 +551,42 @@ fn closing_views_leaves_the_rest_of_the_attachment_and_connection_working() {
     peer.expect("live stream resumes", |seen| seen.channel == 1 && seen.view.is_none() && seen.is_render());
 }
 
+// An attachment can open with no views: nothing renders on it and it neither
+// votes nor counts until its first view opens, which gets the whole grid.
+// Without the views protocol the daemon refuses it rather than open a view.
+#[test]
+fn an_attachment_without_views_waits_for_its_first_view() {
+    let _lock = fixture_lock();
+    let mut fixture = Fixture::new();
+    fixture.create("alpha", "cat");
+    fixture.service().send_keys("alpha", b"before-views\n").unwrap();
+    wait_until("output before views", || fixture.capture("alpha").contains("before-views"));
+    let mut peer = fixture.peer(true);
+    let open = OpenAttachment { channel: 1, session_id: "alpha".into(), identity: AttachmentIdentity::default() };
+    peer.send(CHANNEL_CONTROL, MSG_CONTROL_OPEN_ATTACHMENT, &open);
+    peer.pump(Duration::from_millis(300));
+    fixture.service().send_keys("alpha", b"while-viewless\n").unwrap();
+    wait_until("output while viewless", || fixture.capture("alpha").contains("while-viewless"));
+    peer.pump(Duration::from_millis(300));
+    assert!(!peer.seen.iter().any(|seen| seen.channel == 1), "a viewless attachment received {:?}", peer.summary());
+    assert!(fixture.service().inspect("alpha").unwrap().attachments.is_empty());
+
+    peer.open_view(1, 4, ChannelRole::Controller);
+    assert_eq!(peer.expect_role(1, Some(4)).role, ChannelRole::Controller);
+    let first = peer.expect("first live render", |seen| seen.channel == 1 && seen.view.is_none() && seen.is_render()).render();
+    let text = render_text(&first);
+    assert!(text.contains("before-views") && text.contains("while-viewless"), "first render was not the whole grid: {text}");
+    peer.resize(1, 4, 72, 21);
+    wait_until("the first view votes", || fixture.size("alpha") == (72, 21));
+    assert_eq!(fixture.service().inspect("alpha").unwrap().attachments.len(), 1);
+
+    let mut legacy = fixture.peer(false);
+    legacy.send(CHANNEL_CONTROL, MSG_CONTROL_OPEN_ATTACHMENT, &open);
+    let refused = legacy.expect("refusal", |seen| seen.channel == CHANNEL_CONTROL && seen.frame.msg_type == MSG_CONTROL_ERROR);
+    assert_eq!(refused.frame.decode::<ControlError>().unwrap().channel, 1);
+    assert_eq!(fixture.service().inspect("alpha").unwrap().attachments.len(), 1);
+}
+
 // A refused view closes alone: a reserved id or one view too many is closed
 // by the daemon, a reused id is ignored, and the attachment carries on.
 #[test]
@@ -513,11 +595,13 @@ fn refused_views_close_alone() {
     let mut fixture = Fixture::new();
     fixture.create("alpha", "cat");
     let mut peer = fixture.peer(true);
-    attach_views(&mut peer, "alpha", ChannelRole::Controller, &[(1, ChannelRole::Watcher)]);
+    attach_views(&mut peer, "alpha", ChannelRole::Watcher, &[(1, ChannelRole::Watcher)]);
     peer.open_view(1, 1, ChannelRole::Controller);
     peer.pump(Duration::from_millis(300));
+    // Every kept view watches, so the attachment drives only if a refused
+    // controller view was granted.
     let controllers = || fixture.service().inspect("alpha").unwrap().attachments.iter().filter(|a| a.role == "controller").count();
-    assert_eq!(controllers(), 1, "a reused view id was granted again");
+    assert_eq!(controllers(), 0, "a reused view id was granted again");
     for view in 2..64 {
         peer.open_view(1, view, ChannelRole::Watcher);
     }
@@ -529,9 +613,8 @@ fn refused_views_close_alone() {
         let refused = peer.expect("refused view", |seen| seen.view.is_none() && seen.frame.msg_type == MSG_SESSION_CLOSE_VIEW);
         assert_eq!(refused.frame.decode::<CloseView>().unwrap(), CloseView { view });
     }
-    assert_eq!(fixture.service().inspect("alpha").unwrap().attachments.len(), 64);
-    assert_eq!(controllers(), 1);
-    peer.paste(1, 0, "still-attached\n");
+    assert_eq!(controllers(), 0, "a refused view was granted");
+    fixture.service().send_keys("alpha", b"still-attached\n").unwrap();
     peer.expect("live render", |seen| seen.channel == 1 && seen.is_render() && render_text(&seen.render()).contains("still-attached"));
 }
 
@@ -657,7 +740,7 @@ mod c_api {
                 wait_until("view streams", || cleat_view_connection_state(view) == CLEAT_SESSION_STREAMING);
             }
             wait_until("views intersect", || fixture.size("alpha") == (70, 20));
-            assert_eq!(fixture.service().inspect("alpha").unwrap().attachments.len(), 2);
+            assert_eq!(fixture.service().inspect("alpha").unwrap().attachments.len(), 1, "two views are one attachment");
 
             let text = b"from-the-wide-view\n";
             assert!(cleat_view_write_bytes(wide, text.as_ptr(), text.len()));
@@ -682,6 +765,28 @@ mod c_api {
             wait_until("the closed view stops voting", || fixture.size("alpha") == (100, 30));
             cleat_view_destroy(wide);
             wait_until("no views remain", || fixture.service().inspect("alpha").unwrap().attachments.is_empty());
+
+            // A second handle attaches with no default view: it shows nothing
+            // and counts for nothing until its first view opens.
+            let attached = cleat_session_attach(provider, &CleatSessionDesc {
+                cols: 80,
+                rows: 24,
+                id: id.as_ptr(),
+                id_len: id.len(),
+                role: CLEAT_ROLE_NO_VIEW,
+                ..Default::default()
+            });
+            assert!(!attached.is_null());
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(cleat_session_role(attached), CLEAT_ROLE_UNKNOWN);
+            assert!(fixture.service().inspect("alpha").unwrap().attachments.is_empty());
+            let only = cleat_session_open_view(attached, &view_desc(90, 28, CLEAT_ROLE_CONTROLLER));
+            assert!(!only.is_null());
+            wait_until("first view streams", || cleat_view_connection_state(only) == CLEAT_SESSION_STREAMING);
+            wait_for_update(only, "the whole grid", |text, _| text.contains("while-narrow-browses"));
+            wait_until("the first view votes", || fixture.size("alpha") == (90, 28));
+            cleat_view_destroy(only);
+            cleat_session_destroy(attached);
             cleat_session_destroy(session);
             cleat_provider_close(provider);
         }

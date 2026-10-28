@@ -29,6 +29,9 @@ pub const MSG_CONTROL_ACTIVITY_EVENT: u8 = 8;
 /// Precedes the `ControlError` that closes a channel whose session moved to
 /// another host. Clients that do not know it ignore it and see the close.
 pub const MSG_CONTROL_REDIRECT: u8 = 9;
+/// Views protocol only: open an attachment with no views ([`OpenAttachment`]).
+/// Nothing renders on it until its first view opens.
+pub const MSG_CONTROL_OPEN_ATTACHMENT: u8 = 10;
 
 pub const MSG_SESSION_RENDER: u8 = 16;
 pub const MSG_SESSION_ACK: u8 = 17;
@@ -234,6 +237,15 @@ pub struct OpenChannel {
     /// Preempt the existing controller, which remains connected as a watcher.
     pub take: bool,
     #[serde(default)]
+    pub identity: AttachmentIdentity,
+}
+
+/// An attachment opened without its default view: no role is granted and no
+/// render sent until a view opens on it with [`OpenView`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAttachment {
+    pub channel: u32,
+    pub session_id: String,
     pub identity: AttachmentIdentity,
 }
 
@@ -557,6 +569,15 @@ impl<S: Read + Write> PacketClient<S> {
             session_id: session_id.to_string(),
             role,
             take: false,
+            identity: AttachmentIdentity::default(),
+        })
+    }
+
+    /// Views protocol: open an attachment with no views.
+    pub fn open_attachment(&mut self, channel: u32, session_id: &str) -> std::io::Result<()> {
+        self.write(CHANNEL_CONTROL, MSG_CONTROL_OPEN_ATTACHMENT, &OpenAttachment {
+            channel,
+            session_id: session_id.to_string(),
             identity: AttachmentIdentity::default(),
         })
     }

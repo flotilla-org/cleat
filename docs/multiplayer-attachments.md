@@ -43,6 +43,10 @@ messages they saw before.
   `u32::MAX` is reserved.
 - `MSG_SESSION_CLOSE_VIEW` (`CloseView { view }`) closes one. Closing the last view
   leaves the channel open and touches nothing else on the connection.
+- An attachment holds at most 64 views. The daemon refuses a view past the limit,
+  or with the reserved id, by sending `MSG_SESSION_CLOSE_VIEW` for it; the
+  attachment and connection carry on. A request reusing an open view's id is
+  ignored.
 - `MSG_SESSION_VIEW` wraps a per-view message (`ViewFrame { view, msg_type,
   payload }`). Clients wrap input, resize, viewport, role requests and history
   acks; unwrapped ones address the default view. The daemon wraps history renders,

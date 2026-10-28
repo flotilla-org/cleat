@@ -49,6 +49,8 @@ pub const MSG_SESSION_PROGRAM_STATUS: u8 = 30;
 /// Client: open another view on this attachment ([`OpenView`]). Views protocol only.
 pub const MSG_SESSION_OPEN_VIEW: u8 = 31;
 /// Client: close one view ([`CloseView`]); the attachment stays open.
+/// Daemon: the view was refused (a reserved id, or more views than an
+/// attachment may hold).
 pub const MSG_SESSION_CLOSE_VIEW: u8 = 32;
 /// Either direction: a per-view message wrapped in a [`ViewFrame`].
 pub const MSG_SESSION_VIEW: u8 = 33;

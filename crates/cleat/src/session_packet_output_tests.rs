@@ -282,3 +282,27 @@ fn program_status_hello_capability_matrix() {
         assert_eq!(hello_for_subscription(virtual_placements, program_status, recognizer_roles, true), ControlHello::current());
     }
 }
+
+// An unwrapped ack releases only the attachment's live stream (or a legacy
+// channel's one stream); history credit needs that view's wrapped ack.
+#[test]
+fn unwrapped_acks_never_release_a_views_history_credit() {
+    let mut views = channel(1, image());
+    views.views_protocol = true;
+    views.live = RenderCredit::new(Some(5), 5);
+    views.views.insert(1, PacketView::new(ChannelRole::Watcher, ChannelRole::Watcher, None, RenderCredit::new(Some(6), 6)));
+    let held = |channel: &PacketSessionChannel| (channel.live.in_flight_generation, channel.views[&1].credit.in_flight_generation);
+    views.release_credit(None, 6);
+    assert_eq!(held(&views), (Some(5), Some(6)));
+    views.release_credit(None, 5);
+    assert_eq!(held(&views), (None, Some(6)));
+    views.release_credit(Some(1), 6);
+    assert_eq!(held(&views), (None, None));
+
+    // A legacy channel has no wrapped acks; its unwrapped ack is its one stream.
+    let mut legacy = channel(1, image());
+    legacy.release_credit(Some(0), 1);
+    assert_eq!(legacy.views[&0].credit.in_flight_generation, Some(1));
+    legacy.release_credit(None, 1);
+    assert_eq!(legacy.views[&0].credit.in_flight_generation, None);
+}

@@ -505,6 +505,35 @@ fn closing_views_leaves_the_rest_of_the_attachment_and_connection_working() {
     peer.expect("live stream resumes", |seen| seen.channel == 1 && seen.view.is_none() && seen.is_render());
 }
 
+// A refused view closes alone: a reserved id or one view too many is closed
+// by the daemon, a reused id is ignored, and the attachment carries on.
+#[test]
+fn refused_views_close_alone() {
+    let _lock = fixture_lock();
+    let mut fixture = Fixture::new();
+    fixture.create("alpha", "cat");
+    let mut peer = fixture.peer(true);
+    attach_views(&mut peer, "alpha", ChannelRole::Controller, &[]);
+    for view in 1..64 {
+        peer.open_view(1, view, ChannelRole::Watcher);
+    }
+    for view in 1..64 {
+        peer.expect_role(1, Some(view));
+    }
+    for view in [64, u32::MAX] {
+        peer.open_view(1, view, ChannelRole::Controller);
+        let refused = peer.expect("refused view", |seen| seen.view.is_none() && seen.frame.msg_type == MSG_SESSION_CLOSE_VIEW);
+        assert_eq!(refused.frame.decode::<CloseView>().unwrap(), CloseView { view });
+    }
+    peer.open_view(1, 1, ChannelRole::Controller);
+    peer.pump(Duration::from_millis(300));
+    let attachments = fixture.service().inspect("alpha").unwrap().attachments;
+    assert_eq!(attachments.len(), 64);
+    assert_eq!(attachments.iter().filter(|a| a.role == "controller").count(), 1, "a reused view id was granted again");
+    peer.paste(1, 0, "still-attached\n");
+    peer.expect("live render", |seen| seen.channel == 1 && seen.is_render() && render_text(&seen.render()).contains("still-attached"));
+}
+
 // 7. A peer that did not opt in, as every peer before protocol 16, keeps one
 //    implicit view per channel and today's unwrapped messages.
 #[test]

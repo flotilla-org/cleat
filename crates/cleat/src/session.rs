@@ -1980,6 +1980,8 @@ struct PacketChannelRef {
 
 /// No view uses this id; it names the attachment as a whole.
 const ATTACHMENT_VIEW: u32 = u32::MAX;
+/// Bounds the daemon work and memory one attachment can claim.
+const MAX_VIEWS_PER_ATTACHMENT: usize = 64;
 
 impl PacketChannelRef {
     fn new(client_id: u64, channel: u32, view: u32) -> Self {
@@ -4839,6 +4841,23 @@ impl PacketView {
 }
 
 impl PacketSessionChannel {
+    /// Release render credit for an acknowledged render. An unwrapped ack
+    /// (`view` None) releases the attachment's live stream, or a legacy
+    /// channel's one stream, and never a view's history credit; a wrapped ack
+    /// releases only that view's history credit. Packet capture already
+    /// consumed actor damage into the daemon cache.
+    fn release_credit(&mut self, view: Option<u32>, generation: u64) {
+        let credit = match view {
+            None if self.views_protocol => Some(&mut self.live),
+            None => self.views.get_mut(&crate::packet::DEFAULT_VIEW).map(|view| &mut view.credit),
+            Some(view) if self.views_protocol => self.views.get_mut(&view).map(|view| &mut view.credit),
+            Some(_) => None,
+        };
+        if let Some(credit) = credit.filter(|credit| credit.in_flight_generation == Some(generation)) {
+            credit.in_flight_generation = None;
+        }
+    }
+
     fn has_controller(&self) -> bool {
         self.views.values().any(|view| view.role == ChannelRole::Controller)
     }
@@ -5213,17 +5232,7 @@ fn handle_packet_frame(
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
             let client = &mut packet_clients[index];
             if let Some(session_channel) = client.channels.get_mut(&channel) {
-                // An unwrapped ack releases the attachment's live stream, or a
-                // legacy channel's one stream. Packet capture already consumed
-                // actor damage into the daemon cache.
-                let credit = if session_channel.views_protocol {
-                    Some(&mut session_channel.live)
-                } else {
-                    session_channel.views.get_mut(&crate::packet::DEFAULT_VIEW).map(|view| &mut view.credit)
-                };
-                if let Some(credit) = credit.filter(|credit| credit.in_flight_generation == Some(ack.generation)) {
-                    credit.in_flight_generation = None;
-                }
+                session_channel.release_credit(None, ack.generation);
             }
         }
         (channel, crate::packet::MSG_SESSION_PROGRAM_STATUS) if channel != CHANNEL_CONTROL => {
@@ -5294,9 +5303,8 @@ fn handle_packet_view_frame(
         // Only a wrapped ack reaches here: it releases this view's history credit.
         MSG_SESSION_ACK => {
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
-            let packet_view = packet_clients[index].channels.get_mut(&channel).and_then(|session| session.views.get_mut(&view));
-            if let Some(packet_view) = packet_view.filter(|v| v.credit.in_flight_generation == Some(ack.generation)) {
-                packet_view.credit.in_flight_generation = None;
+            if let Some(session) = packet_clients[index].channels.get_mut(&channel) {
+                session.release_credit(Some(view), ack.generation);
             }
         }
         MSG_SESSION_INPUT => {
@@ -5630,11 +5638,17 @@ fn open_packet_view(
     let Some(session) = packet_clients[index].channels.get(&channel).filter(|session| session.views_protocol) else {
         return Ok(());
     };
-    if open.view == ATTACHMENT_VIEW {
-        return Err(format!("view {ATTACHMENT_VIEW} is reserved"));
-    }
+    // A view id already in use is the client's own mistake: the open view
+    // keeps going and the request is ignored.
     if session.views.contains_key(&open.view) {
-        return Err("view is already open".into());
+        return Ok(());
+    }
+    // A reserved id, or one view too many, is refused alone: the daemon closes
+    // that view and leaves the attachment and connection as they are.
+    if open.view == ATTACHMENT_VIEW || session.views.len() >= MAX_VIEWS_PER_ATTACHMENT {
+        let frame = PacketFrame::new(channel, crate::packet::MSG_SESSION_CLOSE_VIEW, &crate::packet::CloseView { view: open.view })
+            .map_err(|err| format!("encode close-view packet: {err}"))?;
+        return packet_clients[index].enqueue_frame(&frame);
     }
     let session_id = session.session_id.clone();
     let last_sent_generation = session.last_sent_generation;
@@ -6599,6 +6613,22 @@ mod tests {
         let caught_up = cache.since(2).unwrap().packet.update;
         assert_eq!(caught_up.ops[0].kind, FullVisibleReplace);
         assert_eq!(caught_up.ops[0].rows[0], cached_row(0, "x"));
+    }
+
+    // Ops arrive decoded from the wire: rows past the grid are skipped, and a
+    // source row near u16::MAX neither overflows nor panics.
+    #[test]
+    fn packet_cache_skips_scroll_rows_outside_the_grid() {
+        use TerminalRenderUpdateOpKind::{FullVisibleReplace, ScrollCopy};
+        let mut cache = crate::render_cache::PacketRenderCache::default();
+        cache.store(cached_update(1, FullVisibleReplace, vec![cached_row(0, "a"), cached_row(1, "b"), cached_row(2, "c")]));
+        let mut scroll = cached_update(2, ScrollCopy, vec![]);
+        scroll.packet.update.ops[0].src_row = u16::MAX - 1;
+        scroll.packet.update.ops[0].dst_row = 0;
+        scroll.packet.update.ops[0].row_count = 4;
+        cache.store(scroll);
+        let caught_up = cache.since(1).unwrap().packet.update;
+        assert!(caught_up.ops.is_empty(), "rows outside the grid were copied: {:?}", caught_up.ops);
     }
 
     #[cfg(feature = "ghostty-vt")]

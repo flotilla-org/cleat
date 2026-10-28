@@ -42,8 +42,9 @@ impl PacketRenderCache {
             }
             if op.kind == Kind::ScrollCopy {
                 // Snapshot before copying so overlapping scrolls are lossless.
+                // Decoded ops are untrusted: rows past the grid are skipped.
                 let copied: Vec<_> =
-                    (0..op.row_count).filter_map(|offset| self.rows.get(usize::from(op.src_row + offset)).cloned()).collect();
+                    (0..op.row_count).filter_map(|offset| self.rows.get(usize::from(op.src_row) + usize::from(offset)).cloned()).collect();
                 for (offset, mut row) in copied.into_iter().enumerate() {
                     let index = usize::from(op.dst_row) + offset;
                     if let Some(target) = self.rows.get_mut(index) {

@@ -1354,6 +1354,15 @@ impl DaemonConnection {
                 drop(slot);
                 (self.wake)();
             }
+            crate::packet::MSG_SESSION_CLOSE_VIEW => {
+                if let Ok(close) = frame.decode::<crate::packet::CloseView>() {
+                    if let Some(view) = recover_lock(&slot).view_mut(close.view) {
+                        view.closed = Some("the daemon refused this view (an attachment holds at most 64 views)".into());
+                        view.reset();
+                    }
+                    (self.wake)();
+                }
+            }
             crate::packet::MSG_SESSION_VIEW_STATE => {
                 if let Ok(state) = frame.decode::<crate::provider::ViewState>() {
                     let mut slot = recover_lock(&slot);
@@ -2285,6 +2294,14 @@ mod tests {
         connection.send_ack(channel, RenderAck::View(1, 6)).unwrap();
         let (view, ack) = read_view_frame(&mut server);
         assert_eq!((view, ack.decode::<Ack>().unwrap()), (Some(1), Ack { generation: 6 }));
+
+        // A view the daemon refuses reports why; the default view carries on.
+        PacketFrame::new(channel, crate::packet::MSG_SESSION_CLOSE_VIEW, &crate::packet::CloseView { view: 1 })
+            .unwrap()
+            .write(&mut server)
+            .unwrap();
+        wait_until(|| recover_lock(&slot).view_closed(1).is_some_and(|reason| reason.contains("refused")));
+        assert!(recover_lock(&slot).view_closed(0).is_none());
         connection.shutdown();
     }
 

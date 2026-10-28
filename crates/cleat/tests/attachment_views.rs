@@ -513,11 +513,15 @@ fn refused_views_close_alone() {
     let mut fixture = Fixture::new();
     fixture.create("alpha", "cat");
     let mut peer = fixture.peer(true);
-    attach_views(&mut peer, "alpha", ChannelRole::Controller, &[]);
-    for view in 1..64 {
+    attach_views(&mut peer, "alpha", ChannelRole::Controller, &[(1, ChannelRole::Watcher)]);
+    peer.open_view(1, 1, ChannelRole::Controller);
+    peer.pump(Duration::from_millis(300));
+    let controllers = || fixture.service().inspect("alpha").unwrap().attachments.iter().filter(|a| a.role == "controller").count();
+    assert_eq!(controllers(), 1, "a reused view id was granted again");
+    for view in 2..64 {
         peer.open_view(1, view, ChannelRole::Watcher);
     }
-    for view in 1..64 {
+    for view in 2..64 {
         peer.expect_role(1, Some(view));
     }
     for view in [64, u32::MAX] {
@@ -525,11 +529,8 @@ fn refused_views_close_alone() {
         let refused = peer.expect("refused view", |seen| seen.view.is_none() && seen.frame.msg_type == MSG_SESSION_CLOSE_VIEW);
         assert_eq!(refused.frame.decode::<CloseView>().unwrap(), CloseView { view });
     }
-    peer.open_view(1, 1, ChannelRole::Controller);
-    peer.pump(Duration::from_millis(300));
-    let attachments = fixture.service().inspect("alpha").unwrap().attachments;
-    assert_eq!(attachments.len(), 64);
-    assert_eq!(attachments.iter().filter(|a| a.role == "controller").count(), 1, "a reused view id was granted again");
+    assert_eq!(fixture.service().inspect("alpha").unwrap().attachments.len(), 64);
+    assert_eq!(controllers(), 1);
     peer.paste(1, 0, "still-attached\n");
     peer.expect("live render", |seen| seen.channel == 1 && seen.is_render() && render_text(&seen.render()).contains("still-attached"));
 }

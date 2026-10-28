@@ -500,8 +500,11 @@ fn relay_packet_stdio(
             let frame = match PacketFrame::read(&mut read_stream) {
                 Ok(frame) => frame,
                 Err(err) => {
-                    // Detach clears alive before shutting down the stream;
-                    // a still-live relay instead observed transport loss.
+                    // Normal session exit queues a channel-scoped ControlError
+                    // in remove_packet_channels_for_session before flushing the
+                    // client. The handler below consumes that close and returns;
+                    // EOF here while still alive is not a confirmed session end.
+                    // Detach clears alive before shutting down the stream.
                     let was_alive = alive_out.swap(false, Ordering::SeqCst);
                     if connect_only && was_alive {
                         return Err(AttachError::Reconnect(format!("socket disconnected: {err}; recovery requires a fresh connect")));
@@ -605,7 +608,10 @@ fn relay_packet_stdio(
                         };
                         if followed {
                             alive_out.store(false, Ordering::SeqCst);
-                            return Err(AttachError::Reconnect(error.message));
+                            return Err(AttachError::Reconnect(format!(
+                                "session moved again: {}; recovery requires a fresh connect",
+                                error.message
+                            )));
                         }
                         let role = if controller_out.load(Ordering::SeqCst) { ChannelRole::Controller } else { ChannelRole::Watcher };
                         let (stream, opened) = match follow_foreground_redirect(&moved, identity.clone(), role) {

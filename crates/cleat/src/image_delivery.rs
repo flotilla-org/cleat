@@ -83,8 +83,9 @@ impl CaptureImages {
     }
 }
 
-/// Holds at most one view transfer per channel. Chunks are encoded on demand,
-/// not queued as a second whole-image copy behind a blocked socket.
+/// One render delivery: its images, then the render. A channel writes its
+/// deliveries in order. Chunks are encoded on demand, not queued as a second
+/// whole-image copy behind a blocked socket.
 pub(crate) struct ImageTransfer {
     images: VecDeque<Image>,
     offset: usize,
@@ -133,6 +134,13 @@ impl ImageTransfer {
         let images = bundle.images.into_iter().filter(|image| wanted.contains(&key(image)) && !resident.contains(&key(image))).collect();
         *resident = wanted;
         Ok(Self { images, offset: 0, render: Some(render), offered: false, waiting: false, local: true })
+    }
+    /// Address the render, sent after its images, to one view of the attachment.
+    pub fn for_view(mut self, view: u32) -> Result<Self, String> {
+        if let Some(render) = self.render.take() {
+            self.render = Some(crate::packet::ViewFrame::wrap(view, &render).map_err(|e| e.to_string())?);
+        }
+        Ok(self)
     }
     pub fn local_files(mut self, enabled: bool) -> Self {
         self.local = enabled;

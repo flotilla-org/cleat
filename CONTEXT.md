@@ -141,15 +141,28 @@ of the same state, never a separate polling mechanism. A session's address is
 never address a single session.
 
 **Client connection shapes**: a multi-pane client (e.g. uishell) holds one
-multiplexed connection to a daemon carrying the directory subscription and its
-session streams; single-session tools (`cleat attach`, `cleat watch`, one-shot CLI
+multiplexed connection to a daemon carrying the directory subscription and one
+attachment per session it shows, with one view per place it shows it; single-session tools (`cleat attach`, `cleat watch`, one-shot CLI
 commands) keep their simple per-session surface. Both are first-class; the
 single-session shape is not collapsed into the multiplexed one.
 
 **Attach**:
 A client resuming a session that already exists — the program is still running,
-so it is lossless and live. Distinct from recreation.
+so it is lossless and live. Distinct from recreation. Attaching creates an
+attachment with one view; `cleat attach` and `cleat watch` never hold more.
 _Avoid_: connect, open.
+
+**Attachment**:
+One client's subscription to one session over one connection: a single update
+stream, with its clipboard effects and image transfer, shared by the attachment's
+views.
+_Avoid_: channel (the transport's word for it), view.
+
+**View**:
+One place an attachment shows its session, with its own role, window size and
+history position. Live views share the attachment's update stream; a view browsing
+history gets its own. Roles, size votes, focus and take control belong to views.
+_Avoid_: pane, window, attachment.
 
 **Ensure Session**:
 Making a durable session id usable for a client by attaching to the live session,
@@ -193,13 +206,13 @@ What the session advertises *to the PTY child* in answer to its capability queri
   **primary controller** (below); with no controller it falls back to the default.
 
 **Controller**:
-An attachment allowed to drive the session — its input reaches the PTY. In the
+A view allowed to drive the session — its input reaches the PTY. In the
 first cut a session has at most one controller (see Take control); concurrent
 co-controllers are a **deferred** extension, and when they arrive, interference
 between them is the controllers' own responsibility, not cleat's.
 
 **Watcher**:
-An attachment that consumes the Update Packet read-only. It renders the session
+A view that consumes the Update Packet read-only. It renders the session
 but its input does not reach the PTY. The basis for "you are not in control"
 indication.
 
@@ -216,10 +229,11 @@ detaches entirely does Passthrough fall back to the default (engine) policy.
 **Grid geometry** (what size the child sees):
 The PTY grid is one `(rows, cols)` the child lays out to. Who decides it:
 - **Control-driven** (default): the grid is sized by control. With one controller
-  the grid is that controller's size; with concurrent co-controllers (deferred) it
-  is the **intersection** (min rows, min cols) of the controllers' sizes, so every
-  driver can see and type into every cell.
-- **Watchers never vote.** A watcher reconciles its own window against the grid
+  view the grid is that view's size; with several it is the **intersection** (min
+  rows, min cols) of every controller view's size, across all attachments, so every
+  driver can see and type into every cell. Two controller views of one attachment
+  each vote.
+- **Watchers never vote.** A watcher view reconciles its own window against the grid
   client-side from the full grid in the Update Packet — letterbox/center if larger,
   pan a viewport or show a "too small" indicator if smaller.
 - **Pinned** (optional): an explicit fixed geometry set at launch or by resize;

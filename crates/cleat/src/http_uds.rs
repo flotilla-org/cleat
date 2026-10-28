@@ -395,6 +395,9 @@ pub(crate) struct PacketSubscribeRequest {
     /// Opt in to atomic render envelopes carrying original virtual declarations.
     #[serde(default)]
     pub virtual_placements: bool,
+    /// Opt in to several views per attachment (protocol 16).
+    #[serde(default)]
+    pub views: bool,
     #[serde(default)]
     pub selectors: Vec<String>,
     #[serde(default)]

@@ -25,7 +25,7 @@
 //! operations there. The caller's channel id and slot stay valid.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Write,
     path::PathBuf,
     sync::{
@@ -132,20 +132,42 @@ impl LastKnown {
     }
 }
 
-/// Per-session-channel state shared between the reader thread and the FFI
-/// caller.
+/// Per-session-channel (attachment) state shared between the reader thread
+/// and the FFI caller. An attachment holds one or more views; the default
+/// view opens with the channel.
 ///
 /// Lock order: the connection-state mutex is always taken BEFORE a channel
 /// slot (`install_connection`, `request_role`). Never call a connection
 /// method that takes the state lock while holding a slot guard.
 pub(crate) struct ChannelSlot {
     pub session_id: String,
-    /// Latest un-consumed render packet. The ack-gated protocol guarantees at
-    /// most one arrives before we ack, and we ack on consumption.
-    pub pending: Option<TerminalRenderUpdate>,
     pub clipboard: crate::clipboard::ClipboardQueue,
     pub clipboard_upstream_dropped: u64,
     images: crate::image_delivery::ImageReceiver,
+    pub identity: AttachmentIdentity,
+    /// Set when the daemon reported an error for this channel (e.g. the
+    /// session went away).
+    pub closed: Option<String>,
+    /// The current connection speaks the views protocol: per-view messages
+    /// are wrapped and live views share the attachment's live stream.
+    views_protocol: bool,
+    /// Views protocol: the latest live render nobody has consumed yet. The
+    /// first live view to consume it acks it.
+    live_pending: Option<crate::image_delivery::RenderBundle>,
+    /// Views protocol: the attachment's live frame, so a view that is behind
+    /// (or new) catches up with one coalesced update.
+    live: crate::render_cache::PacketRenderCache,
+    pub views: BTreeMap<u32, ViewSlot>,
+    next_view: u32,
+}
+
+/// One view of an attachment: its own role, size, history position and
+/// presented frame.
+pub(crate) struct ViewSlot {
+    /// Latest un-consumed render addressed to this view: a legacy channel's
+    /// render, or a history frame. The ack-gated protocol guarantees at most
+    /// one arrives before we ack, and we ack on consumption.
+    pub pending: Option<TerminalRenderUpdate>,
     pub pending_images: Vec<crate::image_delivery::Image>,
     pub pending_links: Vec<crate::provider::TerminalViewLink>,
     pub view_state: crate::provider::ViewState,
@@ -156,20 +178,201 @@ pub(crate) struct ChannelSlot {
     /// Role the caller wants; requested on every (re)open with take=false —
     /// control lost across a disconnect is re-taken explicitly, not silently.
     pub desired_role: ChannelRole,
-    pub identity: AttachmentIdentity,
     /// Role the daemon granted (None until the first RoleState arrives).
     pub granted_role: Option<ChannelRole>,
-    /// Set when the daemon reported an error for this channel (e.g. the
-    /// session went away).
+    /// Views protocol: showing a history frame rather than the live stream.
+    history: bool,
+    /// Views protocol: the live frame generation this view last presented.
+    live_generation: u64,
+    /// Why this view cannot be served, e.g. the daemon predates views.
     pub closed: Option<String>,
 }
 
-impl ChannelSlot {
-    pub(crate) fn dirty(&self) -> DirtyState {
-        match &self.pending {
-            None => DirtyState::Clean,
-            Some(update) => update_dirty_state(update),
+impl ViewSlot {
+    fn new(geometry: TerminalResizeEvent, role: ChannelRole) -> Self {
+        Self {
+            pending: None,
+            pending_images: Vec::new(),
+            pending_links: Vec::new(),
+            view_state: Default::default(),
+            role_state: None,
+            last: LastKnown::new(geometry.cols, geometry.rows),
+            desired_geometry: geometry,
+            desired_role: role,
+            granted_role: None,
+            history: false,
+            live_generation: 0,
+            closed: None,
         }
+    }
+
+    /// The grant and anything in flight died with the connection or host.
+    fn reset(&mut self) {
+        self.granted_role = None;
+        self.pending = None;
+        self.pending_images.clear();
+        self.pending_links.clear();
+        self.history = false;
+        self.live_generation = 0;
+    }
+}
+
+/// Which render credit a consumed render releases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderAck {
+    /// The channel's unwrapped stream: a views attachment's live stream, or a
+    /// legacy channel's one stream.
+    Channel(u64),
+    /// A views-protocol view's history frame.
+    View(u32, u64),
+}
+
+/// A render taken for presentation by one view.
+pub(crate) struct ConsumedRender {
+    pub update: TerminalRenderUpdate,
+    pub images: Vec<crate::image_delivery::Image>,
+    pub links: Vec<crate::provider::TerminalViewLink>,
+    pub ack: Option<RenderAck>,
+}
+
+impl ChannelSlot {
+    fn new(session_id: String, identity: AttachmentIdentity, geometry: TerminalResizeEvent, role: ChannelRole) -> Self {
+        Self {
+            session_id,
+            clipboard: Default::default(),
+            clipboard_upstream_dropped: 0,
+            images: Default::default(),
+            identity,
+            closed: None,
+            views_protocol: false,
+            live_pending: None,
+            live: Default::default(),
+            views: BTreeMap::from([(crate::packet::DEFAULT_VIEW, ViewSlot::new(geometry, role))]),
+            next_view: crate::packet::DEFAULT_VIEW + 1,
+        }
+    }
+
+    pub(crate) fn view(&self, view: u32) -> Option<&ViewSlot> {
+        self.views.get(&view)
+    }
+
+    pub(crate) fn view_mut(&mut self, view: u32) -> Option<&mut ViewSlot> {
+        self.views.get_mut(&view)
+    }
+
+    pub(crate) fn has_controller(&self) -> bool {
+        self.views.values().any(|view| view.granted_role == Some(ChannelRole::Controller))
+    }
+
+    /// A view's reason it cannot be served: its own, or the attachment's.
+    pub(crate) fn view_closed(&self, view: u32) -> Option<&str> {
+        self.closed.as_deref().or_else(|| self.views.get(&view).map_or(Some("view is closed"), |view| view.closed.as_deref()))
+    }
+
+    /// Whether `view` has presented, or can present, a frame.
+    pub(crate) fn view_streaming(&self, view: u32) -> bool {
+        let Some(slot) = self.views.get(&view) else {
+            return false;
+        };
+        slot.pending.is_some()
+            || slot.last.render_generation > 0
+            || (self.views_protocol && !slot.history && (self.live_pending.is_some() || self.live.latest_generation().is_some()))
+    }
+
+    pub(crate) fn dirty(&self, view: u32) -> DirtyState {
+        let Some(slot) = self.views.get(&view) else {
+            return DirtyState::Clean;
+        };
+        if let Some(update) = &slot.pending {
+            return update_dirty_state(update);
+        }
+        if !self.views_protocol || slot.history {
+            return DirtyState::Clean;
+        }
+        let cached = self.live.latest_generation();
+        match &self.live_pending {
+            Some(pending) if cached.is_none_or(|generation| generation == slot.live_generation) => {
+                update_dirty_state(&pending.packet.update)
+            }
+            Some(_) => DirtyState::Full,
+            None => match cached {
+                Some(generation) if generation > slot.live_generation => {
+                    if self.live.full_since(slot.live_generation) {
+                        DirtyState::Full
+                    } else {
+                        DirtyState::Partial
+                    }
+                }
+                _ => DirtyState::Clean,
+            },
+        }
+    }
+
+    /// Take the next render for `view`, or None when it has nothing new. A
+    /// view that is in step with the live stream gets the daemon's update as
+    /// sent; one that is behind gets a coalesced catch-up from the live frame.
+    pub(crate) fn consume(&mut self, view: u32) -> Option<ConsumedRender> {
+        let views_protocol = self.views_protocol;
+        let slot = self.views.get_mut(&view)?;
+        if let Some(update) = slot.pending.take() {
+            let ack =
+                if views_protocol { RenderAck::View(view, update.render_generation) } else { RenderAck::Channel(update.render_generation) };
+            let images = std::mem::take(&mut slot.pending_images);
+            let links = std::mem::take(&mut slot.pending_links);
+            return Some(slot.present(update, images, links, Some(ack), views_protocol));
+        }
+        if !views_protocol || slot.history {
+            return None;
+        }
+        let mut ack = None;
+        let mut in_step = None;
+        if let Some(pending) = self.live_pending.take() {
+            ack = Some(RenderAck::Channel(pending.packet.update.render_generation));
+            if self.live.latest_generation().is_none_or(|generation| generation == slot.live_generation) {
+                in_step = Some(pending.packet.update.clone());
+            }
+            self.live.store(pending);
+        }
+        let latest = self.live.latest_generation()?;
+        let update = match in_step {
+            Some(update) => update,
+            None if latest > slot.live_generation => self.live.since(slot.live_generation)?.packet.update,
+            None => return None,
+        };
+        slot.live_generation = latest;
+        let bundle = self.live.latest().expect("live frame stored above");
+        let (images, links) = (bundle.images.clone(), bundle.packet.links.clone());
+        Some(slot.present(update, images, links, ack, true))
+    }
+
+    /// Forget everything delivered over a connection that is gone.
+    fn reset_for_reopen(&mut self) {
+        self.clipboard.clear();
+        self.images = Default::default();
+        self.live_pending = None;
+        self.live = Default::default();
+        for view in self.views.values_mut() {
+            view.reset();
+        }
+    }
+}
+
+impl ViewSlot {
+    fn present(
+        &mut self,
+        mut update: TerminalRenderUpdate,
+        images: Vec<crate::image_delivery::Image>,
+        links: Vec<crate::provider::TerminalViewLink>,
+        ack: Option<RenderAck>,
+        monotonic: bool,
+    ) -> ConsumedRender {
+        // A view switching between history frames and the live stream must
+        // not see its render generation go backwards.
+        if monotonic && self.last.render_generation > 0 {
+            update.render_generation = update.render_generation.max(self.last.render_generation.saturating_add(1));
+        }
+        self.last.absorb(&update);
+        ConsumedRender { update, images, links, ack }
     }
 }
 
@@ -371,6 +574,12 @@ struct ConnectionState {
     directory: DirectoryState,
     /// Redirects received for channels whose close has not arrived yet.
     pending_redirects: HashMap<u32, SessionRedirect>,
+    /// The current connection speaks the views protocol.
+    views: bool,
+}
+
+fn views_unsupported() -> String {
+    format!("the daemon predates views (protocol {}); open another session handle instead", crate::packet::VIEWS_PROTOCOL_VERSION)
 }
 
 /// Where a redirected channel lives now.
@@ -428,6 +637,7 @@ impl DaemonConnection {
                 channels: HashMap::new(),
                 directory: DirectoryState::default(),
                 pending_redirects: HashMap::new(),
+                views: false,
             }),
             reader: Mutex::new(None),
             routes: Mutex::new(HashMap::new()),
@@ -502,43 +712,23 @@ impl DaemonConnection {
         role: ChannelRole,
         identity: AttachmentIdentity,
     ) -> (u32, Arc<Mutex<ChannelSlot>>) {
-        let slot = Arc::new(Mutex::new(ChannelSlot {
-            session_id: session_id.clone(),
-            pending: None,
-            clipboard: Default::default(),
-            clipboard_upstream_dropped: 0,
-            images: Default::default(),
-            pending_images: Vec::new(),
-            pending_links: Vec::new(),
-            view_state: Default::default(),
-            role_state: None,
-            last: LastKnown::new(geometry.cols, geometry.rows),
-            desired_geometry: geometry,
-            desired_role: role,
-            identity,
-            granted_role: None,
-            closed: None,
-        }));
+        let slot = Arc::new(Mutex::new(ChannelSlot::new(session_id, identity, geometry, role)));
         let channel = self.register_slot(Arc::clone(&slot));
         (channel, slot)
     }
 
     /// Give `slot` a channel on this connection and open it (now, or on the
-    /// next connect) with the slot's desired geometry and role.
+    /// next connect) with its views' desired geometry and roles.
     fn register_slot(&self, slot: Arc<Mutex<ChannelSlot>>) -> u32 {
-        let (session_id, geometry, role, identity) = {
-            let slot = recover_lock(&slot);
-            (slot.session_id.clone(), slot.desired_geometry, slot.desired_role, slot.identity.clone())
-        };
         let (channel, connected) = {
             let mut state = recover_lock(&self.state);
             let channel = state.next_channel;
             state.next_channel = state.next_channel.wrapping_add(1).max(1);
-            state.channels.insert(channel, slot);
+            state.channels.insert(channel, Arc::clone(&slot));
             (channel, state.connected)
         };
         if connected {
-            let _ = self.send_open_frame(channel, &session_id, geometry, role, &identity);
+            self.reopen_channel(channel, &slot);
         } else {
             // The caller may have just spawned the daemon (session create);
             // cut the reconnect backoff short.
@@ -548,7 +738,7 @@ impl DaemonConnection {
     }
 
     /// Follow a transferred session: re-home the channel's slot on the new
-    /// daemon, re-requesting the role it last held.
+    /// daemon, re-requesting the roles its views last held.
     fn follow_redirect(&self, channel: u32, slot: Arc<Mutex<ChannelSlot>>, redirect: SessionRedirect) {
         if self.transport.is_remote() {
             recover_lock(&slot).closed =
@@ -569,14 +759,12 @@ impl DaemonConnection {
         {
             let mut slot = recover_lock(&slot);
             // The grant died with the old host; the role it held is re-requested.
-            if let Some(role) = slot.granted_role.take() {
-                slot.desired_role = role;
+            for view in slot.views.values_mut() {
+                if let Some(role) = view.granted_role {
+                    view.desired_role = role;
+                }
             }
-            slot.pending = None;
-            slot.clipboard.clear();
-            slot.pending_images.clear();
-            slot.images = Default::default();
-            slot.pending_links.clear();
+            slot.reset_for_reopen();
         }
         let follower = {
             let mut followers = recover_lock(&self.followers);
@@ -588,19 +776,79 @@ impl DaemonConnection {
         recover_lock(&self.routes).insert(channel, ChannelRoute { connection: follower, channel: routed });
     }
 
+    /// Open another view on an attachment. The view is opened now when the
+    /// daemon serves views, or on the next connect; on a daemon that predates
+    /// views it reports why it is closed.
+    pub(crate) fn open_view(&self, channel: u32, geometry: TerminalResizeEvent, role: ChannelRole) -> Option<u32> {
+        if let Some(route) = self.route(channel) {
+            return route.connection.open_view(route.channel, geometry, role);
+        }
+        let (slot, connected, views) = {
+            let state = recover_lock(&self.state);
+            (state.channels.get(&channel).cloned()?, state.connected, state.views)
+        };
+        let view = {
+            let mut slot = recover_lock(&slot);
+            if slot.closed.is_some() {
+                return None;
+            }
+            let view = slot.next_view;
+            slot.next_view = slot.next_view.checked_add(1)?;
+            let mut view_slot = ViewSlot::new(geometry, role);
+            if connected && !views {
+                view_slot.closed = Some(views_unsupported());
+            }
+            slot.views.insert(view, view_slot);
+            view
+        };
+        if connected && views {
+            let _ = self.send_open_view(channel, view, geometry, role);
+        }
+        Some(view)
+    }
+
+    /// Close one view; the attachment and its other views stay open. The
+    /// default view of a daemon that predates views cannot be closed.
+    pub(crate) fn close_view(&self, channel: u32, view: u32) -> Result<(), String> {
+        if let Some(route) = self.route(channel) {
+            return route.connection.close_view(route.channel, view);
+        }
+        let (slot, connected, views) = {
+            let state = recover_lock(&self.state);
+            (state.channels.get(&channel).cloned().ok_or("session channel is closed")?, state.connected, state.views)
+        };
+        {
+            let mut slot = recover_lock(&slot);
+            if connected && !views && view == crate::packet::DEFAULT_VIEW {
+                return Err(views_unsupported());
+            }
+            slot.views.remove(&view).ok_or("view is closed")?;
+        }
+        if connected && views {
+            self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_CLOSE_VIEW, &crate::packet::CloseView { view }))?;
+        }
+        Ok(())
+    }
+
     /// Request a role change (take=true requests exclusive control and demotes
     /// the other controllers). The grant arrives asynchronously as a RoleState.
-    pub(crate) fn request_role(&self, channel: u32, role: ChannelRole, take: bool) -> Result<(), String> {
+    pub(crate) fn request_role(&self, channel: u32, view: u32, role: ChannelRole, take: bool) -> Result<(), String> {
         if let Some(route) = self.route(channel) {
-            return route.connection.request_role(route.channel, role, take);
+            return route.connection.request_role(route.channel, view, role, take);
         }
         {
             let state = recover_lock(&self.state);
             if let Some(slot) = state.channels.get(&channel) {
-                recover_lock(slot).desired_role = role;
+                let mut slot = recover_lock(slot);
+                if let Some(reason) = slot.view_closed(view) {
+                    return Err(reason.to_string());
+                }
+                if let Some(view) = slot.view_mut(view) {
+                    view.desired_role = role;
+                }
             }
         }
-        self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_ROLE, &crate::packet::RoleRequest { role, take }))
+        self.send_view_frame(view, PacketFrame::new(channel, MSG_SESSION_ROLE, &crate::packet::RoleRequest { role, take }))
     }
 
     pub(crate) fn close_session_channel(&self, channel: u32) {
@@ -610,9 +858,11 @@ impl DaemonConnection {
         }
         let removed = {
             let mut state = recover_lock(&self.state);
-            state.channels.remove(&channel).is_some()
+            state.channels.remove(&channel)
         };
-        if removed {
+        if let Some(slot) = removed {
+            // Views opened on this attachment outlive nothing: they report closed.
+            recover_lock(&slot).closed.get_or_insert_with(|| "session handle was destroyed".into());
             let _ = self.send_frame_result(PacketFrame::new(
                 CHANNEL_CONTROL,
                 crate::packet::MSG_CONTROL_CLOSE_CHANNEL,
@@ -621,9 +871,9 @@ impl DaemonConnection {
         }
     }
 
-    pub(crate) fn send_input(&self, channel: u32, event: TerminalInputEvent) -> Result<(), String> {
+    pub(crate) fn send_input(&self, channel: u32, view: u32, event: TerminalInputEvent) -> Result<(), String> {
         if let Some(route) = self.route(channel) {
-            return route.connection.send_input(route.channel, event);
+            return route.connection.send_input(route.channel, view, event);
         }
         let state = recover_lock(&self.state);
         if !state.connected {
@@ -631,6 +881,9 @@ impl DaemonConnection {
         }
         let slot = state.channels.get(&channel).ok_or("session channel is closed")?;
         let slot = recover_lock(slot);
+        if let Some(reason) = slot.view_closed(view) {
+            return Err(reason.to_string());
+        }
         if !matches!(
             event,
             TerminalInputEvent::Focus(_)
@@ -639,20 +892,20 @@ impl DaemonConnection {
                     kind: crate::provider::TerminalMouseEventKind::Wheel,
                     ..
                 })
-        ) && slot.granted_role != Some(ChannelRole::Controller)
+        ) && slot.view(view).and_then(|view| view.granted_role) != Some(ChannelRole::Controller)
         {
             return Err("session is not driving; input was not sent".into());
         }
         drop(slot);
         drop(state);
-        self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_INPUT, &crate::packet::Input { event }))
+        self.send_view_frame(view, PacketFrame::new(channel, MSG_SESSION_INPUT, &crate::packet::Input { event }))
     }
 
-    pub(crate) fn send_resize(&self, channel: u32, cols: u16, rows: u16) -> Result<(), String> {
+    pub(crate) fn send_resize(&self, channel: u32, view: u32, cols: u16, rows: u16) -> Result<(), String> {
         if let Some(route) = self.route(channel) {
-            return route.connection.send_resize(route.channel, cols, rows);
+            return route.connection.send_resize(route.channel, view, cols, rows);
         }
-        self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_RESIZE, &crate::packet::Resize { cols, rows }))
+        self.send_view_frame(view, PacketFrame::new(channel, MSG_SESSION_RESIZE, &crate::packet::Resize { cols, rows }))
     }
 
     pub(crate) fn size_policy(&self, channel: u32, fixed: Option<crate::packet::Resize>) -> Result<(), String> {
@@ -662,40 +915,105 @@ impl DaemonConnection {
         self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_SIZE_POLICY, &fixed))
     }
 
-    pub(crate) fn send_viewport(&self, channel: u32, command: crate::provider::ViewportCommand) -> Result<(), String> {
+    pub(crate) fn send_viewport(&self, channel: u32, view: u32, command: crate::provider::ViewportCommand) -> Result<(), String> {
         if let Some(route) = self.route(channel) {
-            return route.connection.send_viewport(route.channel, command);
+            return route.connection.send_viewport(route.channel, view, command);
         }
-        self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_VIEWPORT, &crate::packet::Viewport { command }))
+        self.send_view_frame(view, PacketFrame::new(channel, crate::packet::MSG_SESSION_VIEWPORT, &crate::packet::Viewport { command }))
     }
 
-    pub(crate) fn send_ack(&self, channel: u32, generation: u64) -> Result<(), String> {
+    pub(crate) fn send_ack(&self, channel: u32, ack: RenderAck) -> Result<(), String> {
         if let Some(route) = self.route(channel) {
-            return route.connection.send_ack(route.channel, generation);
+            return route.connection.send_ack(route.channel, ack);
         }
-        self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_ACK, &crate::packet::Ack { generation }))
+        match ack {
+            RenderAck::Channel(generation) => {
+                self.send_frame_result(PacketFrame::new(channel, MSG_SESSION_ACK, &crate::packet::Ack { generation }))
+            }
+            RenderAck::View(view, generation) => {
+                self.send_view_frame(view, PacketFrame::new(channel, MSG_SESSION_ACK, &crate::packet::Ack { generation }))
+            }
+        }
     }
 
-    fn send_open_frame(
-        &self,
-        channel: u32,
-        session_id: &str,
-        geometry: TerminalResizeEvent,
-        role: ChannelRole,
-        identity: &AttachmentIdentity,
-    ) -> Result<(), String> {
-        self.send_frame_result(PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
+    /// Send a per-view message: wrapped for views, as-is for the default view
+    /// of a daemon that predates them.
+    fn send_view_frame(&self, view: u32, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
+        let views = recover_lock(&self.state).views;
+        if views {
+            let frame = frame.map_err(|err| format!("encode packet frame: {err}"))?;
+            self.send_frame_result(crate::packet::ViewFrame::wrap(view, &frame))
+        } else if view == crate::packet::DEFAULT_VIEW {
+            self.send_frame_result(frame)
+        } else {
+            Err(views_unsupported())
+        }
+    }
+
+    /// (Re)open a channel with its views. The default view opens with the
+    /// channel; a closed default view opens as a watcher and closes at once.
+    fn reopen_channel(&self, channel: u32, slot: &Arc<Mutex<ChannelSlot>>) {
+        let views = recover_lock(&self.state).views;
+        let (session_id, identity, default, others) = {
+            let mut slot = recover_lock(slot);
+            slot.views_protocol = views;
+            let default = slot.view(crate::packet::DEFAULT_VIEW).map(|view| (view.desired_geometry, view.desired_role));
+            let mut others = Vec::new();
+            for (id, view) in slot.views.iter_mut().filter(|(id, _)| **id != crate::packet::DEFAULT_VIEW) {
+                if views {
+                    view.closed = None;
+                    others.push((*id, view.desired_geometry, view.desired_role));
+                } else {
+                    view.closed = Some(views_unsupported());
+                }
+            }
+            (slot.session_id.clone(), slot.identity.clone(), default, others)
+        };
+        let role = default.map_or(ChannelRole::Watcher, |(_, role)| role);
+        let opened = self.send_frame_result(PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL, &OpenChannel {
             channel,
-            session_id: session_id.to_string(),
+            session_id,
             role,
             take: false,
-            identity: identity.clone(),
+            identity,
+        }));
+        if opened.is_err() {
+            return;
+        }
+        match default {
+            // The daemon does not resize on channel open; assert the size this
+            // client wants so a session created detached comes up at view size.
+            // Watcher geometry is retained for promotion but does not size the PTY.
+            // Use the existing input event to carry pixels without a protocol bump.
+            Some((geometry, _)) => {
+                let _ = self.send_view_frame(
+                    crate::packet::DEFAULT_VIEW,
+                    PacketFrame::new(channel, MSG_SESSION_INPUT, &crate::packet::Input { event: TerminalInputEvent::Resize(geometry) }),
+                );
+            }
+            None if views => {
+                let _ =
+                    self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_CLOSE_VIEW, &crate::packet::CloseView {
+                        view: crate::packet::DEFAULT_VIEW,
+                    }));
+            }
+            None => {}
+        }
+        for (view, geometry, role) in others {
+            let _ = self.send_open_view(channel, view, geometry, role);
+        }
+    }
+
+    fn send_open_view(&self, channel: u32, view: u32, geometry: TerminalResizeEvent, role: ChannelRole) -> Result<(), String> {
+        self.send_frame_result(PacketFrame::new(channel, crate::packet::MSG_SESSION_OPEN_VIEW, &crate::packet::OpenView {
+            view,
+            role,
+            take: false,
         }))?;
-        // The daemon does not resize on channel open; assert the size this
-        // client wants so a session created detached comes up at view size.
-        // Watcher geometry is retained for promotion but does not size the PTY.
-        // Use the existing input event to carry pixels without a protocol bump.
-        self.send_input(channel, TerminalInputEvent::Resize(geometry))
+        self.send_view_frame(
+            view,
+            PacketFrame::new(channel, MSG_SESSION_INPUT, &crate::packet::Input { event: TerminalInputEvent::Resize(geometry) }),
+        )
     }
 
     fn send_frame_result(&self, frame: std::io::Result<PacketFrame>) -> Result<(), String> {
@@ -743,7 +1061,7 @@ impl DaemonConnection {
         let mut backoff = RECONNECT_BACKOFF_START;
         while !self.stop.load(Ordering::SeqCst) {
             match self.connect() {
-                Ok(Connected { mut stream, directory, warning }) => {
+                Ok(Connected { mut stream, directory, warning, views }) => {
                     backoff = RECONNECT_BACKOFF_START;
                     {
                         let mut status = recover_lock(&self.status);
@@ -755,7 +1073,7 @@ impl DaemonConnection {
                         }
                         status.warning = warning;
                     }
-                    if !self.install_connection(&stream, directory) {
+                    if !self.install_connection(&stream, directory, views) {
                         continue;
                     }
                     self.read_until_disconnect(&mut stream);
@@ -817,7 +1135,7 @@ impl DaemonConnection {
         (self.wake)();
     }
 
-    fn install_connection(&self, stream: &SessionStream, snapshot: DirectorySnapshot) -> bool {
+    fn install_connection(&self, stream: &SessionStream, snapshot: DirectorySnapshot, views: bool) -> bool {
         let writer_stream = match stream.try_clone() {
             Ok(writer_stream) => writer_stream,
             Err(_) => return false,
@@ -827,35 +1145,31 @@ impl DaemonConnection {
             *writer = Some(writer_stream);
         }
         recover_lock(&self.status).connected = true;
-        let reopen = {
+        let reopen: Vec<(u32, Arc<Mutex<ChannelSlot>>)> = {
             let mut state = recover_lock(&self.state);
             state.connected = true;
+            state.views = views;
             state.directory.replace(snapshot);
-            let reopen: Vec<(u32, String, TerminalResizeEvent, ChannelRole, AttachmentIdentity)> = state
+            state
                 .channels
                 .iter()
-                .filter_map(|(channel, slot)| {
+                .filter(|(_, slot)| {
                     let mut slot = recover_lock(slot);
                     // A closed channel (session gone) stays closed; reopening
                     // it would just re-error on every reconnect until the FFI
                     // caller destroys the session.
                     if slot.closed.is_some() {
-                        return None;
+                        return false;
                     }
-                    // the old grant died with the connection
-                    slot.granted_role = None;
-                    slot.pending = None;
-                    slot.clipboard.clear();
-                    slot.pending_images.clear();
-                    slot.images = Default::default();
-                    slot.pending_links.clear();
-                    Some((*channel, slot.session_id.clone(), slot.desired_geometry, slot.desired_role, slot.identity.clone()))
+                    // the old grants died with the connection
+                    slot.reset_for_reopen();
+                    true
                 })
-                .collect();
-            reopen
+                .map(|(channel, slot)| (*channel, Arc::clone(slot)))
+                .collect()
         };
-        for (channel, session_id, geometry, role, identity) in reopen {
-            let _ = self.send_open_frame(channel, &session_id, geometry, role, &identity);
+        for (channel, slot) in reopen {
+            self.reopen_channel(channel, &slot);
         }
         (self.wake)();
         true
@@ -879,11 +1193,7 @@ impl DaemonConnection {
         if let Some(slot) = slot {
             let mut slot = recover_lock(&slot);
             slot.closed = Some(message.clone());
-            slot.pending = None;
-            slot.clipboard.clear();
-            slot.pending_images.clear();
-            slot.pending_links.clear();
-            slot.images = Default::default();
+            slot.reset_for_reopen();
         }
         let _ = self.send_frame_result(PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, &crate::packet::CloseChannel {
             channel,
@@ -984,7 +1294,9 @@ impl DaemonConnection {
                     let slot = recover_lock(&self.state).channels.get(&channel).cloned();
                     if let Some(slot) = slot {
                         let mut slot = recover_lock(&slot);
-                        if slot.closed.is_none() && slot.granted_role == Some(ChannelRole::Controller) {
+                        // Clipboard effects belong to the attachment: one copy
+                        // while any of its views drives.
+                        if slot.closed.is_none() && slot.has_controller() {
                             slot.clipboard.push(event);
                             drop(slot);
                             (self.wake)();
@@ -992,59 +1304,89 @@ impl DaemonConnection {
                     }
                 }
             }
-            (channel, MSG_SESSION_RENDER | crate::packet::MSG_SESSION_RENDER_VIRTUAL) if channel != CHANNEL_CONTROL => {
-                if let Ok(packet) = RenderPacket::decode_frame(&frame) {
-                    let slot = {
-                        let state = recover_lock(&self.state);
-                        state.channels.get(&channel).cloned()
-                    };
-                    if let Some(slot) = slot {
-                        let mut slot = recover_lock(&slot);
-                        if slot.closed.is_some() {
-                            return;
-                        }
-                        match slot.images.commit(&packet.update.image_resources) {
-                            Ok(images) => slot.pending_images = images,
-                            Err(error) => {
-                                drop(slot);
-                                self.fail_image_channel(channel, error);
-                                return;
-                            }
-                        }
-                        slot.pending_links = packet.links;
-                        slot.view_state = packet.view;
-                        slot.pending = Some(packet.update);
+            (channel, crate::packet::MSG_SESSION_VIEW) if channel != CHANNEL_CONTROL => {
+                if let Ok(wrapped) = frame.decode::<crate::packet::ViewFrame>() {
+                    let (view, frame) = wrapped.unwrap(channel);
+                    self.dispatch_view_frame(view, frame, true);
+                }
+            }
+            (channel, _) if channel != CHANNEL_CONTROL => self.dispatch_view_frame(crate::packet::DEFAULT_VIEW, frame, false),
+            _ => {}
+        }
+    }
+
+    /// Session-channel messages for one view. An unwrapped render on a views
+    /// attachment is its shared live stream; everything else names a view.
+    fn dispatch_view_frame(&self, view: u32, frame: PacketFrame, wrapped: bool) {
+        let channel = frame.channel;
+        let Some(slot) = recover_lock(&self.state).channels.get(&channel).cloned() else {
+            return;
+        };
+        match frame.msg_type {
+            MSG_SESSION_RENDER | crate::packet::MSG_SESSION_RENDER_VIRTUAL => {
+                let Ok(packet) = RenderPacket::decode_frame(&frame) else {
+                    return;
+                };
+                let mut slot = recover_lock(&slot);
+                if slot.closed.is_some() {
+                    return;
+                }
+                let images = match slot.images.commit(&packet.update.image_resources) {
+                    Ok(images) => images,
+                    Err(error) => {
                         drop(slot);
-                        (self.wake)();
+                        self.fail_image_channel(channel, error);
+                        return;
                     }
+                };
+                if slot.views_protocol && !wrapped {
+                    for view in slot.views.values_mut().filter(|view| !view.history) {
+                        view.view_state = packet.view.clone();
+                    }
+                    slot.live_pending = Some(crate::image_delivery::RenderBundle { packet, images });
+                } else if let Some(view) = slot.view_mut(view) {
+                    view.history = wrapped && packet.view.status == crate::provider::ViewStatus::History;
+                    view.pending_images = images;
+                    view.pending_links = packet.links;
+                    view.view_state = packet.view;
+                    view.pending = Some(packet.update);
+                }
+                drop(slot);
+                (self.wake)();
+            }
+            crate::packet::MSG_SESSION_VIEW_STATE => {
+                if let Ok(state) = frame.decode::<crate::provider::ViewState>() {
+                    let mut slot = recover_lock(&slot);
+                    if let Some(view) = slot.view_mut(view) {
+                        // A views attachment sends a view back to its live
+                        // stream with a live state: drop the history frame and
+                        // catch up from the live frame.
+                        if wrapped && state.status == crate::provider::ViewStatus::Live && view.history {
+                            view.history = false;
+                            view.live_generation = 0;
+                            view.pending = None;
+                            view.pending_images.clear();
+                            view.pending_links.clear();
+                        }
+                        view.view_state = state;
+                    }
+                    drop(slot);
+                    (self.wake)();
                 }
             }
-            (channel, crate::packet::MSG_SESSION_VIEW_STATE) if channel != CHANNEL_CONTROL => {
-                if let Ok(view) = frame.decode::<crate::provider::ViewState>() {
-                    let slot = recover_lock(&self.state).channels.get(&channel).cloned();
-                    if let Some(slot) = slot {
-                        recover_lock(&slot).view_state = view;
-                        (self.wake)();
-                    }
-                }
-            }
-            (channel, MSG_SESSION_ROLE) if channel != CHANNEL_CONTROL => {
+            MSG_SESSION_ROLE => {
                 if let Ok(role_state) = frame.decode::<crate::packet::RoleState>() {
-                    let slot = {
-                        let state = recover_lock(&self.state);
-                        state.channels.get(&channel).cloned()
-                    };
-                    if let Some(slot) = slot {
-                        let mut slot = recover_lock(&slot);
-                        if role_state.role != ChannelRole::Controller {
-                            slot.clipboard.clear();
-                        }
-                        slot.granted_role = Some(role_state.role);
-                        slot.desired_role = role_state.role;
-                        slot.role_state = Some(role_state);
-                        drop(slot);
-                        (self.wake)();
+                    let mut slot = recover_lock(&slot);
+                    if let Some(view) = slot.view_mut(view) {
+                        view.granted_role = Some(role_state.role);
+                        view.desired_role = role_state.role;
+                        view.role_state = Some(role_state);
                     }
+                    if !slot.has_controller() {
+                        slot.clipboard.clear();
+                    }
+                    drop(slot);
+                    (self.wake)();
                 }
             }
             _ => {}
@@ -1067,7 +1409,9 @@ impl DaemonConnection {
             for slot in state.channels.values() {
                 let mut slot = recover_lock(slot);
                 slot.clipboard.clear();
-                slot.granted_role = None;
+                for view in slot.views.values_mut() {
+                    view.granted_role = None;
+                }
             }
         }
         (self.wake)();
@@ -1098,6 +1442,8 @@ struct Connected {
     directory: DirectorySnapshot,
     /// The daemon's output-admission warning, for the caller to surface.
     warning: Option<String>,
+    /// The daemon accepted this client's views opt-in.
+    views: bool,
 }
 
 /// Client half of the daemon-scoped `/connect` upgrade: HTTP upgrade dance,
@@ -1118,6 +1464,7 @@ pub(crate) fn connect_packet_endpoint(
         selectors,
         output_context,
         false,
+        false,
     )?;
     if let Some(warning) = &connected.warning {
         eprintln!("cleat: warning: {warning}");
@@ -1125,8 +1472,8 @@ pub(crate) fn connect_packet_endpoint(
     Ok((connected.stream, connected.directory))
 }
 
-/// Provider connections declare virtual placements and keep the admission
-/// warning for [`TransportStatus`] instead of printing it.
+/// Provider connections declare virtual placements and views, and keep the
+/// admission warning for [`TransportStatus`] instead of printing it.
 fn connect_declared(
     stream: std::io::Result<SessionStream>,
     endpoint: &str,
@@ -1134,7 +1481,7 @@ fn connect_declared(
     output_context: &str,
 ) -> Result<Connected, String> {
     let stream = stream.map_err(|err| format!("connect {endpoint}: {err}"))?;
-    upgrade_packet_stream(stream, selectors, output_context, true)
+    upgrade_packet_stream(stream, selectors, output_context, true, true)
 }
 
 fn upgrade_packet_stream(
@@ -1142,6 +1489,7 @@ fn upgrade_packet_stream(
     selectors: &[String],
     output_context: &str,
     virtual_placements: bool,
+    views: bool,
 ) -> Result<Connected, String> {
     let body = serde_json::to_vec(&http_uds::PacketSubscribeRequest {
         recognizer_roles: false,
@@ -1149,6 +1497,7 @@ fn upgrade_packet_stream(
         selectors: selectors.to_vec(),
         screen_activity_stable_ms: None,
         virtual_placements,
+        views,
     })
     .map_err(|err| format!("serialize packet subscribe request: {err}"))?;
     let head = format!(
@@ -1179,7 +1528,8 @@ fn upgrade_packet_stream(
         return Err("packet stream did not send a directory snapshot after hello".to_string());
     }
     let directory = directory.decode::<DirectorySnapshot>().map_err(|err| format!("decode packet directory: {err}"))?;
-    Ok(Connected { stream, directory, warning })
+    let views = views && hello.version >= crate::packet::VIEWS_PROTOCOL_VERSION;
+    Ok(Connected { stream, directory, warning, views })
 }
 
 #[cfg(all(test, any(unix, windows)))]
@@ -1204,12 +1554,18 @@ mod tests {
 
     struct FakeDaemon {
         listener: SessionListener,
+        hello: ControlHello,
     }
 
     impl FakeDaemon {
         fn bind(layout: &RuntimeLayout) -> Self {
             let _ = std::fs::remove_file(layout.socket_path());
-            Self { listener: bind_session_listener(&layout.socket_path()).expect("bind fake daemon socket") }
+            // A daemon before views, unless a test asks for one with views.
+            let hello = ControlHello {
+                version: crate::packet::VIEWS_PROTOCOL_VERSION - 1,
+                min_supported_version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION,
+            };
+            Self { listener: bind_session_listener(&layout.socket_path()).expect("bind fake daemon socket"), hello }
         }
 
         /// Accept a connection and drive the server half of the upgrade.
@@ -1248,7 +1604,7 @@ mod tests {
                 buffer.extend_from_slice(&chunk[..n]);
             }
             stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nx-cleat-output-admission: 1\r\n\r\n").expect("write 101");
-            PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_HELLO, &ControlHello::current())
+            PacketFrame::new(CHANNEL_CONTROL, MSG_CONTROL_HELLO, &self.hello)
                 .expect("hello frame")
                 .write(&mut stream)
                 .expect("write hello");
@@ -1349,18 +1705,18 @@ mod tests {
             .expect("render frame")
             .write(&mut server)
             .expect("write render");
-        wait_until(|| slot.lock().expect("slot").pending.is_some());
-        assert_eq!(slot.lock().expect("slot").dirty(), DirtyState::Full);
+        wait_until(|| slot.lock().expect("slot").view_mut(0).unwrap().pending.is_some());
+        assert_eq!(slot.lock().expect("slot").dirty(0), DirtyState::Full);
 
         // Consume like the FFI does: take pending, absorb, ack.
-        let update = slot.lock().expect("slot").pending.take().expect("pending update");
-        slot.lock().expect("slot").last.absorb(&update);
-        connection.send_ack(channel, update.render_generation).expect("ack");
+        let update = slot.lock().expect("slot").view_mut(0).unwrap().pending.take().expect("pending update");
+        slot.lock().expect("slot").view_mut(0).unwrap().last.absorb(&update);
+        connection.send_ack(channel, RenderAck::Channel(update.render_generation)).expect("ack");
         let ack = PacketFrame::read(&mut server).expect("ack frame");
         assert_eq!((ack.channel, ack.msg_type), (channel, MSG_SESSION_ACK));
         assert_eq!(ack.decode::<Ack>().expect("ack payload"), Ack { generation: 7 });
 
-        connection.send_viewport(channel, crate::provider::ViewportCommand::DeltaRows(-12)).expect("viewport");
+        connection.send_viewport(channel, 0, crate::provider::ViewportCommand::DeltaRows(-12)).expect("viewport");
         let viewport = PacketFrame::read(&mut server).expect("viewport frame");
         assert_eq!((viewport.channel, viewport.msg_type), (channel, crate::packet::MSG_SESSION_VIEWPORT));
         assert_eq!(viewport.decode::<crate::packet::Viewport>().expect("viewport payload"), crate::packet::Viewport {
@@ -1395,14 +1751,14 @@ mod tests {
         let mut update = render_update(7);
         update.virtual_placements = declarations.clone();
         RenderPacket::live(update).frame(channel, true).unwrap().write(&mut server).unwrap();
-        wait_until(|| recover_lock(&slot).pending.is_some());
-        let observed = recover_lock(&slot).pending.take().unwrap();
+        wait_until(|| recover_lock(&slot).view_mut(0).unwrap().pending.is_some());
+        let observed = recover_lock(&slot).view_mut(0).unwrap().pending.take().unwrap();
         assert_eq!(observed.virtual_placements, declarations);
-        recover_lock(&slot).last.absorb(&observed);
-        assert_eq!(recover_lock(&slot).last.clean_update().virtual_placements, declarations);
+        recover_lock(&slot).view_mut(0).unwrap().last.absorb(&observed);
+        assert_eq!(recover_lock(&slot).view_mut(0).unwrap().last.clean_update().virtual_placements, declarations);
         RenderPacket::live(render_update(8)).frame(channel, true).unwrap().write(&mut server).unwrap();
-        wait_until(|| recover_lock(&slot).pending.is_some());
-        assert!(recover_lock(&slot).pending.as_ref().unwrap().virtual_placements.is_empty());
+        wait_until(|| recover_lock(&slot).view_mut(0).unwrap().pending.is_some());
+        assert!(recover_lock(&slot).view_mut(0).unwrap().pending.as_ref().unwrap().virtual_placements.is_empty());
         connection.shutdown();
     }
 
@@ -1456,20 +1812,20 @@ mod tests {
                 ..Default::default()
             });
             PacketFrame::new(channel, MSG_SESSION_RENDER, &RenderPacket::live(update)).unwrap().write(&mut server).unwrap();
-            wait_until(|| recover_lock(&slot).pending.is_some());
-            assert_eq!(recover_lock(&slot).pending_images[0].bytes(), &[1, 2, 3]);
+            wait_until(|| recover_lock(&slot).view_mut(0).unwrap().pending.is_some());
+            assert_eq!(recover_lock(&slot).view_mut(0).unwrap().pending_images[0].bytes(), &[1, 2, 3]);
             PacketFrame { channel, msg_type: invalid_type, payload: Vec::new() }.write(&mut server).unwrap();
             let close = PacketFrame::read(&mut server).unwrap();
             assert_eq!((close.channel, close.msg_type), (CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL));
             assert_eq!(close.decode::<CloseChannel>().unwrap().channel, channel);
             {
-                let slot = recover_lock(&slot);
+                let mut slot = recover_lock(&slot);
                 assert!(slot.closed.is_some());
-                assert!(slot.pending.is_none());
-                assert!(slot.pending_images.is_empty());
+                assert!(slot.view_mut(0).unwrap().pending.is_none());
+                assert!(slot.view_mut(0).unwrap().pending_images.is_empty());
             }
             PacketFrame::new(other, MSG_SESSION_RENDER, &RenderPacket::live(render_update(2))).unwrap().write(&mut server).unwrap();
-            wait_until(|| recover_lock(&sibling).pending.is_some());
+            wait_until(|| recover_lock(&sibling).view_mut(0).unwrap().pending.is_some());
             assert!(recover_lock(&sibling).closed.is_none());
             connection.close_session_channel(channel);
             let _ = PacketFrame::read(&mut server).unwrap();
@@ -1505,16 +1861,19 @@ mod tests {
         drop(server);
         wait_until(|| !connection.is_connected());
         if let Ok(mut slot) = slot.lock() {
-            slot.desired_geometry = TerminalResizeEvent { cell_width_px: 12.0, cell_height_px: 24.0, ..geometry(120, 50) };
-            slot.pending = Some(render_update(99));
-            slot.pending_images.push(crate::image_backing::RetainedImage::from_owned(crate::provider::TerminalImageBytes {
-                image_id: 1,
-                generation: 1,
-                bytes: vec![1],
-            }));
-            slot.pending_links.push(crate::provider::TerminalViewLink { col: 0, row: 0, uri: b"https://example.com".to_vec() });
+            slot.view_mut(0).unwrap().desired_geometry =
+                TerminalResizeEvent { cell_width_px: 12.0, cell_height_px: 24.0, ..geometry(120, 50) };
+            slot.view_mut(0).unwrap().pending = Some(render_update(99));
+            slot.view_mut(0).unwrap().pending_images.push(crate::image_backing::RetainedImage::from_owned(
+                crate::provider::TerminalImageBytes { image_id: 1, generation: 1, bytes: vec![1] },
+            ));
+            slot.view_mut(0).unwrap().pending_links.push(crate::provider::TerminalViewLink {
+                col: 0,
+                row: 0,
+                uri: b"https://example.com".to_vec(),
+            });
         }
-        assert!(connection.send_input(channel, TerminalInputEvent::RawBytes(b"discarded".to_vec())).is_err());
+        assert!(connection.send_input(channel, 0, TerminalInputEvent::RawBytes(b"discarded".to_vec())).is_err());
 
         let mut server = daemon.accept(vec![directory_entry("alpha")]);
         wait_until(|| connection.is_connected());
@@ -1527,10 +1886,10 @@ mod tests {
             identity: AttachmentIdentity::default(),
         });
         {
-            let slot = recover_lock(&slot);
-            assert!(slot.pending.is_none());
-            assert!(slot.pending_images.is_empty());
-            assert!(slot.pending_links.is_empty());
+            let mut slot = recover_lock(&slot);
+            assert!(slot.view_mut(0).unwrap().pending.is_none());
+            assert!(slot.view_mut(0).unwrap().pending_images.is_empty());
+            assert!(slot.view_mut(0).unwrap().pending_links.is_empty());
         }
         let resize = PacketFrame::read(&mut server).expect("resize frame");
         assert_eq!(
@@ -1549,8 +1908,8 @@ mod tests {
         .unwrap()
         .write(&mut server)
         .unwrap();
-        wait_until(|| recover_lock(&slot).granted_role == Some(ChannelRole::Controller));
-        connection.send_input(channel, TerminalInputEvent::RawBytes(b"fresh".to_vec())).unwrap();
+        wait_until(|| recover_lock(&slot).view_mut(0).unwrap().granted_role == Some(ChannelRole::Controller));
+        connection.send_input(channel, 0, TerminalInputEvent::RawBytes(b"fresh".to_vec())).unwrap();
         let input = PacketFrame::read(&mut server).expect("fresh input frame");
         assert_eq!((input.channel, input.msg_type), (channel, MSG_SESSION_INPUT));
         assert_eq!(input.decode::<Input>().expect("input payload"), Input { event: TerminalInputEvent::RawBytes(b"fresh".to_vec()) });
@@ -1604,7 +1963,7 @@ mod tests {
         let _open = PacketFrame::read(&mut server).unwrap();
         let _resize = PacketFrame::read(&mut server).unwrap();
         PacketFrame::new(channel, MSG_SESSION_ROLE, &role_state(ChannelRole::Controller)).unwrap().write(&mut server).unwrap();
-        wait_until(|| recover_lock(&slot).granted_role == Some(ChannelRole::Controller));
+        wait_until(|| recover_lock(&slot).view_mut(0).unwrap().granted_role == Some(ChannelRole::Controller));
 
         send_redirect_and_close(&mut server, channel, redirect_to(&target, "alpha", PROTOCOL_VERSION));
         let mut moved = target_daemon.accept(vec![directory_entry("alpha")]);
@@ -1616,14 +1975,14 @@ mod tests {
         PacketFrame::new(open.channel, MSG_SESSION_ROLE, &role_state(ChannelRole::Controller)).unwrap().write(&mut moved).unwrap();
         PacketFrame::new(open.channel, MSG_SESSION_RENDER, &RenderPacket::live(render_update(3))).unwrap().write(&mut moved).unwrap();
         wait_until(|| {
-            let slot = recover_lock(&slot);
-            slot.granted_role == Some(ChannelRole::Controller) && slot.pending.is_some()
+            let mut slot = recover_lock(&slot);
+            slot.view_mut(0).unwrap().granted_role == Some(ChannelRole::Controller) && slot.view_mut(0).unwrap().pending.is_some()
         });
         assert!(recover_lock(&slot).closed.is_none());
         assert!(connection.channel_connected(channel));
 
         // The caller's channel id keeps working: input reaches the new host.
-        connection.send_input(channel, TerminalInputEvent::RawBytes(b"after".to_vec())).unwrap();
+        connection.send_input(channel, 0, TerminalInputEvent::RawBytes(b"after".to_vec())).unwrap();
         let input = PacketFrame::read(&mut moved).unwrap();
         assert_eq!((input.channel, input.msg_type), (open.channel, MSG_SESSION_INPUT));
         assert_eq!(input.decode::<Input>().unwrap().event, TerminalInputEvent::RawBytes(b"after".to_vec()));
@@ -1743,6 +2102,227 @@ mod tests {
         connection.shutdown();
     }
 
+    fn views_daemon(layout: &RuntimeLayout) -> FakeDaemon {
+        FakeDaemon { hello: ControlHello::current(), ..FakeDaemon::bind(layout) }
+    }
+
+    /// The next frame, with the view it was wrapped for.
+    fn read_view_frame(server: &mut SessionStream) -> (Option<u32>, PacketFrame) {
+        let frame = PacketFrame::read(server).expect("frame");
+        if frame.msg_type == crate::packet::MSG_SESSION_VIEW {
+            let (view, inner) = frame.decode::<crate::packet::ViewFrame>().expect("view frame").unwrap(frame.channel);
+            (Some(view), inner)
+        } else {
+            (None, frame)
+        }
+    }
+
+    fn rows_update(generation: u64, full: bool, rows: &[(u16, &str)]) -> TerminalRenderUpdate {
+        use crate::provider::{TerminalRenderCell, TerminalRenderRow, TerminalRenderUpdateOp};
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|(row, text)| TerminalRenderRow {
+                row: *row,
+                col_count: 80,
+                cells: (0..80)
+                    .map(|col| TerminalRenderCell {
+                        graphemes: text.chars().nth(col).map(|ch| vec![ch as u32]).unwrap_or_default(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        let ops = if full {
+            vec![TerminalRenderUpdateOp {
+                kind: TerminalRenderUpdateOpKind::FullVisibleReplace,
+                row_count: 24,
+                col_count: 80,
+                rows,
+                ..Default::default()
+            }]
+        } else {
+            rows.into_iter()
+                .map(|row| TerminalRenderUpdateOp {
+                    kind: TerminalRenderUpdateOpKind::RowReplace,
+                    first_row: row.row,
+                    row_count: 1,
+                    col_count: 80,
+                    rows: vec![row],
+                    ..Default::default()
+                })
+                .collect()
+        };
+        TerminalRenderUpdate {
+            render_generation: generation,
+            cols: 80,
+            rows: 24,
+            dirty: if full { DirtyState::Full } else { DirtyState::Partial },
+            ops,
+            ..Default::default()
+        }
+    }
+
+    fn update_text(update: &TerminalRenderUpdate) -> String {
+        update
+            .ops
+            .iter()
+            .flat_map(|op| &op.rows)
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| cell.graphemes.iter().filter_map(|scalar| char::from_u32(*scalar)))
+            .collect()
+    }
+
+    /// Open a views channel with a watcher view 1 and consume the open frames.
+    fn open_two_views(connection: &DaemonConnection, server: &mut SessionStream) -> (u32, Arc<Mutex<ChannelSlot>>) {
+        let (channel, slot) =
+            connection.open_session_channel("alpha".into(), geometry(80, 24), ChannelRole::Controller, AttachmentIdentity::default());
+        assert_eq!(read_view_frame(server).1.msg_type, MSG_CONTROL_OPEN_CHANNEL);
+        let (view, resize) = read_view_frame(server);
+        assert_eq!((view, resize.msg_type), (Some(0), MSG_SESSION_INPUT));
+        assert_eq!(connection.open_view(channel, geometry(60, 20), ChannelRole::Watcher), Some(1));
+        let (view, open) = read_view_frame(server);
+        assert_eq!(
+            (view, open.decode::<crate::packet::OpenView>().unwrap()),
+            (None, crate::packet::OpenView { view: 1, role: ChannelRole::Watcher, take: false })
+        );
+        let (view, resize) = read_view_frame(server);
+        assert_eq!((view, resize.decode::<Input>().unwrap().event), (Some(1), TerminalInputEvent::Resize(geometry(60, 20))));
+        (channel, slot)
+    }
+
+    // Live views fan out the attachment's one stream: the first to consume a
+    // render gets it as sent and acks it; a view that is behind catches up
+    // from the live frame without another render from the daemon.
+    #[test]
+    fn live_views_share_one_stream_and_a_lagging_view_catches_up() {
+        let (_temp, layout) = test_layout();
+        let daemon = views_daemon(&layout);
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let (channel, slot) = open_two_views(&connection, &mut server);
+
+        let first = rows_update(7, true, &[(0, "prompt"), (1, "first")]);
+        RenderPacket::live(first.clone()).frame(channel, false).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).dirty(0) == DirtyState::Full);
+        assert_eq!(recover_lock(&slot).dirty(1), DirtyState::Full);
+        let consumed = recover_lock(&slot).consume(0).expect("view 0 render");
+        assert_eq!(consumed.update, first);
+        assert_eq!(consumed.ack, Some(RenderAck::Channel(7)));
+        assert!(recover_lock(&slot).consume(0).is_none());
+        assert_eq!(recover_lock(&slot).dirty(0), DirtyState::Clean);
+        let caught_up = recover_lock(&slot).consume(1).expect("view 1 catch-up");
+        assert_eq!(caught_up.ack, None);
+        assert_eq!(caught_up.update.ops[0].kind, TerminalRenderUpdateOpKind::FullVisibleReplace);
+        assert!(update_text(&caught_up.update).contains("first"));
+
+        let second = rows_update(8, false, &[(2, "second")]);
+        RenderPacket::live(second.clone()).frame(channel, false).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).dirty(1) == DirtyState::Partial);
+        let consumed = recover_lock(&slot).consume(1).expect("view 1 render");
+        assert_eq!((consumed.update.clone(), consumed.ack), (second, Some(RenderAck::Channel(8))));
+        let lagging = recover_lock(&slot).consume(0).expect("view 0 catch-up");
+        assert_eq!(lagging.ack, None);
+        assert_eq!(lagging.update.ops.len(), 1);
+        assert_eq!((lagging.update.ops[0].kind, lagging.update.ops[0].first_row), (TerminalRenderUpdateOpKind::RowReplace, 2));
+        assert_eq!(update_text(&lagging.update), "second");
+
+        // One ack per live render, from whichever view consumed it.
+        connection.send_ack(channel, RenderAck::Channel(8)).unwrap();
+        let (view, ack) = read_view_frame(&mut server);
+        assert_eq!((view, ack.msg_type, ack.decode::<Ack>().unwrap()), (None, MSG_SESSION_ACK, Ack { generation: 8 }));
+        connection.shutdown();
+    }
+
+    // A history frame is one view's own; the daemon's live state sends the
+    // view back to the shared stream with a full catch-up.
+    #[test]
+    fn history_frames_belong_to_one_view_until_it_returns_to_live() {
+        let (_temp, layout) = test_layout();
+        let daemon = views_daemon(&layout);
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let (channel, slot) = open_two_views(&connection, &mut server);
+
+        RenderPacket::live(rows_update(5, true, &[(0, "live")])).frame(channel, false).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).dirty(1) == DirtyState::Full);
+        let live = recover_lock(&slot).consume(1).expect("live frame");
+        assert_eq!((update_text(&live.update).as_str(), live.ack), ("live", Some(RenderAck::Channel(5))));
+        let history = RenderPacket {
+            update: rows_update(6, true, &[(0, "history")]),
+            links: Vec::new(),
+            view: crate::provider::ViewState { status: crate::provider::ViewStatus::History, notice: None },
+        };
+        crate::packet::ViewFrame::wrap(1, &history.frame(channel, false).unwrap()).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).view(1).unwrap().pending.is_some());
+        let consumed = recover_lock(&slot).consume(1).expect("history frame");
+        assert_eq!((update_text(&consumed.update).as_str(), consumed.ack), ("history", Some(RenderAck::View(1, 6))));
+        let live = recover_lock(&slot).consume(0).expect("live frame");
+        assert_eq!((update_text(&live.update).as_str(), live.ack), ("live", None));
+
+        // While in history, view 1 ignores the live stream.
+        RenderPacket::live(rows_update(7, false, &[(1, "more")])).frame(channel, false).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).dirty(0) == DirtyState::Partial);
+        assert_eq!(recover_lock(&slot).dirty(1), DirtyState::Clean);
+        assert!(recover_lock(&slot).consume(1).is_none());
+        assert!(recover_lock(&slot).consume(0).is_some());
+
+        let live_state = crate::provider::ViewState::default();
+        crate::packet::ViewFrame::wrap(1, &PacketFrame::new(channel, crate::packet::MSG_SESSION_VIEW_STATE, &live_state).unwrap())
+            .unwrap()
+            .write(&mut server)
+            .unwrap();
+        wait_until(|| recover_lock(&slot).dirty(1) == DirtyState::Full);
+        // It shows history rows: only a whole live grid replaces them.
+        let back = recover_lock(&slot).consume(1).expect("return to live");
+        assert_eq!(back.update.ops.len(), 1);
+        assert_eq!(back.update.ops[0].kind, TerminalRenderUpdateOpKind::FullVisibleReplace);
+        assert!(update_text(&back.update).contains("live") && update_text(&back.update).contains("more"));
+        assert!(back.update.render_generation > 6, "a view's generation went backwards");
+
+        connection.send_ack(channel, RenderAck::View(1, 6)).unwrap();
+        let (view, ack) = read_view_frame(&mut server);
+        assert_eq!((view, ack.decode::<Ack>().unwrap()), (Some(1), Ack { generation: 6 }));
+        connection.shutdown();
+    }
+
+    // Against a daemon before views, the default view works as it always has
+    // and other views report why they cannot be served.
+    #[test]
+    fn a_daemon_before_views_serves_only_the_default_view() {
+        let (_temp, layout) = test_layout();
+        let daemon = FakeDaemon::bind(&layout);
+        let connection = DaemonConnection::open(layout, Vec::new(), Arc::new(|| {}));
+        let mut server = daemon.accept(vec![directory_entry("alpha")]);
+        wait_until(|| connection.is_connected());
+        let (channel, slot) =
+            connection.open_session_channel("alpha".into(), geometry(80, 24), ChannelRole::Controller, AttachmentIdentity::default());
+        assert_eq!(read_view_frame(&mut server).1.msg_type, MSG_CONTROL_OPEN_CHANNEL);
+        assert_eq!(
+            read_view_frame(&mut server),
+            (None, PacketFrame::new(channel, MSG_SESSION_INPUT, &Input { event: TerminalInputEvent::Resize(geometry(80, 24)) }).unwrap())
+        );
+
+        let view = connection.open_view(channel, geometry(60, 20), ChannelRole::Controller).expect("view handle");
+        assert!(recover_lock(&slot).view_closed(view).is_some_and(|reason| reason.contains("predates views")));
+        assert!(connection.send_resize(channel, view, 10, 10).is_err());
+        assert!(connection.close_view(channel, 0).is_err());
+        assert!(connection.close_view(channel, view).is_ok());
+
+        RenderPacket::live(render_update(3)).frame(channel, false).unwrap().write(&mut server).unwrap();
+        wait_until(|| recover_lock(&slot).view(0).unwrap().pending.is_some());
+        let consumed = recover_lock(&slot).consume(0).expect("default view render");
+        assert_eq!((consumed.update, consumed.ack), (render_update(3), Some(RenderAck::Channel(3))));
+        connection.send_resize(channel, 0, 100, 30).unwrap();
+        assert_eq!(
+            read_view_frame(&mut server),
+            (None, PacketFrame::new(channel, MSG_SESSION_RESIZE, &crate::packet::Resize { cols: 100, rows: 30 }).unwrap())
+        );
+        connection.shutdown();
+    }
+
     #[test]
     fn poisoned_client_mutexes_do_not_cascade_panics() {
         let (_temp, layout) = test_layout();
@@ -1760,13 +2340,13 @@ mod tests {
             let _slot = slot.lock().expect("slot lock");
             panic!("poison channel slot lock");
         }));
-        assert!(connection.request_role(channel, ChannelRole::Watcher, false).is_err());
+        assert!(connection.request_role(channel, 0, ChannelRole::Watcher, false).is_err());
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _writer = connection.writer.lock().expect("writer lock");
             panic!("poison writer lock");
         }));
-        assert!(connection.send_resize(channel, 100, 40).is_err());
+        assert!(connection.send_resize(channel, 0, 100, 40).is_err());
 
         connection.shutdown();
     }

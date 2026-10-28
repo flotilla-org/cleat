@@ -31,21 +31,18 @@ fn channel(id: u32, image: Image) -> PacketSessionChannel {
         status_generation: None,
         _output_lease: None,
         session_id: "benchmark".into(),
-        role: ChannelRole::Watcher,
-        requested_role: ChannelRole::Watcher,
         identity: Default::default(),
-        denial_reason: None,
-        in_flight_generation: Some(1),
+        views_protocol: false,
+        views: BTreeMap::from([(
+            crate::packet::DEFAULT_VIEW,
+            PacketView::new(ChannelRole::Watcher, ChannelRole::Watcher, None, RenderCredit::new(Some(1), 1)),
+        )]),
+        live: RenderCredit::new(None, 1),
         last_sent_generation: 1,
-        last_source_generation: 1,
-        history: false,
-        view_changed: false,
-        view_state: Default::default(),
-        next_capture: Instant::now(),
         clipboard_loss: 0,
         local_images: false,
         image_resident: resident,
-        image_transfer: Some(transfer),
+        image_transfers: VecDeque::from([transfer]),
     }
 }
 fn client(id: u64, channels: u32, image: &Image) -> (PacketClient, UnixStream) {
@@ -240,7 +237,7 @@ fn ready_assets_remain_writable_work_but_file_ack_waits_do_not() {
     assert!(client.has_pending_output());
     let image = RetainedImage::from_owned(crate::provider::TerminalImageBytes { image_id: 1, generation: 1, bytes: vec![1; 4] });
     let mut ch = channel(1, image);
-    ch.image_transfer = ch.image_transfer.take().map(|t| t.local_files(true));
+    ch.image_transfers = ch.image_transfers.drain(..).map(|t| t.local_files(true)).collect();
     client.channels.insert(1, ch);
     client.queue_image_frames(|| Duration::ZERO).unwrap();
     assert_eq!(
@@ -253,8 +250,8 @@ fn ready_assets_remain_writable_work_but_file_ack_waits_do_not() {
         .channels
         .get_mut(&1)
         .unwrap()
-        .image_transfer
-        .as_mut()
+        .image_transfers
+        .front_mut()
         .unwrap()
         .file_result(crate::packet::ImageFileResult { image_id: 1, generation: 1, acquired: true })
         .unwrap();
@@ -269,12 +266,19 @@ fn ready_assets_remain_writable_work_but_file_ack_waits_do_not() {
 #[test]
 fn program_status_hello_capability_matrix() {
     for (virtual_placements, program_status, version) in [(false, false, 12), (true, false, 13), (false, true, 14), (true, true, 14)] {
-        assert_eq!(hello_for_subscription(virtual_placements, program_status, false), ControlHello { version, min_supported_version: 12 });
+        assert_eq!(hello_for_subscription(virtual_placements, program_status, false, false), ControlHello {
+            version,
+            min_supported_version: 12
+        });
     }
     for (virtual_placements, program_status) in [(false, false), (true, false), (false, true), (true, true)] {
-        assert_eq!(hello_for_subscription(virtual_placements, program_status, true), ControlHello {
+        assert_eq!(hello_for_subscription(virtual_placements, program_status, true, false), ControlHello {
             version: 15,
             min_supported_version: 12
         });
+    }
+    // Only a views opt-in sees protocol 16; every other hello is unchanged.
+    for (virtual_placements, program_status, recognizer_roles) in [(false, false, false), (true, true, true)] {
+        assert_eq!(hello_for_subscription(virtual_placements, program_status, recognizer_roles, true), ControlHello::current());
     }
 }

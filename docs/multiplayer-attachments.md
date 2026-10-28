@@ -5,6 +5,70 @@ and daemon-backed library clients can drive the same session together.
 Watchers receive renders and can browse history without writing application
 input. Embedded library sessions remain in-process and are not attachable.
 
+## Attachments and views
+
+A packet channel is an **attachment**: one client's subscription to one session.
+It holds one or more **views**, one per place the client shows the session
+([ADR 0009](adr/0009-views-within-an-attachment.md)). `cleat attach`, `cleat
+watch` and clients that did not opt in hold exactly one view, opened with the
+channel, and see no difference.
+
+| Per attachment | Per view |
+| --- | --- |
+| Live render stream and its ack credit | Role (controller or watcher), take control |
+| Image transfer and local file offers | Window size vote and reconciliation |
+| Clipboard effects and loss counts | Focus and cell pixel size |
+| Program status opt-in | History position, history frames and their credit |
+
+Live views share the attachment's one render stream: a second live view adds no
+frames. The C provider keeps the attachment's live grid and gives each view its
+own updates; a view that falls behind or returns from history catches up with one
+coalesced update, and render generations never go backwards for a view. A view in
+history receives its own frames, wrapped for that view. Typing into a controller
+view returns that view, and only that view, to live. An attachment with no live
+views receives no live frames until one returns.
+
+Clipboard effects reach an attachment once while any of its views is a controller,
+and never an attachment with only watcher views.
+
+### Protocol
+
+Views are protocol 16. A client opts in with `"views": true` in its `/connect`
+body; only then does the daemon advertise 16. Other clients keep the hello and
+messages they saw before.
+
+- A channel opens with its default view, `0`, with the role in `OpenChannel`.
+- `MSG_SESSION_OPEN_VIEW` (`OpenView { view, role, take }`) opens another view;
+  the grant arrives as that view's `RoleState`. The client chooses view ids;
+  `u32::MAX` is reserved.
+- `MSG_SESSION_CLOSE_VIEW` (`CloseView { view }`) closes one. Closing the last view
+  leaves the channel open and touches nothing else on the connection.
+- `MSG_SESSION_VIEW` wraps a per-view message (`ViewFrame { view, msg_type,
+  payload }`). Clients wrap input, resize, viewport, role requests and history
+  acks; unwrapped ones address the default view. The daemon wraps history renders,
+  view state and role state for every view, the default view included. Live
+  renders and their acks stay unwrapped: they belong to the attachment.
+- A size policy is accepted from any attachment with a controller view.
+
+### C API
+
+A `cleat_session` is the attachment and keeps its default view: every existing
+`cleat_session_*` call behaves as before and acts on that view.
+`cleat_session_open_view(session, &desc)` returns a `cleat_view` for daemon
+sessions (null for in-process and mock ones). `cleat_view_*` mirrors the
+per-view session calls: role, set role and take control; resize and geometry;
+input, input batches and raw bytes; poll and dirty; scrollback extent, scrollbar
+and scrolling; render updates, their release and virtual placements; image bytes
+and backings; `cleat_view_state_json`; connection state and
+`cleat_view_close_reason`. `cleat_view_destroy` closes the view.
+`cleat_session_close_default_view` leaves the attachment to its other views; the
+session's per-view calls then fail. Ending the session, fixed size, clipboard,
+transfer and adoption stay on the session handle. Adoption and transfer refuse
+while other views are open. Against a daemon older than protocol 16 an opened
+view reports `CLEAT_SESSION_CLOSED` with a reason, and the default view works as
+before. Daemon sessions never served snapshots, so views have no snapshot call;
+a view's first render update carries the whole grid.
+
 ## Roles, geometry and input
 
 Attaching normally requests shared driving. `cleat attach --take` requests
@@ -15,15 +79,18 @@ watchers must request driving themselves. `--strict` fails if driving cannot be
 granted. `send-keys` remains an out-of-band operation and works regardless of
 attachment roles.
 
-The PTY uses the minimum columns and minimum rows reported by drivers.
+The PTY uses the minimum columns and minimum rows reported by controller views,
+across all attachments; two controller views of one attachment both vote.
 Watchers do not vote. With no drivers, the last applied size remains. An explicit
 session resize sets a fixed size; the packet and C APIs can restore automatic
-sizing. The earliest driver connection, then lowest channel ID, supplies the
-application's cell pixel size; other clients' mouse coordinates are converted to
-those units. Application focus
-is the union of driver focus, gated by the application's focus-reporting mode.
+sizing. The earliest driving view (connection, then channel ID, then view ID)
+supplies the application's cell pixel size; other views' mouse coordinates are
+converted from their own cell size to those units. Application focus is the union
+of controller views' focus, gated by the application's focus-reporting mode.
+Taking control on a view demotes every other controller view, including the other
+views of its attachment.
 
-Text, keys and pastes from a driver return its own view to live before writing.
+Text, keys and pastes from a driver view return that view to live before writing.
 A paste is one actor operation. The application still owns one cursor; history
 views hide it. Clients own local selection. Disconnecting an attachment leaves
 the session running. Reconnecting library clients request their last granted

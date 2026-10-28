@@ -1278,6 +1278,7 @@ impl SessionService {
             selectors: selectors.to_vec(),
             screen_activity_stable_ms,
             virtual_placements: false,
+            views: false,
         })
         .map_err(|err| format!("serialize packet subscription request: {err}"))?;
         write!(

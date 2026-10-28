@@ -30,6 +30,7 @@ pub mod proxy;
 pub mod proxy_command;
 pub mod recording;
 pub mod recreate;
+mod render_cache;
 pub mod replay;
 pub mod runtime;
 mod screen_activity;

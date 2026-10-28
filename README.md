@@ -173,6 +173,19 @@ find .tools/ghostty-install -maxdepth 3 | sort
 
 ## Session Model
 
+`cleat attach` and `cleat watch` exit with these statuses:
+
+| Status | Meaning |
+| --- | --- |
+| `0` | Deliberate detach or a clean session end. |
+| `75` (`EX_TEMPFAIL`) | The attachment ended while the session may still be live; a fresh connect could recover it. Resolve the current address before reconnecting. |
+| `1` | Refusal, initial connection failure, unknown session, or another error. |
+
+Status 75 includes a lost `--socket` relay, a closed socket attachment channel
+(including handover), and a local attachment whose transfer redirect could not
+be followed. Diagnostics remain on stderr. The session program's exit status
+is not passed through.
+
 **Named daemons host sets of sessions.** Each physical daemon has a positive, monotonically increasing *generation*, stored at `<root>/<name>@<generation>/`. `<root>/<name>` aliases the current generation (a symlink on Unix, a text file on Windows). New sessions target the current generation; session-ID commands search the selected name’s generations and refuse ambiguous IDs. Use `--server name@N` to select one generation. Auto-start creates generation 1 initially, or advances after the current daemon dies; it never creates a successor to a live daemon. A live legacy directory stays in place; a dead legacy directory is adopted as generation 1. Retained sessions in dead generations remain recreatable: `attach` through the logical name adopts their recording into the current generation. Explicit generation addresses stay pinned and report a dead host instead of auto-starting it. Each session has a separate *hosting epoch*, initially 1.
 
 After installing a new fleet generation, run `cleat server drain --server NAME` once for each logical daemon on the host (`default` when omitted). It compares the running daemon's git SHA and packet protocol to the installed client. A matching build reports `nothing to drain`; otherwise it starts the installed executable in the next generation, waits up to a bounded health deadline (10 seconds plus an in-flight request), atomically publishes the alias, and asks the old generation to drain. `--json` reports `changed`, `installed`, `old`, `current`, and an optional `warning`, including build identities and the old generation's remaining session count. A startup or health failure leaves the alias unchanged. The installed client must have a known git SHA so an unknown revision cannot silently count as a matching build. Explicit generation targets are rejected; drain always operates on a logical name.

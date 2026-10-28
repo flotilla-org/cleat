@@ -538,6 +538,45 @@ fn the_compatibility_gate_refuses_then_drops_incompatible_clients() {
     assert!(reason.contains("speaking protocol 99"), "{reason}");
 }
 
+// An established local attachment may recover on a fresh connect when the
+// transport is lost, automatic redirect is incompatible, or the one-follow
+// limit is exhausted.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn local_attach_and_watch_require_fresh_connect_when_redirect_cannot_be_followed() {
+    for ending in ["incompatible", "second-redirect", "transport-loss"] {
+        let root = Root::new();
+        root.launch_shell("moved");
+        let mut children: Vec<_> = ["attach", "watch"]
+            .into_iter()
+            .map(|verb| {
+                root.command(&[verb, "moved"], &[])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        wait_until("both attachments", Duration::from_secs(5), || root.inspect(&["inspect", "moved"]).attachments.len() == 2);
+        if ending == "transport-loss" {
+            root.kill_source();
+        } else if ending == "incompatible" {
+            root.transfer("moved", "newer", &["--drop-incompatible"], &[("CLEAT_TEST_PACKET_PROTOCOL_VERSION", "99")]).unwrap();
+        } else {
+            root.transfer("moved", "second", &[], &[]).unwrap();
+            wait_until("both redirected attachments", Duration::from_secs(5), || {
+                root.inspect(&["--server", "second", "inspect", "moved"]).attachments.len() == 2
+            });
+            root.transfer("moved", "third", &[], &[]).unwrap();
+        }
+        for child in &mut children {
+            wait_until("attachment exits", Duration::from_secs(5), || child.try_wait().unwrap().is_some());
+            assert_eq!(child.wait().unwrap().code(), Some(75), "ending={ending}");
+        }
+    }
+}
+
 #[cfg(feature = "ghostty-vt")]
 #[test]
 fn cleat_attach_and_watch_follow_the_move_with_a_notice() {
@@ -573,6 +612,23 @@ fn assert_cli_clients_follow(handover: bool) {
     let rendered = |file: &tempfile::NamedTempFile| std::fs::metadata(file.path()).unwrap().len() > 0;
     wait_until("the initial renders", Duration::from_secs(10), || rendered(&attach_output) && rendered(&watch_output));
 
+    // A socket attachment cannot use host-local redirect coordinates. Handover
+    // must return 75 so its caller can resolve a new forwarding address.
+    let mut socket_attach = handover.then(|| {
+        Command::new(env!("CARGO_BIN_EXE_cleat"))
+            .args(["attach", "followed", "--socket"])
+            .arg(root.path().join("default@1/socket"))
+            .env_remove("CLEAT_DAEMON")
+            .env_remove("CLEAT_SESSION")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    });
+    if socket_attach.is_some() {
+        wait_until("socket attachment", Duration::from_secs(5), || root.inspect(&["inspect", "followed"]).attachments.len() == 3);
+    }
     let target = if handover {
         root.ok(&["server", "handover"]);
         "default@2"
@@ -580,6 +636,10 @@ fn assert_cli_clients_follow(handover: bool) {
         root.transfer("followed", "other", &[], &[]).unwrap();
         "other@1"
     };
+    if let Some(child) = socket_attach.as_mut() {
+        wait_until("socket attachment exits", Duration::from_secs(5), || child.try_wait().unwrap().is_some());
+        assert_eq!(child.wait().unwrap().code(), Some(75));
+    }
     let noticed = |file: &tempfile::NamedTempFile| {
         String::from_utf8_lossy(&std::fs::read(file.path()).unwrap()).contains(&format!("session moved to daemon:{target}"))
     };

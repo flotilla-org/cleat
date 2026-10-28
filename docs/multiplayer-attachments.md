@@ -8,10 +8,16 @@ input. Embedded library sessions remain in-process and are not attachable.
 ## Attachments and views
 
 A packet channel is an **attachment**: one client's subscription to one session.
-It holds one or more **views**, one per place the client shows the session
+It holds **views**, one per place the client shows the session
 ([ADR 0009](adr/0009-views-within-an-attachment.md)). `cleat attach`, `cleat
 watch` and clients that did not opt in hold exactly one view, opened with the
 channel, and see no difference.
+
+Presence counts attachments, not views. Participants in `RoleState`, `cleat
+inspect` attachments and directory controller and watcher counts list one entry
+per attachment that has at least one view. An attachment is a controller while
+any of its views is one, and a watcher otherwise; an attachment with no views is
+not present.
 
 | Per attachment | Per view |
 | --- | --- |
@@ -38,6 +44,11 @@ body; only then does the daemon advertise 16. Other clients keep the hello and
 messages they saw before.
 
 - A channel opens with its default view, `0`, with the role in `OpenChannel`.
+- `MSG_CONTROL_OPEN_ATTACHMENT` (`OpenAttachment { channel, session_id,
+  identity }`) opens a channel with no views: no role grant, no render and no
+  size vote until its first `OpenView`, whose live stream starts with the whole
+  grid. The daemon refuses it with a `ControlError` on a connection that did not
+  opt in.
 - `MSG_SESSION_OPEN_VIEW` (`OpenView { view, role, take }`) opens another view;
   the grant arrives as that view's `RoleState`. The client chooses view ids;
   `u32::MAX` is reserved.
@@ -66,7 +77,12 @@ and scrolling; render updates, their release and virtual placements; image bytes
 and backings; `cleat_view_state_json`; connection state and
 `cleat_view_close_reason`. `cleat_view_destroy` closes the view.
 `cleat_session_close_default_view` leaves the attachment to its other views; the
-session's per-view calls then fail. Ending the session, fixed size, clipboard,
+session's per-view calls then fail. A desc role of `CLEAT_ROLE_NO_VIEW` attaches
+(or creates) with no default view, as if it had been closed, without ever
+opening one. It never falls back to a default view: against a daemon already
+known to predate views the call returns null, and one that connects later and
+predates them closes the attachment, so its views report `CLEAT_SESSION_CLOSED`
+with the reason. Ending the session, fixed size, clipboard,
 transfer and adoption stay on the session handle. Adoption and transfer refuse
 while other views are open. Against a daemon older than protocol 16 an opened
 view reports `CLEAT_SESSION_CLOSED` with a reason, and the default view works as

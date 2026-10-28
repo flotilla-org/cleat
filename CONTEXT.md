@@ -155,13 +155,15 @@ _Avoid_: connect, open.
 **Attachment**:
 One client's subscription to one session over one connection: a single update
 stream, with its clipboard effects and image transfer, shared by the attachment's
-views.
+views. Presence counts attachments: one drives while any of its views does, and
+one showing no view is not present.
 _Avoid_: channel (the transport's word for it), view.
 
 **View**:
 One place an attachment shows its session, with its own role, window size and
 history position. Live views share the attachment's update stream; a view browsing
 history gets its own. Roles, size votes, focus and take control belong to views.
+An attachment may hold none, showing nothing until its first view opens.
 _Avoid_: pane, window, attachment.
 
 **Ensure Session**:

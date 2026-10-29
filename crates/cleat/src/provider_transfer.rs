@@ -73,9 +73,9 @@ pub unsafe extern "C" fn cleat_session_hosting(session: *mut CleatSession, out: 
     };
     session.transfer.hosting = match &session.backend {
         SessionBackend::InProcess(_) => "in_process".into(),
-        SessionBackend::Daemon(daemon) => match daemon.connection.transport() {
+        SessionBackend::Daemon(daemon) => match daemon.view.connection.transport() {
             crate::provider_daemon::Transport::Runtime => {
-                let layout = daemon.connection.channel_layout(daemon.channel);
+                let layout = daemon.view.connection.channel_layout(daemon.view.channel);
                 format!("daemon:{}", layout.resolved().unwrap_or(layout).daemon_name())
             }
             transport => format!("remote:{}", transport.kind()),
@@ -222,16 +222,7 @@ fn transfer_session(session: &mut CleatSession, name: String) -> Result<(), Stri
             crate::packet::ChannelRole::Controller,
             session.transfer.identity.clone(),
         );
-        Ok(DaemonSession {
-            dedicated_connection: true,
-            id,
-            connection,
-            channel,
-            slot,
-            images: Vec::new(),
-            image_resources: Vec::new(),
-            links: Vec::new(),
-        })
+        Ok(DaemonSession { dedicated_connection: true, id, view: DaemonView::new(connection, channel, crate::packet::DEFAULT_VIEW, slot) })
     })();
     match result {
         Ok(daemon) => {
@@ -252,11 +243,11 @@ fn adopt_session(session: &mut CleatSession) -> Result<(), String> {
     let SessionBackend::Daemon(daemon) = &session.backend else {
         return Err("session is not daemon-backed".into());
     };
-    if daemon.connection.transport().is_remote() {
+    if daemon.view.connection.transport().is_remote() {
         return Err("sessions cannot be adopted over a remote transport".into());
     }
-    let identity = daemon.slot.lock().map_err(|_| "session channel lock poisoned")?.identity.clone();
-    let layout = daemon.connection.channel_layout(daemon.channel).resolved()?;
+    let identity = daemon.view.slot.lock().map_err(|_| "session channel lock poisoned")?.identity.clone();
+    let layout = daemon.view.connection.channel_layout(daemon.view.channel).resolved()?;
     let mut inspect_stream = stream(&layout)?;
     crate::http_uds::write_request(&mut inspect_stream, http::Method::GET, &format!("/sessions/{}", daemon.id), &[])
         .map_err(|err| err.to_string())?;
@@ -300,8 +291,21 @@ fn adopt_session(session: &mut CleatSession) -> Result<(), String> {
 #[cfg(unix)]
 fn check_borrows(session: &CleatSession) -> Result<(), String> {
     if session.last_snapshot.is_some() || session.last_render_update.is_some() {
-        Err("release the current render update or snapshot before changing hosting".into())
-    } else {
-        Ok(())
+        return Err("release the current render update or snapshot before changing hosting".into());
     }
+    // In-process hosting has no attachment to carry other views.
+    if let SessionBackend::Daemon(daemon) = &session.backend {
+        if daemon
+            .view
+            .slot
+            .lock()
+            .map_err(|_| "session channel lock poisoned")?
+            .views
+            .keys()
+            .any(|view| *view != crate::packet::DEFAULT_VIEW)
+        {
+            return Err("destroy the session's other views before changing hosting".into());
+        }
+    }
+    Ok(())
 }

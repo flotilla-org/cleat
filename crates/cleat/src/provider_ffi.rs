@@ -42,6 +42,8 @@ pub const CLEAT_SESSION_CLOSED: u32 = 3;
 pub const CLEAT_ROLE_UNKNOWN: u32 = 0;
 pub const CLEAT_ROLE_WATCHER: u32 = 1;
 pub const CLEAT_ROLE_CONTROLLER: u32 = 2;
+/// Session desc only: attach with no default view (see `cleat_session_open_view`).
+pub const CLEAT_ROLE_NO_VIEW: u32 = 3;
 pub const CLEAT_ATTACHMENT_PRINCIPAL: u32 = 0;
 pub const CLEAT_ATTACHMENT_SUPERVISOR: u32 = 1;
 pub const CLEAT_ATTACHMENT_TOOL: u32 = 2;
@@ -294,7 +296,8 @@ pub struct CleatSessionDesc {
     /// Requested attachment role for daemon sessions: CLEAT_ROLE_UNKNOWN /
     /// CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
     /// another controller holds exclusive control); CLEAT_ROLE_WATCHER attaches
-    /// read-only. Ignored by other backends.
+    /// read-only; CLEAT_ROLE_NO_VIEW attaches with no default view. Ignored by
+    /// other backends.
     pub role: u32,
     /// UTF-8 name used in seat status and watcher banners.
     pub attachment_name: *const u8,
@@ -779,6 +782,10 @@ impl OwnedDirectory {
 mod session_transfer;
 pub use session_transfer::{cleat_session_adopt, cleat_session_hosting, cleat_session_transfer, cleat_session_transfer_error};
 
+#[path = "provider_views.rs"]
+mod views;
+pub use views::*;
+
 pub struct CleatSession {
     backend: SessionBackend,
     geometry: TerminalGeometry,
@@ -816,23 +823,223 @@ struct InProcessSession {
     actor: SessionActor,
 }
 
+/// A daemon session handle is one attachment (channel) and its default view.
 struct DaemonSession {
     dedicated_connection: bool,
     id: String,
+    view: DaemonView,
+}
+
+impl Drop for DaemonSession {
+    fn drop(&mut self) {
+        self.view.connection.close_session_channel(self.view.channel);
+        if self.dedicated_connection {
+            self.view.connection.shutdown();
+        }
+    }
+}
+
+/// One view of a daemon attachment and the resources of the frame it last
+/// presented.
+struct DaemonView {
     connection: Arc<DaemonConnection>,
     channel: u32,
+    view: u32,
     slot: Arc<Mutex<ChannelSlot>>,
     images: Vec<crate::image_delivery::Image>,
     image_resources: Vec<TerminalImageResource>,
     links: Vec<crate::provider::TerminalViewLink>,
 }
 
-impl Drop for DaemonSession {
-    fn drop(&mut self) {
-        self.connection.close_session_channel(self.channel);
-        if self.dedicated_connection {
-            self.connection.shutdown();
+impl DaemonView {
+    fn new(connection: Arc<DaemonConnection>, channel: u32, view: u32, slot: Arc<Mutex<ChannelSlot>>) -> Self {
+        Self { connection, channel, view, slot, images: Vec::new(), image_resources: Vec::new(), links: Vec::new() }
+    }
+
+    fn role(&self) -> u32 {
+        match self.slot.lock().ok().and_then(|slot| slot.view(self.view).and_then(|view| view.granted_role)) {
+            Some(crate::packet::ChannelRole::Controller) => CLEAT_ROLE_CONTROLLER,
+            Some(crate::packet::ChannelRole::Watcher) => CLEAT_ROLE_WATCHER,
+            None => CLEAT_ROLE_UNKNOWN,
         }
+    }
+
+    fn set_role(&self, role: crate::packet::ChannelRole, take: bool) -> bool {
+        self.connection.request_role(self.channel, self.view, role, take).is_ok()
+    }
+
+    fn connection_state(&self) -> u32 {
+        // Copy the slot fields before checking connectivity:
+        // is_connected() takes the connection-state lock, and the reader
+        // thread takes connection-state -> slot (install_connection,
+        // request_role), so holding the slot across it would invert the
+        // lock order and deadlock the connection.
+        let (closed, streaming) = match self.slot.lock() {
+            Ok(slot) => (slot.view_closed(self.view).is_some(), slot.view_streaming(self.view)),
+            Err(_) => return CLEAT_SESSION_CLOSED,
+        };
+        if closed {
+            CLEAT_SESSION_CLOSED
+        } else if !self.connection.channel_connected(self.channel) {
+            CLEAT_SESSION_DISCONNECTED
+        } else if streaming {
+            CLEAT_SESSION_STREAMING
+        } else {
+            CLEAT_SESSION_CONNECTING
+        }
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> bool {
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        if let Ok(mut slot) = self.slot.lock() {
+            let Some(view) = slot.view_mut(self.view) else {
+                return false;
+            };
+            view.desired_geometry.cols = cols;
+            view.desired_geometry.rows = rows;
+        }
+        // Best-effort while connected; the desired size is re-asserted on
+        // every reconnect, so a send failure is not a caller error.
+        let _ = self.connection.send_resize(self.channel, self.view, cols, rows);
+        true
+    }
+
+    fn set_cell_size(&self, geometry: TerminalGeometry) -> bool {
+        let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(geometry);
+        let resize = {
+            let Ok(mut slot) = self.slot.lock() else {
+                return false;
+            };
+            let Some(view) = slot.view_mut(self.view) else {
+                return false;
+            };
+            view.desired_geometry.cell_width_px = cell_width_px as f32;
+            view.desired_geometry.cell_height_px = cell_height_px as f32;
+            view.desired_geometry
+        };
+        // Like grid resizes, retain offline changes for the next open.
+        let _ = self.connection.send_input(self.channel, self.view, TerminalInputEvent::Resize(resize));
+        true
+    }
+
+    fn send_input(&self, event: &CleatInputEvent) -> Option<usize> {
+        match packet_input_event(event) {
+            Ok(Some(input)) => self.connection.send_input(self.channel, self.view, input).ok().map(|_| 1),
+            Ok(None) => Some(0),
+            Err(_) => None,
+        }
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) -> bool {
+        self.connection.send_input(self.channel, self.view, TerminalInputEvent::RawBytes(bytes.to_vec())).is_ok()
+    }
+
+    fn dirty(&self) -> DirtyState {
+        self.slot.lock().map(|slot| slot.dirty(self.view)).unwrap_or(DirtyState::Clean)
+    }
+
+    /// The next frame for this view, or a clean update repeating the last one.
+    fn render_update(&mut self) -> Option<TerminalRenderUpdate> {
+        let consumed = {
+            let mut slot = self.slot.lock().ok()?;
+            slot.view(self.view)?;
+            slot.consume(self.view)
+        };
+        match consumed {
+            Some(consumed) => {
+                self.images = consumed.images;
+                self.image_resources = consumed.update.image_resources.clone();
+                self.links = consumed.links;
+                // Consuming the packet is the observation; ack it so the
+                // daemon may send the next one (one-un-acked backpressure).
+                if let Some(ack) = consumed.ack {
+                    let _ = self.connection.send_ack(self.channel, ack);
+                }
+                Some(consumed.update)
+            }
+            None => self.slot.lock().ok()?.view(self.view).map(|view| view.last.clean_update()),
+        }
+    }
+
+    fn scrollback_extent(&self) -> TerminalScrollbackExtent {
+        self.slot
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.view(self.view).map(|view| TerminalScrollbackExtent {
+                    normal_scrollback_rows: view.last.scrollbar.total_rows.saturating_sub(u64::from(view.last.rows)),
+                    live_rows: view.last.rows,
+                    alternate_screen: view.last.terminal_modes.active_alternate_screen,
+                })
+            })
+            .unwrap_or(TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: 0, alternate_screen: false })
+    }
+
+    fn scrollbar_state(&self) -> TerminalScrollbarState {
+        self.slot
+            .lock()
+            .ok()
+            .and_then(|slot| slot.view(self.view).map(|view| view.last.scrollbar))
+            .unwrap_or_else(|| TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, 0))
+    }
+
+    // Fire-and-forget over the packet connection: the true outcome shows
+    // up as viewport/scrollbar state in the next render packet, so report
+    // Moved optimistically on send.
+    fn scroll_viewport(&self, command: ViewportCommand) -> ViewportCommandOutcome {
+        match self.connection.send_viewport(self.channel, self.view, command) {
+            Ok(()) => ViewportCommandOutcome::Moved,
+            Err(_) => ViewportCommandOutcome::NoOp,
+        }
+    }
+
+    fn state_json(&self) -> Option<Vec<u8>> {
+        let slot = self.slot.lock().ok()?;
+        let view = slot.view(self.view)?;
+        serde_json::to_vec(&serde_json::json!({ "role": view.role_state, "view": view.view_state, "links": self.links })).ok()
+    }
+
+    fn with_image_resource_data(&self, image_id: u32, generation: u64, callback: impl FnOnce(&[u8]) -> bool) -> bool {
+        self.images
+            .iter()
+            .find(|image| image.image_id == image_id && image.generation == generation)
+            .is_some_and(|image| callback(image.bytes()))
+    }
+
+    fn image_resource_backing(&self, image_id: u32, generation: u64, kind: u32) -> Result<(CleatImageBacking, OwnedImageBacking), String> {
+        if !matches!(kind, CLEAT_IMAGE_BACKING_FILE | CLEAT_IMAGE_BACKING_SHM) {
+            return Err("unsupported image backing kind".to_string());
+        }
+        let image = self
+            .images
+            .iter()
+            .find(|image| image.image_id == image_id && image.generation == generation)
+            .ok_or("image generation unavailable")?
+            .clone();
+        let resource = self
+            .image_resources
+            .iter()
+            .find(|resource| resource.image_id == image_id && resource.generation == generation)
+            .ok_or("image descriptor unavailable")?;
+        let owned = match kind {
+            CLEAT_IMAGE_BACKING_FILE => {
+                let path = image.backing.path().ok_or("image generation has byte backing")?;
+                OwnedImageBacking { name: path.as_os_str().as_encoded_bytes().to_vec(), _image: Some(image.clone()) }
+            }
+            _ => OwnedImageBacking { name: crate::image_shm::create_shm(image.bytes())?, _image: None },
+        };
+        let value = CleatImageBacking {
+            size: std::mem::size_of::<CleatImageBacking>(),
+            kind,
+            name: owned.name.as_ptr(),
+            name_len: owned.name.len(),
+            width_px: resource.width_px,
+            height_px: resource.height_px,
+            format: resource.format,
+            compression: resource.compression,
+            data_len: resource.data_len,
+        };
+        Ok((value, owned))
     }
 }
 
@@ -1702,11 +1909,7 @@ pub unsafe extern "C" fn cleat_session_role(session: *const CleatSession) -> u32
     };
     match &session.backend {
         SessionBackend::Mock(_) | SessionBackend::InProcess(_) => CLEAT_ROLE_CONTROLLER,
-        SessionBackend::Daemon(daemon) => match daemon.slot.lock().ok().and_then(|slot| slot.granted_role) {
-            Some(crate::packet::ChannelRole::Controller) => CLEAT_ROLE_CONTROLLER,
-            Some(crate::packet::ChannelRole::Watcher) => CLEAT_ROLE_WATCHER,
-            None => CLEAT_ROLE_UNKNOWN,
-        },
+        SessionBackend::Daemon(daemon) => daemon.view.role(),
     }
 }
 
@@ -1726,11 +1929,11 @@ pub unsafe extern "C" fn cleat_session_end(session: *mut CleatSession) -> bool {
         Err(format!("session role {role_name} cannot end a session; controller role required"))
     } else {
         match &session.backend {
-            SessionBackend::Daemon(daemon) if daemon.connection.transport().is_remote() => {
+            SessionBackend::Daemon(daemon) if daemon.view.connection.transport().is_remote() => {
                 Err("ending sessions over a remote transport is unsupported; end them on the daemon's host".into())
             }
             SessionBackend::Daemon(daemon) => {
-                crate::server::SessionService::new(daemon.connection.channel_layout(daemon.channel)).request_end(&daemon.id)
+                crate::server::SessionService::new(daemon.view.connection.channel_layout(daemon.view.channel)).request_end(&daemon.id)
             }
             SessionBackend::InProcess(_) => Err("ending in-process sessions is unsupported".into()),
             SessionBackend::Mock(_) => Err("ending mock sessions is unsupported".into()),
@@ -1776,9 +1979,7 @@ pub unsafe extern "C" fn cleat_session_take_control(session: *mut CleatSession) 
     };
     match &session.backend {
         SessionBackend::Mock(_) | SessionBackend::InProcess(_) => true,
-        SessionBackend::Daemon(daemon) => {
-            daemon.connection.request_role(daemon.channel, crate::packet::ChannelRole::Controller, true).is_ok()
-        }
+        SessionBackend::Daemon(daemon) => daemon.view.set_role(crate::packet::ChannelRole::Controller, true),
     }
 }
 
@@ -1797,7 +1998,7 @@ pub unsafe extern "C" fn cleat_session_set_role(session: *mut CleatSession, role
         _ => return false,
     };
     match &session.backend {
-        SessionBackend::Daemon(daemon) => daemon.connection.request_role(daemon.channel, role, take).is_ok(),
+        SessionBackend::Daemon(daemon) => daemon.view.set_role(role, take),
         _ => role == crate::packet::ChannelRole::Controller,
     }
 }
@@ -1814,7 +2015,8 @@ pub unsafe extern "C" fn cleat_session_set_fixed_size(session: *mut CleatSession
     let SessionBackend::Daemon(daemon) = &session.backend else {
         return false;
     };
-    if daemon.slot.lock().ok().and_then(|slot| slot.granted_role) != Some(crate::packet::ChannelRole::Controller) {
+    // Pinning is session-wide: any driving view of this attachment may set it.
+    if !daemon.view.slot.lock().ok().is_some_and(|slot| slot.has_controller()) {
         return false;
     }
     let fixed = if cols == 0 && rows == 0 {
@@ -1824,7 +2026,7 @@ pub unsafe extern "C" fn cleat_session_set_fixed_size(session: *mut CleatSession
     } else {
         return false;
     };
-    daemon.connection.size_policy(daemon.channel, fixed).is_ok()
+    daemon.view.connection.size_policy(daemon.view.channel, fixed).is_ok()
 }
 
 /// Copy attachment presence, view status and current frame's links as UTF-8 JSON.
@@ -1844,11 +2046,7 @@ pub unsafe extern "C" fn cleat_session_attachment_state_json(
     let SessionBackend::Daemon(daemon) = &session.backend else {
         return false;
     };
-    let Ok(slot) = daemon.slot.lock() else {
-        return false;
-    };
-    let Ok(bytes) = serde_json::to_vec(&serde_json::json!({ "role": slot.role_state, "view": slot.view_state, "links": daemon.links }))
-    else {
+    let Some(bytes) = daemon.view.state_json() else {
         return false;
     };
     *out_len = bytes.len();
@@ -1882,26 +2080,7 @@ pub unsafe extern "C" fn cleat_session_connection_state(session: *const CleatSes
     };
     match &session.backend {
         SessionBackend::Mock(_) | SessionBackend::InProcess(_) => CLEAT_SESSION_STREAMING,
-        SessionBackend::Daemon(daemon) => {
-            // Copy the slot fields before checking connectivity:
-            // is_connected() takes the connection-state lock, and the reader
-            // thread takes connection-state -> slot (install_connection,
-            // request_role), so holding the slot across it would invert the
-            // lock order and deadlock the connection.
-            let (closed, streaming) = match daemon.slot.lock() {
-                Ok(slot) => (slot.closed.is_some(), slot.pending.is_some() || slot.last.render_generation > 0),
-                Err(_) => return CLEAT_SESSION_CLOSED,
-            };
-            if closed {
-                CLEAT_SESSION_CLOSED
-            } else if !daemon.connection.channel_connected(daemon.channel) {
-                CLEAT_SESSION_DISCONNECTED
-            } else if streaming {
-                CLEAT_SESSION_STREAMING
-            } else {
-                CLEAT_SESSION_CONNECTING
-            }
-        }
+        SessionBackend::Daemon(daemon) => daemon.view.connection_state(),
     }
 }
 
@@ -1935,17 +2114,7 @@ pub unsafe extern "C" fn cleat_session_resize(session: *mut CleatSession, cols: 
         SessionBackend::InProcess(in_process) => {
             in_process.actor.request_result(|reply| SessionCommand::Resize { cols: cols.max(1), rows: rows.max(1), reply }).is_ok()
         }
-        SessionBackend::Daemon(daemon) => {
-            let (cols, rows) = (cols.max(1), rows.max(1));
-            if let Ok(mut slot) = daemon.slot.lock() {
-                slot.desired_geometry.cols = cols;
-                slot.desired_geometry.rows = rows;
-            }
-            // Best-effort while connected; the desired size is re-asserted on
-            // every reconnect, so a send failure is not a caller error.
-            let _ = daemon.connection.send_resize(daemon.channel, cols, rows);
-            true
-        }
+        SessionBackend::Daemon(daemon) => daemon.view.resize(cols, rows),
     }
 }
 
@@ -1979,17 +2148,9 @@ pub unsafe extern "C" fn cleat_session_update_geometry(session: *mut CleatSessio
             session.geometry = geometry;
         }
         SessionBackend::Daemon(daemon) => {
-            let (cell_width_px, cell_height_px) = geometry_cell_size_to_backend(geometry);
-            let resize = {
-                let Ok(mut slot) = daemon.slot.lock() else {
-                    return false;
-                };
-                slot.desired_geometry.cell_width_px = cell_width_px as f32;
-                slot.desired_geometry.cell_height_px = cell_height_px as f32;
-                slot.desired_geometry
-            };
-            // Like grid resizes, retain offline changes for the next open.
-            let _ = daemon.connection.send_input(daemon.channel, TerminalInputEvent::Resize(resize));
+            if !daemon.view.set_cell_size(geometry) {
+                return false;
+            }
             session.geometry = geometry;
             notify_wake(&session.wake);
         }
@@ -2109,16 +2270,7 @@ fn send_input_event(session: &mut CleatSession, event: &CleatInputEvent) -> Opti
             Ok(None) => Some(0),
             Err(_) => None,
         },
-        SessionBackend::Daemon(daemon) => match packet_input_event(event) {
-            Ok(Some(input)) => {
-                if daemon.connection.send_input(daemon.channel, input).is_err() {
-                    return None;
-                }
-                Some(1)
-            }
-            Ok(None) => Some(0),
-            Err(_) => None,
-        },
+        SessionBackend::Daemon(daemon) => daemon.view.send_input(event),
     }
 }
 
@@ -2247,9 +2399,7 @@ pub unsafe extern "C" fn cleat_session_write_bytes(session: *mut CleatSession, b
         SessionBackend::InProcess(in_process) => {
             in_process.actor.request_result(|reply| SessionCommand::WriteInput { bytes: bytes.to_vec(), reply }).is_ok()
         }
-        SessionBackend::Daemon(daemon) => {
-            daemon.connection.send_input(daemon.channel, TerminalInputEvent::RawBytes(bytes.to_vec())).is_ok()
-        }
+        SessionBackend::Daemon(daemon) => daemon.view.write_bytes(bytes),
     }
 }
 
@@ -2289,7 +2439,7 @@ pub unsafe extern "C" fn cleat_session_dirty(session: *const CleatSession) -> Cl
 }
 
 fn daemon_slot_dirty(daemon: &DaemonSession) -> DirtyState {
-    daemon.slot.lock().map(|slot| slot.dirty()).unwrap_or(DirtyState::Clean)
+    daemon.view.dirty()
 }
 
 /// # Safety
@@ -2465,36 +2615,10 @@ pub unsafe extern "C" fn cleat_session_render_update(session: *mut CleatSession,
             Ok(update) => update,
             Err(_) => return false,
         },
-        SessionBackend::Daemon(daemon) => {
-            let taken = {
-                let mut slot = match daemon.slot.lock() {
-                    Ok(slot) => slot,
-                    Err(_) => return false,
-                };
-                match slot.pending.take() {
-                    Some(update) => {
-                        daemon.images = std::mem::take(&mut slot.pending_images);
-                        daemon.image_resources = update.image_resources.clone();
-                        daemon.links = std::mem::take(&mut slot.pending_links);
-                        slot.last.absorb(&update);
-                        Some(update)
-                    }
-                    None => None,
-                }
-            };
-            match taken {
-                Some(update) => {
-                    // Consuming the packet is the observation; ack it so the
-                    // daemon may send the next one (one-un-acked backpressure).
-                    let _ = daemon.connection.send_ack(daemon.channel, update.render_generation);
-                    update
-                }
-                None => match daemon.slot.lock() {
-                    Ok(slot) => slot.last.clean_update(),
-                    Err(_) => return false,
-                },
-            }
-        }
+        SessionBackend::Daemon(daemon) => match daemon.view.render_update() {
+            Some(update) => update,
+            None => return false,
+        },
     };
     update.geometry = session.geometry;
     update.scrollbar = session_scrollbar_state(session);
@@ -2576,11 +2700,9 @@ pub unsafe extern "C" fn cleat_session_with_image_resource_data(
     };
     match &mut session.backend {
         SessionBackend::Mock(_) => false,
-        SessionBackend::Daemon(daemon) => daemon
-            .images
-            .iter()
-            .find(|image| image.image_id == image_id && image.generation == generation)
-            .is_some_and(|image| unsafe { callback(user_data, image.bytes().as_ptr(), image.bytes().len()) }),
+        SessionBackend::Daemon(daemon) => {
+            daemon.view.with_image_resource_data(image_id, generation, |bytes| unsafe { callback(user_data, bytes.as_ptr(), bytes.len()) })
+        }
         SessionBackend::InProcess(in_process) => {
             let user_data = user_data as usize;
             in_process
@@ -2610,45 +2732,14 @@ pub unsafe extern "C" fn cleat_session_image_resource_backing(
 ) -> bool {
     let (Some(session), Some(out)) = (unsafe { session.as_mut() }, unsafe { out.as_mut() }) else { return false };
     session.backing_error.clear();
-    let result = (|| {
-        if !matches!(kind, CLEAT_IMAGE_BACKING_FILE | CLEAT_IMAGE_BACKING_SHM) {
-            return Err("unsupported image backing kind".to_string());
-        }
-        let SessionBackend::Daemon(daemon) = &session.backend else {
-            return Err("unsupported image backing backend".to_string());
-        };
-        let image = daemon
-            .images
-            .iter()
-            .find(|image| image.image_id == image_id && image.generation == generation)
-            .ok_or("image generation unavailable")?
-            .clone();
-        let resource = daemon
-            .image_resources
-            .iter()
-            .find(|resource| resource.image_id == image_id && resource.generation == generation)
-            .ok_or("image descriptor unavailable")?;
-        let owned = match kind {
-            CLEAT_IMAGE_BACKING_FILE => {
-                let path = image.backing.path().ok_or("image generation has byte backing")?;
-                OwnedImageBacking { name: path.as_os_str().as_encoded_bytes().to_vec(), _image: Some(image.clone()) }
-            }
-            _ => OwnedImageBacking { name: crate::image_shm::create_shm(image.bytes())?, _image: None },
-        };
-        let value = CleatImageBacking {
-            size: std::mem::size_of::<CleatImageBacking>(),
-            kind,
-            name: owned.name.as_ptr(),
-            name_len: owned.name.len(),
-            width_px: resource.width_px,
-            height_px: resource.height_px,
-            format: resource.format,
-            compression: resource.compression,
-            data_len: resource.data_len,
-        };
-        session.image_backings.insert(value.name as usize, owned);
-        Ok(value)
-    })();
+    let result = match &session.backend {
+        SessionBackend::Daemon(daemon) => daemon.view.image_resource_backing(image_id, generation, kind).map(|(value, owned)| {
+            session.image_backings.insert(value.name as usize, owned);
+            value
+        }),
+        _ if !matches!(kind, CLEAT_IMAGE_BACKING_FILE | CLEAT_IMAGE_BACKING_SHM) => Err("unsupported image backing kind".to_string()),
+        _ => Err("unsupported image backing backend".to_string()),
+    };
     match result {
         Ok(value) => {
             *out = value;
@@ -2717,15 +2808,7 @@ fn session_scrollback_extent(session: &mut CleatSession) -> TerminalScrollbackEx
                 alternate_screen: false,
             })
         }
-        SessionBackend::Daemon(daemon) => daemon
-            .slot
-            .lock()
-            .map(|slot| TerminalScrollbackExtent {
-                normal_scrollback_rows: slot.last.scrollbar.total_rows.saturating_sub(u64::from(slot.last.rows)),
-                live_rows: slot.last.rows,
-                alternate_screen: slot.last.terminal_modes.active_alternate_screen,
-            })
-            .unwrap_or(TerminalScrollbackExtent { normal_scrollback_rows: 0, live_rows: 0, alternate_screen: false }),
+        SessionBackend::Daemon(daemon) => daemon.view.scrollback_extent(),
     }
 }
 
@@ -2735,11 +2818,7 @@ fn session_scrollbar_state(session: &mut CleatSession) -> TerminalScrollbarState
         SessionBackend::InProcess(in_process) => {
             in_process.actor.request(|reply| SessionCommand::ScrollbarState { reply }, TerminalScrollbarState::default())
         }
-        SessionBackend::Daemon(daemon) => daemon
-            .slot
-            .lock()
-            .map(|slot| slot.last.scrollbar)
-            .unwrap_or_else(|_| TerminalScrollbarState::for_live_viewport(TerminalViewportKind::LiveNormal, 0)),
+        SessionBackend::Daemon(daemon) => daemon.view.scrollbar_state(),
     }
 }
 
@@ -2757,13 +2836,7 @@ fn session_scroll_viewport(session: &mut CleatSession, command: Option<ViewportC
                 Err(_) => ViewportCommandOutcome::Unsupported,
             }
         }
-        // Fire-and-forget over the packet connection: the true outcome shows
-        // up as viewport/scrollbar state in the next render packet, so report
-        // Moved optimistically on send.
-        SessionBackend::Daemon(daemon) => match daemon.connection.send_viewport(daemon.channel, command) {
-            Ok(()) => ViewportCommandOutcome::Moved,
-            Err(_) => ViewportCommandOutcome::NoOp,
-        },
+        SessionBackend::Daemon(daemon) => daemon.view.scroll_viewport(command),
     }
 }
 
@@ -2874,21 +2947,11 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
         environment: Vec::new(),
     })?;
-    let (channel, slot) = connection.open_session_channel(
-        metadata.id.clone(),
-        daemon_geometry_from_desc(desc),
-        channel_role_from_ffi(desc.role)?,
-        attachment_identity_from_desc(desc)?,
-    );
+    let (channel, slot) = open_daemon_channel(connection, metadata.id.clone(), desc)?;
     Ok(DaemonSession {
         dedicated_connection: false,
         id: metadata.id,
-        connection: Arc::clone(connection),
-        channel,
-        slot,
-        images: Vec::new(),
-        image_resources: Vec::new(),
-        links: Vec::new(),
+        view: DaemonView::new(Arc::clone(connection), channel, crate::packet::DEFAULT_VIEW, slot),
     })
 }
 
@@ -2897,22 +2960,27 @@ fn attach_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let id = read_optional_utf8(desc.id, desc.id_len)
         .map_err(|err| format!("id is not valid UTF-8: {err}"))?
         .ok_or_else(|| "attach requires a session id".to_string())?;
-    let (channel, slot) = connection.open_session_channel(
-        id.clone(),
-        daemon_geometry_from_desc(desc),
-        channel_role_from_ffi(desc.role)?,
-        attachment_identity_from_desc(desc)?,
-    );
+    let (channel, slot) = open_daemon_channel(connection, id.clone(), desc)?;
     Ok(DaemonSession {
         dedicated_connection: false,
         id,
-        connection: Arc::clone(connection),
-        channel,
-        slot,
-        images: Vec::new(),
-        image_resources: Vec::new(),
-        links: Vec::new(),
+        view: DaemonView::new(Arc::clone(connection), channel, crate::packet::DEFAULT_VIEW, slot),
     })
+}
+
+/// Open the attachment a session handle holds: with its default view, or with
+/// none when the desc asks for CLEAT_ROLE_NO_VIEW, which never falls back to a
+/// default view on a daemon that predates views.
+fn open_daemon_channel(
+    connection: &Arc<crate::provider_daemon::DaemonConnection>,
+    id: String,
+    desc: CleatSessionDesc,
+) -> Result<(u32, Arc<Mutex<crate::provider_daemon::ChannelSlot>>), String> {
+    let identity = attachment_identity_from_desc(desc)?;
+    if desc.role != CLEAT_ROLE_NO_VIEW {
+        return Ok(connection.open_session_channel(id, daemon_geometry_from_desc(desc), channel_role_from_ffi(desc.role)?, identity));
+    }
+    connection.open_attachment_channel(id, identity)
 }
 
 fn daemon_geometry_from_desc(desc: CleatSessionDesc) -> TerminalResizeEvent {
@@ -3268,11 +3336,9 @@ pub unsafe extern "C" fn cleat_session_clipboard_supported(session: *const Cleat
     match &session.backend {
         SessionBackend::Mock(_) => false,
         SessionBackend::InProcess(s) => s.actor.clipboard_supported().unwrap_or(false),
-        SessionBackend::Daemon(s) => s
-            .slot
-            .lock()
-            .ok()
-            .is_some_and(|slot| slot.closed.is_none() && slot.role_state.as_ref().is_some_and(|role| role.clipboard_writes)),
+        SessionBackend::Daemon(s) => s.view.slot.lock().ok().is_some_and(|slot| {
+            slot.closed.is_none() && slot.views.values().any(|view| view.role_state.as_ref().is_some_and(|role| role.clipboard_writes))
+        }),
     }
 }
 /// Acquire and remove one event; null means no pending event. Does not consume
@@ -3287,13 +3353,17 @@ pub unsafe extern "C" fn cleat_session_acquire_clipboard_event(session: *mut Cle
     let event = match &session.backend {
         SessionBackend::Mock(_) => None,
         SessionBackend::InProcess(s) => s.actor.pop_clipboard(0).ok().flatten(),
-        SessionBackend::Daemon(s) => s.slot.lock().ok().and_then(|mut slot| {
-            if slot.closed.is_none() && slot.granted_role == Some(crate::packet::ChannelRole::Controller) {
-                slot.clipboard.pop()
-            } else {
-                None
-            }
-        }),
+        SessionBackend::Daemon(s) => {
+            s.view.slot.lock().ok().and_then(
+                |mut slot| {
+                    if slot.closed.is_none() && slot.has_controller() {
+                        slot.clipboard.pop()
+                    } else {
+                        None
+                    }
+                },
+            )
+        }
     };
     let Some(event) = event else {
         return ptr::null();
@@ -3337,7 +3407,9 @@ pub unsafe extern "C" fn cleat_session_clipboard_dropped(session: *const CleatSe
     match &session.backend {
         SessionBackend::Mock(_) => 0,
         SessionBackend::InProcess(s) => s.actor.clipboard_loss().unwrap_or(0),
-        SessionBackend::Daemon(s) => s.slot.lock().map_or(0, |slot| slot.clipboard.dropped.saturating_add(slot.clipboard_upstream_dropped)),
+        SessionBackend::Daemon(s) => {
+            s.view.slot.lock().map_or(0, |slot| slot.clipboard.dropped.saturating_add(slot.clipboard_upstream_dropped))
+        }
     }
 }
 

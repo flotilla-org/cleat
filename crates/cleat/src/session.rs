@@ -1,7 +1,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{self, Read, Write},
     panic::{self, AssertUnwindSafe},
@@ -1969,17 +1969,33 @@ struct PendingExpect {
     registered_at: Instant,
 }
 
-/// Identity of a session channel on a packet connection, stable across the
+/// Identity of one view on a packet connection, stable across the
 /// packet_clients vec's swap_remove reordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PacketChannelRef {
     client_id: u64,
     channel: u32,
+    view: u32,
 }
 
+/// No view uses this id; it names the attachment as a whole.
+const ATTACHMENT_VIEW: u32 = u32::MAX;
+/// Bounds the daemon work and memory one attachment can claim.
+const MAX_VIEWS_PER_ATTACHMENT: usize = 64;
+
 impl PacketChannelRef {
+    fn new(client_id: u64, channel: u32, view: u32) -> Self {
+        Self { client_id, channel, view }
+    }
+
+    /// The session actor's key for this view's history position and held input.
     fn view_id(self) -> u128 {
-        (u128::from(self.client_id) << 32) | u128::from(self.channel)
+        (u128::from(self.client_id) << 64) | (u128::from(self.channel) << 32) | u128::from(self.view)
+    }
+
+    /// Clipboard effects are delivered to an attachment, not to each view.
+    fn attachment_id(self) -> u128 {
+        Self { view: ATTACHMENT_VIEW, ..self }.view_id()
     }
 }
 
@@ -2042,7 +2058,7 @@ struct HostedSession {
     focused: bool,
     applied_size: (u16, u16),
     applied_cell_size: (u32, u32),
-    packet_render_cache: PacketRenderCache,
+    packet_render_cache: crate::render_cache::PacketRenderCache,
     had_foreground_client: bool,
     pending_sends: Vec<PendingSend>,
     pending_waits: Vec<PendingWait>,
@@ -2094,7 +2110,7 @@ impl HostedSession {
             packet_control: Default::default(),
             fixed_size: None,
             focused: false,
-            packet_render_cache: PacketRenderCache::default(),
+            packet_render_cache: crate::render_cache::PacketRenderCache::default(),
             had_foreground_client: false,
             pending_sends: Vec::new(),
             pending_waits: Vec::new(),
@@ -2698,12 +2714,10 @@ fn packet_role_counts(session_id: &str, packet_clients: &[PacketClient]) -> (u32
     let mut controllers = 0u32;
     let mut watchers = 0u32;
     for client in packet_clients {
-        for session_channel in client.channels.values() {
-            if session_channel.session_id == session_id {
-                match session_channel.role {
-                    ChannelRole::Controller => controllers = controllers.saturating_add(1),
-                    ChannelRole::Watcher => watchers = watchers.saturating_add(1),
-                }
+        for session_channel in client.channels.values().filter(|channel| channel.present_in(session_id)) {
+            match session_channel.role() {
+                ChannelRole::Controller => controllers = controllers.saturating_add(1),
+                ChannelRole::Watcher => watchers = watchers.saturating_add(1),
             }
         }
     }
@@ -2751,7 +2765,7 @@ fn sync_packet_geometry(hosted: &mut HostedSession) -> Result<(), String> {
 
 fn sync_packet_controller_presence(layout: &RuntimeLayout, hosted: &HostedSession, previously_had_controller: bool) -> Result<(), String> {
     hosted.actor.set_clipboard_target(if hosted.active_client.is_none() {
-        hosted.packet_control.controllers().next().map(PacketChannelRef::view_id)
+        hosted.packet_control.controllers().next().map(PacketChannelRef::attachment_id)
     } else {
         None
     })?;
@@ -2777,8 +2791,8 @@ fn packet_presence(hosted: &HostedSession, clients: &[PacketClient]) -> (Vec<cra
         .iter()
         .filter(|client| !client.dead)
         .flat_map(|client| {
-            client.channels.iter().filter(|(_, channel)| channel.session_id == hosted.metadata.id).map(move |(id, channel)| {
-                crate::packet::Participant { connection: client.id, channel: *id, identity: channel.identity.clone(), role: channel.role }
+            client.channels.iter().filter(|(_, channel)| channel.present_in(&hosted.metadata.id)).map(move |(id, channel)| {
+                crate::packet::Participant { connection: client.id, channel: *id, identity: channel.identity.clone(), role: channel.role() }
             })
         })
         .collect();
@@ -2826,33 +2840,33 @@ fn announce_seat_state_except(
         watcher.enqueue_frame(&Frame::SeatState(SeatState { role: "watcher".to_string(), controller: controller.clone() }))?;
     }
     for client in packet_clients {
-        let channels: Vec<(u32, ChannelRole, ChannelRole)> = client
+        let views: Vec<(u32, u32)> = client
             .channels
             .iter()
             .filter(|(_, channel)| channel.session_id == hosted.metadata.id)
-            .map(|(id, channel)| (*id, channel.role, channel.requested_role))
+            .flat_map(|(id, channel)| channel.views.keys().map(move |view| (*id, *view)))
             .collect();
-        for (channel, role, requested_role) in channels {
-            if excluded == Some(PacketChannelRef { client_id: client.id, channel }) {
+        for (channel, view) in views {
+            if excluded == Some(PacketChannelRef::new(client.id, channel, view)) {
                 continue;
             }
-            let denial_reason = (exclusive.is_some() && role == ChannelRole::Watcher && requested_role == ChannelRole::Controller)
-                .then_some(RoleDenialReason { held_by: holder_kind });
-            if let Some(session_channel) = client.channels.get_mut(&channel) {
-                session_channel.denial_reason = denial_reason;
-            }
-            client.enqueue_frame(
-                &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState {
-                    clipboard_writes: hosted.actor.clipboard_supported()?,
-                    role,
-                    controller: controller.clone(),
-                    denial_reason,
-                    participants: participants.clone(),
-                    exclusive: exclusive.clone(),
-                    fixed_size: hosted.fixed_size.map(|(cols, rows)| Resize { cols, rows }),
-                })
-                .map_err(|err| format!("encode seat state packet: {err}"))?,
-            )?;
+            let session_channel = client.channels.get_mut(&channel).expect("announced channel exists");
+            let packet_view = session_channel.views.get_mut(&view).expect("announced view exists");
+            let role = packet_view.role;
+            let denial_reason =
+                (exclusive.is_some() && role == ChannelRole::Watcher && packet_view.requested_role == ChannelRole::Controller)
+                    .then_some(RoleDenialReason { held_by: holder_kind });
+            packet_view.denial_reason = denial_reason;
+            let frame = session_channel.view_frame(channel, view, MSG_SESSION_ROLE, &RoleState {
+                clipboard_writes: hosted.actor.clipboard_supported()?,
+                role,
+                controller: controller.clone(),
+                denial_reason,
+                participants: participants.clone(),
+                exclusive: exclusive.clone(),
+                fixed_size: hosted.fixed_size.map(|(cols, rows)| Resize { cols, rows }),
+            })?;
+            client.enqueue_frame(&frame)?;
         }
     }
     Ok(())
@@ -2879,15 +2893,15 @@ fn inspect_hosted_session(hosted: &HostedSession, packet_clients: &[PacketClient
         denial_reason: client.denial_reason,
     }));
     for client in packet_clients {
-        result.attachments.extend(client.channels.values().filter(|channel| channel.session_id == result.session.id).map(|channel| {
+        result.attachments.extend(client.channels.values().filter(|channel| channel.present_in(&result.session.id)).map(|channel| {
             crate::protocol::AttachmentInspect {
-                role: match channel.role {
+                role: match channel.role() {
                     ChannelRole::Controller => "controller",
                     ChannelRole::Watcher => "watcher",
                 }
                 .to_string(),
                 identity: channel.identity.clone(),
-                denial_reason: channel.denial_reason,
+                denial_reason: channel.denial_reason(),
             }
         }));
     }
@@ -3924,6 +3938,7 @@ fn handle_http_request(
             client.virtual_placements = subscribe.virtual_placements;
             client.program_status = subscribe.program_status || subscribe.recognizer_roles;
             client.recognizer_roles = subscribe.recognizer_roles;
+            client.views = subscribe.views && advertised_hello().version >= crate::packet::VIEWS_PROTOCOL_VERSION;
             if let Some(activity) = &activity {
                 if let Err(message) = client.admit_activity(state.layout, &activity.sessions) {
                     return http_uds::write_error(stream, StatusCode::CONFLICT, &message.to_string())
@@ -3932,7 +3947,7 @@ fn handle_http_request(
             }
             client.enqueue_control(
                 MSG_CONTROL_HELLO,
-                &hello_for_subscription(client.virtual_placements, client.program_status, client.recognizer_roles),
+                &hello_for_subscription(client.virtual_placements, client.program_status, client.recognizer_roles, client.views),
             )?;
             client.enqueue_control(MSG_CONTROL_DIRECTORY_SNAPSHOT, &directory)?;
             if let Some(activity) = activity {
@@ -4005,8 +4020,10 @@ fn handle_http_request(
                 hosted.actor.retain_input_sources(vec![])?;
                 for client in state.packet_clients.iter_mut() {
                     for channel in client.channels.values_mut().filter(|c| c.session_id == id) {
-                        channel.role = ChannelRole::Watcher;
-                        channel.denial_reason = Some(RoleDenialReason { held_by: ControllerHolder::Stream });
+                        for view in channel.views.values_mut() {
+                            view.role = ChannelRole::Watcher;
+                            view.denial_reason = Some(RoleDenialReason { held_by: ControllerHolder::Stream });
+                        }
                     }
                 }
             }
@@ -4119,18 +4136,30 @@ fn handle_http_request(
             if hosted.active_client.is_some() {
                 hosted.actor.record_detach()?;
             }
+            // Detaching closes each attachment holding a controller view,
+            // with every view it holds.
             let controllers: Vec<_> = hosted.packet_control.controllers().collect();
+            let mut detached: Vec<_> = controllers.iter().map(|key| (key.client_id, key.channel)).collect();
+            detached.dedup();
             for controller in controllers {
                 hosted.packet_control.remove(controller);
                 hosted.actor.release_input(controller.view_id())?;
                 hosted.actor.release_attachment_view(controller.view_id());
-                if let Some(client) = state.packet_clients.iter_mut().find(|client| client.id == controller.client_id) {
-                    client.enqueue_control(MSG_CONTROL_ERROR, &ControlError {
-                        channel: controller.channel,
-                        message: format!("session {id} detached"),
-                    })?;
-                    client.channels.remove(&controller.channel);
+            }
+            for (client_id, channel) in detached {
+                let Some(client) = state.packet_clients.iter_mut().find(|client| client.id == client_id) else {
+                    continue;
+                };
+                let Some(removed) = client.channels.remove(&channel) else {
+                    continue;
+                };
+                for view in removed.views.keys() {
+                    let key = PacketChannelRef::new(client_id, channel, *view);
+                    hosted.packet_control.remove(key);
+                    hosted.actor.release_input(key.view_id())?;
+                    hosted.actor.release_attachment_view(key.view_id());
                 }
+                client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message: format!("session {id} detached") })?;
             }
             hosted.actor.set_query_passthrough(false)?;
             hosted.active_client = None;
@@ -4640,8 +4669,15 @@ fn advertised_hello() -> ControlHello {
     ControlHello::current()
 }
 
-fn hello_for_subscription(virtual_placements: bool, program_status: bool, recognizer_roles: bool) -> ControlHello {
+fn hello_for_subscription(virtual_placements: bool, program_status: bool, recognizer_roles: bool, views: bool) -> ControlHello {
     let hello = advertised_hello();
+    if views {
+        return hello;
+    }
+    // Clients that did not opt in to views keep the hello they saw before.
+    if recognizer_roles && hello == ControlHello::current() {
+        return ControlHello { version: 15, min_supported_version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION };
+    }
     if !recognizer_roles && program_status && hello == ControlHello::current() {
         return ControlHello { version: 14, min_supported_version: crate::packet::MIN_SUPPORTED_PROTOCOL_VERSION };
     }
@@ -4712,6 +4748,9 @@ fn http_input_key_bytes(key: http_uds::KeyRequest) -> Vec<u8> {
 }
 
 struct PacketClient {
+    /// Opted in to views (protocol 16): channels open with a default view and
+    /// may open more.
+    views: bool,
     recognizer_roles: bool,
     known_roles: HashMap<String, Vec<crate::recognizer::Role>>,
     program_status: bool,
@@ -4737,127 +4776,116 @@ struct PacketClient {
     dead: bool,
 }
 
+/// One attachment: a client's subscription to one session over a packet
+/// connection. It holds one or more views; legacy channels hold exactly one.
 struct PacketSessionChannel {
     program_status: bool,
     status_generation: Option<u64>,
     _output_lease: Option<crate::output_admission::OutputLease>,
     session_id: String,
-    role: ChannelRole,
-    requested_role: ChannelRole,
     identity: AttachmentIdentity,
-    denial_reason: Option<RoleDenialReason>,
-    in_flight_generation: Option<u64>,
+    /// Views protocol: per-view messages are wrapped, and live views share the
+    /// attachment's `live` render stream. Otherwise the one view's renders,
+    /// live or history, travel unwrapped under its own credit.
+    views_protocol: bool,
+    views: BTreeMap<u32, PacketView>,
+    /// The shared live render stream of a views-protocol attachment.
+    live: RenderCredit,
+    /// Delivery sequence shared by every render on the channel, live or history.
     last_sent_generation: u64,
-    last_source_generation: u64,
-    history: bool,
-    view_changed: bool,
-    view_state: crate::provider::ViewState,
-    next_capture: Instant,
     clipboard_loss: u64,
     local_images: bool,
     image_resident: HashSet<crate::image_delivery::ImageKey>,
-    image_transfer: Option<ImageTransfer>,
+    /// Render deliveries in send order; the front one is being written.
+    image_transfers: VecDeque<ImageTransfer>,
 }
 
-#[derive(Default)]
-struct PacketRenderCache {
-    latest: Option<RenderBundle>,
-    history_cursor: u128,
-    rows: Vec<crate::provider::TerminalRenderRow>,
-    row_generations: Vec<u64>,
-    reset_generation: u64,
+/// One render stream's acknowledgement credit: one unacknowledged render.
+struct RenderCredit {
+    in_flight_generation: Option<u64>,
+    last_source_generation: u64,
+    next_capture: Instant,
 }
 
-impl PacketRenderCache {
-    fn store(&mut self, mut bundle: RenderBundle) {
-        use crate::provider::TerminalRenderUpdateOpKind as Kind;
-        let update = &mut bundle.packet.update;
-        let generation = update.render_generation;
-        if self.latest.as_ref().is_none_or(|previous| {
-            let previous = &previous.packet.update;
-            previous.cols != update.cols
-                || previous.rows != update.rows
-                || previous.terminal_modes.active_alternate_screen != update.terminal_modes.active_alternate_screen
-        }) {
-            self.rows = (0..update.rows)
-                .map(|row| crate::provider::TerminalRenderRow {
-                    row,
-                    col_count: update.cols,
-                    cells: vec![Default::default(); update.cols as usize],
-                    ..Default::default()
-                })
-                .collect();
-            self.row_generations = vec![generation; update.rows as usize];
-            self.reset_generation = generation;
+impl RenderCredit {
+    fn new(in_flight_generation: Option<u64>, last_source_generation: u64) -> Self {
+        Self { in_flight_generation, last_source_generation, next_capture: Instant::now() }
+    }
+}
+
+/// A sub-address within an attachment: its own role, size vote, focus and
+/// history position.
+struct PacketView {
+    role: ChannelRole,
+    requested_role: ChannelRole,
+    denial_reason: Option<RoleDenialReason>,
+    history: bool,
+    view_changed: bool,
+    view_state: crate::provider::ViewState,
+    /// Legacy channels: the channel's one render stream. Views protocol: this
+    /// view's history renders.
+    credit: RenderCredit,
+}
+
+impl PacketView {
+    fn new(role: ChannelRole, requested_role: ChannelRole, denial_reason: Option<RoleDenialReason>, credit: RenderCredit) -> Self {
+        Self { role, requested_role, denial_reason, history: false, view_changed: false, view_state: Default::default(), credit }
+    }
+}
+
+impl PacketSessionChannel {
+    /// Release render credit for an acknowledged render. An unwrapped ack
+    /// (`view` None) releases the attachment's live stream, or a legacy
+    /// channel's one stream, and never a view's history credit; a wrapped ack
+    /// releases only that view's history credit. Packet capture already
+    /// consumed actor damage into the daemon cache.
+    fn release_credit(&mut self, view: Option<u32>, generation: u64) {
+        let credit = match view {
+            None if self.views_protocol => Some(&mut self.live),
+            None => self.views.get_mut(&crate::packet::DEFAULT_VIEW).map(|view| &mut view.credit),
+            Some(view) if self.views_protocol => self.views.get_mut(&view).map(|view| &mut view.credit),
+            Some(_) => None,
+        };
+        if let Some(credit) = credit.filter(|credit| credit.in_flight_generation == Some(generation)) {
+            credit.in_flight_generation = None;
         }
-        for op in std::mem::take(&mut update.ops) {
-            if op.kind == Kind::FullVisibleReplace {
-                self.reset_generation = generation;
-            }
-            if op.kind == Kind::ScrollCopy {
-                // Snapshot before copying so overlapping scrolls are lossless.
-                let copied: Vec<_> =
-                    (0..op.row_count).filter_map(|offset| self.rows.get(usize::from(op.src_row + offset)).cloned()).collect();
-                for (offset, mut row) in copied.into_iter().enumerate() {
-                    let index = usize::from(op.dst_row) + offset;
-                    if let Some(target) = self.rows.get_mut(index) {
-                        row.row = index as u16;
-                        *target = row;
-                        self.row_generations[index] = generation;
-                    }
-                }
-            } else {
-                for row in op.rows {
-                    let index = usize::from(row.row);
-                    if let Some(target) = self.rows.get_mut(index) {
-                        *target = row;
-                        self.row_generations[index] = generation;
-                    }
-                }
-            }
-        }
-        self.latest = Some(bundle);
     }
 
-    fn since(&self, generation: u64) -> Option<RenderBundle> {
-        use crate::provider::{TerminalRenderUpdateOp, TerminalRenderUpdateOpKind as Kind};
-        let mut bundle = self.latest.clone()?;
-        let update = &mut bundle.packet.update;
-        if generation < self.reset_generation {
-            update.dirty = DirtyState::Full;
-            update.ops.push(TerminalRenderUpdateOp {
-                kind: Kind::FullVisibleReplace,
-                row_count: update.rows,
-                col_count: update.cols,
-                rows: self.rows.clone(),
-                ..Default::default()
-            });
+    fn has_controller(&self) -> bool {
+        self.views.values().any(|view| view.role == ChannelRole::Controller)
+    }
+
+    /// Presence counts attachments that show the session in at least one view.
+    fn present_in(&self, session_id: &str) -> bool {
+        self.session_id == session_id && !self.views.is_empty()
+    }
+
+    /// Presence counts attachments: one drives while any of its views does.
+    fn role(&self) -> ChannelRole {
+        if self.has_controller() {
+            ChannelRole::Controller
         } else {
-            update.ops = self
-                .rows
-                .iter()
-                .zip(&self.row_generations)
-                .filter(|(_, changed)| **changed > generation)
-                .map(|(row, _)| TerminalRenderUpdateOp {
-                    kind: Kind::RowReplace,
-                    first_row: row.row,
-                    row_count: 1,
-                    col_count: update.cols,
-                    rows: vec![row.clone()],
-                    ..Default::default()
-                })
-                .collect();
-            update.dirty = if update.ops.is_empty() { DirtyState::Clean } else { DirtyState::Partial };
+            ChannelRole::Watcher
         }
-        Some(bundle)
     }
 
-    fn latest_generation(&self) -> Option<u64> {
-        self.latest.as_ref().map(|update| update.packet.update.render_generation)
+    /// A watching attachment reports why its views were refused control.
+    fn denial_reason(&self) -> Option<RoleDenialReason> {
+        if self.has_controller() {
+            None
+        } else {
+            self.views.values().find_map(|view| view.denial_reason)
+        }
     }
 
-    fn latest(&self) -> Option<&RenderBundle> {
-        self.latest.as_ref()
+    /// Address a per-view server message: wrapped on views channels, as-is on legacy ones.
+    fn view_frame<T: serde::Serialize>(&self, channel: u32, view: u32, msg_type: u8, value: &T) -> Result<PacketFrame, String> {
+        let frame = PacketFrame::new(channel, msg_type, value).map_err(|err| format!("encode view packet: {err}"))?;
+        if self.views_protocol {
+            crate::packet::ViewFrame::wrap(view, &frame).map_err(|err| format!("encode view packet: {err}"))
+        } else {
+            Ok(frame)
+        }
     }
 }
 
@@ -4878,6 +4906,7 @@ impl PacketClient {
             pending_output: PendingOutput::new(),
             image_output_cursor: 0,
             virtual_placements: false,
+            views: false,
             recognizer_roles: false,
             known_roles: HashMap::new(),
             program_status: false,
@@ -4961,7 +4990,7 @@ impl PacketClient {
     #[cfg(unix)]
     fn has_pending_output(&self) -> bool {
         !self.pending_output.is_empty()
-            || self.channels.values().any(|channel| channel.image_transfer.as_ref().is_some_and(ImageTransfer::ready))
+            || self.channels.values().any(|channel| channel.image_transfers.front().is_some_and(ImageTransfer::ready))
     }
 
     /// Rotate after every frame, including across calls when backpressure or a
@@ -4973,7 +5002,7 @@ impl PacketClient {
         let mut channels: Vec<_> = self
             .channels
             .iter()
-            .filter(|(_, channel)| channel.image_transfer.as_ref().is_some_and(ImageTransfer::ready))
+            .filter(|(_, channel)| channel.image_transfers.front().is_some_and(ImageTransfer::ready))
             .map(|(id, _)| *id)
             .collect();
         channels.sort_unstable();
@@ -4994,11 +5023,11 @@ impl PacketClient {
             index = (index + 1) % channels.len();
             self.image_output_cursor = id;
             let channel = self.channels.get_mut(&id).expect("channel exists");
-            let frame = match &mut channel.image_transfer {
+            let frame = match channel.image_transfers.front_mut() {
                 Some(transfer) => {
                     let frame = transfer.next(id)?;
                     if transfer.complete() {
-                        channel.image_transfer = None;
+                        channel.image_transfers.pop_front();
                     }
                     frame
                 }
@@ -5093,10 +5122,12 @@ fn release_packet_client_roles(
     for (channel, session_channel) in &removed.channels {
         if let Some(hosted) = sessions.get_mut(&session_channel.session_id) {
             let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
-            hosted.packet_control.remove(PacketChannelRef { client_id: removed.id, channel: *channel });
-            let id = PacketChannelRef { client_id: removed.id, channel: *channel }.view_id();
-            let _ = hosted.actor.release_input(id);
-            hosted.actor.release_attachment_view(id);
+            for view in session_channel.views.keys() {
+                let key = PacketChannelRef::new(removed.id, *channel, *view);
+                hosted.packet_control.remove(key);
+                let _ = hosted.actor.release_input(key.view_id());
+                hosted.actor.release_attachment_view(key.view_id());
+            }
             let _ = sync_packet_geometry(hosted);
             let _ = sync_packet_controller_presence(layout, hosted, previously_had_controller);
         }
@@ -5129,8 +5160,9 @@ fn packet_controller_holder_is_live(current: PacketChannelRef, packet_clients: &
     packet_clients.iter().any(|client| client.id == current.client_id && !client.dead)
 }
 
-/// Resolve a controller/watcher request for `requester`, demoting the current
-/// controller when `take` is set. Legacy stream controllers are moved into the
+/// Resolve a controller/watcher request for the `requester` view, demoting
+/// every other controller view when `take` is set, including views on the
+/// requester's own attachment. Legacy stream controllers are moved into the
 /// watcher set so their connection and output stream remain alive.
 fn grant_packet_role(
     hosted: &mut HostedSession,
@@ -5154,9 +5186,14 @@ fn grant_packet_role(
     if granted && take {
         for client in packet_clients.iter_mut() {
             for (channel, session) in &mut client.channels {
-                if session.session_id == hosted.metadata.id && (PacketChannelRef { client_id: client.id, channel: *channel }) != requester {
-                    session.role = ChannelRole::Watcher;
-                    session.denial_reason = Some(RoleDenialReason { held_by: ControllerHolder::Packet });
+                if session.session_id != hosted.metadata.id {
+                    continue;
+                }
+                for (view, packet_view) in &mut session.views {
+                    if PacketChannelRef::new(client.id, *channel, *view) != requester {
+                        packet_view.role = ChannelRole::Watcher;
+                        packet_view.denial_reason = Some(RoleDenialReason { held_by: ControllerHolder::Packet });
+                    }
                 }
             }
         }
@@ -5176,7 +5213,25 @@ fn handle_packet_frame(
     match (frame.channel, frame.msg_type) {
         (CHANNEL_CONTROL, MSG_CONTROL_OPEN_CHANNEL) => {
             let open = frame.decode::<OpenChannel>().map_err(|err| format!("decode open-channel packet: {err}"))?;
-            open_packet_channel(layout, sessions, packet_clients, index, open, &mut updates)?;
+            open_packet_channel(layout, sessions, packet_clients, index, open, true, &mut updates)?;
+        }
+        (CHANNEL_CONTROL, crate::packet::MSG_CONTROL_OPEN_ATTACHMENT) => {
+            let open = frame.decode::<crate::packet::OpenAttachment>().map_err(|err| format!("decode open-attachment packet: {err}"))?;
+            if !packet_clients[index].views {
+                packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
+                    channel: open.channel,
+                    message: "an attachment without a default view needs the views protocol".to_string(),
+                })?;
+                return Ok(updates);
+            }
+            let open = OpenChannel {
+                channel: open.channel,
+                session_id: open.session_id,
+                role: ChannelRole::Watcher,
+                take: false,
+                identity: open.identity,
+            };
+            open_packet_channel(layout, sessions, packet_clients, index, open, false, &mut updates)?;
         }
         (CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL) => {
             let close = frame.decode::<CloseChannel>().map_err(|err| format!("decode close-channel packet: {err}"))?;
@@ -5184,8 +5239,11 @@ fn handle_packet_frame(
             if let Some(removed) = packet_clients[index].channels.remove(&close.channel) {
                 if let Some(hosted) = sessions.get_mut(&removed.session_id) {
                     let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
-                    hosted.packet_control.remove(PacketChannelRef { client_id, channel: close.channel });
-                    hosted.actor.release_attachment_view(PacketChannelRef { client_id, channel: close.channel }.view_id());
+                    for view in removed.views.keys() {
+                        let key = PacketChannelRef::new(client_id, close.channel, *view);
+                        hosted.packet_control.remove(key);
+                        hosted.actor.release_attachment_view(key.view_id());
+                    }
                     sync_packet_geometry(hosted)?;
                     sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
                     announce_seat_state(hosted, packet_clients)?;
@@ -5195,7 +5253,7 @@ fn handle_packet_frame(
         }
         (channel, crate::packet::MSG_SESSION_IMAGE_FILE_RESULT) if channel != CHANNEL_CONTROL => {
             if let Some(session) = packet_clients[index].channels.get_mut(&channel) {
-                if let Some(transfer) = &mut session.image_transfer {
+                if let Some(transfer) = session.image_transfers.front_mut() {
                     let result = frame.decode::<crate::packet::ImageFileResult>().map_err(|e| e.to_string())?;
                     if !result.acquired {
                         session.local_images = false;
@@ -5208,11 +5266,7 @@ fn handle_packet_frame(
             let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
             let client = &mut packet_clients[index];
             if let Some(session_channel) = client.channels.get_mut(&channel) {
-                if session_channel.in_flight_generation == Some(ack.generation) {
-                    session_channel.in_flight_generation = None;
-                    // ACKs release channel backpressure only. Packet capture
-                    // already consumed actor damage into the daemon cache.
-                }
+                session_channel.release_credit(None, ack.generation);
             }
         }
         (channel, crate::packet::MSG_SESSION_PROGRAM_STATUS) if channel != CHANNEL_CONTROL => {
@@ -5222,131 +5276,11 @@ fn handle_packet_frame(
                 session.status_generation = None;
             }
         }
-        (channel, MSG_SESSION_INPUT) if channel != CHANNEL_CONTROL => {
-            let input = frame.decode::<Input>().map_err(|err| format!("decode input packet: {err}"))?;
-            if let Some(session) = packet_clients[index].channels.get(&channel) {
-                if let Some(hosted) = sessions.get_mut(&session.session_id) {
-                    let key = PacketChannelRef { client_id: packet_clients[index].id, channel };
-                    match input.event {
-                        TerminalInputEvent::Resize(event) => {
-                            hosted.packet_control.resize(key, event.cols, event.rows);
-                            if event.cell_width_px.is_finite()
-                                && event.cell_height_px.is_finite()
-                                && event.cell_width_px > 0.0
-                                && event.cell_height_px > 0.0
-                            {
-                                hosted.packet_control.set_cell_size(
-                                    key,
-                                    event.cell_width_px.round() as u32,
-                                    event.cell_height_px.round() as u32,
-                                );
-                            }
-                            sync_packet_geometry(hosted)?;
-                            updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
-                        }
-                        TerminalInputEvent::Focus(event) => {
-                            hosted.packet_control.focus(key, event.focused);
-                            sync_packet_geometry(hosted)?;
-                        }
-                        TerminalInputEvent::Mouse(mut event) => {
-                            let modes = hosted.packet_render_cache.latest().map(|u| u.packet.update.terminal_modes).unwrap_or_default();
-                            let local_wheel = event.kind == TerminalMouseEventKind::Wheel
-                                && (session.history
-                                    || session.role == ChannelRole::Watcher
-                                    || !(modes.mouse_tracking || modes.active_alternate_screen && modes.alternate_scroll));
-                            if local_wheel {
-                                let delta =
-                                    if event.wheel_delta_y.is_finite() { (event.wheel_delta_y.round() as i64).saturating_neg() } else { 0 };
-                                if delta != 0 {
-                                    match hosted.actor.request_result(|reply| crate::host::actor::SessionCommand::SetAttachmentView {
-                                        id: key.view_id(),
-                                        command: crate::provider::ViewportCommand::DeltaRows(delta),
-                                        reply,
-                                    }) {
-                                        Ok(history) => {
-                                            let session = packet_clients[index].channels.get_mut(&channel).expect("channel exists");
-                                            session.history = history;
-                                            session.view_changed = true;
-                                        }
-                                        Err(err) => packet_clients[index].enqueue_frame(
-                                            &PacketFrame::new(
-                                                channel,
-                                                crate::packet::MSG_SESSION_VIEW_STATE,
-                                                &crate::provider::ViewState {
-                                                    status: crate::provider::ViewStatus::Stale,
-                                                    notice: Some(err),
-                                                },
-                                            )
-                                            .map_err(|e| e.to_string())?,
-                                        )?,
-                                    }
-                                }
-                            } else if !session.history
-                                && session.role == ChannelRole::Controller
-                                && ((event.cell_col < hosted.applied_size.0 && event.cell_row < hosted.applied_size.1)
-                                    || event.kind == TerminalMouseEventKind::Release)
-                            {
-                                event.cell_col = event.cell_col.min(hosted.applied_size.0.saturating_sub(1));
-                                event.cell_row = event.cell_row.min(hosted.applied_size.1.saturating_sub(1));
-                                let source = hosted.packet_control.cell_size(key);
-                                event.x_px = event.x_px / source.0 as f32 * hosted.applied_cell_size.0 as f32;
-                                event.y_px = event.y_px / source.1 as f32 * hosted.applied_cell_size.1 as f32;
-                                event.x_px = event
-                                    .x_px
-                                    .clamp(0.0, (f32::from(hosted.applied_size.0) * hosted.applied_cell_size.0 as f32 - 1.0).max(0.0));
-                                event.y_px = event
-                                    .y_px
-                                    .clamp(0.0, (f32::from(hosted.applied_size.1) * hosted.applied_cell_size.1 as f32 - 1.0).max(0.0));
-                                if let Err(message) = route_packet_mouse_event(&hosted.actor, key.view_id(), event) {
-                                    packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message })?;
-                                }
-                            }
-                        }
-                        event if session.role == ChannelRole::Controller => {
-                            if matches!(
-                                event,
-                                TerminalInputEvent::Text(_)
-                                    | TerminalInputEvent::Paste(_)
-                                    | TerminalInputEvent::Key(crate::provider::TerminalKeyEvent {
-                                        action: crate::provider::TerminalKeyAction::Press,
-                                        ..
-                                    })
-                                    | TerminalInputEvent::RawBytes(_)
-                            ) {
-                                hosted.actor.release_attachment_view(key.view_id());
-                                let session = packet_clients[index].channels.get_mut(&channel).expect("channel exists");
-                                if session.history {
-                                    session.history = false;
-                                    session.view_changed = true;
-                                }
-                            }
-                            if let Err(message) = route_packet_input_event(&hosted.actor, key.view_id(), event) {
-                                packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message })?;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        (channel, MSG_SESSION_RESIZE) if channel != CHANNEL_CONTROL => {
-            let resize = frame.decode::<Resize>().map_err(|err| format!("decode resize packet: {err}"))?;
-            if let Some(session) = packet_clients[index].channels.get(&channel) {
-                if let Some(hosted) = sessions.get_mut(&session.session_id) {
-                    hosted.packet_control.resize(
-                        PacketChannelRef { client_id: packet_clients[index].id, channel },
-                        resize.cols,
-                        resize.rows,
-                    );
-                    sync_packet_geometry(hosted)?;
-                    updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
-                }
-            }
-        }
         (channel, crate::packet::MSG_SESSION_SIZE_POLICY) if channel != CHANNEL_CONTROL => {
             let fixed = frame.decode::<Option<Resize>>().map_err(|e| e.to_string())?;
             if let Some(session) = packet_clients[index].channels.get(&channel) {
-                if session.role == ChannelRole::Controller {
+                // Pinning is session-wide; any controller view may set it.
+                if session.has_controller() {
                     if let Some(hosted) = sessions.get_mut(&session.session_id) {
                         hosted.fixed_size = fixed.map(|size| (size.cols.max(1), size.rows.max(1)));
                         sync_packet_geometry(hosted)?;
@@ -5356,40 +5290,189 @@ fn handle_packet_frame(
                 }
             }
         }
-        (channel, MSG_SESSION_VIEWPORT) if channel != CHANNEL_CONTROL => {
-            let viewport = frame.decode::<crate::packet::Viewport>().map_err(|err| format!("decode viewport packet: {err}"))?;
-            if let Some(session) = packet_clients[index].channels.get_mut(&channel) {
-                if let Some(hosted) = sessions.get(&session.session_id) {
-                    let id = PacketChannelRef { client_id: packet_clients[index].id, channel }.view_id();
-                    match hosted.actor.request_result(|reply| crate::host::actor::SessionCommand::SetAttachmentView {
-                        id,
-                        command: viewport.command,
-                        reply,
-                    }) {
-                        Ok(history) => {
-                            session.history = history;
-                            session.view_changed = true;
-                        }
-                        Err(err) => {
-                            packet_clients[index].enqueue_frame(
-                                &PacketFrame::new(channel, crate::packet::MSG_SESSION_VIEW_STATE, &crate::provider::ViewState {
-                                    status: crate::provider::ViewStatus::Stale,
-                                    notice: Some(err),
-                                })
-                                .map_err(|e| e.to_string())?,
-                            )?;
-                        }
-                    }
-                }
+        (channel, crate::packet::MSG_SESSION_OPEN_VIEW) if channel != CHANNEL_CONTROL => {
+            let open = frame.decode::<crate::packet::OpenView>().map_err(|err| format!("decode open-view packet: {err}"))?;
+            open_packet_view(layout, sessions, packet_clients, index, channel, open, &mut updates)?;
+        }
+        (channel, crate::packet::MSG_SESSION_CLOSE_VIEW) if channel != CHANNEL_CONTROL => {
+            let close = frame.decode::<crate::packet::CloseView>().map_err(|err| format!("decode close-view packet: {err}"))?;
+            close_packet_view(layout, sessions, packet_clients, index, channel, close.view, &mut updates)?;
+        }
+        (channel, crate::packet::MSG_SESSION_VIEW) if channel != CHANNEL_CONTROL => {
+            let wrapped = frame.decode::<crate::packet::ViewFrame>().map_err(|err| format!("decode view packet: {err}"))?;
+            if packet_clients[index].channels.get(&channel).is_some_and(|session| session.views_protocol) {
+                let (view, frame) = wrapped.unwrap(channel);
+                handle_packet_view_frame(layout, sessions, packet_clients, index, view, frame, &mut updates)?;
             }
         }
-        (channel, MSG_SESSION_ROLE) if channel != CHANNEL_CONTROL => {
-            let request = frame.decode::<RoleRequest>().map_err(|err| format!("decode role request packet: {err}"))?;
-            apply_packet_role_request(layout, sessions, packet_clients, index, channel, request, &mut updates)?;
+        (channel, _) if channel != CHANNEL_CONTROL => {
+            handle_packet_view_frame(layout, sessions, packet_clients, index, crate::packet::DEFAULT_VIEW, frame, &mut updates)?;
         }
         _ => {}
     }
     Ok(updates)
+}
+
+/// Per-view messages: unwrapped ones address the default view.
+fn handle_packet_view_frame(
+    layout: &RuntimeLayout,
+    sessions: &mut HashMap<String, HostedSession>,
+    packet_clients: &mut [PacketClient],
+    index: usize,
+    view: u32,
+    frame: PacketFrame,
+    updates: &mut Vec<DirectoryEntry>,
+) -> Result<(), String> {
+    let channel = frame.channel;
+    let key = PacketChannelRef::new(packet_clients[index].id, channel, view);
+    let Some(session) = packet_clients[index].channels.get(&channel) else {
+        return Ok(());
+    };
+    let Some(packet_view) = session.views.get(&view) else {
+        return Ok(());
+    };
+    let (role, history) = (packet_view.role, packet_view.history);
+    let session_id = session.session_id.clone();
+    match frame.msg_type {
+        // Only a wrapped ack reaches here: it releases this view's history credit.
+        MSG_SESSION_ACK => {
+            let ack = frame.decode::<Ack>().map_err(|err| format!("decode ack packet: {err}"))?;
+            if let Some(session) = packet_clients[index].channels.get_mut(&channel) {
+                session.release_credit(Some(view), ack.generation);
+            }
+        }
+        MSG_SESSION_INPUT => {
+            let input = frame.decode::<Input>().map_err(|err| format!("decode input packet: {err}"))?;
+            let Some(hosted) = sessions.get_mut(&session_id) else {
+                return Ok(());
+            };
+            match input.event {
+                TerminalInputEvent::Resize(event) => {
+                    hosted.packet_control.resize(key, event.cols, event.rows);
+                    if event.cell_width_px.is_finite()
+                        && event.cell_height_px.is_finite()
+                        && event.cell_width_px > 0.0
+                        && event.cell_height_px > 0.0
+                    {
+                        hosted.packet_control.set_cell_size(key, event.cell_width_px.round() as u32, event.cell_height_px.round() as u32);
+                    }
+                    sync_packet_geometry(hosted)?;
+                    updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+                }
+                TerminalInputEvent::Focus(event) => {
+                    hosted.packet_control.focus(key, event.focused);
+                    sync_packet_geometry(hosted)?;
+                }
+                TerminalInputEvent::Mouse(mut event) => {
+                    let modes = hosted.packet_render_cache.latest().map(|u| u.packet.update.terminal_modes).unwrap_or_default();
+                    let local_wheel = event.kind == TerminalMouseEventKind::Wheel
+                        && (history
+                            || role == ChannelRole::Watcher
+                            || !(modes.mouse_tracking || modes.active_alternate_screen && modes.alternate_scroll));
+                    if local_wheel {
+                        let delta = if event.wheel_delta_y.is_finite() { (event.wheel_delta_y.round() as i64).saturating_neg() } else { 0 };
+                        if delta != 0 {
+                            move_packet_view(hosted, packet_clients, index, key, crate::provider::ViewportCommand::DeltaRows(delta))?;
+                        }
+                    } else if !history
+                        && role == ChannelRole::Controller
+                        && ((event.cell_col < hosted.applied_size.0 && event.cell_row < hosted.applied_size.1)
+                            || event.kind == TerminalMouseEventKind::Release)
+                    {
+                        event.cell_col = event.cell_col.min(hosted.applied_size.0.saturating_sub(1));
+                        event.cell_row = event.cell_row.min(hosted.applied_size.1.saturating_sub(1));
+                        let source = hosted.packet_control.cell_size(key);
+                        event.x_px = event.x_px / source.0 as f32 * hosted.applied_cell_size.0 as f32;
+                        event.y_px = event.y_px / source.1 as f32 * hosted.applied_cell_size.1 as f32;
+                        event.x_px =
+                            event.x_px.clamp(0.0, (f32::from(hosted.applied_size.0) * hosted.applied_cell_size.0 as f32 - 1.0).max(0.0));
+                        event.y_px =
+                            event.y_px.clamp(0.0, (f32::from(hosted.applied_size.1) * hosted.applied_cell_size.1 as f32 - 1.0).max(0.0));
+                        if let Err(message) = route_packet_mouse_event(&hosted.actor, key.view_id(), event) {
+                            packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message })?;
+                        }
+                    }
+                }
+                event if role == ChannelRole::Controller => {
+                    if matches!(
+                        event,
+                        TerminalInputEvent::Text(_)
+                            | TerminalInputEvent::Paste(_)
+                            | TerminalInputEvent::Key(crate::provider::TerminalKeyEvent {
+                                action: crate::provider::TerminalKeyAction::Press,
+                                ..
+                            })
+                            | TerminalInputEvent::RawBytes(_)
+                    ) {
+                        // Typing returns this view, and only this view, to live.
+                        hosted.actor.release_attachment_view(key.view_id());
+                        let packet_view = packet_clients[index].channels.get_mut(&channel).and_then(|s| s.views.get_mut(&view));
+                        if let Some(packet_view) = packet_view.filter(|v| v.history) {
+                            packet_view.history = false;
+                            packet_view.view_changed = true;
+                        }
+                    }
+                    if let Err(message) = route_packet_input_event(&hosted.actor, key.view_id(), event) {
+                        packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message })?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        MSG_SESSION_RESIZE => {
+            let resize = frame.decode::<Resize>().map_err(|err| format!("decode resize packet: {err}"))?;
+            if let Some(hosted) = sessions.get_mut(&session_id) {
+                hosted.packet_control.resize(key, resize.cols, resize.rows);
+                sync_packet_geometry(hosted)?;
+                updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+            }
+        }
+        MSG_SESSION_VIEWPORT => {
+            let viewport = frame.decode::<crate::packet::Viewport>().map_err(|err| format!("decode viewport packet: {err}"))?;
+            if let Some(hosted) = sessions.get(&session_id) {
+                move_packet_view(hosted, packet_clients, index, key, viewport.command)?;
+            }
+        }
+        MSG_SESSION_ROLE => {
+            let request = frame.decode::<RoleRequest>().map_err(|err| format!("decode role request packet: {err}"))?;
+            apply_packet_role_request(layout, sessions, packet_clients, index, key, request, updates)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Move one view's history position. The resulting frame flows back through
+/// the next render rather than a reply; a refused move reports stale state.
+fn move_packet_view(
+    hosted: &HostedSession,
+    packet_clients: &mut [PacketClient],
+    index: usize,
+    key: PacketChannelRef,
+    command: crate::provider::ViewportCommand,
+) -> Result<(), String> {
+    let result =
+        hosted.actor.request_result(|reply| crate::host::actor::SessionCommand::SetAttachmentView { id: key.view_id(), command, reply });
+    let client = &mut packet_clients[index];
+    let Some(session) = client.channels.get_mut(&key.channel) else {
+        return Ok(());
+    };
+    match result {
+        Ok(history) => {
+            if let Some(packet_view) = session.views.get_mut(&key.view) {
+                packet_view.history = history;
+                packet_view.view_changed = true;
+            }
+        }
+        Err(err) => {
+            let frame = session.view_frame(key.channel, key.view, crate::packet::MSG_SESSION_VIEW_STATE, &crate::provider::ViewState {
+                status: crate::provider::ViewStatus::Stale,
+                notice: Some(err),
+            })?;
+            client.enqueue_frame(&frame)?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_packet_role_request(
@@ -5397,11 +5480,11 @@ fn apply_packet_role_request(
     sessions: &mut HashMap<String, HostedSession>,
     packet_clients: &mut [PacketClient],
     index: usize,
-    channel: u32,
+    requester: PacketChannelRef,
     request: RoleRequest,
     updates: &mut Vec<DirectoryEntry>,
 ) -> Result<(), String> {
-    let Some(session_id) = packet_clients[index].channels.get(&channel).map(|session| session.session_id.clone()) else {
+    let Some(session_id) = packet_clients[index].channels.get(&requester.channel).map(|session| session.session_id.clone()) else {
         return Ok(());
     };
     let Some(hosted) = sessions.get_mut(&session_id) else {
@@ -5412,28 +5495,26 @@ fn apply_packet_role_request(
         return Ok(());
     }
     let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
-    let requester = PacketChannelRef { client_id: packet_clients[index].id, channel };
     let (granted, denial_reason) = grant_packet_role(hosted, packet_clients, requester, request.role, request.take)?;
     let controller = controller_identity(hosted, packet_clients);
     let client = &mut packet_clients[index];
-    if let Some(session_channel) = client.channels.get_mut(&channel) {
-        session_channel.role = granted;
-        session_channel.requested_role = request.role;
-        session_channel.denial_reason = denial_reason;
+    if let Some(packet_view) = client.channels.get_mut(&requester.channel).and_then(|session| session.views.get_mut(&requester.view)) {
+        packet_view.role = granted;
+        packet_view.requested_role = request.role;
+        packet_view.denial_reason = denial_reason;
     }
     let (participants, exclusive) = packet_presence(hosted, packet_clients);
-    packet_clients[index].enqueue_frame(
-        &PacketFrame::new(channel, MSG_SESSION_ROLE, &RoleState {
-            clipboard_writes: hosted.actor.clipboard_supported()?,
-            role: granted,
-            controller,
-            denial_reason,
-            participants,
-            exclusive,
-            fixed_size: hosted.fixed_size.map(|(cols, rows)| Resize { cols, rows }),
-        })
-        .map_err(|err| format!("encode role state packet: {err}"))?,
-    )?;
+    let session = &packet_clients[index].channels[&requester.channel];
+    let frame = session.view_frame(requester.channel, requester.view, MSG_SESSION_ROLE, &RoleState {
+        clipboard_writes: hosted.actor.clipboard_supported()?,
+        role: granted,
+        controller,
+        denial_reason,
+        participants,
+        exclusive,
+        fixed_size: hosted.fixed_size.map(|(cols, rows)| Resize { cols, rows }),
+    })?;
+    packet_clients[index].enqueue_frame(&frame)?;
     sync_packet_geometry(hosted)?;
     sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
     if let Some(hosted) = sessions.get(&session_id) {
@@ -5451,6 +5532,7 @@ fn open_packet_channel(
     packet_clients: &mut [PacketClient],
     index: usize,
     open: OpenChannel,
+    default_view: bool,
     updates: &mut Vec<DirectoryEntry>,
 ) -> Result<(), String> {
     if open.channel == CHANNEL_CONTROL {
@@ -5517,8 +5599,32 @@ fn open_packet_channel(
             return Ok(());
         }
     };
+    if !default_view {
+        // No view, no reader: the attachment's live stream starts with a full
+        // frame when its first view opens.
+        if fresh {
+            hosted.packet_render_cache.store(update.clone());
+        }
+        packet_clients[index].channels.insert(open.channel, PacketSessionChannel {
+            program_status: false,
+            status_generation: None,
+            _output_lease: output_lease,
+            session_id: open.session_id,
+            identity: open.identity,
+            views_protocol: true,
+            views: BTreeMap::new(),
+            live: RenderCredit::new(None, 0),
+            last_sent_generation: update.packet.update.render_generation,
+            clipboard_loss: 0,
+            local_images: true,
+            image_resident: HashSet::new(),
+            image_transfers: VecDeque::new(),
+        });
+        return Ok(());
+    }
     let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
-    let requester = PacketChannelRef { client_id: packet_clients[index].id, channel: open.channel };
+    // The channel opens with its default view.
+    let requester = PacketChannelRef::new(packet_clients[index].id, open.channel, crate::packet::DEFAULT_VIEW);
     let (granted, denial_reason) = grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?;
     let session_id = open.session_id;
     let generation = update.packet.update.render_generation;
@@ -5527,43 +5633,44 @@ fn open_packet_channel(
     if fresh {
         hosted.packet_render_cache.store(update.clone());
     }
+    // The initial render travels on the live stream of a views attachment, or
+    // on the one view's stream of a legacy channel.
+    let views_protocol = packet_clients[index].views;
+    let (live, view_credit) = if views_protocol {
+        (RenderCredit::new(Some(generation), generation), RenderCredit::new(None, generation))
+    } else {
+        (RenderCredit::new(None, generation), RenderCredit::new(Some(generation), generation))
+    };
     packet_clients[index].channels.insert(open.channel, PacketSessionChannel {
         program_status: false,
         status_generation: None,
         _output_lease: output_lease,
         session_id: session_id.clone(),
-        role: granted,
-        requested_role: open.role,
         identity: open.identity,
-        denial_reason,
-        in_flight_generation: Some(generation),
+        views_protocol,
+        views: BTreeMap::from([(crate::packet::DEFAULT_VIEW, PacketView::new(granted, open.role, denial_reason, view_credit))]),
+        live,
         last_sent_generation: generation,
-        last_source_generation: generation,
-        history: false,
-        view_changed: false,
-        view_state: Default::default(),
-        next_capture: Instant::now(),
         clipboard_loss: 0,
         local_images: true,
         image_resident: HashSet::new(),
-        image_transfer: None,
+        image_transfers: VecDeque::new(),
     });
     let (participants, exclusive) = packet_presence(hosted, packet_clients);
     let client = &mut packet_clients[index];
-    client.enqueue_frame(
-        &PacketFrame::new(open.channel, MSG_SESSION_ROLE, &RoleState {
-            clipboard_writes: hosted.actor.clipboard_supported()?,
-            role: granted,
-            controller,
-            denial_reason,
-            participants,
-            exclusive,
-            fixed_size: hosted.fixed_size.map(|(cols, rows)| Resize { cols, rows }),
-        })
-        .map_err(|err| format!("encode role state packet: {err}"))?,
-    )?;
     let channel = client.channels.get_mut(&open.channel).expect("opened channel");
-    channel.image_transfer = Some(ImageTransfer::negotiated(open.channel, update, &mut channel.image_resident, client.virtual_placements)?);
+    let frame = channel.view_frame(open.channel, crate::packet::DEFAULT_VIEW, MSG_SESSION_ROLE, &RoleState {
+        clipboard_writes: hosted.actor.clipboard_supported()?,
+        role: granted,
+        controller,
+        denial_reason,
+        participants,
+        exclusive,
+        fixed_size: hosted.fixed_size.map(|(cols, rows)| Resize { cols, rows }),
+    })?;
+    let transfer = ImageTransfer::negotiated(open.channel, update, &mut channel.image_resident, client.virtual_placements)?;
+    channel.image_transfers.push_back(transfer);
+    client.enqueue_frame(&frame)?;
     sync_packet_geometry(hosted)?;
     sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
     if let Some(hosted) = sessions.get(&session_id) {
@@ -5575,24 +5682,128 @@ fn open_packet_channel(
     Ok(())
 }
 
+/// Views protocol: open another view on an attachment. A live view needs no
+/// render of its own: the client already holds the attachment's live stream.
+fn open_packet_view(
+    layout: &RuntimeLayout,
+    sessions: &mut HashMap<String, HostedSession>,
+    packet_clients: &mut [PacketClient],
+    index: usize,
+    channel: u32,
+    open: crate::packet::OpenView,
+    updates: &mut Vec<DirectoryEntry>,
+) -> Result<(), String> {
+    let Some(session) = packet_clients[index].channels.get(&channel).filter(|session| session.views_protocol) else {
+        return Ok(());
+    };
+    // A view id already in use is the client's own mistake: the open view
+    // keeps going and the request is ignored.
+    if session.views.contains_key(&open.view) {
+        return Ok(());
+    }
+    // A reserved id, or one view too many, is refused alone: the daemon closes
+    // that view and leaves the attachment and connection as they are.
+    if open.view == ATTACHMENT_VIEW || session.views.len() >= MAX_VIEWS_PER_ATTACHMENT {
+        let frame = PacketFrame::new(channel, crate::packet::MSG_SESSION_CLOSE_VIEW, &crate::packet::CloseView { view: open.view })
+            .map_err(|err| format!("encode close-view packet: {err}"))?;
+        return packet_clients[index].enqueue_frame(&frame);
+    }
+    let session_id = session.session_id.clone();
+    let last_sent_generation = session.last_sent_generation;
+    let Some(hosted) = sessions.get_mut(&session_id) else {
+        return Ok(());
+    };
+    let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
+    let requester = PacketChannelRef::new(packet_clients[index].id, channel, open.view);
+    // A view opened during an outgoing transfer waits as a watcher, like a
+    // role request; the client asks again once the session settles.
+    let (granted, denial_reason) = if hosted.transferring || hosted.hosted_elsewhere {
+        hosted.packet_control.request(requester, false, false);
+        (ChannelRole::Watcher, None)
+    } else {
+        grant_packet_role(hosted, packet_clients, requester, open.role, open.take)?
+    };
+    let session = packet_clients[index].channels.get_mut(&channel).expect("channel checked above");
+    session.views.insert(open.view, PacketView::new(granted, open.role, denial_reason, RenderCredit::new(None, last_sent_generation)));
+    let controller = controller_identity(hosted, packet_clients);
+    let (participants, exclusive) = packet_presence(hosted, packet_clients);
+    let frame = packet_clients[index].channels[&channel].view_frame(channel, open.view, MSG_SESSION_ROLE, &RoleState {
+        clipboard_writes: hosted.actor.clipboard_supported()?,
+        role: granted,
+        controller,
+        denial_reason,
+        participants,
+        exclusive,
+        fixed_size: hosted.fixed_size.map(|(cols, rows)| Resize { cols, rows }),
+    })?;
+    packet_clients[index].enqueue_frame(&frame)?;
+    sync_packet_geometry(hosted)?;
+    sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
+    updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+    announce_seat_state_except(hosted, packet_clients, Some(requester))?;
+    Ok(())
+}
+
+/// Close one view. The attachment, its other views and the connection's
+/// other channels stay open, even when this was the attachment's last view.
+fn close_packet_view(
+    layout: &RuntimeLayout,
+    sessions: &mut HashMap<String, HostedSession>,
+    packet_clients: &mut [PacketClient],
+    index: usize,
+    channel: u32,
+    view: u32,
+    updates: &mut Vec<DirectoryEntry>,
+) -> Result<(), String> {
+    let client_id = packet_clients[index].id;
+    let Some(session) = packet_clients[index].channels.get_mut(&channel).filter(|session| session.views_protocol) else {
+        return Ok(());
+    };
+    if session.views.remove(&view).is_none() {
+        return Ok(());
+    }
+    let session_id = session.session_id.clone();
+    let Some(hosted) = sessions.get_mut(&session_id) else {
+        return Ok(());
+    };
+    let previously_had_controller = hosted.active_client.is_some() || hosted.packet_control.has_controllers();
+    let key = PacketChannelRef::new(client_id, channel, view);
+    hosted.packet_control.remove(key);
+    hosted.actor.release_input(key.view_id())?;
+    hosted.actor.release_attachment_view(key.view_id());
+    sync_packet_geometry(hosted)?;
+    sync_packet_controller_presence(layout, hosted, previously_had_controller)?;
+    announce_seat_state(hosted, packet_clients)?;
+    updates.push(directory_entry_for_session(layout, hosted, packet_clients)?);
+    Ok(())
+}
+
+/// What a due render delivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderTarget {
+    /// A legacy channel's one view, live or history, unwrapped.
+    Legacy,
+    /// A views attachment's shared live stream.
+    Live,
+    /// One view's own history frame, wrapped.
+    History,
+}
+
 fn push_due_packet_renders(
     session_id: &str,
     actor: &SessionActor,
     packet_clients: &mut [PacketClient],
-    render_cache: &mut PacketRenderCache,
+    render_cache: &mut crate::render_cache::PacketRenderCache,
 ) -> Result<(), String> {
     if !packet_clients.iter().any(|client| client.channels.values().any(|channel| channel.session_id == session_id)) {
         return Ok(());
     }
 
-    // Transient clipboard effects drain even with clean cells or render credit held.
+    // Transient clipboard effects drain even with clean cells or render credit
+    // held. They reach an attachment once, however many controller views it has.
     for client in packet_clients.iter_mut() {
-        let channels: Vec<_> = client
-            .channels
-            .iter()
-            .filter(|(_, c)| c.session_id == session_id && c.role == ChannelRole::Controller)
-            .map(|(id, _)| *id)
-            .collect();
+        let channels: Vec<_> =
+            client.channels.iter().filter(|(_, c)| c.session_id == session_id && c.has_controller()).map(|(id, _)| *id).collect();
         for channel in channels {
             let loss = actor.clipboard_loss()?;
             if client.channels[&channel].clipboard_loss != loss {
@@ -5602,7 +5813,7 @@ fn push_due_packet_renders(
                         .map_err(|e| e.to_string())?,
                 )?;
             }
-            let target = PacketChannelRef { client_id: client.id, channel }.view_id();
+            let target = PacketChannelRef::new(client.id, channel, crate::packet::DEFAULT_VIEW).attachment_id();
             for event in actor.drain_clipboard(target)? {
                 client
                     .enqueue_frame(&PacketFrame::new(channel, crate::packet::MSG_SESSION_CLIPBOARD, &event).map_err(|e| e.to_string())?)?;
@@ -5615,16 +5826,27 @@ fn push_due_packet_renders(
             Ok(Some(update)) => render_cache.store(update),
             Ok(None) => {}
             Err(error) => {
+                let state = crate::provider::ViewState { status: crate::provider::ViewStatus::Stale, notice: Some(error) };
                 for client in packet_clients.iter_mut() {
                     let channels: Vec<_> = client.channels.iter().filter(|(_, c)| c.session_id == session_id).map(|(id, _)| *id).collect();
                     for id in channels {
+                        // Legacy channels report on their one view; views
+                        // attachments on each view following the live stream.
                         let channel = client.channels.get_mut(&id).expect("channel exists");
-                        let state = crate::provider::ViewState { status: crate::provider::ViewStatus::Stale, notice: Some(error.clone()) };
-                        if channel.view_state != state {
-                            channel.view_state = state.clone();
-                            client.enqueue_frame(
-                                &PacketFrame::new(id, crate::packet::MSG_SESSION_VIEW_STATE, &state).map_err(|e| e.to_string())?,
-                            )?;
+                        let views: Vec<u32> = channel
+                            .views
+                            .iter()
+                            .filter(|(_, view)| !channel.views_protocol || !view.history)
+                            .map(|(view, _)| *view)
+                            .collect();
+                        for view in views {
+                            let channel = client.channels.get_mut(&id).expect("channel exists");
+                            let packet_view = channel.views.get_mut(&view).expect("view exists");
+                            if packet_view.view_state != state {
+                                packet_view.view_state = state.clone();
+                                let frame = channel.view_frame(id, view, crate::packet::MSG_SESSION_VIEW_STATE, &state)?;
+                                client.enqueue_frame(&frame)?;
+                            }
                         }
                     }
                 }
@@ -5638,33 +5860,75 @@ fn push_due_packet_renders(
     };
 
     let now = Instant::now();
+    // A views-protocol view that came back to live needs no frame of its own:
+    // tell it to follow the attachment's live stream again.
+    for client in packet_clients.iter_mut() {
+        let mut notices = Vec::new();
+        for (id, channel) in client.channels.iter_mut().filter(|(_, c)| c.session_id == session_id && c.views_protocol) {
+            for (view, packet_view) in channel.views.iter_mut().filter(|(_, v)| !v.history && v.view_changed) {
+                packet_view.view_changed = false;
+                packet_view.credit.in_flight_generation = None;
+                packet_view.view_state = Default::default();
+                notices.push((*id, *view));
+            }
+        }
+        for (id, view) in notices {
+            let frame =
+                client.channels[&id].view_frame(id, view, crate::packet::MSG_SESSION_VIEW_STATE, &crate::provider::ViewState::default())?;
+            client.enqueue_frame(&frame)?;
+        }
+    }
     let mut due: Vec<_> = packet_clients
         .iter()
         .enumerate()
         .flat_map(|(index, client)| {
-            client.channels.iter().filter_map(move |(channel, session)| {
-                (session.session_id == session_id
-                    && session.in_flight_generation.is_none()
-                    && (session.view_changed || session.last_source_generation < latest_generation)
-                    && (now >= session.next_capture
-                        || (!session.history && session.view_state.status != crate::provider::ViewStatus::Stale)))
-                    .then_some((PacketChannelRef { client_id: client.id, channel: *channel }, index))
+            client.channels.iter().filter(|(_, channel)| channel.session_id == session_id).flat_map(move |(channel, session)| {
+                let key = move |view| PacketChannelRef::new(client.id, *channel, view);
+                let legacy = (!session.views_protocol)
+                    .then(|| session.views.get(&crate::packet::DEFAULT_VIEW))
+                    .flatten()
+                    .filter(|view| {
+                        view.credit.in_flight_generation.is_none()
+                            && (view.view_changed || view.credit.last_source_generation < latest_generation)
+                            && (now >= view.credit.next_capture
+                                || (!view.history && view.view_state.status != crate::provider::ViewStatus::Stale))
+                    })
+                    .map(|_| (key(crate::packet::DEFAULT_VIEW), index, RenderTarget::Legacy));
+                let live = (session.views_protocol
+                    && session.views.values().any(|view| !view.history)
+                    && session.live.in_flight_generation.is_none()
+                    && session.live.last_source_generation < latest_generation
+                    && now >= session.live.next_capture)
+                    .then(|| (key(crate::packet::DEFAULT_VIEW), index, RenderTarget::Live));
+                let history = session
+                    .views
+                    .iter()
+                    .filter(move |(_, view)| {
+                        session.views_protocol
+                            && view.history
+                            && view.credit.in_flight_generation.is_none()
+                            && (view.view_changed || view.credit.last_source_generation < latest_generation)
+                            && now >= view.credit.next_capture
+                    })
+                    .map(move |(view, _)| (key(*view), index, RenderTarget::History));
+                legacy.into_iter().chain(live).chain(history)
             })
         })
         .collect();
-    due.sort_by_key(|(key, _)| (key.view_id() <= render_cache.history_cursor, key.view_id()));
+    due.sort_by_key(|(key, _, target)| (*target != RenderTarget::Live && key.view_id() <= render_cache.history_cursor, key.view_id()));
     let mut captures = 0;
-    for (key, index) in due {
+    for (key, index, target) in due {
         let session = &packet_clients[index].channels[&key.channel];
-        if session.history && captures >= 2 {
+        let history = target != RenderTarget::Live && session.views[&key.view].history;
+        if history && captures >= 2 {
             continue;
         }
-        let result = if session.history {
+        let result = if history {
             captures += 1;
             render_cache.history_cursor = key.view_id();
             actor.request_result(|reply| crate::host::actor::SessionCommand::CaptureAttachmentView { id: key.view_id(), reply }).map(
                 |capture| match capture {
-                    Some(frame) => RenderBundle {
+                    Some(frame) => Some(RenderBundle {
                         images: frame.images.into_iter().map(crate::image_backing::RetainedImage::from_owned).collect(),
                         packet: RenderPacket {
                             update: frame.update,
@@ -5674,52 +5938,91 @@ fn push_due_packet_renders(
                                 notice: frame.discarded.then(|| "Earlier history was discarded".into()),
                             },
                         },
-                    },
+                    }),
+                    // A views attachment returns the view to its live stream
+                    // instead of sending it a live frame of its own.
+                    None if target == RenderTarget::History => None,
                     None => {
                         let mut packet = render_cache.since(0).expect("cache generation checked above");
                         packet.packet.view.notice = Some("History was cleared; returned to live".into());
-                        packet
+                        Some(packet)
                     }
                 },
             )
-        } else if session.view_changed {
-            Ok(render_cache.since(0).expect("cache generation checked above"))
+        } else if target == RenderTarget::Live {
+            Ok(Some(render_cache.since(session.live.last_source_generation).expect("cache generation checked above")))
+        } else if session.views[&key.view].view_changed {
+            Ok(Some(render_cache.since(0).expect("cache generation checked above")))
         } else {
-            Ok(render_cache.since(session.last_source_generation).expect("cache generation checked above"))
+            Ok(Some(render_cache.since(session.views[&key.view].credit.last_source_generation).expect("cache generation checked above")))
         };
         let next_generation = session.last_sent_generation.saturating_add(1);
-        let result = result.and_then(|mut packet| {
+        let result = result.and_then(|packet| {
+            let Some(mut packet) = packet else {
+                return Ok(None);
+            };
             packet.packet.update.render_generation = next_generation;
             let view = packet.packet.view.clone();
             let client = &mut packet_clients[index];
             let session = client.channels.get_mut(&key.channel).expect("due channel");
-            let transfer = ImageTransfer::negotiated(key.channel, packet, &mut session.image_resident, client.virtual_placements)?
+            let mut transfer = ImageTransfer::negotiated(key.channel, packet, &mut session.image_resident, client.virtual_placements)?
                 .local_files(session.local_images);
-            Ok((transfer, view))
+            if target == RenderTarget::History {
+                transfer = transfer.for_view(key.view)?;
+            }
+            Ok(Some((transfer, view)))
         });
+        let client = &mut packet_clients[index];
+        let session = client.channels.get_mut(&key.channel).expect("due channel");
         match result {
-            Ok((transfer, view)) => {
-                let client = &mut packet_clients[index];
-                let session = client.channels.get_mut(&key.channel).expect("due channel");
-                session.image_transfer = Some(transfer);
-                session.history = view.status == crate::provider::ViewStatus::History;
-                session.view_state = view;
-                session.view_changed = false;
-                session.in_flight_generation = Some(next_generation);
+            Ok(Some((transfer, view))) => {
+                session.image_transfers.push_back(transfer);
                 session.last_sent_generation = next_generation;
-                session.last_source_generation = latest_generation;
-                session.next_capture = now + Duration::from_millis(34);
+                if target == RenderTarget::Live {
+                    session.live.in_flight_generation = Some(next_generation);
+                    session.live.last_source_generation = latest_generation;
+                    for packet_view in session.views.values_mut().filter(|v| !v.history) {
+                        packet_view.view_state = view.clone();
+                    }
+                } else {
+                    let packet_view = session.views.get_mut(&key.view).expect("due view");
+                    packet_view.history = view.status == crate::provider::ViewStatus::History;
+                    packet_view.view_state = view;
+                    packet_view.view_changed = false;
+                    packet_view.credit.in_flight_generation = Some(next_generation);
+                    packet_view.credit.last_source_generation = latest_generation;
+                    packet_view.credit.next_capture = now + Duration::from_millis(34);
+                }
+            }
+            Ok(None) => {
+                let state = crate::provider::ViewState {
+                    status: crate::provider::ViewStatus::Live,
+                    notice: Some("History was cleared; returned to live".into()),
+                };
+                let packet_view = session.views.get_mut(&key.view).expect("due view");
+                packet_view.history = false;
+                packet_view.view_changed = false;
+                packet_view.view_state = state.clone();
+                let frame = session.view_frame(key.channel, key.view, crate::packet::MSG_SESSION_VIEW_STATE, &state)?;
+                client.enqueue_frame(&frame)?;
             }
             Err(err) => {
-                let client = &mut packet_clients[index];
-                let session = client.channels.get_mut(&key.channel).expect("due channel");
-                session.next_capture = now + Duration::from_millis(250);
                 let state = crate::provider::ViewState { status: crate::provider::ViewStatus::Stale, notice: Some(err) };
-                if session.view_state != state {
-                    session.view_state = state.clone();
-                    client.enqueue_frame(
-                        &PacketFrame::new(key.channel, crate::packet::MSG_SESSION_VIEW_STATE, &state).map_err(|e| e.to_string())?,
-                    )?;
+                let views: Vec<u32> = if target == RenderTarget::Live {
+                    session.live.next_capture = now + Duration::from_millis(250);
+                    session.views.iter().filter(|(_, v)| !v.history).map(|(view, _)| *view).collect()
+                } else {
+                    session.views.get_mut(&key.view).expect("due view").credit.next_capture = now + Duration::from_millis(250);
+                    vec![key.view]
+                };
+                for view in views {
+                    let session = client.channels.get_mut(&key.channel).expect("due channel");
+                    let packet_view = session.views.get_mut(&view).expect("due view");
+                    if packet_view.view_state != state {
+                        packet_view.view_state = state.clone();
+                        let frame = session.view_frame(key.channel, view, crate::packet::MSG_SESSION_VIEW_STATE, &state)?;
+                        client.enqueue_frame(&frame)?;
+                    }
                 }
             }
         }
@@ -6325,7 +6628,7 @@ mod tests {
     #[test]
     fn packet_cache_catches_up_each_client_without_cells_for_image_only_changes() {
         use TerminalRenderUpdateOpKind::{FullVisibleReplace, RowReplace};
-        let mut cache = super::PacketRenderCache::default();
+        let mut cache = crate::render_cache::PacketRenderCache::default();
         cache.store(cached_update(1, FullVisibleReplace, vec![cached_row(0, "a"), cached_row(1, "b"), cached_row(2, "c")]));
         cache.store(cached_update(2, RowReplace, vec![cached_row(0, "A")]));
         cache.store(cached_update(3, RowReplace, vec![cached_row(2, "C")]));
@@ -6352,7 +6655,7 @@ mod tests {
     #[test]
     fn packet_cache_materializes_overlapping_scrolls_and_resets_on_screen_change() {
         use TerminalRenderUpdateOpKind::{FullVisibleReplace, ScrollCopy};
-        let mut cache = super::PacketRenderCache::default();
+        let mut cache = crate::render_cache::PacketRenderCache::default();
         cache.store(cached_update(1, FullVisibleReplace, vec![cached_row(0, "a"), cached_row(1, "b"), cached_row(2, "c")]));
         let mut scroll = cached_update(2, ScrollCopy, vec![]);
         scroll.packet.update.ops[0].src_row = 0;
@@ -6368,6 +6671,22 @@ mod tests {
         let caught_up = cache.since(2).unwrap().packet.update;
         assert_eq!(caught_up.ops[0].kind, FullVisibleReplace);
         assert_eq!(caught_up.ops[0].rows[0], cached_row(0, "x"));
+    }
+
+    // Ops arrive decoded from the wire: rows past the grid are skipped, and a
+    // source row near u16::MAX neither overflows nor panics.
+    #[test]
+    fn packet_cache_skips_scroll_rows_outside_the_grid() {
+        use TerminalRenderUpdateOpKind::{FullVisibleReplace, ScrollCopy};
+        let mut cache = crate::render_cache::PacketRenderCache::default();
+        cache.store(cached_update(1, FullVisibleReplace, vec![cached_row(0, "a"), cached_row(1, "b"), cached_row(2, "c")]));
+        let mut scroll = cached_update(2, ScrollCopy, vec![]);
+        scroll.packet.update.ops[0].src_row = u16::MAX - 1;
+        scroll.packet.update.ops[0].dst_row = 0;
+        scroll.packet.update.ops[0].row_count = 4;
+        cache.store(scroll);
+        let caught_up = cache.since(1).unwrap().packet.update;
+        assert!(caught_up.ops.is_empty(), "rows outside the grid were copied: {:?}", caught_up.ops);
     }
 
     #[cfg(feature = "ghostty-vt")]
@@ -7441,7 +7760,7 @@ mod tests {
             crate::output_admission::OutputContext::External,
         )
         .expect("create packet client");
-        let holder = super::PacketChannelRef { client_id: 7, channel: 1 };
+        let holder = super::PacketChannelRef::new(7, 1, 0);
 
         assert!(super::packet_controller_holder_is_live(holder, std::slice::from_ref(&client)));
 

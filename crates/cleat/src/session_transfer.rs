@@ -652,7 +652,9 @@ pub(super) fn incompatible_clients(hosted: &HostedSession, protocol: TargetProto
     if !packet_compatible {
         for client in packet_clients.iter().filter(|client| !client.dead) {
             for channel in client.channels.values().filter(|channel| channel.session_id == hosted.metadata.id) {
-                incompatible.push(describe_client(&channel.identity, channel.role));
+                for view in channel.views.values() {
+                    incompatible.push(describe_client(&channel.identity, view.role));
+                }
             }
         }
     }

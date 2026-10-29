@@ -8,9 +8,13 @@ use crate::{
     provider::{TerminalInputEvent, TerminalRenderUpdate},
 };
 
-/// Version 14 adds opt-in program-status activity events; 13 adds virtual-declaration render envelopes. Protocol 12
-/// remains supported with byte-for-byte unchanged legacy render layouts.
-pub const PROTOCOL_VERSION: u16 = 15;
+/// Version 16 adds opt-in views (several views on one attachment); 15 adds recognizer roles; 14 adds opt-in
+/// program-status activity events; 13 adds virtual-declaration render envelopes. Protocol 12 remains supported with
+/// byte-for-byte unchanged legacy render layouts.
+pub const PROTOCOL_VERSION: u16 = 16;
+/// The first protocol that carries views. A connection that did not opt in, or
+/// a daemon below it, keeps one implicit view per channel.
+pub const VIEWS_PROTOCOL_VERSION: u16 = 16;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 12;
 pub const CHANNEL_CONTROL: u32 = 0;
 
@@ -25,6 +29,9 @@ pub const MSG_CONTROL_ACTIVITY_EVENT: u8 = 8;
 /// Precedes the `ControlError` that closes a channel whose session moved to
 /// another host. Clients that do not know it ignore it and see the close.
 pub const MSG_CONTROL_REDIRECT: u8 = 9;
+/// Views protocol only: open an attachment with no views ([`OpenAttachment`]).
+/// Nothing renders on it until its first view opens.
+pub const MSG_CONTROL_OPEN_ATTACHMENT: u8 = 10;
 
 pub const MSG_SESSION_RENDER: u8 = 16;
 pub const MSG_SESSION_ACK: u8 = 17;
@@ -42,6 +49,17 @@ pub const MSG_SESSION_CLIPBOARD_LOSS: u8 = 28;
 pub const MSG_SESSION_RENDER_VIRTUAL: u8 = 29;
 /// Client: boolean opt-in on an admitted channel. Server: attach_status::StatusSnapshot.
 pub const MSG_SESSION_PROGRAM_STATUS: u8 = 30;
+/// Client: open another view on this attachment ([`OpenView`]). Views protocol only.
+pub const MSG_SESSION_OPEN_VIEW: u8 = 31;
+/// Client: close one view ([`CloseView`]); the attachment stays open.
+/// Daemon: the view was refused (a reserved id, or more views than an
+/// attachment may hold).
+pub const MSG_SESSION_CLOSE_VIEW: u8 = 32;
+/// Either direction: a per-view message wrapped in a [`ViewFrame`].
+pub const MSG_SESSION_VIEW: u8 = 33;
+/// The view every channel opens with. Unwrapped per-view client messages
+/// (input, resize, viewport, role) address it.
+pub const DEFAULT_VIEW: u32 = 0;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ClipboardLoss {
     /// Cumulative observed drops for the current host actor; a new/restarted actor resets the total.
@@ -222,6 +240,15 @@ pub struct OpenChannel {
     pub identity: AttachmentIdentity,
 }
 
+/// An attachment opened without its default view: no role is granted and no
+/// render sent until a view opens on it with [`OpenView`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAttachment {
+    pub channel: u32,
+    pub session_id: String,
+    pub identity: AttachmentIdentity,
+}
+
 /// Client→server on an open session channel: request a role change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleRequest {
@@ -275,6 +302,43 @@ impl ControllerHolder {
             Self::Packet => "packet",
             Self::Stream => "stream",
         }
+    }
+}
+
+/// Client→server on a views channel: open `view` with a requested role. The
+/// granted role arrives as a view-wrapped `RoleState`; a live view then shares
+/// the attachment's live render stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenView {
+    pub view: u32,
+    pub role: ChannelRole,
+    pub take: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseView {
+    pub view: u32,
+}
+
+/// A per-view message. Client→server it carries input, resize, viewport, role
+/// requests and history acks; server→client, history renders, view state and
+/// role state. The live render stream and its acks stay unwrapped: they belong
+/// to the attachment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewFrame {
+    pub view: u32,
+    pub msg_type: u8,
+    pub payload: Vec<u8>,
+}
+
+impl ViewFrame {
+    pub fn wrap(view: u32, frame: &PacketFrame) -> std::io::Result<PacketFrame> {
+        PacketFrame::new(frame.channel, MSG_SESSION_VIEW, &ViewFrame { view, msg_type: frame.msg_type, payload: frame.payload.clone() })
+    }
+
+    /// The wrapped message as a frame on `channel`.
+    pub fn unwrap(self, channel: u32) -> (u32, PacketFrame) {
+        (self.view, PacketFrame { channel, msg_type: self.msg_type, payload: self.payload })
     }
 }
 
@@ -509,6 +573,15 @@ impl<S: Read + Write> PacketClient<S> {
         })
     }
 
+    /// Views protocol: open an attachment with no views.
+    pub fn open_attachment(&mut self, channel: u32, session_id: &str) -> std::io::Result<()> {
+        self.write(CHANNEL_CONTROL, MSG_CONTROL_OPEN_ATTACHMENT, &OpenAttachment {
+            channel,
+            session_id: session_id.to_string(),
+            identity: AttachmentIdentity::default(),
+        })
+    }
+
     pub fn close_channel(&mut self, channel: u32, reason: Option<String>) -> std::io::Result<()> {
         self.write(CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, &CloseChannel { channel, reason })
     }
@@ -536,6 +609,20 @@ impl<S: Read + Write> PacketClient<S> {
 
     pub fn request_role(&mut self, channel: u32, role: ChannelRole, take: bool) -> std::io::Result<()> {
         self.write(channel, MSG_SESSION_ROLE, &RoleRequest { role, take })
+    }
+
+    /// Views protocol: open another view on an open channel.
+    pub fn open_view(&mut self, channel: u32, view: u32, role: ChannelRole, take: bool) -> std::io::Result<()> {
+        self.write(channel, MSG_SESSION_OPEN_VIEW, &OpenView { view, role, take })
+    }
+
+    pub fn close_view(&mut self, channel: u32, view: u32) -> std::io::Result<()> {
+        self.write(channel, MSG_SESSION_CLOSE_VIEW, &CloseView { view })
+    }
+
+    /// Views protocol: send a per-view message (input, resize, viewport, role or history ack).
+    pub fn write_view<T: Serialize>(&mut self, channel: u32, view: u32, msg_type: u8, value: &T) -> std::io::Result<()> {
+        ViewFrame::wrap(view, &PacketFrame::new(channel, msg_type, value)?)?.write(&mut self.stream)
     }
 
     pub fn read_frame(&mut self) -> std::io::Result<PacketFrame> {
@@ -621,7 +708,7 @@ mod tests {
 
     #[test]
     fn clipboard_effects_require_protocol_version_twelve() {
-        assert_eq!(PROTOCOL_VERSION, 15);
+        assert_eq!(PROTOCOL_VERSION, 16);
         assert!(ControlHello::current().accepts(12));
         assert!(!ControlHello::current().accepts(11));
     }
@@ -632,6 +719,16 @@ mod tests {
         let event = ActivityEvent::MembershipRemoved { session_id: "s".into(), tags: vec![], changed_at_unix_ms: 0 };
         assert_eq!(postcard::to_allocvec(&event).unwrap(), [2, 1, b's', 0, 0]);
         assert_eq!(postcard::to_allocvec(&ControlHello { version: 12, min_supported_version: 12 }).unwrap(), [12, 12]);
+    }
+
+    #[test]
+    fn view_frames_round_trip_the_wrapped_message() {
+        let inner = PacketFrame::new(7, MSG_SESSION_INPUT, &Resize { cols: 3, rows: 4 }).expect("encode inner");
+        let wrapped = ViewFrame::wrap(2, &inner).expect("wrap");
+        assert_eq!((wrapped.channel, wrapped.msg_type), (7, MSG_SESSION_VIEW));
+        let (view, unwrapped) = wrapped.decode::<ViewFrame>().expect("decode view frame").unwrap(7);
+        assert_eq!(view, 2);
+        assert_eq!(unwrapped, inner);
     }
 
     #[test]

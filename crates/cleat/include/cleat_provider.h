@@ -29,6 +29,8 @@ extern "C" {
 #define CLEAT_ROLE_UNKNOWN 0u
 #define CLEAT_ROLE_WATCHER 1u
 #define CLEAT_ROLE_CONTROLLER 2u
+/* cleat_session_desc.role only: attach with no default view. */
+#define CLEAT_ROLE_NO_VIEW 3u
 #define CLEAT_ATTACHMENT_PRINCIPAL 0u
 #define CLEAT_ATTACHMENT_SUPERVISOR 1u
 #define CLEAT_ATTACHMENT_TOOL 2u
@@ -269,6 +271,14 @@ typedef struct cleat_session_desc {
      * CLEAT_ROLE_CONTROLLER request control (the daemon may grant watcher if
      * another controller holds exclusive control); CLEAT_ROLE_WATCHER attaches
      * read-only. The granted role is reported by cleat_session_role.
+     * CLEAT_ROLE_NO_VIEW attaches with no default view: nothing renders and
+     * nothing votes until cleat_session_open_view, and the session handle's
+     * per-view calls fail as after cleat_session_close_default_view. It never
+     * falls back to a default view: against a daemon already known to predate
+     * views (protocol 16) the create or attach returns NULL; one not yet
+     * connected closes the attachment when it connects, so its views report
+     * CLOSED with the reason (cleat_view_close_reason) and later
+     * cleat_session_open_view calls return NULL.
      */
     uint32_t role;
     /*
@@ -843,6 +853,81 @@ bool cleat_session_with_image_resource_data(cleat_session *session,
 bool cleat_session_viewport_snapshot(cleat_session *session, const cleat_viewport_request *request, cleat_snapshot *out);
 void cleat_session_release_snapshot(cleat_session *session, cleat_snapshot *snapshot);
 void cleat_session_release_render_update(cleat_session *session, cleat_render_update *update);
+
+/*
+ * Views (daemon sessions, packet protocol 16). A session handle is one
+ * attachment to its session and keeps a default view, on which every
+ * per-view cleat_session_* call above acts, unless it attached with
+ * CLEAT_ROLE_NO_VIEW. Each cleat_view is another place
+ * showing the session, with its own role, window size, focus, history
+ * position and render updates. Live views share the attachment's one update
+ * stream. Grid size is the intersection over controller views across all
+ * attachments; take control on a view demotes every other controller view.
+ * Clipboard effects reach the session handle once while any of its views
+ * drives. Ending the session, fixed size, clipboard, transfer and adoption
+ * stay on the session handle; adoption and transfer refuse while views are
+ * open. Destroy views before their session; after the session is destroyed a
+ * view reports CLOSED and its calls fail. Additive exports; no existing struct
+ * layout or ABI version changes.
+ */
+typedef struct cleat_view cleat_view;
+
+typedef struct {
+    uint16_t cols;
+    uint16_t rows;
+    float cell_width_px;
+    float cell_height_px;
+    /* CLEAT_ROLE_UNKNOWN/CONTROLLER request shared driving; WATCHER watches. */
+    uint32_t role;
+} cleat_view_desc;
+
+/* NULL for in-process and mock sessions, an invalid desc, or a closed
+ * attachment. Against a daemon before views the view reports CLOSED with a
+ * reason (cleat_view_close_reason); the session's default view is unaffected. */
+cleat_view *cleat_session_open_view(cleat_session *session, const cleat_view_desc *desc);
+/* Close the session handle's default view; its per-view calls then fail and
+ * its connection state is CLOSED. False against a daemon before views. */
+bool cleat_session_close_default_view(cleat_session *session);
+/* Close the view; the attachment and its other views stay open. */
+void cleat_view_destroy(cleat_view *view);
+uint32_t cleat_view_connection_state(const cleat_view *view);
+/* Empty while open. Borrowed until the next call or destruction. */
+bool cleat_view_close_reason(cleat_view *view, cleat_str *out);
+uint32_t cleat_view_role(const cleat_view *view);
+bool cleat_view_set_role(cleat_view *view, uint32_t role, bool take);
+bool cleat_view_take_control(cleat_view *view);
+/* The view's window: a controller view votes with it on the grid size. */
+bool cleat_view_resize(cleat_view *view, uint16_t cols, uint16_t rows);
+bool cleat_view_update_geometry(cleat_view *view, const cleat_terminal_geometry *geometry);
+/* Text, key presses, pastes and bytes from a controller view return that view,
+ * and only that view, to live. */
+bool cleat_view_send_input(cleat_view *view, const cleat_input_event *event);
+bool cleat_view_send_input_ex(cleat_view *view, const cleat_input_event *event, cleat_input_result *out);
+bool cleat_view_send_input_batch(cleat_view *view, const cleat_input_event *events, size_t event_count, cleat_input_result *out);
+bool cleat_view_write_bytes(cleat_view *view, const uint8_t *bytes, size_t size);
+cleat_dirty_state cleat_view_poll(cleat_view *view);
+cleat_dirty_state cleat_view_dirty(const cleat_view *view);
+bool cleat_view_scrollback_extent(cleat_view *view, cleat_scrollback_extent *out);
+bool cleat_view_scrollbar_state(cleat_view *view, cleat_terminal_scrollbar_state *out);
+/* A view in history gets its own render updates; the others stay live. */
+bool cleat_view_scroll_viewport(cleat_view *view, const cleat_viewport_command *command, cleat_viewport_command_result *out);
+/* As cleat_session_render_update. A new or returning live view first receives
+ * the whole grid; render generations never go backwards for a view. One
+ * outstanding update per view. */
+bool cleat_view_render_update(cleat_view *view, cleat_render_update *out);
+void cleat_view_release_render_update(cleat_view *view, cleat_render_update *update);
+const cleat_virtual_placement *cleat_view_render_update_virtual_placements(cleat_view *view, size_t *count);
+bool cleat_view_with_image_resource_data(cleat_view *view,
+                                         uint32_t image_id,
+                                         uint64_t generation,
+                                         cleat_image_resource_data_fn *callback,
+                                         void *user_data);
+bool cleat_view_image_resource_backing(cleat_view *view,
+    uint32_t image_id, uint64_t generation, uint32_t kind, cleat_image_backing *out);
+void cleat_view_release_image_resource_backing(cleat_view *view, cleat_image_backing *backing);
+bool cleat_view_image_resource_backing_error(const cleat_view *view, cleat_str *out);
+/* Role state, view status and current-frame links, as attachment_state_json. */
+bool cleat_view_state_json(const cleat_view *view, uint8_t *buffer, size_t capacity, size_t *out_len);
 
 /* Live writes only; clipboard reads remain unsupported. Acquire removes one
  * event and is independent of render credit. Returned text is owned by the

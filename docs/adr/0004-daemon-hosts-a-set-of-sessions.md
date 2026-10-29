@@ -57,7 +57,8 @@ it was a historical artifact of the daemon predating the shared host shape.
   selector) over one multiplexed connection that also carries their session
   streams; `cleat list` is a one-shot read of the same state. The single-session
   surfaces (`attach`, `watch`, one-shot CLI ops) remain first-class alongside —
-  the CLI is not collapsed into the uishell model.
+  the CLI is not collapsed into the uishell model. [ADR 0009](0009-views-within-an-attachment.md) refines
+  the streams: one attachment per session, carrying a view per place it is shown.
 - **Blast radius is managed, not eliminated.** A daemon crash now takes down every
   session it hosts. Mitigations, in order: per-session `catch_unwind` containment,
   FD transfer for planned handoff/upgrade, recreation-from-recording as the

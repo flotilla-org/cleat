@@ -1,5 +1,12 @@
 //! Live clipboard writes are transient effects, never render or replay state.
-use std::{collections::VecDeque, io::Write};
+use std::{
+    collections::VecDeque,
+    io::Write,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -146,6 +153,13 @@ impl ClipboardRouter {
         event.sequence = self.sequence;
         self.queue.push(event)
     }
+    pub(crate) fn pop_for(&mut self, target: u128) -> Option<ClipboardEvent> {
+        if self.target == Some(target) {
+            self.queue.pop()
+        } else {
+            None
+        }
+    }
     pub(crate) fn drain(&mut self, target: u128) -> Vec<ClipboardEvent> {
         if self.target != Some(target) {
             return Vec::new();
@@ -154,11 +168,53 @@ impl ClipboardRouter {
     }
 }
 
+/// The router shared between a session actor, which mutates it, and the
+/// session handle, which polls it without a round trip. The lock is held only
+/// for queue operations, never across a blocking call.
+#[derive(Clone, Default)]
+pub(crate) struct SharedClipboard(Arc<SharedClipboardInner>);
+#[derive(Default)]
+struct SharedClipboardInner {
+    router: Mutex<ClipboardRouter>,
+    /// Fixed for the life of the session's VT engine; published once at startup.
+    supported: AtomicBool,
+}
+impl SharedClipboard {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ClipboardRouter> {
+        // Queue operations leave the router consistent, so poison is harmless.
+        self.0.router.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    pub(crate) fn set_supported(&self, supported: bool) {
+        self.0.supported.store(supported, Ordering::Release);
+    }
+    pub(crate) fn supported(&self) -> bool {
+        self.0.supported.load(Ordering::Acquire)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn event(text: Option<String>) -> ClipboardEvent {
         ClipboardEvent { session_epoch: [0; 16], connection_epoch: 0, sequence: 0, destination: 0, text }
+    }
+    #[test]
+    fn pop_for_delivers_in_order_to_the_target_only_and_counts_invalid_writes() {
+        let shared = SharedClipboard::default();
+        let mut router = shared.lock();
+        router.set_target(Some(7));
+        for text in ["a", "b"] {
+            assert!(router.accept(event(Some(text.into()))));
+        }
+        assert!(!router.accept(event(Some(String::new()))), "empty text is invalid");
+        assert_eq!(router.queue.dropped, 1);
+        assert!(router.pop_for(8).is_none(), "a non-target receives nothing");
+        let first = router.pop_for(7).unwrap();
+        let second = router.pop_for(7).unwrap();
+        assert_eq!((first.text.as_deref(), first.sequence), (Some("a"), 1));
+        assert_eq!((second.text.as_deref(), second.sequence), (Some("b"), 2));
+        assert_eq!(first.session_epoch, second.session_epoch);
+        assert!(router.pop_for(7).is_none());
     }
     #[test]
     fn exhausted_connection_epoch_rotates_identity_and_discards_pending() {

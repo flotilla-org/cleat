@@ -958,6 +958,7 @@ impl SessionActor {
     }
 
     #[cfg(test)]
+    // The inert handle has no actor, so its clipboard stays empty and unsupported (`supported == false`).
     pub(crate) fn from_parts(
         tx: mpsc::Sender<SessionCommand>,
         observation: Arc<ObservationMirror>,

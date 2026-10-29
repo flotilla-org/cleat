@@ -3335,7 +3335,7 @@ pub unsafe extern "C" fn cleat_session_clipboard_supported(session: *const Cleat
     };
     match &session.backend {
         SessionBackend::Mock(_) => false,
-        SessionBackend::InProcess(s) => s.actor.clipboard_supported().unwrap_or(false),
+        SessionBackend::InProcess(s) => s.actor.clipboard().supported(),
         SessionBackend::Daemon(s) => s.view.slot.lock().ok().is_some_and(|slot| {
             slot.closed.is_none() && slot.views.values().any(|view| view.role_state.as_ref().is_some_and(|role| role.clipboard_writes))
         }),
@@ -3352,7 +3352,7 @@ pub unsafe extern "C" fn cleat_session_acquire_clipboard_event(session: *mut Cle
     };
     let event = match &session.backend {
         SessionBackend::Mock(_) => None,
-        SessionBackend::InProcess(s) => s.actor.pop_clipboard(0).ok().flatten(),
+        SessionBackend::InProcess(s) => s.actor.clipboard().lock().pop_for(0),
         SessionBackend::Daemon(s) => {
             s.view.slot.lock().ok().and_then(
                 |mut slot| {
@@ -3406,7 +3406,7 @@ pub unsafe extern "C" fn cleat_session_clipboard_dropped(session: *const CleatSe
     };
     match &session.backend {
         SessionBackend::Mock(_) => 0,
-        SessionBackend::InProcess(s) => s.actor.clipboard_loss().unwrap_or(0),
+        SessionBackend::InProcess(s) => s.actor.clipboard().lock().queue.dropped,
         SessionBackend::Daemon(s) => {
             s.view.slot.lock().map_or(0, |slot| slot.clipboard.dropped.saturating_add(slot.clipboard_upstream_dropped))
         }
@@ -3807,6 +3807,43 @@ mod tests {
         });
         let result = done_rx.recv_timeout(Duration::from_millis(100)).expect("dirty queries blocked waiting for actor replies");
         assert_eq!(result, (CleatDirtyState::Full, CleatDirtyState::Full));
+
+        unsafe {
+            cleat_session_destroy(session);
+        }
+    }
+
+    #[test]
+    fn in_process_clipboard_polls_do_not_wait_for_actor_replies() {
+        // The receiver is held but never serviced: a request to the actor
+        // would block until the reply deadline.
+        let (tx, _rx) = mpsc::channel::<SessionCommand>();
+        let session = Box::into_raw(Box::new(CleatSession {
+            backend: SessionBackend::InProcess(Box::new(InProcessSession {
+                actor: SessionActor::from_parts(tx, Arc::new(ObservationMirror::new()), None),
+            })),
+            geometry: TerminalGeometry::default(),
+            next_input_sequence: 1,
+            wake: Arc::new(Mutex::new(WakeCallback::default())),
+            last_snapshot: None,
+            last_render_update: None,
+            transfer: Default::default(),
+            end_error: String::new(),
+            backing_error: String::new(),
+            image_backings: Default::default(),
+        }));
+
+        let session_addr = session as usize;
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || unsafe {
+            let session = session_addr as *mut CleatSession;
+            let event = cleat_session_acquire_clipboard_event(session);
+            let dropped = cleat_session_clipboard_dropped(session);
+            let supported = cleat_session_clipboard_supported(session);
+            let _ = done_tx.send((event.is_null(), dropped, supported));
+        });
+        let result = done_rx.recv_timeout(Duration::from_millis(100)).expect("clipboard polls blocked waiting for actor replies");
+        assert_eq!(result, (true, 0, false));
 
         unsafe {
             cleat_session_destroy(session);

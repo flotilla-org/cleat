@@ -21,12 +21,12 @@ use crate::{
     http_uds,
     image_delivery::{ImageReceiver, ImageTransfer, RenderBundle},
     packet::{
-        Ack, ActivityEvent, ActivitySession, ActivitySnapshot, ChannelRole, CloseChannel, ControlError, ControlHello, ControllerHolder,
-        DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame, RenderPacket, Resize, RoleDenialReason,
-        RoleRequest, RoleState, ScreenActivity, CHANNEL_CONTROL, MSG_CONTROL_ACTIVITY_EVENT, MSG_CONTROL_ACTIVITY_SNAPSHOT,
-        MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO,
-        MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE,
-        MSG_SESSION_VIEWPORT,
+        Ack, ActivityEvent, ActivitySession, ActivitySnapshot, ChannelExit, ChannelRole, CloseChannel, ControlError, ControlHello,
+        ControllerHolder, DirectoryDelta, DirectoryEntry, DirectorySnapshot, Input, OpenChannel, PacketFrame, RenderPacket, Resize,
+        RoleDenialReason, RoleRequest, RoleState, ScreenActivity, CHANNEL_CONTROL, MSG_CONTROL_ACTIVITY_EVENT,
+        MSG_CONTROL_ACTIVITY_SNAPSHOT, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA, MSG_CONTROL_DIRECTORY_SNAPSHOT,
+        MSG_CONTROL_ERROR, MSG_CONTROL_EXIT, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_SESSION_ACK, MSG_SESSION_INPUT,
+        MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE, MSG_SESSION_VIEWPORT,
     },
     platform::{
         daemon::{is_session_daemon_alive, spawn_daemon_process},
@@ -35,6 +35,7 @@ use crate::{
             shutdown_stream, try_connect_session_stream, validate_session_socket_path, SessionStream,
         },
         terminal::{attach_signal_exit_requested, current_terminal_size, stdout_is_tty, AttachSignalHandlers, ForegroundTerminal},
+        ChildExit,
     },
     protocol::{AttachmentIdentity, Frame, SeatState},
     provider::{DirtyState, TerminalInputEvent, TerminalMouseButton, TerminalMouseEventKind, TerminalRenderUpdate},
@@ -2595,7 +2596,7 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
                     hosted.active_client = None;
                     hosted.watchers.clear();
                     let _ = fs::remove_file(layout.foreground_path(&session_id));
-                    remove_packet_channels_for_session(&session_id, &mut packet_clients);
+                    remove_packet_channels_for_session(&session_id, hosted.actor.observation().exit(), &mut packet_clients);
                     broadcast_directory_upsert(directory_entry_for_session(&layout, hosted, &packet_clients)?, &mut packet_clients)?;
                 }
                 Some((session_did_work, None)) => {
@@ -2613,14 +2614,14 @@ pub fn run_session_daemon(root: &Path, daemon_name: &str) -> Result<(), String> 
             cleanup_exited_session(&layout, &session_id, true);
             broadcast_directory_remove(&session_id, &mut packet_clients)?;
             sessions.remove(&session_id);
-            remove_packet_channels_for_session(&session_id, &mut packet_clients);
+            remove_packet_channels_for_session(&session_id, None, &mut packet_clients);
         }
 
         if let Some((session_id, should_keep_session_dir)) = exited_session.take() {
             cleanup_exited_session(&layout, &session_id, should_keep_session_dir);
             broadcast_directory_remove(&session_id, &mut packet_clients)?;
-            sessions.remove(&session_id);
-            remove_packet_channels_for_session(&session_id, &mut packet_clients);
+            let exit = sessions.remove(&session_id).and_then(|hosted| hosted.actor.observation().exit());
+            remove_packet_channels_for_session(&session_id, exit, &mut packet_clients);
         }
 
         service_activity_subscriptions(&layout, &sessions, &mut packet_clients)?;
@@ -2693,7 +2694,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-fn remove_packet_channels_for_session(session_id: &str, packet_clients: &mut [PacketClient]) {
+fn remove_packet_channels_for_session(session_id: &str, exit: Option<ChildExit>, packet_clients: &mut [PacketClient]) {
     for client in packet_clients {
         // Tell the client each affected channel is gone before dropping it.
         // Directory deltas are selector-filtered, so an attached client may
@@ -2702,6 +2703,9 @@ fn remove_packet_channels_for_session(session_id: &str, packet_clients: &mut [Pa
         // is already dead and its teardown path will reap it.
         let closed: Vec<u32> = client.channels.iter().filter(|(_, ch)| ch.session_id == session_id).map(|(id, _)| *id).collect();
         for channel in closed {
+            if let Some(exit) = exit {
+                let _ = client.enqueue_control(MSG_CONTROL_EXIT, &ChannelExit { channel, exit_code: exit.code() });
+            }
             let _ = client.enqueue_control(MSG_CONTROL_ERROR, &ControlError { channel, message: format!("session {session_id} exited") });
             client.channels.remove(&channel);
         }
@@ -5555,6 +5559,9 @@ fn open_packet_channel(
         return Ok(());
     };
     if hosted.exit_finalized {
+        if let Some(exit) = hosted.actor.observation().exit() {
+            packet_clients[index].enqueue_control(MSG_CONTROL_EXIT, &ChannelExit { channel: open.channel, exit_code: exit.code() })?;
+        }
         packet_clients[index].enqueue_control(MSG_CONTROL_ERROR, &ControlError {
             channel: open.channel,
             message: format!("session {} has exited", open.session_id),

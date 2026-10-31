@@ -41,12 +41,16 @@ use http::StatusCode;
 use crate::{
     http_uds,
     packet::{
-        ChannelRedirect, ChannelRole, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot, OpenChannel,
-        PacketFrame, RenderPacket, SessionRedirect, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA,
-        MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL, MSG_CONTROL_REDIRECT,
-        MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE, PROTOCOL_VERSION,
+        ChannelExit, ChannelRedirect, ChannelRole, ControlError, ControlHello, DirectoryDelta, DirectoryEntry, DirectorySnapshot,
+        OpenChannel, PacketFrame, RenderPacket, SessionRedirect, CHANNEL_CONTROL, MSG_CONTROL_CLOSE_CHANNEL, MSG_CONTROL_DIRECTORY_DELTA,
+        MSG_CONTROL_DIRECTORY_SNAPSHOT, MSG_CONTROL_ERROR, MSG_CONTROL_EXIT, MSG_CONTROL_HELLO, MSG_CONTROL_OPEN_CHANNEL,
+        MSG_CONTROL_REDIRECT, MSG_SESSION_ACK, MSG_SESSION_INPUT, MSG_SESSION_RENDER, MSG_SESSION_RESIZE, MSG_SESSION_ROLE,
+        PROTOCOL_VERSION,
     },
-    platform::ipc::{shutdown_stream, try_connect_session_stream, SessionStream},
+    platform::{
+        ipc::{shutdown_stream, try_connect_session_stream, SessionStream},
+        ChildExit,
+    },
     protocol::AttachmentIdentity,
     provider::{
         DirtyState, TerminalCursor, TerminalInputEvent, TerminalRenderUpdate, TerminalRenderUpdateOpKind, TerminalResizeEvent,
@@ -148,6 +152,8 @@ pub(crate) struct ChannelSlot {
     /// Set when the daemon reported an error for this channel (e.g. the
     /// session went away).
     pub closed: Option<String>,
+    /// Set when the daemon reported that the session's program exited.
+    pub exit: Option<crate::platform::ChildExit>,
     /// The current connection speaks the views protocol: per-view messages
     /// are wrapped and live views share the attachment's live stream.
     views_protocol: bool,
@@ -251,6 +257,7 @@ impl ChannelSlot {
             images: Default::default(),
             identity,
             closed: None,
+            exit: None,
             views_protocol: false,
             live_pending: None,
             live: Default::default(),
@@ -1256,6 +1263,14 @@ impl DaemonConnection {
             (CHANNEL_CONTROL, MSG_CONTROL_REDIRECT) => {
                 if let Ok(redirect) = frame.decode::<ChannelRedirect>() {
                     recover_lock(&self.state).pending_redirects.insert(redirect.channel, redirect.redirect);
+                }
+            }
+            (CHANNEL_CONTROL, MSG_CONTROL_EXIT) => {
+                if let Ok(exit) = frame.decode::<ChannelExit>() {
+                    let slot = recover_lock(&self.state).channels.get(&exit.channel).cloned();
+                    if let Some(slot) = slot {
+                        recover_lock(&slot).exit = Some(exit.exit_code.map_or(ChildExit::Unknown, ChildExit::Code));
+                    }
                 }
             }
             (CHANNEL_CONTROL, MSG_CONTROL_ERROR) => {

@@ -25,6 +25,11 @@ extern "C" {
 #define CLEAT_SESSION_STREAMING 1u
 #define CLEAT_SESSION_DISCONNECTED 2u
 #define CLEAT_SESSION_CLOSED 3u
+/* Program state of a session (cleat_session_program_state). */
+#define CLEAT_PROGRAM_UNKNOWN 0u
+#define CLEAT_PROGRAM_RUNNING 1u
+#define CLEAT_PROGRAM_EXITED 2u
+#define CLEAT_PROGRAM_EXITED_STATUS_UNKNOWN 3u
 /* Attachment role (cleat_session_role / cleat_session_desc.role). */
 #define CLEAT_ROLE_UNKNOWN 0u
 #define CLEAT_ROLE_WATCHER 1u
@@ -719,8 +724,22 @@ bool cleat_session_id(const cleat_session *session, cleat_str *out);
  * STREAMING. Daemon sessions report CONNECTING until the first render packet,
  * DISCONNECTED while the connection is down (it reconnects with backoff and
  * recovers on its own), and CLOSED once the daemon reported the session gone.
+ * Whether the program still runs is cleat_session_program_state.
  */
 uint32_t cleat_session_connection_state(const cleat_session *session);
+/*
+ * Whether the session's program still runs (CLEAT_PROGRAM_*). EXITED writes
+ * the exit status to exit_code when it is non-null; EXITED_STATUS_UNKNOWN
+ * means the host saw the exit but not its status. Mock sessions simulate a
+ * live program and always report RUNNING. In-process sessions report
+ * their own child, and keep reporting STREAMING as their transport state.
+ * Daemon sessions learn the exit from a notice just before they report
+ * CLOSED; they are UNKNOWN while disconnected and when closed for another
+ * reason or by a daemon that predates the notice. Once the program exited,
+ * resizes no longer change the session's screen: its last frame stays, and a
+ * smaller client clips it. Additive export; no ABI version change.
+ */
+uint32_t cleat_session_program_state(const cleat_session *session, int32_t *exit_code);
 /*
  * Granted attachment role (CLEAT_ROLE_*). In-process sessions are their own
  * controllers. Daemon sessions report UNKNOWN until the daemon's grant

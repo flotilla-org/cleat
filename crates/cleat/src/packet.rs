@@ -32,6 +32,9 @@ pub const MSG_CONTROL_REDIRECT: u8 = 9;
 /// Views protocol only: open an attachment with no views ([`OpenAttachment`]).
 /// Nothing renders on it until its first view opens.
 pub const MSG_CONTROL_OPEN_ATTACHMENT: u8 = 10;
+/// Precedes the `ControlError` that closes a channel whose session's program
+/// exited ([`ChannelExit`]). Clients that do not know it ignore it and see the close.
+pub const MSG_CONTROL_EXIT: u8 = 11;
 
 pub const MSG_SESSION_RENDER: u8 = 16;
 pub const MSG_SESSION_ACK: u8 = 17;
@@ -394,6 +397,13 @@ impl SessionRedirect {
 pub struct ChannelRedirect {
     pub channel: u32,
     pub redirect: SessionRedirect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelExit {
+    pub channel: u32,
+    /// The program's exit status, or `None` when the host could not observe it.
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

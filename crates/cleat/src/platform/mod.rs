@@ -16,3 +16,13 @@ pub enum ChildExit {
     Code(i32),
     Unknown,
 }
+
+impl ChildExit {
+    /// The exit status, when the host observed one.
+    pub fn code(self) -> Option<i32> {
+        match self {
+            Self::Code(code) => Some(code),
+            Self::Unknown => None,
+        }
+    }
+}

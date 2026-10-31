@@ -9,6 +9,7 @@ use std::{
 use crate::{
     host::actor::{ObservationState, SessionActor, SessionCommand, SessionMouseEvent, SessionWheelEvent},
     keys,
+    platform::ChildExit,
     protocol::{AttachmentIdentity, AttachmentKind},
     provider::{
         DirtyState, ProviderFeatures, TerminalCell, TerminalCellFlags, TerminalCellWidth, TerminalCursor, TerminalCursorStyle,
@@ -39,6 +40,10 @@ pub const CLEAT_SESSION_CONNECTING: u32 = 0;
 pub const CLEAT_SESSION_STREAMING: u32 = 1;
 pub const CLEAT_SESSION_DISCONNECTED: u32 = 2;
 pub const CLEAT_SESSION_CLOSED: u32 = 3;
+pub const CLEAT_PROGRAM_UNKNOWN: u32 = 0;
+pub const CLEAT_PROGRAM_RUNNING: u32 = 1;
+pub const CLEAT_PROGRAM_EXITED: u32 = 2;
+pub const CLEAT_PROGRAM_EXITED_STATUS_UNKNOWN: u32 = 3;
 pub const CLEAT_ROLE_UNKNOWN: u32 = 0;
 pub const CLEAT_ROLE_WATCHER: u32 = 1;
 pub const CLEAT_ROLE_CONTROLLER: u32 = 2;
@@ -2068,6 +2073,7 @@ pub unsafe extern "C" fn cleat_session_attachment_state_json(
 /// `CLEAT_SESSION_DISCONNECTED` while the daemon connection is down (it
 /// reconnects with backoff and recovers the stream), and
 /// `CLEAT_SESSION_CLOSED` once the daemon reported the session gone.
+/// Whether the program still runs is `cleat_session_program_state`.
 ///
 /// # Safety
 ///
@@ -2081,6 +2087,52 @@ pub unsafe extern "C" fn cleat_session_connection_state(session: *const CleatSes
     match &session.backend {
         SessionBackend::Mock(_) | SessionBackend::InProcess(_) => CLEAT_SESSION_STREAMING,
         SessionBackend::Daemon(daemon) => daemon.view.connection_state(),
+    }
+}
+
+/// Whether the session's program is still running. `CLEAT_PROGRAM_EXITED`
+/// writes the exit status to `exit_code` (when non-null);
+/// `CLEAT_PROGRAM_EXITED_STATUS_UNKNOWN` means the host saw the exit but not
+/// its status. In-process sessions report their own child. Daemon sessions
+/// report the daemon's exit notice, which precedes `CLEAT_SESSION_CLOSED`;
+/// they are `CLEAT_PROGRAM_UNKNOWN` while disconnected and when closed for
+/// another reason (or by a daemon that predates the notice). Once exited, a
+/// session's screen keeps its last frame: resizes no longer change it.
+///
+/// # Safety
+///
+/// `session` must be a valid session pointer; `exit_code` must be null or
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn cleat_session_program_state(session: *const CleatSession, exit_code: *mut i32) -> u32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return CLEAT_PROGRAM_UNKNOWN;
+    };
+    let exit = match &session.backend {
+        SessionBackend::Mock(_) => None,
+        SessionBackend::InProcess(in_process) => in_process.actor.observation().exit(),
+        SessionBackend::Daemon(daemon) => {
+            // Copy the slot fields before checking connectivity (lock order,
+            // as in DaemonView::connection_state).
+            let (closed, exit) = match daemon.view.slot.lock() {
+                Ok(slot) => (slot.closed.is_some(), slot.exit),
+                Err(_) => return CLEAT_PROGRAM_UNKNOWN,
+            };
+            if exit.is_none() && (closed || !daemon.view.connection.channel_connected(daemon.view.channel)) {
+                return CLEAT_PROGRAM_UNKNOWN;
+            }
+            exit
+        }
+    };
+    match exit {
+        None => CLEAT_PROGRAM_RUNNING,
+        Some(ChildExit::Unknown) => CLEAT_PROGRAM_EXITED_STATUS_UNKNOWN,
+        Some(ChildExit::Code(code)) => {
+            if let Some(out) = unsafe { exit_code.as_mut() } {
+                *out = code;
+            }
+            CLEAT_PROGRAM_EXITED
+        }
     }
 }
 

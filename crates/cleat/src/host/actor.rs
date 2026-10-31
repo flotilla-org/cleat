@@ -303,9 +303,15 @@ impl ObservationMirror {
     /// The exit code, when the child exited with a known status.
     #[cfg(test)]
     pub(crate) fn exit_code(&self) -> Option<i32> {
+        self.exit().and_then(ChildExit::code)
+    }
+
+    /// How the child exited, once it has.
+    pub(crate) fn exit(&self) -> Option<ChildExit> {
         match self.exit_code.load(AtomicOrdering::SeqCst) {
-            EXIT_CODE_UNSET | EXIT_CODE_UNKNOWN => None,
-            code => Some(code as i32),
+            EXIT_CODE_UNSET => None,
+            EXIT_CODE_UNKNOWN => Some(ChildExit::Unknown),
+            code => Some(ChildExit::Code(code as i32)),
         }
     }
 
@@ -1543,6 +1549,13 @@ fn session_actor_handle_command(
             let _ = reply.send(Ok(state.clipboard.lock().queue.dropped));
         }
         SessionCommand::Resize { cols, rows, reply } => {
+            // Nothing redraws an exited program's screen, and the alternate
+            // screen does not reflow: keep its last frame, clipped by smaller
+            // clients, instead of losing what a shrink would drop.
+            if state.exited {
+                let _ = reply.send(Ok(()));
+                return false;
+            }
             let cols = cols.max(1);
             let rows = rows.max(1);
             let result = runtime.resize(cols, rows).map(|_| {
@@ -1818,12 +1831,15 @@ fn session_actor_handle_command(
         SessionCommand::ApplyAttachState { cols, rows, capabilities, reply } => {
             let cols = cols.max(1);
             let rows = rows.max(1);
-            let result = runtime
-                .apply_attach_state(cols, rows, &capabilities)
-                .inspect(|_| {
+            // Like a resize, attaching keeps an exited program's last frame.
+            let payload = if state.exited {
+                runtime.replay_payload(&capabilities)
+            } else {
+                runtime.apply_attach_state(cols, rows, &capabilities).inspect(|_| {
                     mark_full_and_wake(&mut state.observation, rows, wake);
                 })
-                .map(|payload| RawOutputReplay { payload, through_sequence: state.last_raw_output_sequence });
+            };
+            let result = payload.map(|payload| RawOutputReplay { payload, through_sequence: state.last_raw_output_sequence });
             let _ = reply.send(result);
         }
         SessionCommand::ReplayPayload { capabilities, reply } => {
@@ -2641,6 +2657,25 @@ mod synchronized_output_tests {
         let update = present_until(&actor, "final frame", |update| text(update).contains("gone"));
         assert!(started.elapsed() < Duration::from_millis(900), "exit waited for the deadline");
         assert!(!update.cursor.visible);
+    }
+
+    // Nothing redraws an exited program, and the alternate screen does not
+    // reflow: resizes and attaches keep its last frame in both hostings.
+    #[test]
+    fn exited_session_keeps_its_screen_through_resizes() {
+        let (_temp, actor, _wakes) = spawn("exited-resize", r"printf '\033[?1049h\033[1;15Hmark'; exit 0");
+        wait_until("exit", Duration::from_secs(10), || actor.observation().exited());
+        assert!(actor.capture_text().unwrap().contains("mark"));
+        let size = |actor: &SessionActor| {
+            let terminal = actor.inspect(false, 0).unwrap().terminal;
+            (terminal.cols, terminal.rows)
+        };
+        actor.resize(5, 2).unwrap();
+        assert_eq!(size(&actor), (20, 3));
+        actor.apply_attach_state(5, 2, vt::ClientCapabilities::conservative_fallback()).unwrap();
+        assert_eq!(size(&actor), (20, 3));
+        actor.resize(20, 3).unwrap();
+        assert!(actor.capture_text().unwrap().contains("mark"));
     }
 }
 

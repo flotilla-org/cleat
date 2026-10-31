@@ -117,6 +117,7 @@ fn wait(what: &str, mut ready: impl FnMut() -> bool) {
 struct Client {
     session: *mut CleatSession,
     frame: Frame,
+    generation: u64,
 }
 
 impl Client {
@@ -126,6 +127,7 @@ impl Client {
             let mut update = CleatRenderUpdate::default();
             if cleat_session_render_update(self.session, &mut update) {
                 self.frame.apply(&update);
+                self.generation = update.render_generation;
                 cleat_session_mark_observed(self.session, update.render_generation);
                 cleat_session_release_render_update(self.session, &mut update);
             }
@@ -191,7 +193,7 @@ fn run_exited_session_scenario(backend: u32) {
             ..Default::default()
         });
         assert!(!session.is_null());
-        let mut client = Client { session, frame: Frame::default() };
+        let mut client = Client { session, frame: Frame::default(), generation: 0 };
         if backend == CLEAT_PROVIDER_BACKEND_DAEMON {
             wait("controller grant", || cleat_session_role(session) == CLEAT_ROLE_CONTROLLER);
         }
@@ -221,7 +223,7 @@ fn run_exited_session_scenario(backend: u32) {
             assert_eq!(cleat_session_connection_state(session), CLEAT_SESSION_STREAMING);
         }
         client.pump();
-        let last = client.frame.clone();
+        let (last, generation) = (client.frame.clone(), client.generation);
         assert_eq!((last.cols, last.rows), (109, 25));
         assert!(last.has_markers(), "{last:?}");
 
@@ -229,6 +231,9 @@ fn run_exited_session_scenario(backend: u32) {
         client.resize(43, 10);
         client.resize(109, 25);
         assert_eq!(client.frame, last, "backend={backend}");
+        // No new frame was rendered, so none can still be on its way.
+        client.pump();
+        assert_eq!(client.generation, generation, "backend={backend}");
         assert_eq!(client.program_state(), (CLEAT_PROGRAM_EXITED, Some(3)));
 
         cleat_session_destroy(session);

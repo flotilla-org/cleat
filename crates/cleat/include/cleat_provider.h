@@ -730,7 +730,8 @@ uint32_t cleat_session_connection_state(const cleat_session *session);
 /*
  * Whether the session's program still runs (CLEAT_PROGRAM_*). EXITED writes
  * the exit status to exit_code when it is non-null; EXITED_STATUS_UNKNOWN
- * means the host saw the exit but not its status. In-process sessions report
+ * means the host saw the exit but not its status. Mock sessions simulate a
+ * live program and always report RUNNING. In-process sessions report
  * their own child, and keep reporting STREAMING as their transport state.
  * Daemon sessions learn the exit from a notice just before they report
  * CLOSED; they are UNKNOWN while disconnected and when closed for another

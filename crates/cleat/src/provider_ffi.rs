@@ -2093,7 +2093,8 @@ pub unsafe extern "C" fn cleat_session_connection_state(session: *const CleatSes
 /// Whether the session's program is still running. `CLEAT_PROGRAM_EXITED`
 /// writes the exit status to `exit_code` (when non-null);
 /// `CLEAT_PROGRAM_EXITED_STATUS_UNKNOWN` means the host saw the exit but not
-/// its status. In-process sessions report their own child. Daemon sessions
+/// its status. Mock sessions simulate a live program and always report
+/// `CLEAT_PROGRAM_RUNNING`. In-process sessions report their own child. Daemon sessions
 /// report the daemon's exit notice, which precedes `CLEAT_SESSION_CLOSED`;
 /// they are `CLEAT_PROGRAM_UNKNOWN` while disconnected and when closed for
 /// another reason (or by a daemon that predates the notice). Once exited, a

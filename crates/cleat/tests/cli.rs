@@ -224,8 +224,21 @@ fn launch_command_parses() {
         tags: Vec::new(),
         env_clear: false,
         environment: Vec::new(),
-        record: RecordFlags::default()
+        record: RecordFlags::default(),
+        argv: Vec::new()
     });
+}
+
+// `launch` takes its argv only after `--`, verbatim (hyphenated words
+// included), and never together with a shell command.
+#[test]
+fn launch_takes_argv_after_double_dash_exclusive_with_cmd() {
+    let cli = Cli::try_parse_from(["cleat", "launch", "work", "--env-clear", "--", "tool", "--cmd", "-lc", "two words", ""]).unwrap();
+    assert!(
+        matches!(cli.command, Command::Launch { cmd: None, env_clear: true, ref argv, .. } if argv == &["tool", "--cmd", "-lc", "two words", ""])
+    );
+    assert!(Cli::try_parse_from(["cleat", "launch", "work", "tool"]).is_err());
+    assert!(Cli::try_parse_from(["cleat", "launch", "work", "--cmd", "true", "--", "tool"]).is_err());
 }
 
 #[test]
@@ -288,7 +301,8 @@ fn launch_command_parses_positional_name() {
         tags: Vec::new(),
         env_clear: false,
         environment: Vec::new(),
-        record: RecordFlags::default()
+        record: RecordFlags::default(),
+        argv: Vec::new()
     });
 }
 
@@ -341,7 +355,8 @@ fn launch_command_parses_json() {
         tags: Vec::new(),
         env_clear: false,
         environment: Vec::new(),
-        record: RecordFlags::default()
+        record: RecordFlags::default(),
+        argv: Vec::new()
     });
 }
 
@@ -360,7 +375,8 @@ fn launch_command_parses_vt() {
         tags: Vec::new(),
         env_clear: false,
         environment: Vec::new(),
-        record: RecordFlags::default()
+        record: RecordFlags::default(),
+        argv: Vec::new()
     });
 }
 
@@ -379,7 +395,8 @@ fn create_alias_still_parses_as_launch() {
         tags: Vec::new(),
         env_clear: false,
         environment: Vec::new(),
-        record: RecordFlags::default()
+        record: RecordFlags::default(),
+        argv: Vec::new()
     });
 }
 

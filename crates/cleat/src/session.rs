@@ -98,6 +98,8 @@ pub struct SessionStartOptions {
     pub tags: Vec<String>,
     pub environment_policy: crate::runtime::ChildEnvironmentPolicy,
     pub environment: Vec<(String, String)>,
+    /// Run this program directly instead of `cmd` or the user's shell.
+    pub argv: Option<Vec<String>>,
 }
 
 /// An attachment relay failure, distinct from a failure to attach initially.
@@ -1540,7 +1542,9 @@ fn start_session(
     let id = id.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
     crate::runtime::validate_runtime_name(&id)?;
     crate::runtime::validate_environment(&options.environment)?;
+    crate::runtime::validate_program(cmd.as_deref(), options.argv.as_deref())?;
     let mut session = layout.session_metadata(id, vt_engine, cwd, cmd);
+    session.argv = options.argv;
     session.record = options.record;
     session.initial_size = options.initial_size;
     session.colors = options.colors;
@@ -3872,6 +3876,7 @@ fn handle_http_request(
             }
             crate::runtime::validate_runtime_name(&session.id)?;
             crate::runtime::validate_environment(&session.environment)?;
+            crate::runtime::validate_program(session.cmd.as_deref(), session.argv.as_deref())?;
             session.vt_engine.ensure_available()?;
             #[cfg(unix)]
             if state.transfers.transfer_pending(&session.id) {
@@ -7850,6 +7855,7 @@ mod tests {
             vt_engine: vt::default_vt_engine_kind(),
             cwd: None,
             cmd: None,
+            argv: None,
             tags: Vec::new(),
             environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
@@ -7876,6 +7882,7 @@ mod tests {
             vt_engine: vt::default_vt_engine_kind(),
             cwd: None,
             cmd: None,
+            argv: None,
             tags: Vec::new(),
             environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),

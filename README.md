@@ -212,6 +212,14 @@ A daemon is the process boundary for one named session set. The default daemon i
 
 **Sibling sessions.** `cleat launch [ID] --from SOURCE` resolves the daemon that owns `SOURCE` and applies the normal launch behavior there. The new session shares that daemon's initial execution context, not the source session's current cwd or exported variables. `--from` and `--server` are mutually exclusive; use `--server` directly when the same source ID exists in more than one daemon.
 
+**Session programs.** A session runs one of three programs, fixed at creation:
+
+- No command: the user's login shell (`$SHELL`, else `/bin/sh`; PowerShell on Windows).
+- `--cmd CMD`: a command line run by that shell as `$SHELL -lc CMD` (`cmd.exe /D /C CMD` on Windows), so login profiles apply and may change the environment, including `PATH`.
+- `cleat launch [ID] [OPTIONS] -- PROGRAM [ARG]...`: an argv executed directly, with no shell and no profile. Each argument arrives unchanged. `PROGRAM` without a path separator is searched on the `PATH` of the session's own environment (after `--env-clear` and `--env`), not the daemon's; a program that is not found fails the launch. On Windows the arguments are quoted for the program's argv parser and a bare name gains `.exe`; one not found on that `PATH` also fails the launch (run batch files as `cmd /D /C file.cmd`). Only a child environment without `PATH` leaves the search to CreateProcessW. `--cmd` and an argv are mutually exclusive.
+
+The HTTP create request (`POST /sessions`, a `SessionMetadata` body) carries the argv as `"argv": ["PROGRAM", "ARG", ...]` alongside `"cmd": null`; `list`/`inspect` JSON reports it in the same field, which is absent for shell sessions. Provider hosts set `cleat_session_desc.argv`/`argc` (ABI 12).
+
 **Screen queries.** `cleat inspect ID --screen` exposes the region tree as JSON (`--json` is optional); add `--select 'region:has(cursor):last-match'` to return matching nodes with cell coordinates and named regex captures. `--text-only` prints physical rows. `cleat wait ID --select SEL` waits until the current screen matches, alongside the existing OR conditions. Selector syntax is stable for version 1; waits are advisory. See [screen queries and the shared CLI/HTTP schema](docs/screen-queries.md).
 
 **Tags.** Sessions may carry flat, opaque tags. Add them at launch with repeated `--tag TAG`, mutate them with `cleat tag <id> +TAG -TAG`, and filter directory reads with repeated `--selector TAG`. Selectors are exact whole-tag matches and are ANDed when repeated. `key=value` is only a client convention; cleat does not interpret tag keys, values, hierarchy, or globs.

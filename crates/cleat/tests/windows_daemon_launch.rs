@@ -123,3 +123,47 @@ fn declared_launch_preserves_windows_baseline_and_excludes_daemon_environment() 
     assert!(entries.contains(&"term=dumb".to_owned()));
     // Empty declarations are checked directly by the native-block contract.
 }
+
+// Scenario: `launch -- PROGRAM ARGS` starts the program itself under ConPTY,
+// not through `cmd /C`: the bare name `cmd` is found on the declared PATH as
+// cmd.exe, the spaced script argument reaches it as one argument, and a name
+// missing from that PATH is refused.
+#[test]
+fn argv_launch_runs_program_directly_on_declared_path() {
+    let temp = tempfile::tempdir().expect("runtime root");
+    let root = temp.path().join("runtime");
+    let _daemon = OwnedDaemon { root: root.clone(), name: "argv-test" };
+    let system_root = std::env::var("SystemRoot").expect("Windows installation directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_cleat"))
+        .arg("--runtime-root")
+        .arg(&root)
+        .args(["--server", "argv-test", "launch", "argv", "--vt", "passthrough", "--env-clear", "--json", "--cwd"])
+        .arg(temp.path())
+        .args(["--env", &format!("SystemRoot={system_root}"), "--env", &format!("PATH={system_root}\\System32")])
+        .args(["--", "cmd", "/D", "/C", "echo %CLEAT_SESSION%> session.txt"])
+        .output()
+        .expect("launch child");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("launch JSON");
+    assert_eq!(value["argv"], serde_json::json!(["cmd", "/D", "/C", "echo %CLEAT_SESSION%> session.txt"]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let capture = temp.path().join("session.txt");
+    loop {
+        if std::fs::read_to_string(&capture).is_ok_and(|contents| contents.trim_end() == "argv") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "argv child did not run");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // A bare name absent from the declared PATH fails the launch instead of
+    // falling back to a search of the daemon's PATH.
+    let missing = Command::new(env!("CARGO_BIN_EXE_cleat"))
+        .arg("--runtime-root")
+        .arg(&root)
+        .args(["--server", "argv-test", "launch", "missing", "--vt", "passthrough", "--env-clear"])
+        .args(["--env", &format!("SystemRoot={system_root}"), "--env", &format!("PATH={system_root}\\System32")])
+        .args(["--", "cleat-no-such-program"])
+        .output()
+        .expect("launch missing program");
+    assert!(!missing.status.success());
+}

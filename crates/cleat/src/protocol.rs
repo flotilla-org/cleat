@@ -16,6 +16,9 @@ pub struct SessionInfo {
     pub functional_vt_available: bool,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
+    /// Present for a session that runs a program directly (no shell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub status: SessionStatus,
@@ -214,6 +217,9 @@ pub struct SessionInspect {
     pub functional_vt_available: bool,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
+    /// Present for a session that runs a program directly (no shell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

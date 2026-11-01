@@ -28,7 +28,7 @@ use nix::{
 use crate::{
     platform::ipc::{SessionListener, SessionStream},
     protocol::SignalTarget,
-    runtime::{AmbientSessionCoordinates, SessionMetadata, AMBIENT_COORDINATE_ENV_NAMES},
+    runtime::{AmbientSessionCoordinates, SessionMetadata, SessionProgram, AMBIENT_COORDINATE_ENV_NAMES},
 };
 
 const STRIP_ENV_VARS: &[&str] = &["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"];
@@ -613,15 +613,28 @@ struct ChildExecSpec {
 
 impl ChildExecSpec {
     fn new(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Self, String> {
-        let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-        let program = cstring_from_os(resolve_shell_program(&shell).as_os_str(), "shell path contains interior nul")?;
-        let mut argv = vec![cstring_from_os(&shell, "shell contains interior nul")?];
-        if let Some(cmd) = &session.cmd {
-            argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
-            argv.push(CString::new(cmd.as_str()).map_err(|_| "cmd contains interior nul".to_string())?);
-        }
         let inherited = session.environment_policy.base_environment();
         let envp = child_envp_from(inherited, session.vt_engine, &session.environment, coordinates, session.cwd.as_deref())?;
+        let (program, argv) = match session.program() {
+            SessionProgram::Argv(args) => {
+                let argv = args
+                    .iter()
+                    .map(|arg| CString::new(arg.as_str()).map_err(|_| "argv contains interior nul".to_string()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let program = resolve_argv_program(OsStr::new(&args[0]), envp_path(&envp), session.cwd.as_deref())?;
+                (cstring_from_os(program.as_os_str(), "program path contains interior nul")?, argv)
+            }
+            program => {
+                let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+                let resolved = cstring_from_os(resolve_shell_program(&shell).as_os_str(), "shell path contains interior nul")?;
+                let mut argv = vec![cstring_from_os(&shell, "shell contains interior nul")?];
+                if let SessionProgram::ShellCommand(cmd) = program {
+                    argv.push(CString::new("-lc").map_err(|_| "invalid -lc".to_string())?);
+                    argv.push(CString::new(cmd).map_err(|_| "cmd contains interior nul".to_string())?);
+                }
+                (resolved, argv)
+            }
+        };
         let cwd = session.cwd.as_ref().map(|cwd| cstring_from_os(cwd.as_os_str(), "cwd contains interior nul")).transpose()?;
         let argv_ptrs = null_terminated_ptrs(&argv);
         let envp_ptrs = null_terminated_ptrs(&envp);
@@ -656,6 +669,37 @@ fn resolve_shell_program(shell: &OsStr) -> PathBuf {
         }
     }
     PathBuf::from(shell)
+}
+
+/// The child's own `PATH`, which an argv launch searches instead of the
+/// daemon's. `child_envp_from` emits each name once (a declaration replaces
+/// the inherited value); the first entry is what `getenv` would read.
+fn envp_path(envp: &[CString]) -> Option<&OsStr> {
+    envp.iter().find_map(|entry| entry.as_bytes().strip_prefix(b"PATH=")).map(OsStr::from_bytes)
+}
+
+/// Resolve an argv program as `execvp` would in the child: a name containing
+/// `/` is used as given, anything else is searched on the child's `PATH`.
+/// Relative `PATH` entries (an empty one means `.`) are taken from the
+/// session's working directory, where the child starts. Without a session cwd
+/// the child inherits the daemon's, so resolving against the daemon's cwd is
+/// what `execvp` in the child would do.
+fn resolve_argv_program(program: &OsStr, path: Option<&OsStr>, cwd: Option<&Path>) -> Result<PathBuf, String> {
+    if program.as_bytes().contains(&b'/') {
+        return Ok(PathBuf::from(program));
+    }
+    let path = path.unwrap_or_else(|| OsStr::new("/bin:/usr/bin"));
+    for dir in env::split_paths(path) {
+        let dir = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir };
+        let candidate = match cwd {
+            Some(cwd) if dir.is_relative() => cwd.join(dir).join(program),
+            _ => dir.join(program),
+        };
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("{}: program not found on the session PATH", program.to_string_lossy()))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -954,6 +998,7 @@ mod tests {
             vt_engine: VtEngineKind::Passthrough,
             cwd: None,
             cmd: Some("sleep 0.2; printf READY; sleep 0.2".to_string()),
+            argv: None,
             tags: Vec::new(),
             environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
@@ -1003,6 +1048,7 @@ mod tests {
             vt_engine: VtEngineKind::Passthrough,
             cwd: None,
             cmd: Some("sleep 5".to_string()),
+            argv: None,
             tags: Vec::new(),
             environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),

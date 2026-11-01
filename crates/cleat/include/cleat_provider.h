@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CLEAT_PROVIDER_ABI_VERSION 11u
+#define CLEAT_PROVIDER_ABI_VERSION 12u
 #define CLEAT_PROVIDER_BACKEND_MOCK 0u
 #define CLEAT_PROVIDER_BACKEND_IN_PROCESS 1u
 #define CLEAT_PROVIDER_BACKEND_DAEMON 2u
@@ -293,6 +293,16 @@ typedef struct cleat_session_desc {
     const uint8_t *attachment_name;
     size_t attachment_name_len;
     uint32_t attachment_kind;
+    /*
+     * Creation only (ABI 12): when argc is nonzero, run argv[0] with these
+     * arguments directly, with no shell and no login profile. The program is
+     * searched on the child environment's PATH. command must then be empty.
+     * When argc is zero, command runs through the platform shell
+     * ($SHELL -lc, or cmd.exe /D /C on Windows), and with neither the
+     * session runs the user's shell.
+     */
+    const cleat_str *argv;
+    size_t argc;
 } cleat_session_desc;
 
 /*

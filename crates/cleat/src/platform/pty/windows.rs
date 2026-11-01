@@ -3,7 +3,7 @@ use std::{
     io,
     mem::{size_of, zeroed},
     os::windows::ffi::OsStrExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr::{null, null_mut},
     thread,
     time::Duration,
@@ -29,7 +29,7 @@ use super::conpty::{self, ConptyApi, ConptyPreference};
 use crate::{
     platform::ipc::{handle_has_available_bytes, SessionListener, SessionStream},
     protocol::{ConptyInfo, ConptyKind, SignalTarget},
-    runtime::{AmbientSessionCoordinates, SessionMetadata, AMBIENT_COORDINATE_ENV_NAMES},
+    runtime::{AmbientSessionCoordinates, SessionMetadata, SessionProgram, AMBIENT_COORDINATE_ENV_NAMES},
 };
 
 const POSIX_SIGINT: i32 = 2;
@@ -333,13 +333,20 @@ fn spawn_with_conpty(
     let mut command_line = wide_null(command_line);
     let cwd = session.cwd.as_ref().map(|path| wide_null(&path.to_string_lossy()));
     let cwd_ptr = cwd.as_ref().map(|value| value.as_ptr()).unwrap_or_else(null);
-    let mut environment = child_environment_block(session, coordinates)?;
+    let variables = child_environment(session, coordinates)?;
+    let application = match session.program() {
+        SessionProgram::Argv(argv) => resolve_argv_program(&argv[0], environment_path(&variables), session.cwd.as_deref())?,
+        _ => None,
+    };
+    let application = application.map(|path| path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>());
+    let application_ptr = application.as_ref().map(|value| value.as_ptr()).unwrap_or_else(null);
+    let mut environment = environment_block(variables)?;
     let environment_ptr = environment.as_mut_ptr().cast::<c_void>();
     let creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
 
     let created = unsafe {
         CreateProcessW(
-            null(),
+            application_ptr,
             command_line.as_mut_ptr(),
             null(),
             null(),
@@ -363,7 +370,15 @@ fn spawn_with_conpty(
     }
 }
 
+#[cfg(test)]
 fn child_environment_block(session: &SessionMetadata, coordinates: Option<&AmbientSessionCoordinates>) -> Result<Vec<u16>, String> {
+    environment_block(child_environment(session, coordinates)?)
+}
+
+fn child_environment(
+    session: &SessionMetadata,
+    coordinates: Option<&AmbientSessionCoordinates>,
+) -> Result<Vec<(OsString, OsString)>, String> {
     let inherited = session.environment_policy.base_environment();
     let identity = crate::terminal_identity::defaults(session.vt_engine, &inherited, &session.environment, session.cwd.as_deref());
     let mut variables: Vec<(OsString, OsString)> = inherited
@@ -388,7 +403,10 @@ fn child_environment_block(session: &SessionMetadata, coordinates: Option<&Ambie
         variables.extend(coordinates.child_environment().map(|(name, value)| (OsString::from(name), value.to_os_string())));
     }
     variables.sort_by_key(|(name, _)| name.to_string_lossy().to_ascii_lowercase());
+    Ok(variables)
+}
 
+fn environment_block(variables: Vec<(OsString, OsString)>) -> Result<Vec<u16>, String> {
     let mut block = Vec::new();
     for (key, value) in variables {
         let mut entry: Vec<u16> = key.encode_wide().chain(std::iter::once('=' as u16)).chain(value.encode_wide()).collect();
@@ -403,12 +421,49 @@ fn child_environment_block(session: &SessionMetadata, coordinates: Option<&Ambie
 }
 
 fn windows_shell_command(session: &SessionMetadata) -> String {
-    match &session.cmd {
+    match session.program() {
         // Keep explicit commands in cmd.exe syntax for now. A PowerShell
         // command path would need separate quoting and -Command semantics.
-        Some(cmd) => format!("cmd.exe /D /C {}", quote_windows_arg(cmd)),
-        None => "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass".to_string(),
+        SessionProgram::ShellCommand(cmd) => format!("cmd.exe /D /C {}", quote_windows_arg(cmd)),
+        // No shell: each argument is quoted for the program's own argv parser.
+        SessionProgram::Argv(argv) => argv.iter().map(|arg| quote_windows_arg(arg)).collect::<Vec<_>>().join(" "),
+        SessionProgram::Shell => "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass".to_string(),
     }
+}
+
+/// The child's own `PATH`, which an argv launch searches instead of the
+/// daemon's. `child_environment` holds each name once, compared
+/// case-insensitively (a declaration replaces the inherited value); the
+/// first entry is taken, as on Unix.
+fn environment_path(variables: &[(OsString, OsString)]) -> Option<&OsStr> {
+    variables.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, value)| value.as_os_str())
+}
+
+/// Search a bare argv program on the child's `PATH`, adding `.exe` when it
+/// has no extension, and fail when that `PATH` has no match rather than let
+/// CreateProcessW search the daemon's. `None` (a name with a path, or a child
+/// without `PATH`) leaves the search to CreateProcessW, which then covers only
+/// the application and system directories and the daemon's `PATH`. Batch
+/// files are not programs: run them as `cmd /D /C file.cmd`.
+fn resolve_argv_program(program: &str, path: Option<&OsStr>, cwd: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    if program.contains(['\\', '/', ':']) {
+        return Ok(None);
+    }
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let file = if Path::new(program).extension().is_some() { program.to_string() } else { format!("{program}.exe") };
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .find_map(|dir| {
+            let candidate = match cwd {
+                Some(cwd) if dir.is_relative() => cwd.join(dir).join(&file),
+                _ => dir.join(&file),
+            };
+            candidate.is_file().then_some(candidate)
+        })
+        .map(Some)
+        .ok_or_else(|| format!("{file}: program not found on the session PATH"))
 }
 
 fn quote_windows_arg(arg: &str) -> String {
@@ -525,6 +580,7 @@ mod tests {
             vt_engine: VtEngineKind::Passthrough,
             cwd: None,
             cmd: Some("echo ready".into()),
+            argv: None,
             tags: Vec::new(),
             environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
@@ -536,5 +592,47 @@ mod tests {
         let command = windows_shell_command(&session);
 
         assert_eq!(command, "cmd.exe /D /C \"echo ready\"");
+    }
+
+    // An argv session's command line parses back, through the Windows argv
+    // parser, to exactly the argv given: nothing is added, dropped or altered.
+    // Arguments draw from spaces, tabs, quotes, backslashes (including before
+    // quotes and at the end), cmd.exe metacharacters, non-ASCII and the empty string.
+    #[hegel::test(test_cases = 300)]
+    fn argv_command_line_round_trips_through_windows_parser(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let program = tc.draw(gs::sampled_from(vec!["tool", "tool.exe", "C:\\Program Files\\tool.exe", "..\\bin\\tool"]));
+        let alphabet = vec!['a', ' ', '\t', '"', '\\', '%', '^', '&', '|', '<', 'é'];
+        let args: Vec<String> =
+            tc.draw(gs::vecs(gs::vecs(gs::sampled_from(alphabet)).max_size(8)).max_size(5)).into_iter().map(String::from_iter).collect();
+        let mut argv = vec![program.to_string()];
+        argv.extend(args);
+        let session = SessionMetadata {
+            argv: Some(argv.clone()),
+            ..crate::runtime::RuntimeLayout::new(std::env::temp_dir()).session_metadata(
+                "argv".into(),
+                VtEngineKind::Passthrough,
+                None,
+                None,
+            )
+        };
+        assert_eq!(parse_windows_command_line(&windows_shell_command(&session)), argv);
+    }
+
+    fn parse_windows_command_line(command_line: &str) -> Vec<String> {
+        use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
+        let wide = super::wide_null(command_line);
+        let mut count = 0;
+        let parsed = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut count) };
+        assert!(!parsed.is_null());
+        let argv = (0..count as usize)
+            .map(|index| unsafe {
+                let arg = *parsed.add(index);
+                let len = (0..).take_while(|&offset| *arg.add(offset) != 0).count();
+                String::from_utf16(std::slice::from_raw_parts(arg, len)).unwrap()
+            })
+            .collect();
+        unsafe { LocalFree(parsed.cast()) };
+        argv
     }
 }

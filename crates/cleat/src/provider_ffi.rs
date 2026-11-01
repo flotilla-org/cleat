@@ -27,7 +27,7 @@ use crate::{
     vt::{self, Rgb, TerminalColors, VtEngineKind},
 };
 
-pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 11;
+pub const CLEAT_PROVIDER_ABI_VERSION: u32 = 12;
 pub const CLEAT_PROVIDER_BACKEND_MOCK: u32 = 0;
 pub const CLEAT_PROVIDER_BACKEND_IN_PROCESS: u32 = 1;
 pub const CLEAT_PROVIDER_BACKEND_DAEMON: u32 = 2;
@@ -309,6 +309,10 @@ pub struct CleatSessionDesc {
     pub attachment_name_len: usize,
     /// CLEAT_ATTACHMENT_PRINCIPAL / SUPERVISOR / TOOL.
     pub attachment_kind: u32,
+    /// Program and arguments run directly, with no shell or login profile.
+    /// When `argc` is nonzero `command` must be empty. Creation only.
+    pub argv: *const CleatStr,
+    pub argc: usize,
 }
 
 #[repr(C)]
@@ -1789,6 +1793,8 @@ pub unsafe extern "C" fn cleat_session_create(provider: *mut CleatProvider, desc
         attachment_name: ptr::null(),
         attachment_name_len: 0,
         attachment_kind: CLEAT_ATTACHMENT_TOOL,
+        argv: ptr::null(),
+        argc: 0,
     });
     let identity = match attachment_identity_from_desc(desc) {
         Ok(identity) => identity,
@@ -2954,7 +2960,10 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     let cmd = read_optional_utf8(desc.command, desc.command_len).map_err(|err| format!("command is not valid UTF-8: {err}"))?;
     let cwd = read_optional_utf8(desc.cwd, desc.cwd_len).map_err(|err| format!("cwd is not valid UTF-8: {err}"))?.map(PathBuf::from);
     let id = read_optional_utf8(desc.id, desc.id_len).map_err(|err| format!("id is not valid UTF-8: {err}"))?;
+    let argv = read_desc_argv(desc)?;
+    crate::runtime::validate_program(cmd.as_deref(), argv.as_deref())?;
     let mut metadata = layout.create_session(id, vt_engine, cwd, cmd)?;
+    metadata.argv = argv;
     metadata.record = desc.record;
     metadata.colors = colors;
     metadata.tags = read_selector_strings(desc.tags, desc.tag_count).map_err(|err| err.to_string())?;
@@ -2979,6 +2988,11 @@ fn create_in_process_session(provider: &CleatProvider, desc: CleatSessionDesc) -
     Ok(InProcessSession { actor })
 }
 
+fn read_desc_argv(desc: CleatSessionDesc) -> Result<Option<Vec<String>>, String> {
+    let argv = read_selector_strings(desc.argv, desc.argc).map_err(|err| format!("argv is not valid UTF-8: {err}"))?;
+    Ok((!argv.is_empty()).then_some(argv))
+}
+
 fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Result<DaemonSession, String> {
     let connection = provider.daemon.as_ref().ok_or_else(|| "provider has no daemon connection".to_string())?;
     if connection.transport().is_remote() {
@@ -2992,6 +3006,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
     let cols = desc.cols.max(1);
     let rows = desc.rows.max(1);
     let tags = read_selector_strings(desc.tags, desc.tag_count).map_err(|err| format!("tag is not valid UTF-8: {err}"))?;
+    let argv = read_desc_argv(desc)?;
     let metadata = ensure_session_started(connection.layout(), id, Some(vt_engine), cwd, cmd, SessionStartOptions {
         record: desc.record,
         initial_size: TerminalSize { cols, rows },
@@ -2999,6 +3014,7 @@ fn create_daemon_session(provider: &CleatProvider, desc: CleatSessionDesc) -> Re
         tags,
         environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
         environment: Vec::new(),
+        argv,
     })?;
     let (channel, slot) = open_daemon_channel(connection, metadata.id.clone(), desc)?;
     Ok(DaemonSession {
@@ -3513,7 +3529,7 @@ mod tests {
             y_offset_px: 6,
         }];
         unsafe {
-            assert_eq!(CLEAT_PROVIDER_ABI_VERSION, 11);
+            assert_eq!(CLEAT_PROVIDER_ABI_VERSION, 12);
             let provider = cleat_provider_open(ptr::null());
             let session = cleat_session_create(provider, ptr::null());
             let mut count = usize::MAX;

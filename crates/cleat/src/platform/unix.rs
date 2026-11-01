@@ -672,14 +672,18 @@ fn resolve_shell_program(shell: &OsStr) -> PathBuf {
 }
 
 /// The child's own `PATH`, which an argv launch searches instead of the
-/// daemon's.
+/// daemon's. `child_envp_from` emits each name once (a declaration replaces
+/// the inherited value); the first entry is what `getenv` would read.
 fn envp_path(envp: &[CString]) -> Option<&OsStr> {
-    envp.iter().rev().find_map(|entry| entry.as_bytes().strip_prefix(b"PATH=")).map(OsStr::from_bytes)
+    envp.iter().find_map(|entry| entry.as_bytes().strip_prefix(b"PATH=")).map(OsStr::from_bytes)
 }
 
 /// Resolve an argv program as `execvp` would in the child: a name containing
 /// `/` is used as given, anything else is searched on the child's `PATH`.
-/// Relative `PATH` entries are taken from the session's working directory.
+/// Relative `PATH` entries (an empty one means `.`) are taken from the
+/// session's working directory, where the child starts. Without a session cwd
+/// the child inherits the daemon's, so resolving against the daemon's cwd is
+/// what `execvp` in the child would do.
 fn resolve_argv_program(program: &OsStr, path: Option<&OsStr>, cwd: Option<&Path>) -> Result<PathBuf, String> {
     if program.as_bytes().contains(&b'/') {
         return Ok(PathBuf::from(program));

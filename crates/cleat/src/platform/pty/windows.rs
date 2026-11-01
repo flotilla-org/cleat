@@ -335,7 +335,7 @@ fn spawn_with_conpty(
     let cwd_ptr = cwd.as_ref().map(|value| value.as_ptr()).unwrap_or_else(null);
     let variables = child_environment(session, coordinates)?;
     let application = match session.program() {
-        SessionProgram::Argv(argv) => resolve_argv_program(&argv[0], environment_path(&variables), session.cwd.as_deref()),
+        SessionProgram::Argv(argv) => resolve_argv_program(&argv[0], environment_path(&variables), session.cwd.as_deref())?,
         _ => None,
     };
     let application = application.map(|path| path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>());
@@ -438,20 +438,30 @@ fn environment_path(variables: &[(OsString, OsString)]) -> Option<&OsStr> {
 }
 
 /// Search a bare argv program on the child's `PATH`, adding `.exe` when it
-/// has no extension. `None` leaves the search to CreateProcessW, which also
-/// covers the application and system directories.
-fn resolve_argv_program(program: &str, path: Option<&OsStr>, cwd: Option<&Path>) -> Option<PathBuf> {
+/// has no extension, and fail when that `PATH` has no match rather than let
+/// CreateProcessW search the daemon's. `None` (a name with a path, or a child
+/// without `PATH`) leaves the search to CreateProcessW, which then covers only
+/// the application and system directories and the daemon's `PATH`. Batch
+/// files are not programs: run them as `cmd /D /C file.cmd`.
+fn resolve_argv_program(program: &str, path: Option<&OsStr>, cwd: Option<&Path>) -> Result<Option<PathBuf>, String> {
     if program.contains(['\\', '/', ':']) {
-        return None;
+        return Ok(None);
     }
+    let Some(path) = path else {
+        return Ok(None);
+    };
     let file = if Path::new(program).extension().is_some() { program.to_string() } else { format!("{program}.exe") };
-    std::env::split_paths(path?).filter(|dir| !dir.as_os_str().is_empty()).find_map(|dir| {
-        let candidate = match cwd {
-            Some(cwd) if dir.is_relative() => cwd.join(dir).join(&file),
-            _ => dir.join(&file),
-        };
-        candidate.is_file().then_some(candidate)
-    })
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .find_map(|dir| {
+            let candidate = match cwd {
+                Some(cwd) if dir.is_relative() => cwd.join(dir).join(&file),
+                _ => dir.join(&file),
+            };
+            candidate.is_file().then_some(candidate)
+        })
+        .map(Some)
+        .ok_or_else(|| format!("{file}: program not found on the session PATH"))
 }
 
 fn quote_windows_arg(arg: &str) -> String {

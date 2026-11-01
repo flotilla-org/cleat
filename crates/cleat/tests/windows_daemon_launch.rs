@@ -126,7 +126,8 @@ fn declared_launch_preserves_windows_baseline_and_excludes_daemon_environment() 
 
 // Scenario: `launch -- PROGRAM ARGS` starts the program itself under ConPTY,
 // not through `cmd /C`: the bare name `cmd` is found on the declared PATH as
-// cmd.exe, and the spaced script argument reaches it as one argument.
+// cmd.exe, the spaced script argument reaches it as one argument, and a name
+// missing from that PATH is refused.
 #[test]
 fn argv_launch_runs_program_directly_on_declared_path() {
     let temp = tempfile::tempdir().expect("runtime root");
@@ -154,4 +155,15 @@ fn argv_launch_runs_program_directly_on_declared_path() {
         assert!(std::time::Instant::now() < deadline, "argv child did not run");
         thread::sleep(Duration::from_millis(10));
     }
+    // A bare name absent from the declared PATH fails the launch instead of
+    // falling back to a search of the daemon's PATH.
+    let missing = Command::new(env!("CARGO_BIN_EXE_cleat"))
+        .arg("--runtime-root")
+        .arg(&root)
+        .args(["--server", "argv-test", "launch", "missing", "--vt", "passthrough", "--env-clear"])
+        .args(["--env", &format!("SystemRoot={system_root}"), "--env", &format!("PATH={system_root}\\System32")])
+        .args(["--", "cleat-no-such-program"])
+        .output()
+        .expect("launch missing program");
+    assert!(!missing.status.success());
 }

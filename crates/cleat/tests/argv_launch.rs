@@ -148,7 +148,8 @@ fn argv_session_runs_without_shell_or_profile() {
 }
 
 // The provider descriptor's argv reaches both the in-process and the daemon
-// spawn, and a descriptor naming both a command and an argv creates nothing.
+// spawn (an empty, non-NULL command is no command), and a descriptor naming
+// both a command and an argv creates nothing.
 #[test]
 fn provider_descriptor_argv_runs_directly_in_both_backends() {
     let temp = tempfile::Builder::new().prefix("cleat-argv-").tempdir_in("/tmp").unwrap();
@@ -172,6 +173,9 @@ fn provider_descriptor_argv_runs_directly_in_both_backends() {
                 cols: 80,
                 rows: 24,
                 vt_engine: CLEAT_PROVIDER_VT_PASSTHROUGH,
+                // A non-NULL empty command counts as no command.
+                command: command.as_ptr(),
+                command_len: 0,
                 argv: argv_strs.as_ptr(),
                 argc: argv_strs.len(),
                 ..CleatSessionDesc::default()

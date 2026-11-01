@@ -77,6 +77,10 @@ pub struct SessionMetadata {
     pub vt_engine: VtEngineKind,
     pub cwd: Option<PathBuf>,
     pub cmd: Option<String>,
+    /// Program and arguments executed directly, with no shell or login
+    /// profile. Exclusive with `cmd`; see [`SessionMetadata::program`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -87,6 +91,47 @@ pub struct SessionMetadata {
     pub record: bool,
     pub initial_size: TerminalSize,
     pub colors: TerminalColors,
+}
+
+/// What a session runs, as each native spawn adapter sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionProgram<'a> {
+    /// The user's interactive shell (POSIX `$SHELL`, Windows PowerShell).
+    Shell,
+    /// A command line for the platform shell: `$SHELL -lc` or `cmd.exe /D /C`.
+    ShellCommand(&'a str),
+    /// A program and its arguments, executed without a shell or profile.
+    Argv(&'a [String]),
+}
+
+impl SessionMetadata {
+    pub fn program(&self) -> SessionProgram<'_> {
+        match (&self.argv, &self.cmd) {
+            (Some(argv), _) => SessionProgram::Argv(argv),
+            (None, Some(cmd)) => SessionProgram::ShellCommand(cmd),
+            (None, None) => SessionProgram::Shell,
+        }
+    }
+}
+
+/// Reject a session that names both a shell command and an argv, or an argv
+/// that cannot be executed.
+pub fn validate_program(cmd: Option<&str>, argv: Option<&[String]>) -> Result<(), String> {
+    let Some(argv) = argv else {
+        return Ok(());
+    };
+    if cmd.is_some() {
+        return Err("a session takes either a shell command or an argv, not both".to_string());
+    }
+    match argv.first() {
+        None => return Err("argv must name a program".to_string()),
+        Some(program) if program.is_empty() => return Err("argv program must not be empty".to_string()),
+        Some(_) => {}
+    }
+    if argv.iter().any(|arg| arg.contains('\0')) {
+        return Err("argv must not contain NUL".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -437,6 +482,7 @@ impl RuntimeLayout {
             vt_engine,
             cwd,
             cmd,
+            argv: None,
             tags: Vec::new(),
             environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),

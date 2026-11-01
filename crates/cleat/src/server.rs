@@ -682,6 +682,7 @@ impl SessionService {
             tags: Vec::new(),
             environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
+            argv: None,
         })
     }
 
@@ -729,6 +730,7 @@ impl SessionService {
             functional_vt_available: crate::vt::functional_vt_available(),
             cwd: session.cwd,
             cmd: session.cmd,
+            argv: session.argv,
             tags: session.tags,
             status: SessionStatus::Detached,
             screen_activity: crate::protocol::ScreenActivity::Stable,
@@ -863,6 +865,7 @@ impl SessionService {
                         functional_vt_available: result.session.functional_vt_available,
                         cwd: result.session.cwd,
                         cmd: result.session.cmd,
+                        argv: result.session.argv,
                         tags: result.session.tags,
                         status,
                         screen_activity: result.screen_activity,
@@ -1157,6 +1160,7 @@ impl SessionService {
                     functional_vt_available: crate::vt::functional_vt_available(),
                     cwd: session.cwd,
                     cmd: session.cmd,
+                    argv: session.argv,
                     tags: session.tags,
                     status: SessionStatus::Attached,
                     screen_activity: crate::protocol::ScreenActivity::Stable,
@@ -1586,6 +1590,7 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
             functional_vt_available: false,
             cwd: None,
             cmd: None,
+            argv: None,
             tags: Vec::new(),
             status: SessionStatus::Detached,
             screen_activity: crate::protocol::ScreenActivity::Stable,
@@ -1666,6 +1671,7 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         functional_vt_available: result.session.functional_vt_available,
         cwd: result.session.cwd,
         cmd: result.session.cmd,
+        argv: result.session.argv,
         tags: result.session.tags,
         status,
         screen_activity: result.screen_activity,

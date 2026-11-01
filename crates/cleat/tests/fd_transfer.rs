@@ -38,6 +38,7 @@ fn manifest() -> FdTransferManifest {
             vt_engine: VtEngineKind::Passthrough,
             cwd: Some("/workspace".into()),
             cmd: Some("cargo test".into()),
+            argv: None,
             tags: vec!["transfer".into()],
             environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
             environment: vec![],

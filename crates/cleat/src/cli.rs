@@ -282,7 +282,13 @@ pub enum Command {
     /// Create a new session
     #[command(
         alias = "create",
-        after_long_help = "Tip: launch a shell (e.g. zsh) and use `send` to run commands.\nSessions exit when the launched process exits."
+        after_long_help = "Without a command, the session runs the user's login shell ($SHELL; PowerShell on Windows).\n\
+                           --cmd runs a command line through that shell: `$SHELL -lc CMD` (`cmd.exe /D /C CMD` on Windows),\n\
+                           so login profiles apply. Arguments after `--` are executed directly instead, with no shell and no\n\
+                           profile: the program is searched on the PATH of the child environment (--env/--env-clear).\n\
+                           Example: cleat launch work --env-clear --env PATH=/opt/bin:/usr/bin -- tool --flag 'two words'\n\
+                           \n\
+                           Tip: launch a shell (e.g. zsh) and use `send` to run commands.\nSessions exit when the launched process exits."
     )]
     Launch {
         #[arg(value_name = "ID")]
@@ -312,6 +318,9 @@ pub enum Command {
         env_clear: bool,
         #[command(flatten)]
         record: RecordFlags,
+        /// Program and arguments to run directly, without a shell or login profile
+        #[arg(last = true, value_name = "PROGRAM", conflicts_with = "cmd")]
+        argv: Vec<String>,
     },
     /// List all sessions
     List {
@@ -966,7 +975,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             Ok(lines) => ExecResult::Ok(Some(lines.join("\n"))),
             Err(err) => ExecResult::Err(err),
         },
-        Command::Launch { id, from: _, json, size, vt, cwd, cmd, mut tags, recognizer, environment, env_clear, record } => {
+        Command::Launch { id, from: _, json, size, vt, cwd, cmd, mut tags, recognizer, environment, env_clear, record, argv } => {
             if let Some(id) = recognizer {
                 tags.push(format!("recognizer:{id}"));
             }
@@ -994,6 +1003,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                     crate::runtime::ChildEnvironmentPolicy::Inherit
                 },
                 environment,
+                argv: (!argv.is_empty()).then_some(argv),
             };
             let create_result = match &daemon_target {
                 DaemonTarget::Running(daemon) => service.create_with_options_in_running_daemon(daemon, id, vt, cwd, cmd, options),
@@ -1670,6 +1680,8 @@ fn format_session_human(session: &crate::protocol::SessionInfo) -> String {
         fields.push(cwd.display().to_string());
     } else if let Some(cmd) = &session.cmd {
         fields.push(cmd.clone());
+    } else if let Some(argv) = &session.argv {
+        fields.push(argv.join(" "));
     }
     if !session.tags.is_empty() {
         fields.push(format!("tags={}", session.tags.join(",")));

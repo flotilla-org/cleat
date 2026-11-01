@@ -1051,6 +1051,7 @@ fn list_and_inspect_report_opaque_tags() {
                 tags: vec!["task=99".into(), "role=impl".into(), "role=impl".into()],
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             },
         )
         .expect("create alpha");
@@ -1160,6 +1161,7 @@ fn list_selector_requires_exact_opaque_tag_matches() {
                 tags: vec!["role=impl".into(), "task=99".into()],
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             },
         )
         .expect("create alpha");
@@ -1176,6 +1178,7 @@ fn list_selector_requires_exact_opaque_tag_matches() {
                 tags: vec!["role=shepherd".into()],
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             },
         )
         .expect("create beta");
@@ -1264,6 +1267,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 tags: vec![selector.clone()],
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             },
         )
         .expect("create alpha");
@@ -1293,6 +1297,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 tags: vec![selector.clone()],
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             },
         )
         .expect("create gamma");
@@ -1324,6 +1329,7 @@ fn directory_subscription_filters_and_emits_lifecycle_deltas() {
                 tags: vec![selector.clone()],
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             },
         )
         .expect("create short");
@@ -1354,6 +1360,7 @@ fn activity_subscription_snapshot_covers_all_matching_sessions() {
                 tags,
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             })
             .expect("create session");
     }
@@ -1398,6 +1405,7 @@ fn activity_subscription_emits_threshold_transitions() {
                 tags: vec![selector.clone()],
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             },
         )
         .expect("create alpha");
@@ -1455,6 +1463,7 @@ fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_sna
                 tags,
                 environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: Vec::new(),
+                argv: None,
             })
             .expect("create session");
     }
@@ -1475,6 +1484,7 @@ fn activity_subscription_emits_membership_deltas_and_reconnects_with_a_fresh_sna
             tags: vec![selector.clone()],
             environment_policy: cleat::runtime::ChildEnvironmentPolicy::Inherit,
             environment: Vec::new(),
+            argv: None,
         })
         .expect("create gamma");
     let ActivityEvent::MembershipAdded { session: added, .. } = read_activity_event(&mut stream, Duration::from_secs(2)) else {

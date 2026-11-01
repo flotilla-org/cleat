@@ -432,9 +432,11 @@ fn windows_shell_command(session: &SessionMetadata) -> String {
 }
 
 /// The child's own `PATH`, which an argv launch searches instead of the
-/// daemon's.
+/// daemon's. `child_environment` holds each name once, compared
+/// case-insensitively (a declaration replaces the inherited value); the
+/// first entry is taken, as on Unix.
 fn environment_path(variables: &[(OsString, OsString)]) -> Option<&OsStr> {
-    variables.iter().rev().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, value)| value.as_os_str())
+    variables.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH")).map(|(_, value)| value.as_os_str())
 }
 
 /// Search a bare argv program on the child's `PATH`, adding `.exe` when it

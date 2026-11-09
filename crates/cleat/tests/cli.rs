@@ -792,6 +792,7 @@ fn send_command_parses() {
         text: "echo hello".into(),
         no_enter: false,
         submit: false,
+        paste: false,
         controller_idle: None,
         selector: None,
         mark_before: None
@@ -807,6 +808,7 @@ fn send_command_parses_no_enter() {
         text: "partial".into(),
         no_enter: true,
         submit: false,
+        paste: false,
         controller_idle: None,
         selector: None,
         mark_before: None
@@ -822,6 +824,7 @@ fn send_command_parses_submit() {
         text: "prompt".into(),
         no_enter: false,
         submit: true,
+        paste: false,
         controller_idle: None,
         selector: None,
         mark_before: None
@@ -833,13 +836,30 @@ fn send_command_rejects_submit_with_no_enter() {
     assert!(Cli::try_parse_from(["cleat", "send", "--submit", "--no-enter", "demo", "prompt"]).is_err());
 }
 
-// Network-boundary fake: verify each submit crosses HTTP exactly once, including its marker and guard.
+#[test]
+fn send_command_parses_paste_and_rejects_enter_flags() {
+    let cli = Cli::try_parse_from(["cleat", "send", "--paste", "--controller-idle", "2s", "demo", "draft"]).expect("send --paste parses");
+    assert!(matches!(cli.command, Command::Send { paste: true, no_enter: false, submit: false, controller_idle: Some(_), .. }));
+    for flag in ["--submit", "--no-enter"] {
+        assert!(Cli::try_parse_from(["cleat", "send", "--paste", flag, "demo", "draft"]).is_err(), "--paste with {flag}");
+    }
+}
+
+// Network-boundary fake: verify each submit or paste crosses HTTP exactly once, including its marker and guard.
+// A paste carries no_enter, so a daemon that drops the paste field still writes no Enter.
 #[cfg(unix)]
 #[test]
 fn send_submit_posts_one_transaction() {
-    for (flags, idle, marker, offset) in [
-        (vec![], serde_json::Value::Null, serde_json::Value::Null, serde_json::Value::Null),
-        (vec!["--mark-before", "m1", "--controller-idle", "500ms"], serde_json::json!(500), serde_json::json!("m1"), serde_json::json!(42)),
+    for (mode, flags, idle, marker, offset) in [
+        ("--submit", vec![], serde_json::Value::Null, serde_json::Value::Null, serde_json::Value::Null),
+        (
+            "--submit",
+            vec!["--mark-before", "m1", "--controller-idle", "500ms"],
+            serde_json::json!(500),
+            serde_json::json!("m1"),
+            serde_json::json!(42),
+        ),
+        ("--paste", vec!["--controller-idle", "2s"], serde_json::json!(2000), serde_json::Value::Null, serde_json::Value::Null),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let service = SessionService::new(RuntimeLayout::new(temp.path().to_path_buf()));
@@ -860,7 +880,7 @@ fn send_submit_posts_one_transaction() {
             .unwrap();
             request
         });
-        let mut args = vec!["cleat", "send", "--submit"];
+        let mut args = vec!["cleat", "send", mode];
         args.extend(flags);
         args.extend(["alpha", "hello"]);
         assert_eq!(
@@ -870,10 +890,13 @@ fn send_submit_posts_one_transaction() {
         let request = reader.join().unwrap();
         assert!(request.starts_with("POST /sessions/alpha/input HTTP/1.1\r\n"));
         let body: serde_json::Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({"kind":"send", "text":"hello", "submit":true, "no_enter":false, "controller_idle_ms":idle, "marker_name":marker})
-        );
+        let mut expected = serde_json::json!({"kind":"send", "text":"hello", "submit":true, "no_enter":false, "controller_idle_ms":idle, "marker_name":marker});
+        if mode == "--paste" {
+            expected["submit"] = false.into();
+            expected["no_enter"] = true.into();
+            expected["paste"] = true.into();
+        }
+        assert_eq!(body, expected);
     }
 }
 
@@ -1045,6 +1068,7 @@ fn send_mark_before_parses() {
         text: "echo hi".into(),
         no_enter: false,
         submit: false,
+        paste: false,
         controller_idle: None,
         selector: None,
         mark_before: Some("m1".into())

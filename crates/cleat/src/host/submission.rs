@@ -10,6 +10,17 @@ fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+/// How a send writes its text to the PTY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendMode {
+    /// Raw bytes, as typed, optionally followed by Enter.
+    Type { enter: bool },
+    /// Paste-encoded, with no Enter.
+    Paste,
+    /// Paste-encoded, then a delayed Enter in the same transaction.
+    Submit,
+}
+
 /// Predicates evaluated by the actor before any marker or PTY write.
 #[derive(Default)]
 pub(crate) struct SendPreconditions {

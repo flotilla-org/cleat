@@ -155,6 +155,10 @@ pub(crate) enum InputRequest {
         text: String,
         submit: bool,
         no_enter: bool,
+        /// Paste-encode without Enter; requires `no_enter`, so an older daemon
+        /// that drops the field still writes no Enter.
+        #[serde(default, skip_serializing_if = "is_false")]
+        paste: bool,
         controller_idle_ms: Option<u64>,
         #[serde(default, rename = "if", skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
@@ -1172,6 +1176,7 @@ mod guarded_send_compatibility {
                 text: "message".into(),
                 submit: true,
                 no_enter: false,
+                paste: false,
                 controller_idle_ms: None,
                 selector: selector.clone(),
                 marker_name: None,

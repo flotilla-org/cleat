@@ -30,7 +30,7 @@ use nix::{
 
 #[cfg(all(test, unix))]
 use super::submission::CONTROLLER_QUEUE_BYTES;
-pub(crate) use super::submission::{ControllerRefusalCause, SendError, SendPreconditions};
+pub(crate) use super::submission::{ControllerRefusalCause, SendError, SendMode, SendPreconditions};
 use super::{
     presentation::{GateTransition, PresentationGate},
     submission::{
@@ -442,8 +442,7 @@ pub(crate) enum SessionCommand {
     },
     Send {
         text: Vec<u8>,
-        submit: bool,
-        no_enter: bool,
+        mode: SendMode,
         preconditions: SendPreconditions,
         marker_name: Option<String>,
         reply: mpsc::Sender<Result<Option<u64>, SendError>>,
@@ -1097,14 +1096,13 @@ impl SessionActor {
     pub(crate) fn begin_send(
         &self,
         text: Vec<u8>,
-        submit: bool,
-        no_enter: bool,
+        mode: SendMode,
         preconditions: SendPreconditions,
         marker_name: Option<String>,
     ) -> Result<Receiver<Result<Option<u64>, SendError>>, String> {
         let (reply, rx) = mpsc::channel();
         self.tx
-            .send(SessionCommand::Send { text, submit, no_enter, preconditions, marker_name, reply })
+            .send(SessionCommand::Send { text, mode, preconditions, marker_name, reply })
             .map_err(|_| "session actor unavailable".to_string())?;
         Ok(rx)
     }
@@ -1627,7 +1625,7 @@ fn session_actor_handle_command(
             };
             let _ = reply.send(result);
         }
-        SessionCommand::Send { text, submit, no_enter, preconditions, marker_name, reply } => {
+        SessionCommand::Send { text, mode, preconditions, marker_name, reply } => {
             // Static capability validation precedes the output pump and any screen read.
             let support = preconditions.selector.as_ref().map(|selector| runtime.check_selector_support(selector)).transpose();
             if let Err(error) = support {
@@ -1651,21 +1649,24 @@ fn session_actor_handle_command(
                     |runtime, selector, require_roles| runtime.check_selector(selector, require_roles),
                     |runtime| {
                         let marker_offset = marker_name.map(|name| runtime.mark(Some(name))).transpose()?;
-                        if submit {
-                            route_paste_on_actor(runtime, &text)?;
-                        } else {
-                            let mut bytes = text;
-                            if !no_enter {
-                                bytes.push(b'\r');
+                        match mode {
+                            SendMode::Paste | SendMode::Submit => {
+                                route_paste_on_actor(runtime, &text)?;
                             }
-                            runtime.write_input(&bytes)?;
+                            SendMode::Type { enter } => {
+                                let mut bytes = text;
+                                if enter {
+                                    bytes.push(b'\r');
+                                }
+                                runtime.write_input(&bytes)?;
+                            }
                         }
                         Ok(marker_offset)
                     },
                 )
             })();
             match result {
-                Ok(marker_offset) if submit => {
+                Ok(marker_offset) if mode == SendMode::Submit => {
                     state.submission = Some(Submission { enter_at: Instant::now() + SUBMIT_ENTER_DELAY, marker_offset, reply });
                 }
                 result => {
@@ -2834,13 +2835,13 @@ pub(crate) mod submission_tests {
             let (_temp, actor, tap) = spawn(&command);
             let mut output = Vec::new();
             collect_until(&tap, &mut output, b"READY");
-            let submit = actor.begin_send(b"abc".to_vec(), true, false, Default::default(), None).unwrap();
+            let submit = actor.begin_send(b"abc".to_vec(), SendMode::Submit, Default::default(), None).unwrap();
             actor.inspect(false, 0).unwrap(); // FIFO barrier: paste is written, Enter is still held.
             assert!(submit.try_recv().is_err());
             actor.controller_input(0, TerminalInputEvent::RawBytes(payload.clone())).unwrap();
             actor.controller_input(1, TerminalInputEvent::Text(TerminalTextEvent { text: "txt".into() })).unwrap();
             actor.controller_input(2, TerminalInputEvent::Paste(TerminalPasteEvent { text: "paste".into() })).unwrap();
-            let second = actor.begin_send(b"BAD".to_vec(), true, false, Default::default(), None).unwrap();
+            let second = actor.begin_send(b"BAD".to_vec(), SendMode::Submit, Default::default(), None).unwrap();
             let error = second.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
             assert_eq!(error.controller.unwrap().cause, ControllerRefusalCause::Busy);
             assert!(error.error.contains("busy"));
@@ -2875,7 +2876,12 @@ pub(crate) mod submission_tests {
             actor.controller_input(0, event).unwrap();
             for idle in [Duration::ZERO, Duration::from_millis(1), Duration::from_secs(10)] {
                 let result = actor
-                    .begin_send(b"BAD".to_vec(), true, false, SendPreconditions { controller_idle: Some(idle), ..Default::default() }, None)
+                    .begin_send(
+                        b"BAD".to_vec(),
+                        SendMode::Submit,
+                        SendPreconditions { controller_idle: Some(idle), ..Default::default() },
+                        None,
+                    )
                     .unwrap();
                 assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
             }
@@ -2883,8 +2889,7 @@ pub(crate) mod submission_tests {
             let result = actor
                 .begin_send(
                     b"BAD".to_vec(),
-                    true,
-                    false,
+                    SendMode::Submit,
                     SendPreconditions { controller_idle: Some(Duration::ZERO), ..Default::default() },
                     None,
                 )
@@ -2895,8 +2900,7 @@ pub(crate) mod submission_tests {
             let result = actor
                 .begin_send(
                     b"ok".to_vec(),
-                    false,
-                    true,
+                    SendMode::Type { enter: false },
                     SendPreconditions { controller_idle: Some(Duration::ZERO), ..Default::default() },
                     None,
                 )
@@ -2923,7 +2927,7 @@ pub(crate) mod submission_tests {
         let inspection = actor.inspect(false, 0).unwrap();
         assert_eq!(inspection.controller_input_generation, 3);
         assert!(inspection.last_controller_input_at.is_some());
-        let send = actor.begin_send(vec![], true, false, Default::default(), None).unwrap();
+        let send = actor.begin_send(vec![], SendMode::Submit, Default::default(), None).unwrap();
         actor.inspect(false, 0).unwrap();
         let error = actor.controller_input(0, TerminalInputEvent::RawBytes(vec![b'x'; CONTROLLER_QUEUE_BYTES + 1])).unwrap_err();
         assert!(error.contains("input refused"));
@@ -2936,7 +2940,8 @@ pub(crate) mod submission_tests {
     fn selector_without_vt_is_unsupported_before_writing() {
         let (_temp, actor, _tap) = spawn("stty raw -echo; sleep 10");
         let guard = SendPreconditions { selector: Some(terminal_screen::Selector::parse("screen").unwrap()), ..Default::default() };
-        let error = actor.begin_send(b"BAD".to_vec(), true, false, guard, Some("refused".into())).unwrap().recv().unwrap().unwrap_err();
+        let error =
+            actor.begin_send(b"BAD".to_vec(), SendMode::Submit, guard, Some("refused".into())).unwrap().recv().unwrap().unwrap_err();
         assert_eq!((error.status, error.reason.as_str()), (422, "unsupported"));
         assert_eq!(actor.resolve_marker("refused".into()).unwrap(), None);
     }
@@ -2967,7 +2972,7 @@ pub(crate) mod submission_tests {
                 controller_idle: Some(Duration::ZERO),
                 selector: Some(terminal_screen::Selector::parse(source).unwrap()),
             };
-            let result = actor.begin_send(b"BAD".to_vec(), true, false, guard, Some("guarded".into())).unwrap().recv().unwrap();
+            let result = actor.begin_send(b"BAD".to_vec(), SendMode::Submit, guard, Some("guarded".into())).unwrap().recv().unwrap();
             if let Some((status, reason)) = expected {
                 let error = result.unwrap_err();
                 assert_eq!((error.status, error.reason.as_str()), (status, reason), "{source}");
@@ -3018,7 +3023,7 @@ pub(crate) mod submission_tests {
                 controller_idle: Some(Duration::ZERO),
                 selector: Some(terminal_screen::Selector::parse("composer[value='']").unwrap()),
             };
-            let result = actor.begin_send(b"ok".to_vec(), false, true, guard, None).unwrap().recv().unwrap();
+            let result = actor.begin_send(b"ok".to_vec(), SendMode::Type { enter: false }, guard, None).unwrap().recv().unwrap();
             let fence = actor.inspect(false, 0).unwrap().controller_fence;
             if draft.is_empty() {
                 result.unwrap();
@@ -3050,13 +3055,14 @@ pub(crate) mod submission_tests {
         let mut output = Vec::new();
         collect_until(&tap, &mut output, b"READY");
         let guard = || SendPreconditions { selector: Some(terminal_screen::Selector::parse("screen").unwrap()), ..Default::default() };
-        let send = actor.begin_send(b"ok".to_vec(), true, false, guard(), None).unwrap();
+        let send = actor.begin_send(b"ok".to_vec(), SendMode::Submit, guard(), None).unwrap();
         actor.inspect(false, 0).unwrap(); // FIFO barrier after paste, before delayed Enter.
         actor.controller_input(0, TerminalInputEvent::RawBytes(b"x".to_vec())).unwrap();
         send.recv().unwrap().unwrap();
         collect_until(&tap, &mut output, b"DONE");
         assert!(String::from_utf8(output).unwrap().contains("6f6b0d78"));
-        let error = actor.begin_send(b"BAD".to_vec(), true, false, guard(), Some("refused".into())).unwrap().recv().unwrap().unwrap_err();
+        let error =
+            actor.begin_send(b"BAD".to_vec(), SendMode::Submit, guard(), Some("refused".into())).unwrap().recv().unwrap().unwrap_err();
         assert_eq!((error.status, error.reason.as_str()), (409, "controller-active"));
         assert_eq!(actor.resolve_marker("refused".into()).unwrap(), None);
     }

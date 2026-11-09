@@ -48,7 +48,7 @@ cleat kill build                     # ends it; recording survives
 |---|---|
 | Create/reuse a session | `launch <id> [--tag k=v]... [--size CxR] [--cwd DIR] --cmd "..."` |
 | See the rendered screen | `capture <id>` |
-| Type text | `send <id> "text"` (appends Enter), `send --no-enter`, `send-keys <id> C-c Enter ...` |
+| Type text | `send <id> "text"` (appends Enter), `send --no-enter`, `send --paste` (paste-encoded, no Enter), `send-keys <id> C-c Enter ...` |
 | **Submit into a TUI composer** | `send <id> --submit "prompt"` — paste-encoded + delayed Enter. Plain `send` text+Enter gets swallowed by paste heuristics (codex, claude). |
 | Wait for readiness | `wait <id> --text "str" --screen-stable 30 --idle-time 5 --timeout 600` — conditions OR together |
 | Structured state | `inspect <id>` — size, leader pid, **foreground pgid** (`fg_pgid != leader_pid` ⇒ a command is running), attachments, recording |

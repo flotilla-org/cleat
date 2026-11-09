@@ -532,6 +532,8 @@ resolved through the live daemon socket. \n\
                            By default, Enter is appended (disable with --no-enter).\n\
                            Use --submit for TUI composers: it paste-encodes the\n\
                            text, waits briefly, then sends Enter as a separate key.\n\
+                           Use --paste to put text in a TUI composer without submitting\n\
+                           it: the text is paste-encoded and no Enter is sent.\n\
                            \n\
                            In interactive shells, the sent text will be echoed back in the\n\
                            terminal output before any command results appear. This means\n\
@@ -558,6 +560,8 @@ resolved through the live daemon socket. \n\
         no_enter: bool,
         #[arg(long, conflicts_with = "no_enter", help = "Paste-encode text, then send delayed Enter in one daemon transaction")]
         submit: bool,
+        #[arg(long, conflicts_with_all = ["no_enter", "submit"], help = "Paste-encode text without sending Enter")]
+        paste: bool,
         /// Refuse unless controller input has been quiet for this duration (heuristic; drafts may remain).
         #[arg(long, value_name = "DURATION", value_parser = crate::duration_parser::parse_humantime_or_seconds)]
         controller_idle: Option<Duration>,
@@ -1377,8 +1381,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Send { id, text, no_enter, submit, controller_idle, selector, mark_before, ack } => {
-            if !ack && !submit && controller_idle.is_none() && selector.is_none() {
+        Command::Send { id, text, no_enter, submit, paste, controller_idle, selector, mark_before, ack } => {
+            if !ack && !submit && !paste && controller_idle.is_none() && selector.is_none() {
                 let mut bytes = text.into_bytes();
                 if !no_enter {
                     bytes.push(b'\r');
@@ -1403,7 +1407,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
             match service.send_transaction(&id, &http_uds::InputRequest::Send {
                 text,
                 submit,
-                no_enter,
+                no_enter: no_enter || paste,
+                paste,
                 controller_idle_ms,
                 selector,
                 marker_name: mark_before,

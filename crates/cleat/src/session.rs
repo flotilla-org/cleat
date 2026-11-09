@@ -4229,11 +4229,20 @@ fn handle_http_request(
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
-                http_uds::InputRequest::Send { text, submit, no_enter, controller_idle_ms, selector, marker_name, acknowledge } => {
-                    if submit && no_enter {
-                        return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "submit and no_enter are mutually exclusive")
-                            .map_err(|error| format!("write send validation error: {error}"));
-                    }
+                http_uds::InputRequest::Send { text, submit, no_enter, paste, controller_idle_ms, selector, marker_name, acknowledge } => {
+                    let mode = match (submit, no_enter, paste) {
+                        (true, true, _) => {
+                            return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "submit and no_enter are mutually exclusive")
+                                .map_err(|error| format!("write send validation error: {error}"))
+                        }
+                        (_, false, true) => {
+                            return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "paste requires no_enter")
+                                .map_err(|error| format!("write send validation error: {error}"))
+                        }
+                        (true, false, false) => crate::host::actor::SendMode::Submit,
+                        (false, true, true) => crate::host::actor::SendMode::Paste,
+                        (false, no_enter, false) => crate::host::actor::SendMode::Type { enter: !no_enter },
+                    };
                     let selector = match selector.map(|source| terminal_screen::Selector::parse(&source)).transpose() {
                         Ok(selector) => selector,
                         Err(error) => {
@@ -4248,8 +4257,7 @@ fn handle_http_request(
                     let pending_stream = stream.try_clone().map_err(|err| format!("clone send response: {err}"))?;
                     let result = hosted.actor.begin_send(
                         text.into_bytes(),
-                        submit,
-                        no_enter,
+                        mode,
                         crate::host::actor::SendPreconditions { controller_idle: controller_idle_ms.map(Duration::from_millis), selector },
                         marker_name,
                     )?;
@@ -4267,8 +4275,7 @@ fn handle_http_request(
                     let pending_stream = stream.try_clone().map_err(|err| format!("clone clear response: {err}"))?;
                     let result = hosted.actor.begin_send(
                         keys,
-                        false,
-                        true,
+                        crate::host::actor::SendMode::Type { enter: false },
                         crate::host::actor::SendPreconditions {
                             controller_idle: Some(Duration::from_millis(controller_idle_ms)),
                             selector: Some(selector),

@@ -312,7 +312,7 @@ This subscription contract starts with packet protocol v4. Version 3 used raw PT
 | `inspect`, `kill`, `signal` | daemon state | No VT / recording involvement |
 | `capture` | VT engine | Renders the current screen grid to text; errors on the `passthrough` engine |
 | `transcript`, `expect` | recording | Reads raw bytes from asciicast; no re-rendering |
-| `send`, `send --submit`, `send-keys`, `interrupt`, `escape` | daemon → PTY | Writes to child stdin via the PTY master; `--submit` sends paste/text then Enter |
+| `send`, `send --submit`, `send --paste`, `send-keys`, `interrupt`, `escape` | daemon → PTY | Writes to child stdin via the PTY master; `--submit` sends paste/text then Enter; `--paste` sends paste without Enter |
 | `record`, `mark` | recording | Enables recording or writes a marker |
 | `wait --idle-time` | daemon | PTY-output idle timer |
 | `wait --text` | VT engine | Consults the rendered screen grid |

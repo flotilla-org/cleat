@@ -84,7 +84,12 @@ No flotilla classifier or consumer behavior changes here.
 
 POST this to `/sessions/SESSION/input`. Successful HTTP 200 returns
 `{"marker_offset":null}` or a recording offset when a marker was requested.
-`submit` and `no_enter` together are HTTP 400. Existing input variants and marker
+`submit` and `no_enter` together are HTTP 400.
+
+`cleat send SESSION --paste --controller-idle DURATION TEXT` puts text in a
+composer without submitting it: the same paste encoding as `--submit`, under the
+same guards, with no Enter. Its request sets `"paste":true` and `"no_enter":true`;
+`paste` without `no_enter` is HTTP 400. Existing input variants and marker
 endpoints retain their response shapes. Legacy automation endpoints also refuse
 writes during a submission; their existing error handling reports that refusal.
 

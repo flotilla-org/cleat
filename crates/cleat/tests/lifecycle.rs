@@ -4902,6 +4902,60 @@ fn controller_activity_raw_path_without_vt() {
     service.kill("controller-raw").unwrap();
 }
 
+// The daemon refuses a paste that could press Enter: paste without no_enter, alone or with submit.
+#[test]
+fn send_paste_without_no_enter_is_bad_request() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service.create(Some("paste-400".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).unwrap();
+    for submit in [false, true] {
+        let request = serde_json::json!({"kind":"send","text":"x","submit":submit,"no_enter":false,"paste":true,"controller_idle_ms":null,"marker_name":null})
+            .to_string();
+        let response = http_session_request(
+            temp.path(),
+            "paste-400",
+            &format!(
+                "POST /sessions/paste-400/input HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                request.len(),
+                request
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "submit={submit}: {response}");
+        assert!(response.contains("paste requires no_enter"));
+    }
+    service.kill("paste-400").unwrap();
+}
+
+// `send --paste` under the controller guard puts a multi-line draft in as one bracketed paste with no Enter.
+// A raw PTY child dumps exactly the bytes delivered; the trailing sentinel shows nothing came between.
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn send_paste_delivers_one_bracketed_paste_without_enter() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    let (ready, out) = (temp.path().join("ready"), temp.path().join("out"));
+    let expected = b"\x1b[200~one\ntwo\x1b[201~X";
+    let command = format!(
+        "printf '\\033[?2004h'; stty raw -echo; touch '{r}'; dd bs=1 count={n} 2>/dev/null | od -An -tx1 > '{o}.tmp'; mv '{o}.tmp' '{o}'; sleep 30",
+        r = ready.display(),
+        n = expected.len(),
+        o = out.display()
+    );
+    service.create(Some("paste".into()), Some(VtEngineKind::Ghostty), None, Some(command), true).unwrap();
+    wait_until("raw child ready", || ready.exists());
+    let paste = Cli::try_parse_from(["cleat", "send", "paste", "--paste", "--controller-idle", "2s", "one\ntwo"]).unwrap();
+    assert!(matches!(cli::execute(paste, &service), ExecResult::Ok(None)));
+    let sentinel = Cli::try_parse_from(["cleat", "send", "paste", "--no-enter", "X"]).unwrap();
+    assert!(matches!(cli::execute(sentinel, &service), ExecResult::Ok(None)));
+    wait_until("child dumped input", || out.exists());
+    let hex = std::fs::read_to_string(&out).unwrap();
+    let delivered: Vec<u8> = hex.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect();
+    assert_eq!(String::from_utf8_lossy(&delivered), String::from_utf8_lossy(expected));
+    service.kill("paste").unwrap();
+}
+
 // Real packet routing counts keyboard presses/repeats, text, paste and raw events, across shared controllers.
 // Key release, watcher input and packet resize never advance activity.
 #[cfg(feature = "ghostty-vt")]

@@ -4902,6 +4902,31 @@ fn controller_activity_raw_path_without_vt() {
     service.kill("controller-raw").unwrap();
 }
 
+// The daemon refuses a paste that could press Enter: paste without no_enter, alone or with submit.
+#[test]
+fn send_paste_without_no_enter_is_bad_request() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let service = service_for(temp.path());
+    service.create(Some("paste-400".into()), Some(VtEngineKind::Passthrough), None, Some("sleep 30".into()), true).unwrap();
+    for submit in [false, true] {
+        let request = serde_json::json!({"kind":"send","text":"x","submit":submit,"no_enter":false,"paste":true,"controller_idle_ms":null,"marker_name":null})
+            .to_string();
+        let response = http_session_request(
+            temp.path(),
+            "paste-400",
+            &format!(
+                "POST /sessions/paste-400/input HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                request.len(),
+                request
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "submit={submit}: {response}");
+        assert!(response.contains("paste requires no_enter"));
+    }
+    service.kill("paste-400").unwrap();
+}
+
 // `send --paste` under the controller guard puts a multi-line draft in as one bracketed paste with no Enter.
 // A raw PTY child dumps exactly the bytes delivered; the trailing sentinel shows nothing came between.
 #[cfg(feature = "ghostty-vt")]

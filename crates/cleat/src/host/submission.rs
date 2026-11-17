@@ -681,11 +681,13 @@ pub(crate) fn validate_key(key: Option<&str>) -> Option<SendError> {
 pub(crate) struct SubmittedKeys(std::collections::VecDeque<(String, u64)>);
 
 impl SubmittedKeys {
+    #[cfg(unix)]
     pub(crate) fn from_entries(entries: Vec<(String, u64)>) -> Self {
         let skip = entries.len().saturating_sub(SUBMITTED_KEY_CAPACITY);
         Self(entries.into_iter().skip(skip).collect())
     }
 
+    #[cfg(unix)]
     pub(crate) fn entries(&self) -> Vec<(String, u64)> {
         self.0.iter().cloned().collect()
     }

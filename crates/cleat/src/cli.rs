@@ -572,7 +572,7 @@ resolved through the live daemon socket. \n\
         #[arg(
             long,
             value_name = "KEY",
-            help = "Idempotency key: if already accepted for this session, write nothing and print `already <unix-ms>`"
+            help = "Idempotency key (1-256 bytes): if already accepted for this session, write nothing and print `already <unix-ms>`"
         )]
         key: Option<String>,
     },

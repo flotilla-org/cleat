@@ -59,6 +59,10 @@ pub struct FdTransferManifest {
     /// capture keeps working on the adopter.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub markers: std::collections::HashMap<String, u64>,
+    /// Accepted keyed-send keys with first-acceptance unix ms, oldest first,
+    /// so a repeat after the transfer still writes nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submitted_keys: Vec<(String, u64)>,
     /// The recording is paused (`cleat record` off) rather than absent.
     #[serde(default, skip_serializing_if = "is_false")]
     pub recording_paused: bool,

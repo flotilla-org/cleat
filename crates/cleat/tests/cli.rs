@@ -788,6 +788,7 @@ fn send_command_parses() {
     let cli = Cli::try_parse_from(["cleat", "send", "demo", "echo hello"]).expect("send parses");
     assert_eq!(cli.command, Command::Send {
         ack: false,
+        key: None,
         id: "demo".into(),
         text: "echo hello".into(),
         no_enter: false,
@@ -804,6 +805,7 @@ fn send_command_parses_no_enter() {
     let cli = Cli::try_parse_from(["cleat", "send", "--no-enter", "demo", "partial"]).expect("send --no-enter parses");
     assert_eq!(cli.command, Command::Send {
         ack: false,
+        key: None,
         id: "demo".into(),
         text: "partial".into(),
         no_enter: true,
@@ -820,6 +822,7 @@ fn send_command_parses_submit() {
     let cli = Cli::try_parse_from(["cleat", "send", "--submit", "demo", "prompt"]).expect("send --submit parses");
     assert_eq!(cli.command, Command::Send {
         ack: false,
+        key: None,
         id: "demo".into(),
         text: "prompt".into(),
         no_enter: false,
@@ -1064,6 +1067,7 @@ fn send_mark_before_parses() {
     let cli = Cli::try_parse_from(["cleat", "send", "--mark-before", "m1", "sess", "echo hi"]).expect("parse");
     assert_eq!(cli.command, Command::Send {
         ack: false,
+        key: None,
         id: "sess".into(),
         text: "echo hi".into(),
         no_enter: false,

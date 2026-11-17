@@ -30,7 +30,7 @@ use nix::{
 
 #[cfg(all(test, unix))]
 use super::submission::CONTROLLER_QUEUE_BYTES;
-pub(crate) use super::submission::{ControllerRefusalCause, SendError, SendMode, SendPreconditions};
+pub(crate) use super::submission::{ControllerRefusalCause, SendError, SendMode, SendOutcome, SendPreconditions};
 use super::{
     presentation::{GateTransition, PresentationGate},
     submission::{
@@ -445,7 +445,8 @@ pub(crate) enum SessionCommand {
         mode: SendMode,
         preconditions: SendPreconditions,
         marker_name: Option<String>,
-        reply: mpsc::Sender<Result<Option<u64>, SendError>>,
+        key: Option<String>,
+        reply: mpsc::Sender<Result<SendOutcome, SendError>>,
     },
     WriteInput {
         bytes: Vec<u8>,
@@ -666,6 +667,8 @@ impl CommandSender {
         }
     }
 
+    // The error carries the unsent command back; it only crosses the threshold with the send key.
+    #[allow(clippy::result_large_err)]
     fn send(&self, command: SessionCommand) -> Result<(), mpsc::SendError<SessionCommand>> {
         self.tx.send(command)?;
         #[cfg(unix)]
@@ -1099,10 +1102,21 @@ impl SessionActor {
         mode: SendMode,
         preconditions: SendPreconditions,
         marker_name: Option<String>,
-    ) -> Result<Receiver<Result<Option<u64>, SendError>>, String> {
+    ) -> Result<Receiver<Result<SendOutcome, SendError>>, String> {
+        self.begin_keyed_send(text, mode, preconditions, marker_name, None)
+    }
+
+    pub(crate) fn begin_keyed_send(
+        &self,
+        text: Vec<u8>,
+        mode: SendMode,
+        preconditions: SendPreconditions,
+        marker_name: Option<String>,
+        key: Option<String>,
+    ) -> Result<Receiver<Result<SendOutcome, SendError>>, String> {
         let (reply, rx) = mpsc::channel();
         self.tx
-            .send(SessionCommand::Send { text, mode, preconditions, marker_name, reply })
+            .send(SessionCommand::Send { text, mode, preconditions, marker_name, key, reply })
             .map_err(|_| "session actor unavailable".to_string())?;
         Ok(rx)
     }
@@ -1312,7 +1326,7 @@ struct PumpResult {
 struct Submission {
     enter_at: Instant,
     marker_offset: Option<u64>,
-    reply: mpsc::Sender<Result<Option<u64>, SendError>>,
+    reply: mpsc::Sender<Result<SendOutcome, SendError>>,
 }
 
 struct SessionActorLoopState {
@@ -1625,7 +1639,13 @@ fn session_actor_handle_command(
             };
             let _ = reply.send(result);
         }
-        SessionCommand::Send { text, mode, preconditions, marker_name, reply } => {
+        SessionCommand::Send { text, mode, preconditions, marker_name, key, reply } => {
+            // Before every guard: a repeat must not be refused as busy, or by a
+            // selector the first send already changed.
+            if let Some(at) = key.as_deref().and_then(|key| runtime.submitted_key_at(key)) {
+                let _ = reply.send(Ok(SendOutcome { marker_offset: None, already_submitted_at: Some(at) }));
+                return false;
+            }
             // Static capability validation precedes the output pump and any screen read.
             let support = preconditions.selector.as_ref().map(|selector| runtime.check_selector_support(selector)).transpose();
             if let Err(error) = support {
@@ -1665,12 +1685,17 @@ fn session_actor_handle_command(
                     },
                 )
             })();
+            if result.is_ok() {
+                if let Some(key) = key {
+                    runtime.record_submitted_key(key);
+                }
+            }
             match result {
                 Ok(marker_offset) if mode == SendMode::Submit => {
                     state.submission = Some(Submission { enter_at: Instant::now() + SUBMIT_ENTER_DELAY, marker_offset, reply });
                 }
                 result => {
-                    let _ = reply.send(result);
+                    let _ = reply.send(result.map(|marker_offset| SendOutcome { marker_offset, already_submitted_at: None }));
                 }
             }
         }
@@ -2070,7 +2095,12 @@ fn finish_submission(runtime: &mut SessionRuntime, state: &mut SessionActorLoopS
         }
     }
     // An error may follow a successful Enter: callers must not infer that retrying is safe.
-    let _ = submission.reply.send(result.and(replay_result).map(|_| submission.marker_offset).map_err(SendError::from));
+    let _ = submission.reply.send(
+        result
+            .and(replay_result)
+            .map(|_| SendOutcome { marker_offset: submission.marker_offset, already_submitted_at: None })
+            .map_err(SendError::from),
+    );
     wake();
 }
 
@@ -2826,6 +2856,27 @@ pub(crate) mod submission_tests {
 
     // The actor must replay controller input after paste+Enter, byte-for-byte, and reject competing automation.
     // A real PTY child is the process boundary; its hex dump observes exactly the bytes delivered.
+    // A repeat while the first keyed submission waits for its Enter is "already", not busy.
+    #[test]
+    fn repeated_key_while_enter_is_pending_answers_already() {
+        let (_temp, actor, tap) = spawn("stty raw -echo; printf READY; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf DONE; sleep 10");
+        let mut output = Vec::new();
+        collect_until(&tap, &mut output, b"READY");
+        let first = actor.begin_keyed_send(b"abc".to_vec(), SendMode::Submit, Default::default(), None, Some("k".into())).unwrap();
+        actor.inspect(false, 0).unwrap(); // FIFO barrier: paste is written, Enter is still held.
+        assert!(first.try_recv().is_err());
+        let repeat = actor.begin_keyed_send(b"BAD".to_vec(), SendMode::Submit, Default::default(), None, Some("k".into())).unwrap();
+        let outcome = repeat.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        assert!(outcome.already_submitted_at.is_some());
+        let other = actor.begin_keyed_send(b"BAD".to_vec(), SendMode::Submit, Default::default(), None, Some("other".into())).unwrap();
+        let error = other.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+        assert_eq!(error.controller.unwrap().cause, ControllerRefusalCause::Busy);
+        assert_eq!(first.recv_timeout(Duration::from_secs(1)).unwrap().unwrap().already_submitted_at, None);
+        collect_until(&tap, &mut output, b"DONE");
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("61 62 63 0d"), "{text}");
+    }
+
     #[test]
     fn submission_replays_raw_and_packet_input_losslessly_without_vt() {
         // Explicit generator: empty, ASCII, UTF-8, binary, LF and CR controller payloads.
@@ -2846,7 +2897,7 @@ pub(crate) mod submission_tests {
             assert_eq!(error.controller.unwrap().cause, ControllerRefusalCause::Busy);
             assert!(error.error.contains("busy"));
             assert!(actor.write_input(b"BAD".to_vec()).unwrap_err().contains("busy"));
-            assert_eq!(submit.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(), None);
+            assert_eq!(submit.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(), SendOutcome::default());
             collect_until(&tap, &mut output, b"DONE");
             let text = String::from_utf8(output).unwrap();
             let hex = text.split("READY").nth(1).unwrap().split("DONE").next().unwrap();
@@ -2982,7 +3033,7 @@ pub(crate) mod submission_tests {
                 collect_until(&tap, &mut output, b"PROBED");
                 assert!(String::from_utf8(output).unwrap().contains("70726f62650d"));
             } else {
-                assert!(result.unwrap().is_some());
+                assert!(result.unwrap().marker_offset.is_some());
                 assert!(actor.resolve_marker("guarded".into()).unwrap().is_some());
             }
         }

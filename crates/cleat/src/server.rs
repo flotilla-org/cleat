@@ -1085,8 +1085,8 @@ impl SessionService {
         &self,
         id: &str,
         input: &http_uds::InputRequest,
-    ) -> Result<Option<u64>, crate::host::submission::SendError> {
-        use crate::host::submission::SendError;
+    ) -> Result<crate::host::submission::SendOutcome, crate::host::submission::SendError> {
+        use crate::host::submission::{SendError, SendOutcome};
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}").into());
         }
@@ -1098,7 +1098,7 @@ impl SessionService {
             return Err(error);
         }
         let response: http_uds::SendResponse = serde_json::from_slice(&response.body).map_err(|e| SendError::from(e.to_string()))?;
-        Ok(response.marker_offset)
+        Ok(SendOutcome { marker_offset: response.marker_offset, already_submitted_at: response.already_submitted_at })
     }
 
     #[cfg(all(test, unix))]

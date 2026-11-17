@@ -54,6 +54,7 @@ pub(crate) struct SessionRuntime {
     conpty_startup: Option<ConptyStartup>,
     recorder: Option<SessionRecorder>,
     markers: HashMap<String, u64>,
+    submitted_keys: crate::host::submission::SubmittedKeys,
     held_keys: crate::keyboard::HeldKeys,
     held_buttons: crate::mouse::HeldButtons,
     epoch: Instant,
@@ -89,6 +90,7 @@ pub(crate) struct TransferSource {
     pub hosting_epoch: u64,
     pub replay_snapshot: crate::recording::ReplaySnapshot,
     pub markers: HashMap<String, u64>,
+    pub submitted_keys: Vec<(String, u64)>,
     pub recording_paused: bool,
     pub controller_input_history: crate::protocol::ControllerInputHistory,
     pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
@@ -110,6 +112,7 @@ pub(crate) struct AdoptedSession {
     pub hosting_epoch: u64,
     pub replay_snapshot: crate::recording::ReplaySnapshot,
     pub markers: HashMap<String, u64>,
+    pub submitted_keys: Vec<(String, u64)>,
     pub recording_paused: bool,
     pub controller_input_history: crate::protocol::ControllerInputHistory,
     pub program_status: Vec<crate::program_status::ProgramStatusRecord>,
@@ -216,6 +219,7 @@ impl SessionRuntime {
             status_output: Default::default(),
             recorder,
             markers: HashMap::new(),
+            submitted_keys: Default::default(),
             held_keys: Default::default(),
             held_buttons: Default::default(),
             epoch: Instant::now(),
@@ -286,6 +290,7 @@ impl SessionRuntime {
             status_output: Default::default(),
             recorder,
             markers: adopted.markers,
+            submitted_keys: crate::host::submission::SubmittedKeys::from_entries(adopted.submitted_keys),
             held_keys: Default::default(),
             held_buttons: Default::default(),
             epoch: Instant::now(),
@@ -352,6 +357,7 @@ impl SessionRuntime {
                 state: String::from_utf8_lossy(&payload).into_owned(),
             },
             markers: self.markers.clone(),
+            submitted_keys: self.submitted_keys.entries(),
             recording_paused: self.recorder.as_ref().is_some_and(SessionRecorder::is_paused),
             controller_input_history: self.controller_input_history.clone(),
             program_status: self.vt_engine.program_status().unwrap_or_default(),
@@ -781,6 +787,14 @@ impl SessionRuntime {
             self.markers.insert(marker_name, recorder.bytes_written());
         }
         Ok(recorder.bytes_written())
+    }
+
+    pub(crate) fn submitted_key_at(&self, key: &str) -> Option<u64> {
+        self.submitted_keys.accepted_at(key)
+    }
+
+    pub(crate) fn record_submitted_key(&mut self, key: String) {
+        self.submitted_keys.record(key, unix_timestamp_millis(SystemTime::now()));
     }
 
     pub(crate) fn resolve_marker(&self, name: &str) -> Option<u64> {

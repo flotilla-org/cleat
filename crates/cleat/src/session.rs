@@ -1893,7 +1893,7 @@ fn apply_attach_state(
 
 struct PendingSend {
     stream: SessionStream,
-    result: std::sync::mpsc::Receiver<Result<Option<u64>, crate::host::submission::SendError>>,
+    result: std::sync::mpsc::Receiver<Result<crate::host::submission::SendOutcome, crate::host::submission::SendError>>,
 }
 
 struct PendingWait {
@@ -3329,8 +3329,8 @@ fn service_pending_sends(sends: &mut Vec<PendingSend>) {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("session actor unavailable".into()),
         };
         match result {
-            Ok(marker_offset) => {
-                let _ = http_uds::write_json(&mut send.stream, StatusCode::OK, &http_uds::SendResponse { marker_offset });
+            Ok(outcome) => {
+                let _ = http_uds::write_json(&mut send.stream, StatusCode::OK, &http_uds::SendResponse::from(outcome));
             }
             Err(error) => {
                 let _ = http_uds::write_json(
@@ -4229,7 +4229,17 @@ fn handle_http_request(
             let body: http_uds::InputRequest =
                 serde_json::from_slice(request.body()).map_err(|err| format!("parse HTTP input request: {err}"))?;
             match body {
-                http_uds::InputRequest::Send { text, submit, no_enter, paste, controller_idle_ms, selector, marker_name, acknowledge } => {
+                http_uds::InputRequest::Send {
+                    text,
+                    submit,
+                    no_enter,
+                    paste,
+                    controller_idle_ms,
+                    selector,
+                    marker_name,
+                    acknowledge,
+                    key,
+                } => {
                     let mode = match (submit, no_enter, paste) {
                         (true, true, _) => {
                             return http_uds::write_error(stream, StatusCode::BAD_REQUEST, "submit and no_enter are mutually exclusive")
@@ -4255,11 +4265,12 @@ fn handle_http_request(
                         }
                     };
                     let pending_stream = stream.try_clone().map_err(|err| format!("clone send response: {err}"))?;
-                    let result = hosted.actor.begin_send(
+                    let result = hosted.actor.begin_keyed_send(
                         text.into_bytes(),
                         mode,
                         crate::host::actor::SendPreconditions { controller_idle: controller_idle_ms.map(Duration::from_millis), selector },
                         marker_name,
+                        key,
                     )?;
                     if acknowledge {
                         hosted.actor.acknowledge_program_status();

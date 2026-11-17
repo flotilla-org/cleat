@@ -52,6 +52,7 @@ fn manifest() -> FdTransferManifest {
         hosting_epoch: 3,
         replay_snapshot: ReplaySnapshot { engine: "passthrough".into(), cols: 100, rows: 30, state: "\x1b[Hscreen".into() },
         markers: Default::default(),
+        submitted_keys: Default::default(),
         recording_paused: false,
         controller_input_history: Default::default(),
         program_status: Vec::new(),

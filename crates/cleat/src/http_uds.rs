@@ -150,7 +150,7 @@ pub(crate) struct SessionTransferRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum InputRequest {
-    #[serde(alias = "guarded_send")]
+    #[serde(alias = "guarded_send", alias = "keyed_send")]
     Send {
         text: String,
         submit: bool,
@@ -165,6 +165,9 @@ pub(crate) enum InputRequest {
         marker_name: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         acknowledge: bool,
+        /// Caller-chosen idempotency key: a repeat writes nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     /// Delete exactly the observed composer draft, only while it still matches
     /// and controller input has been quiet (#393). Older daemons reject the kind.
@@ -202,8 +205,10 @@ impl InputRequest {
     /// before any write instead of silently dropping a selector guard.
     pub(crate) fn transaction_body(&self) -> Result<serde_json::Value, String> {
         let mut body = serde_json::to_value(self).map_err(|e| e.to_string())?;
-        if matches!(self, Self::Send { selector: Some(_), .. }) {
-            body["kind"] = "guarded_send".into();
+        match self {
+            Self::Send { key: Some(_), .. } => body["kind"] = "keyed_send".into(),
+            Self::Send { selector: Some(_), .. } => body["kind"] = "guarded_send".into(),
+            _ => {}
         }
         Ok(body)
     }
@@ -212,6 +217,16 @@ impl InputRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SendResponse {
     pub marker_offset: Option<u64>,
+    /// Unix milliseconds of the key's first acceptance; set only when a keyed
+    /// send repeated that key and wrote nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub already_submitted_at: Option<u64>,
+}
+
+impl From<crate::host::submission::SendOutcome> for SendResponse {
+    fn from(outcome: crate::host::submission::SendOutcome) -> Self {
+        Self { marker_offset: outcome.marker_offset, already_submitted_at: outcome.already_submitted_at }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1181,6 +1196,7 @@ mod guarded_send_compatibility {
                 selector: selector.clone(),
                 marker_name: None,
                 acknowledge: false,
+                key: None,
             };
             let body = request.transaction_body().unwrap();
             assert_eq!(serde_json::from_value::<InputRequest>(body.clone()).unwrap(), request);
@@ -1191,6 +1207,22 @@ mod guarded_send_compatibility {
                 assert!(matches!(old, Ok(LegacyInput::Send { text }) if text == "message"));
             }
         }
+        // A key must never be dropped by an older daemon: its kind is unknown there too.
+        let keyed = InputRequest::Send {
+            text: "message".into(),
+            submit: true,
+            no_enter: false,
+            paste: false,
+            controller_idle_ms: None,
+            selector: Some("screen".into()),
+            marker_name: None,
+            acknowledge: false,
+            key: Some("k".into()),
+        };
+        let body = keyed.transaction_body().unwrap();
+        assert_eq!(body["kind"], "keyed_send");
+        assert_eq!(serde_json::from_value::<InputRequest>(body.clone()).unwrap(), keyed);
+        assert!(serde_json::from_value::<LegacyInput>(body).is_err());
         // A guarded clear is likewise known-unsent on a daemon without it (#393).
         let clear = InputRequest::GuardedClear { draft: "draft".into(), controller_idle_ms: 2000, marker_name: None };
         let body = clear.transaction_body().unwrap();

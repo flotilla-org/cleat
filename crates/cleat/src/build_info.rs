@@ -33,7 +33,7 @@ impl BuildInfo {
             target: env!("CLEAT_BUILD_TARGET").into(),
             protocol_version: crate::packet::PROTOCOL_VERSION,
             ghostty_vt: cfg!(feature = "ghostty-vt"),
-            capabilities: vec!["launch_env_clear".into()],
+            capabilities: vec!["launch_env_clear".into(), "keyed_send".into()],
         }
     }
 }
@@ -107,6 +107,7 @@ mod tests {
         let build = BuildInfo::current();
         let mut value = serde_json::to_value(&build).unwrap();
         assert!(value["capabilities"].as_array().unwrap().contains(&serde_json::json!("launch_env_clear")));
+        assert!(value["capabilities"].as_array().unwrap().contains(&serde_json::json!("keyed_send")));
         value.as_object_mut().unwrap().remove("capabilities");
         assert!(serde_json::from_value::<BuildInfo>(value).unwrap().capabilities.is_empty());
     }

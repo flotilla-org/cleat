@@ -996,3 +996,22 @@ fn controller_fence_states_survive_live_transfer() {
         root.ok(&["kill", "fence"]);
     }
 }
+
+// Accepted keys move with the session, so a repeat after the transfer writes nothing.
+#[test]
+fn submitted_keys_survive_live_transfer() {
+    let root = Root::new();
+    root.launch_shell("keyed-moving");
+    let ran = root.path().join("ran");
+    let append = |name: &str| format!("echo {name} >> {}", ran.display());
+    let lines = || std::fs::read_to_string(&ran).unwrap_or_default();
+    root.ok(&["send", "keyed-moving", &append("once"), "--key", "once"]);
+    wait_until("first keyed write", Duration::from_secs(10), || lines() == "once\n");
+    root.transfer("keyed-moving", "other", &[], &[]).unwrap();
+    let repeat = root.ok(&["send", "keyed-moving", &append("once"), "--key", "once"]);
+    assert!(repeat.starts_with("already "), "{repeat}");
+    root.ok(&["send", "keyed-moving", &append("twice"), "--key", "twice"]);
+    wait_until("later keyed write", Duration::from_secs(10), || lines().contains("twice"));
+    assert_eq!(lines(), "once\ntwice\n", "the repeat wrote nothing after the transfer");
+    root.ok(&["kill", "keyed-moving"]);
+}

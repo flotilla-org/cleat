@@ -156,6 +156,29 @@ daemons reject that unknown kind before writing; adding an `if` field to their
 ordinary `send` request would otherwise be silently ignored. Upgrade/restart an
 older daemon before using guarded sends. Unguarded transactions retain `send`.
 
+## Keyed send
+
+`cleat send --key KEY ...` makes a send idempotent per session. The first send
+with a key writes and records the key; a repeat writes nothing and answers
+`already <unix-ms>` (the first acceptance), including while the first
+submission is still waiting for its Enter. The check precedes every guard, so a
+repeat is never refused as `busy` or `not-matched`; other refusals are unchanged.
+
+```json
+{"kind":"keyed_send","text":"message","submit":true,"no_enter":false,"key":"turn-42"}
+```
+
+A key is recorded when its first write lands, not when the delayed Enter does:
+if a `--submit` send then errors, a retry with the same key still answers
+`already` and does not resend. Keys are 1 to 256 bytes.
+
+The response is the send response plus `already_submitted_at` (unix
+milliseconds), set only when nothing was written. Keys use the distinct
+`keyed_send` kind so an older daemon refuses the request rather than ignoring
+the key; `build.json` lists the `keyed_send` capability. A session keeps its
+last 256 accepted keys in memory (no time expiry); they move with `cleat
+transfer` and are lost with the session's PTY.
+
 ## Selector evidence replaces the echo fence
 
 A controller keystroke with no predictable echo (an arrow, Escape, a Ctrl chord,

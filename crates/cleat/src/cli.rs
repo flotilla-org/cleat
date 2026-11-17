@@ -569,6 +569,12 @@ resolved through the live daemon socket. \n\
         selector: Option<String>,
         #[arg(long, value_name = "NAME", help = "Set a named marker before sending (requires recording)")]
         mark_before: Option<String>,
+        #[arg(
+            long,
+            value_name = "KEY",
+            help = "Idempotency key (1-256 bytes): if already accepted for this session, write nothing and print `already <unix-ms>`"
+        )]
+        key: Option<String>,
     },
     /// Delete an abandoned composer draft, only if it is still exactly the draft read
     #[command(after_long_help = "Read the draft from `inspect --json` (the recognizer's composer value), \
@@ -1381,8 +1387,8 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 Err(e) => ExecResult::Err(e),
             }
         }
-        Command::Send { id, text, no_enter, submit, paste, controller_idle, selector, mark_before, ack } => {
-            if !ack && !submit && !paste && controller_idle.is_none() && selector.is_none() {
+        Command::Send { id, text, no_enter, submit, paste, controller_idle, selector, mark_before, ack, key } => {
+            if key.is_none() && !ack && !submit && !paste && controller_idle.is_none() && selector.is_none() {
                 let mut bytes = text.into_bytes();
                 if !no_enter {
                     bytes.push(b'\r');
@@ -1413,8 +1419,12 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 selector,
                 marker_name: mark_before,
                 acknowledge: ack,
+                key,
             }) {
-                Ok(offset) => ExecResult::Ok(offset.map(|offset| offset.to_string())),
+                Ok(outcome) => match outcome.already_submitted_at {
+                    Some(at) => ExecResult::Ok(Some(format!("already {at}"))),
+                    None => ExecResult::Ok(outcome.marker_offset.map(|offset| offset.to_string())),
+                },
                 Err(error) if guarded => {
                     ExecResult::Exit { code: if error.status == 409 { 1 } else { 2 }, message: Some(error.to_string()), output: None }
                 }
@@ -1431,7 +1441,7 @@ fn execute_local(cli: Cli, service: &SessionService) -> ExecResult {
                 controller_idle_ms,
                 marker_name: mark_before,
             }) {
-                Ok(offset) => ExecResult::Ok(offset.map(|offset| offset.to_string())),
+                Ok(outcome) => ExecResult::Ok(outcome.marker_offset.map(|offset| offset.to_string())),
                 Err(error) => {
                     ExecResult::Exit { code: if error.status == 409 { 1 } else { 2 }, message: Some(error.to_string()), output: None }
                 }

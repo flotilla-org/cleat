@@ -5372,3 +5372,104 @@ fn atomic_guard_http_and_cli_outcomes() {
     }
     service.kill("guard").unwrap();
 }
+
+fn keyed_send(service: &SessionService, id: &str, text: &str, key: &str) -> ExecResult {
+    let cli = Cli::try_parse_from(["cleat", "send", id, text, "--key", key]).unwrap();
+    cli::execute(cli, service)
+}
+
+fn already_at(result: ExecResult) -> Option<u64> {
+    match result {
+        ExecResult::Ok(Some(text)) => text.strip_prefix("already ").map(|at| at.parse().unwrap()),
+        ExecResult::Ok(None) => None,
+        other => panic!("unexpected keyed send result: {other:?}"),
+    }
+}
+
+fn keyed_session(temp: &std::path::Path, id: &str) -> (SessionService, std::path::PathBuf) {
+    let service = service_for(temp);
+    let sink = temp.join(format!("{id}.sink"));
+    let command = format!("sh -c 'cat >> {}'", sink.display());
+    service.create(Some(id.into()), Some(VtEngineKind::Passthrough), None, Some(command), true).unwrap();
+    (service, sink)
+}
+
+// A repeat of an accepted key writes nothing and reports the first acceptance;
+// a different key still writes.
+#[test]
+fn keyed_send_writes_once_and_repeat_reports_first_acceptance() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let (service, sink) = keyed_session(temp.path(), "keyed");
+    assert_eq!(already_at(keyed_send(&service, "keyed", "ONCE", "k1")), None);
+    let first = already_at(keyed_send(&service, "keyed", "ONCE", "k1")).expect("repeat reports already");
+    assert!(first > 0);
+    assert_eq!(already_at(keyed_send(&service, "keyed", "DIFFERENT", "k1")), Some(first), "the key wins over the text");
+    assert_eq!(already_at(keyed_send(&service, "keyed", "OTHER", "k2")), None);
+    wait_until("both keys written", || std::fs::read_to_string(&sink).is_ok_and(|text| text.contains("OTHER")));
+    assert_eq!(std::fs::read_to_string(&sink).unwrap(), "ONCE\nOTHER\n");
+    service.kill("keyed").unwrap();
+}
+
+// The HTTP route: `keyed_send` answers `already_submitted_at` only for a repeat,
+// and an unkeyed `send` response carries no such field.
+#[test]
+fn keyed_send_http_response_reports_already_submitted_at() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let (service, sink) = keyed_session(temp.path(), "keyed-http");
+    let post = |body: serde_json::Value| -> serde_json::Value {
+        let body = body.to_string();
+        let response = http_session_request(
+            temp.path(),
+            "keyed-http",
+            &format!(
+                "POST /sessions/keyed-http/input HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        serde_json::from_str(http_body(&response)).unwrap()
+    };
+    let request = |kind: &str, key: Option<&str>| {
+        let mut body = serde_json::json!({"kind": kind, "text": "HTTP", "submit": false, "no_enter": false});
+        if let Some(key) = key {
+            body["key"] = key.into();
+        }
+        body
+    };
+    for bad in [String::new(), "k".repeat(257)] {
+        let body = request("keyed_send", Some(&bad)).to_string();
+        let response = http_session_request(
+            temp.path(),
+            "keyed-http",
+            &format!(
+                "POST /sessions/keyed-http/input HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+    assert!(post(request("keyed_send", Some("h1")))["already_submitted_at"].is_null());
+    assert!(post(request("keyed_send", Some("h1")))["already_submitted_at"].as_u64().unwrap() > 0);
+    assert!(post(request("send", None)).get("already_submitted_at").is_none());
+    wait_until("unkeyed write", || std::fs::read_to_string(&sink).is_ok_and(|text| text == "HTTP\nHTTP\n"));
+    service.kill("keyed-http").unwrap();
+}
+
+// Only the last 256 keys are remembered: the 257th evicts the oldest.
+#[test]
+fn keyed_send_257th_key_evicts_the_oldest() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let (service, sink) = keyed_session(temp.path(), "keyed-evict");
+    for n in 0..257 {
+        assert_eq!(already_at(keyed_send(&service, "keyed-evict", "x", &format!("k{n}"))), None);
+    }
+    assert!(already_at(keyed_send(&service, "keyed-evict", "x", "k1")).is_some());
+    assert_eq!(already_at(keyed_send(&service, "keyed-evict", "x", "k0")), None, "evicted key writes again");
+    wait_until("258 writes", || std::fs::read_to_string(&sink).is_ok_and(|text| text.len() == 258 * 2));
+    service.kill("keyed-evict").unwrap();
+}

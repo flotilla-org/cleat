@@ -663,6 +663,58 @@ mod controller_fence_properties {
     }
 }
 
+/// How many accepted keys a session remembers; the oldest is evicted first.
+pub(crate) const SUBMITTED_KEY_CAPACITY: usize = 256;
+
+pub(crate) const SUBMITTED_KEY_MAX_BYTES: usize = 256;
+
+pub(crate) fn validate_key(key: Option<&str>) -> Option<SendError> {
+    let key = key?;
+    (key.is_empty() || key.len() > SUBMITTED_KEY_MAX_BYTES)
+        .then(|| SendError::new(400, "error", format!("key must be 1 to {SUBMITTED_KEY_MAX_BYTES} bytes")))
+}
+
+/// Caller-chosen send keys already accepted, oldest first, with the unix
+/// milliseconds of first acceptance. A key is recorded when its first write
+/// lands, so a repeat arriving before the delayed Enter is also "already".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SubmittedKeys(std::collections::VecDeque<(String, u64)>);
+
+impl SubmittedKeys {
+    #[cfg(unix)]
+    pub(crate) fn from_entries(entries: Vec<(String, u64)>) -> Self {
+        let skip = entries.len().saturating_sub(SUBMITTED_KEY_CAPACITY);
+        Self(entries.into_iter().skip(skip).collect())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn entries(&self) -> Vec<(String, u64)> {
+        self.0.iter().cloned().collect()
+    }
+
+    // The scan is deliberate: at most 256 short keys, and a map would need its own eviction order.
+    pub(crate) fn accepted_at(&self, key: &str) -> Option<u64> {
+        self.0.iter().find(|(known, _)| known == key).map(|(_, at)| *at)
+    }
+
+    pub(crate) fn record(&mut self, key: String, at_unix_ms: u64) {
+        if self.accepted_at(&key).is_some() {
+            return;
+        }
+        if self.0.len() == SUBMITTED_KEY_CAPACITY {
+            self.0.pop_front();
+        }
+        self.0.push_back((key, at_unix_ms));
+    }
+}
+
+/// A completed send: what was marked, or that a repeated key wrote nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SendOutcome {
+    pub(crate) marker_offset: Option<u64>,
+    pub(crate) already_submitted_at: Option<u64>,
+}
+
 /// Stable send failure contract shared by the actor, HTTP transport and CLI.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SendError {

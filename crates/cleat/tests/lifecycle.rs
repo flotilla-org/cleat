@@ -5404,7 +5404,7 @@ fn keyed_send_writes_once_and_repeat_reports_first_acceptance() {
     assert_eq!(already_at(keyed_send(&service, "keyed", "ONCE", "k1")), None);
     let first = already_at(keyed_send(&service, "keyed", "ONCE", "k1")).expect("repeat reports already");
     assert!(first > 0);
-    assert_eq!(already_at(keyed_send(&service, "keyed", "ONCE", "k1")), Some(first));
+    assert_eq!(already_at(keyed_send(&service, "keyed", "DIFFERENT", "k1")), Some(first), "the key wins over the text");
     assert_eq!(already_at(keyed_send(&service, "keyed", "OTHER", "k2")), None);
     wait_until("both keys written", || std::fs::read_to_string(&sink).is_ok_and(|text| text.contains("OTHER")));
     assert_eq!(std::fs::read_to_string(&sink).unwrap(), "ONCE\nOTHER\n");
@@ -5439,6 +5439,19 @@ fn keyed_send_http_response_reports_already_submitted_at() {
         }
         body
     };
+    for bad in [String::new(), "k".repeat(257)] {
+        let body = request("keyed_send", Some(&bad)).to_string();
+        let response = http_session_request(
+            temp.path(),
+            "keyed-http",
+            &format!(
+                "POST /sessions/keyed-http/input HTTP/1.1\r\nHost: cleat\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
     assert!(post(request("keyed_send", Some("h1")))["already_submitted_at"].is_null());
     assert!(post(request("keyed_send", Some("h1")))["already_submitted_at"].as_u64().unwrap() > 0);
     assert!(post(request("send", None)).get("already_submitted_at").is_none());

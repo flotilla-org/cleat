@@ -168,6 +168,10 @@ repeat is never refused as `busy` or `not-matched`; other refusals are unchanged
 {"kind":"keyed_send","text":"message","submit":true,"no_enter":false,"key":"turn-42"}
 ```
 
+A key is recorded when its first write lands, not when the delayed Enter does:
+if a `--submit` send then errors, a retry with the same key still answers
+`already` and does not resend. Keys are 1 to 256 bytes.
+
 The response is the send response plus `already_submitted_at` (unix
 milliseconds), set only when nothing was written. Keys use the distinct
 `keyed_send` kind so an older daemon refuses the request rather than ignoring

@@ -666,6 +666,14 @@ mod controller_fence_properties {
 /// How many accepted keys a session remembers; the oldest is evicted first.
 pub(crate) const SUBMITTED_KEY_CAPACITY: usize = 256;
 
+pub(crate) const SUBMITTED_KEY_MAX_BYTES: usize = 256;
+
+pub(crate) fn validate_key(key: Option<&str>) -> Option<SendError> {
+    let key = key?;
+    (key.is_empty() || key.len() > SUBMITTED_KEY_MAX_BYTES)
+        .then(|| SendError::new(400, "error", format!("key must be 1 to {SUBMITTED_KEY_MAX_BYTES} bytes")))
+}
+
 /// Caller-chosen send keys already accepted, oldest first, with the unix
 /// milliseconds of first acceptance. A key is recorded when its first write
 /// lands, so a repeat arriving before the delayed Enter is also "already".
@@ -682,6 +690,7 @@ impl SubmittedKeys {
         self.0.iter().cloned().collect()
     }
 
+    // The scan is deliberate: at most 256 short keys, and a map would need its own eviction order.
     pub(crate) fn accepted_at(&self, key: &str) -> Option<u64> {
         self.0.iter().find(|(known, _)| known == key).map(|(_, at)| *at)
     }

@@ -4253,6 +4253,9 @@ fn handle_http_request(
                         (false, true, true) => crate::host::actor::SendMode::Paste,
                         (false, no_enter, false) => crate::host::actor::SendMode::Type { enter: !no_enter },
                     };
+                    if let Some(error) = crate::host::submission::validate_key(key.as_deref()) {
+                        return http_uds::write_json(stream, StatusCode::BAD_REQUEST, &error).map_err(|e| e.to_string());
+                    }
                     let selector = match selector.map(|source| terminal_screen::Selector::parse(&source)).transpose() {
                         Ok(selector) => selector,
                         Err(error) => {

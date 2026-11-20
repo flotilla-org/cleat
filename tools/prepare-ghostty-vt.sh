@@ -6,6 +6,16 @@ TOOLCHAIN_FILE="$REPO_ROOT/tools/ghostty-toolchain.toml"
 SOURCE_DIR="$REPO_ROOT/.tools/ghostty-src"
 INSTALL_DIR="$REPO_ROOT/.tools/ghostty-install"
 
+# --fetch-only stops once every Zig package is in the global cache, without
+# building; with ZIG_PACKAGE_ARCHIVE_DIR it collects the archives for a mirror.
+fetch_only=false
+for argument in "$@"; do
+  case "$argument" in
+    --fetch-only) fetch_only=true ;;
+    *) printf 'Unknown argument: %s (usage: %s [--fetch-only])\n' "$argument" "$0" >&2; exit 2 ;;
+  esac
+done
+
 command -v tic >/dev/null 2>&1 || { echo "Missing ncurses tic (install ncurses-bin or ncurses)" >&2; exit 1; }
 
 toml_value() {
@@ -114,6 +124,48 @@ zon_dependency_hash() {
   ' "$file"
 }
 
+# A mirror of package archives, keyed by the hash build.zig.zon declares:
+# $ZIG_PACKAGE_MIRROR/<hash>/<archive name from the .url>. It is tried before
+# the upstream URL. A package the mirror does not hold (HTTP 404) falls back to
+# upstream with a warning; any other mirror failure stops the build, so an
+# unreachable mirror is never silently bypassed. Unset ZIG_PACKAGE_MIRROR to
+# fetch from upstream only. ZIG_PACKAGE_MIRROR_AUTH_HEADER_FILE names a curl
+# header file (for example "Authorization: token ...") sent only to the mirror.
+# Whatever the source, `zig fetch` below re-hashes the archive and it must
+# match the declared hash.
+download_zig_package() {
+  local declared_hash="$1" url="$2" archive="$3" mirror_url status
+  local -a auth=()
+  if [[ -n "${ZIG_PACKAGE_MIRROR:-}" ]]; then
+    mirror_url="${ZIG_PACKAGE_MIRROR%/}/$declared_hash/$(basename "$archive")"
+    if [[ -n "${ZIG_PACKAGE_MIRROR_AUTH_HEADER_FILE:-}" ]]; then
+      [[ -r "$ZIG_PACKAGE_MIRROR_AUTH_HEADER_FILE" ]] \
+        || { echo "ZIG_PACKAGE_MIRROR_AUTH_HEADER_FILE is not readable: $ZIG_PACKAGE_MIRROR_AUTH_HEADER_FILE" >&2; exit 1; }
+      auth=(--header "@$ZIG_PACKAGE_MIRROR_AUTH_HEADER_FILE")
+    fi
+    status="$(curl --location --retry 3 --retry-connrefused --connect-timeout 20 --max-time 600 \
+      --silent --show-error ${auth[@]+"${auth[@]}"} --output "$archive" --write-out '%{http_code}' "$mirror_url")" || status="curl exit $?"
+    case "$status" in
+      200)
+        echo "Prefetching Zig package $declared_hash from the mirror ($mirror_url)" >&2
+        return 0
+        ;;
+      404)
+        rm -f "$archive"
+        printf 'warning: the Zig package mirror has no %s; fetching it from upstream %s\n' "$declared_hash" "$url" >&2
+        ;;
+      *)
+        rm -f "$archive"
+        printf 'The Zig package mirror failed for %s (%s): %s\n' "$declared_hash" "$status" "$mirror_url" >&2
+        echo "Fix the mirror, or unset ZIG_PACKAGE_MIRROR to fetch every package from upstream." >&2
+        exit 1
+        ;;
+    esac
+  fi
+  echo "Prefetching Zig package $declared_hash from $url" >&2
+  curl --fail --location --retry 3 --silent --show-error "$url" -o "$archive"
+}
+
 # Zig's HTTP client cannot fetch some package archives: GitHub's /archive/
 # redirect carries ~10 KB of headers (mostly content-security-policy), which
 # overflows its header buffer (HttpHeadersOversize). Download every package
@@ -174,13 +226,17 @@ prefetch_zig_packages() {
       attempted+="$url "
 
       archive="$download_dir/$(basename "${url%%\?*}")"
-      echo "Prefetching Zig package $declared_hash from $url" >&2
-      curl --fail --location --retry 3 --silent --show-error "$url" -o "$archive"
+      download_zig_package "$declared_hash" "$url" "$archive"
       fetched_hash="$(cd "$SOURCE_DIR" && "$zig" fetch "$archive")"
-      rm -f "$archive"
       if [[ "$fetched_hash" != "$declared_hash" ]]; then
         printf 'Zig package hash mismatch for %s: declared %s, fetched %s\n' "$url" "$declared_hash" "$fetched_hash" >&2
         exit 1
+      fi
+      if [[ -n "${ZIG_PACKAGE_ARCHIVE_DIR:-}" ]]; then
+        mkdir -p "$ZIG_PACKAGE_ARCHIVE_DIR/$declared_hash"
+        mv "$archive" "$ZIG_PACKAGE_ARCHIVE_DIR/$declared_hash/$(basename "$archive")"
+      else
+        rm -f "$archive"
       fi
     done <<< "$missing"
   done
@@ -189,6 +245,9 @@ prefetch_zig_packages() {
 }
 
 prefetch_zig_packages
+if [[ "$fetch_only" == true ]]; then
+  exit 0
+fi
 
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"

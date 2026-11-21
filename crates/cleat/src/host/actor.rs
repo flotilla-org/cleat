@@ -2851,20 +2851,38 @@ pub(crate) mod submission_tests {
         let mut out = format!("DIAG stuck >3s {marker}\n");
         for entry in std::fs::read_dir("/proc").unwrap().flatten() {
             let pid = entry.file_name().to_string_lossy().to_string();
-            if !pid.chars().all(|c| c.is_ascii_digit()) { continue; }
+            if !pid.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
             let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
             let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
-            if !cmd.contains(marker) { continue; }
+            if !cmd.contains(marker) {
+                continue;
+            }
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
             let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
             let syscall = std::fs::read_to_string(format!("/proc/{pid}/syscall")).unwrap_or_default();
             let exe = std::fs::read_link(format!("/proc/{pid}/exe")).map(|p| p.display().to_string()).unwrap_or_default();
             out += &format!("pid {pid} exe {exe}\n cmd {cmd}\n stat {stat} wchan {wchan}\n syscall {syscall}");
             let bt = std::process::Command::new("gdb").args(["-batch", "-p", &pid, "-ex", "bt"]).output();
-            if let Ok(bt) = bt { out += &String::from_utf8_lossy(&bt.stdout).lines().filter(|l| l.starts_with('#')).collect::<Vec<_>>().join("\n"); }
+            if let Ok(bt) = bt {
+                out += &String::from_utf8_lossy(&bt.stdout).lines().filter(|l| l.starts_with('#')).collect::<Vec<_>>().join("\n");
+            }
             // children of this pid
             let kids = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
-            let fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd")).map(|d| d.flatten().map(|e| format!("{}->{}", e.file_name().to_string_lossy(), std::fs::read_link(e.path()).map(|p| p.display().to_string()).unwrap_or_default())).collect()).unwrap_or_default();
+            let fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .map(|d| {
+                    d.flatten()
+                        .map(|e| {
+                            format!(
+                                "{}->{}",
+                                e.file_name().to_string_lossy(),
+                                std::fs::read_link(e.path()).map(|p| p.display().to_string()).unwrap_or_default()
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             out += &format!("\n fds {fds:?}\n children [{kids}]\n");
             for kid in kids.split_whitespace() {
                 let kcmd = String::from_utf8_lossy(&std::fs::read(format!("/proc/{kid}/cmdline")).unwrap_or_default()).replace('\0', " ");
@@ -2925,13 +2943,20 @@ pub(crate) mod submission_tests {
             let Ok(ts) = ts.parse::<f64>() else { continue };
             let src = src.rsplit_once(':').map(|(s, _)| s.to_string()).unwrap_or_default();
             match sources.last_mut() {
-                Some(last) if last.0 == src => { last.2 = ts; last.3 += 1; }
+                Some(last) if last.0 == src => {
+                    last.2 = ts;
+                    last.3 += 1;
+                }
                 _ => sources.push((src, ts, ts, 1)),
             }
         }
-        for (src, a, b, n) in &sources { report += &format!("  {src} {:.1}ms {n} lines\n", (b - a) * 1000.0); }
+        for (src, a, b, n) in &sources {
+            report += &format!("  {src} {:.1}ms {n} lines\n", (b - a) * 1000.0);
+        }
         report += "login trace (first 300 lines):\n";
-        for line in stderr.lines().take(300) { report += &format!("  {line}\n"); }
+        for line in stderr.lines().take(300) {
+            report += &format!("  {line}\n");
+        }
         for (label, shell_prefix) in [("login $SHELL -lc", None), ("/bin/sh -c", Some("/bin/sh"))] {
             let mut times = Vec::new();
             for _ in 0..10 {
@@ -2947,7 +2972,12 @@ pub(crate) mod submission_tests {
                 times.extend(handles.into_iter().map(|h| h.join().unwrap()));
             }
             times.sort();
-            report += &format!("{label}: p50 {}ms p90 {}ms max {}ms\n", times[times.len() / 2], times[times.len() * 9 / 10], times[times.len() - 1]);
+            report += &format!(
+                "{label}: p50 {}ms p90 {}ms max {}ms\n",
+                times[times.len() / 2],
+                times[times.len() * 9 / 10],
+                times[times.len() - 1]
+            );
         }
         panic!("DIAG REPORT\n{report}");
     }
@@ -2977,7 +3007,11 @@ pub(crate) mod submission_tests {
                 initial_size: Default::default(),
                 colors: Default::default(),
             };
-            SessionRuntime::spawn(dir, &session, vt::make_vt_engine_with_colors(vt::VtEngineKind::Passthrough, 80, 24, Default::default()).unwrap())
+            SessionRuntime::spawn(
+                dir,
+                &session,
+                vt::make_vt_engine_with_colors(vt::VtEngineKind::Passthrough, 80, 24, Default::default()).unwrap(),
+            )
         })
         .unwrap();
         reached.recv_timeout(HANG_GUARD).unwrap().unwrap();

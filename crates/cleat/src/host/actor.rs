@@ -75,7 +75,7 @@ impl RawOutputTap {
         self.rx.try_recv()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<RawOutputChunk, mpsc::RecvTimeoutError> {
         self.rx.recv_timeout(timeout)
     }

@@ -2825,7 +2825,7 @@ pub(crate) mod submission_tests {
             SessionRuntime::spawn(dir, &session, vt::make_vt_engine_with_colors(kind, 80, 24, Default::default()).unwrap())
         })
         .unwrap();
-        reached.recv_timeout(HANG_GUARD).expect("child did not reach startup barrier");
+        reached.recv_timeout(HANG_GUARD).expect("child did not reach startup barrier").expect("read startup fifo");
         before_subscribe(&actor, temp.path());
         let tap = actor.subscribe_raw_output().unwrap();
         // The raw tap is live-only. Release the child only after subscription,
@@ -2840,13 +2840,14 @@ pub(crate) mod submission_tests {
 
     /// Signals once a writer opens the fifo at `path`. Opening a fifo for
     /// reading blocks until a writer arrives, so the open itself is the event.
-    fn await_fifo_writer(path: std::path::PathBuf) -> mpsc::Receiver<()> {
+    /// If no writer ever arrives the thread stays blocked in `open` until the
+    /// test process exits; the caller's hang guard fails the test meanwhile.
+    fn await_fifo_writer(path: std::path::PathBuf) -> mpsc::Receiver<std::io::Result<()>> {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let mut fifo = std::fs::File::open(&path).unwrap();
             // Drain to EOF so the child's open-and-close completes cleanly.
-            std::io::Read::read_to_end(&mut fifo, &mut Vec::new()).unwrap();
-            let _ = tx.send(());
+            let reached = std::fs::File::open(&path).and_then(|mut fifo| std::io::Read::read_to_end(&mut fifo, &mut Vec::new()));
+            let _ = tx.send(reached.map(drop));
         });
         rx
     }

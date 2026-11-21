@@ -2825,13 +2825,59 @@ pub(crate) mod submission_tests {
             SessionRuntime::spawn(dir, &session, vt::make_vt_engine_with_colors(kind, 80, 24, Default::default()).unwrap())
         })
         .unwrap();
-        reached.recv_timeout(HANG_GUARD).expect("child did not reach startup barrier").expect("read startup fifo");
+        let diag_start = Instant::now();
+        let diag_marker = waiting.to_string_lossy().to_string();
+        let got = match reached.recv_timeout(Duration::from_secs(3)) {
+            Ok(r) => r,
+            Err(_) => {
+                diag_dump(&diag_marker);
+                reached.recv_timeout(HANG_GUARD).expect("child did not reach startup barrier")
+            }
+        };
+        got.expect("read startup fifo");
+        let ms = diag_start.elapsed().as_millis();
+        if ms > 500 {
+            eprintln!("DIAG slow-startup {ms}ms {diag_marker}");
+        }
         before_subscribe(&actor, temp.path());
         let tap = actor.subscribe_raw_output().unwrap();
         // The raw tap is live-only. Release the child only after subscription,
         // rather than hoping the caller is scheduled within a startup sleep.
         actor.write_input(b"\n".to_vec()).unwrap();
         (temp, actor, tap)
+    }
+
+    fn diag_dump(marker: &str) {
+        let mut out = format!("DIAG stuck >3s {marker}\n");
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let pid = entry.file_name().to_string_lossy().to_string();
+            if !pid.chars().all(|c| c.is_ascii_digit()) { continue; }
+            let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+            if !cmd.contains(marker) { continue; }
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
+            let syscall = std::fs::read_to_string(format!("/proc/{pid}/syscall")).unwrap_or_default();
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).map(|p| p.display().to_string()).unwrap_or_default();
+            out += &format!("pid {pid} exe {exe}\n cmd {cmd}\n stat {stat} wchan {wchan}\n syscall {syscall}");
+            let bt = std::process::Command::new("gdb").args(["-batch", "-p", &pid, "-ex", "bt"]).output();
+            if let Ok(bt) = bt { out += &String::from_utf8_lossy(&bt.stdout).lines().filter(|l| l.starts_with('#')).collect::<Vec<_>>().join("\n"); }
+            // children of this pid
+            let kids = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+            let fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd")).map(|d| d.flatten().map(|e| format!("{}->{}", e.file_name().to_string_lossy(), std::fs::read_link(e.path()).map(|p| p.display().to_string()).unwrap_or_default())).collect()).unwrap_or_default();
+            out += &format!("\n fds {fds:?}\n children [{kids}]\n");
+            for kid in kids.split_whitespace() {
+                let kcmd = String::from_utf8_lossy(&std::fs::read(format!("/proc/{kid}/cmdline")).unwrap_or_default()).replace('\0', " ");
+                let kstat = std::fs::read_to_string(format!("/proc/{kid}/stat")).unwrap_or_default();
+                let kw = std::fs::read_to_string(format!("/proc/{kid}/wchan")).unwrap_or_default();
+                out += &format!("  kid {kid} cmd {kcmd}\n  stat {kstat}  wchan {kw}\n");
+                if let Ok(bt) = std::process::Command::new("gdb").args(["-batch", "-p", kid, "-ex", "bt"]).output() {
+                    out += &String::from_utf8_lossy(&bt.stdout).lines().filter(|l| l.starts_with('#')).collect::<Vec<_>>().join("\n");
+                    out += "\n";
+                }
+            }
+        }
+        eprintln!("{out}");
     }
 
     /// Bounds a wait on a child event only to fail a hung test; it is far
@@ -2857,6 +2903,86 @@ pub(crate) mod submission_tests {
             let chunk = tap.recv_timeout(HANG_GUARD).unwrap_or_else(|err| panic!("missing {:?} in {:?}: {err}", needle, bytes));
             bytes.extend_from_slice(&chunk.bytes);
         }
+    }
+
+    // TEMPORARY DIAGNOSTIC (cleat#414): measure child startup on the CI runner.
+    #[test]
+    fn diag_child_startup_on_this_runner() {
+        let mut report = String::new();
+        report += &format!("SHELL={:?} nproc={:?}\n", std::env::var("SHELL"), thread::available_parallelism());
+        let trace = std::process::Command::new(std::env::var("SHELL").unwrap_or("/bin/sh".into()))
+            .args(["-lxc", "true"])
+            .env("PS4", "+ $EPOCHREALTIME ${BASH_SOURCE:-?}:${LINENO} ")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&trace.stderr);
+        report += &format!("login trace: {} lines\n", stderr.lines().count());
+        // Per-source first/last timestamps and line counts.
+        let mut sources: Vec<(String, f64, f64, usize)> = Vec::new();
+        for line in stderr.lines() {
+            let mut parts = line.trim_start_matches('+').split_whitespace();
+            let (Some(ts), Some(src)) = (parts.next(), parts.next()) else { continue };
+            let Ok(ts) = ts.parse::<f64>() else { continue };
+            let src = src.rsplit_once(':').map(|(s, _)| s.to_string()).unwrap_or_default();
+            match sources.last_mut() {
+                Some(last) if last.0 == src => { last.2 = ts; last.3 += 1; }
+                _ => sources.push((src, ts, ts, 1)),
+            }
+        }
+        for (src, a, b, n) in &sources { report += &format!("  {src} {:.1}ms {n} lines\n", (b - a) * 1000.0); }
+        report += "login trace (first 300 lines):\n";
+        for line in stderr.lines().take(300) { report += &format!("  {line}\n"); }
+        for (label, shell_prefix) in [("login $SHELL -lc", None), ("/bin/sh -c", Some("/bin/sh"))] {
+            let mut times = Vec::new();
+            for _ in 0..10 {
+                let handles: Vec<_> = (0..4)
+                    .map(|_| {
+                        thread::spawn(move || {
+                            let start = Instant::now();
+                            let (_t, _a, _tap) = spawn_diag(shell_prefix);
+                            start.elapsed().as_millis()
+                        })
+                    })
+                    .collect();
+                times.extend(handles.into_iter().map(|h| h.join().unwrap()));
+            }
+            times.sort();
+            report += &format!("{label}: p50 {}ms p90 {}ms max {}ms\n", times[times.len() / 2], times[times.len() * 9 / 10], times[times.len() - 1]);
+        }
+        panic!("DIAG REPORT\n{report}");
+    }
+
+    fn spawn_diag(shell: Option<&'static str>) -> (tempfile::TempDir, SessionActor, RawOutputTap) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let waiting = dir.join("startup-waiting");
+        nix::unistd::mkfifo(&waiting, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        let reached = await_fifo_writer(waiting.clone());
+        let command = format!(": > '{}'; sleep 5", waiting.display());
+        let actor = SessionActor::spawn(24, Arc::new(|| {}), move || {
+            let (cmd, argv) = match shell {
+                Some(sh) => (None, Some(vec![sh.to_string(), "-c".to_string(), command])),
+                None => (Some(command), None),
+            };
+            let session = crate::runtime::SessionMetadata {
+                id: "diag".into(),
+                vt_engine: vt::VtEngineKind::Passthrough,
+                cwd: None,
+                cmd,
+                argv,
+                tags: vec![],
+                environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
+                environment: vec![],
+                record: true,
+                initial_size: Default::default(),
+                colors: Default::default(),
+            };
+            SessionRuntime::spawn(dir, &session, vt::make_vt_engine_with_colors(vt::VtEngineKind::Passthrough, 80, 24, Default::default()).unwrap())
+        })
+        .unwrap();
+        reached.recv_timeout(HANG_GUARD).unwrap().unwrap();
+        let tap = actor.subscribe_raw_output().unwrap();
+        (temp, actor, tap)
     }
 
     // Startup output must reach a live-only tap even when the child gets to

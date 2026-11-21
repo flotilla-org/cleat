@@ -2854,7 +2854,7 @@ pub(crate) mod submission_tests {
 
     fn collect_until(tap: &RawOutputTap, bytes: &mut Vec<u8>, needle: &[u8]) {
         while !bytes.windows(needle.len()).any(|w| w == needle) {
-            let chunk = tap.recv_timeout(HANG_GUARD).unwrap_or_else(|_| panic!("missing {:?} in {:?}", needle, bytes));
+            let chunk = tap.recv_timeout(HANG_GUARD).unwrap_or_else(|err| panic!("missing {:?} in {:?}: {err}", needle, bytes));
             bytes.extend_from_slice(&chunk.bytes);
         }
     }

@@ -75,6 +75,11 @@ impl RawOutputTap {
         self.rx.try_recv()
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<RawOutputChunk, mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_channel(capacity: usize) -> (SyncSender<RawOutputChunk>, Self) {
         let (tx, rx) = mpsc::sync_channel(capacity);
@@ -2795,6 +2800,10 @@ pub(crate) mod submission_tests {
         let temp = tempfile::Builder::new().prefix("submission's-").tempdir().unwrap();
         let dir = temp.path().to_path_buf();
         let waiting = dir.join("startup-waiting");
+        // The child announces the barrier by opening this fifo, so the test
+        // blocks on that event instead of polling against a wall-clock deadline.
+        nix::unistd::mkfifo(&waiting, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        let reached = await_fifo_writer(waiting.clone());
         // This shell is the subprocess boundary. Canonical input queues the
         // release even if the child has not reached read yet; echo stays off.
         let waiting_quoted = waiting.to_string_lossy().replace('\'', "'\\''");
@@ -2804,8 +2813,10 @@ pub(crate) mod submission_tests {
                 id: "submission-test".into(),
                 vt_engine: kind,
                 cwd: None,
-                cmd: Some(command),
-                argv: None,
+                // Not `cmd`: that runs `$SHELL -lc`, and a host login profile
+                // (nvm on GitHub runners) delays every child by ~400 ms (#414).
+                cmd: None,
+                argv: Some(vec!["/bin/sh".into(), "-c".into(), command]),
                 tags,
                 environment_policy: crate::runtime::ChildEnvironmentPolicy::Inherit,
                 environment: vec![],
@@ -2816,11 +2827,7 @@ pub(crate) mod submission_tests {
             SessionRuntime::spawn(dir, &session, vt::make_vt_engine_with_colors(kind, 80, 24, Default::default()).unwrap())
         })
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !waiting.exists() {
-            assert!(Instant::now() < deadline, "child did not reach startup barrier");
-            thread::sleep(Duration::from_millis(2));
-        }
+        reached.recv_timeout(HANG_GUARD).expect("child did not reach startup barrier").expect("read startup fifo");
         before_subscribe(&actor, temp.path());
         let tap = actor.subscribe_raw_output().unwrap();
         // The raw tap is live-only. Release the child only after subscription,
@@ -2829,14 +2836,28 @@ pub(crate) mod submission_tests {
         (temp, actor, tap)
     }
 
+    /// Bounds a wait on a child event only to fail a hung test; it is far
+    /// beyond normal startup so a loaded runner never trips it.
+    const HANG_GUARD: Duration = Duration::from_secs(120);
+
+    /// Signals once a writer opens the fifo at `path`. Opening a fifo for
+    /// reading blocks until a writer arrives, so the open itself is the event.
+    /// If no writer ever arrives the thread stays blocked in `open` until the
+    /// test process exits; the caller's hang guard fails the test meanwhile.
+    fn await_fifo_writer(path: std::path::PathBuf) -> mpsc::Receiver<std::io::Result<()>> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            // Drain to EOF so the child's open-and-close completes cleanly.
+            let reached = std::fs::File::open(&path).and_then(|mut fifo| std::io::Read::read_to_end(&mut fifo, &mut Vec::new()));
+            let _ = tx.send(reached.map(drop));
+        });
+        rx
+    }
+
     fn collect_until(tap: &RawOutputTap, bytes: &mut Vec<u8>, needle: &[u8]) {
-        let deadline = Instant::now() + Duration::from_secs(3);
         while !bytes.windows(needle.len()).any(|w| w == needle) {
-            assert!(Instant::now() < deadline, "missing {:?} in {:?}", needle, bytes);
-            while let Ok(chunk) = tap.try_recv() {
-                bytes.extend_from_slice(&chunk.bytes);
-            }
-            thread::sleep(Duration::from_millis(2));
+            let chunk = tap.recv_timeout(HANG_GUARD).unwrap_or_else(|err| panic!("missing {:?} in {:?}: {err}", needle, bytes));
+            bytes.extend_from_slice(&chunk.bytes);
         }
     }
 

@@ -39,6 +39,11 @@ pub struct SessionInfo {
     pub conpty: Option<ConptyInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The session's directory, absolute, as `list` reports it: live sessions and a dead
+    /// generation's retained ones alike. A client that keeps files beside a session's recording
+    /// uses this path; how cleat spells a name on disk is its own business.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<PathBuf>,
 }
 
 /// Which ConPTY implementation hosts a Windows session, chosen when the

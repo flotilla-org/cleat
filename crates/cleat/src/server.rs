@@ -739,6 +739,7 @@ impl SessionService {
             controller: None,
             conpty: None,
             error: None,
+            directory: None,
         }
     }
 
@@ -863,6 +864,7 @@ impl SessionService {
                 for result in result.sessions {
                     let status =
                         if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
+                    let directory = Some(self.layout.session_dir(&result.session.id));
                     let info = SessionInfo {
                         id: result.session.id,
                         vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
@@ -879,6 +881,7 @@ impl SessionService {
                         controller: controller_identity(&result.attachments),
                         conpty: result.session.conpty,
                         error: None,
+                        directory,
                     };
                     if session_matches_selectors(&info, selectors) {
                         sessions.push(info);
@@ -1201,6 +1204,7 @@ impl SessionService {
                     controller: None,
                     conpty: None,
                     error: None,
+                    directory: None,
                 }
             }
         };
@@ -1652,6 +1656,7 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
             controller: None,
             conpty: None,
             error: Some(err.clone()),
+            directory: Some(path),
         });
     }
     remove_stale_daemon_file(layout.socket_path(), "socket")?;
@@ -1733,6 +1738,7 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         controller: controller_identity(&result.attachments),
         conpty: result.session.conpty,
         error: None,
+        directory: None,
     }
 }
 

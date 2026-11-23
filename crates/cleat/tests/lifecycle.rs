@@ -5511,6 +5511,9 @@ fn sessions_take_any_name_through_the_cli() {
     let mut expected = UNRESTRICTED_NAMES.to_vec();
     expected.sort();
     assert_eq!(ids, expected);
+    for session in &listed {
+        assert_holds_recording(session, temp.path());
+    }
 
     for name in UNRESTRICTED_NAMES {
         run(&service, &["cleat", "kill", name]).expect("kill");
@@ -5532,11 +5535,21 @@ fn a_dead_daemons_sessions_keep_their_names() {
     cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
     wait_until("daemon exit", || UnixStream::connect(session_socket_path(temp.path(), name)).is_err());
 
-    let listed: Vec<SessionInfo> =
-        serde_json::from_str(&run(&service, &["cleat", "list", "--json"]).expect("list").expect("list output")).expect("parse list");
-
-    assert_eq!(listed.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec![name]);
+    for args in [&["cleat", "list", "--json"][..], &["cleat", "list", "--all", "--json"]] {
+        let listed: Vec<SessionInfo> = serde_json::from_str(&run(&service, args).expect("list").expect("list output")).expect("parse list");
+        assert_eq!(listed.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec![name], "{args:?}");
+        assert!(listed[0].error.is_some(), "a dead generation's session is reported as such");
+        assert_holds_recording(&listed[0], temp.path());
+    }
     cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
+}
+
+/// `list` reports where the session lives: an absolute directory under the runtime root that
+/// holds its recording.
+fn assert_holds_recording(session: &SessionInfo, root: &std::path::Path) {
+    let directory = session.directory.as_ref().unwrap_or_else(|| panic!("{} lists no directory", session.id));
+    assert!(directory.is_absolute() && directory.starts_with(root), "{}: {}", session.id, directory.display());
+    assert!(directory.join("session.cast").is_file(), "{}: no recording in {}", session.id, directory.display());
 }
 
 #[test]

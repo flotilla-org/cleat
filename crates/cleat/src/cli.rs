@@ -291,7 +291,7 @@ pub enum Command {
                            Tip: launch a shell (e.g. zsh) and use `send` to run commands.\nSessions exit when the launched process exits."
     )]
     Launch {
-        #[arg(value_name = "ID")]
+        #[arg(value_name = "ID", help = "Session name: any text without NUL")]
         id: Option<String>,
         /// Launch in the daemon that owns this source session
         #[arg(long, value_name = "SESSION", value_parser = parse_session_name)]

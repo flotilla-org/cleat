@@ -145,14 +145,21 @@ fn terminate_daemon(layout: &RuntimeLayout) {
 }
 
 #[test]
-fn recreation_rejects_path_components_before_mutating_the_layout() {
+fn recreation_keeps_path_like_names_inside_the_sessions_directory() {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("unused");
-    let service = SessionService::new(RuntimeLayout::new(root.clone()));
+    let root = temp.path().join("runtime");
+    let layout = RuntimeLayout::new(root.clone());
+    let service = SessionService::new(layout.clone());
+    // Any text is a session name; one that reads as a path is still one
+    // directory directly under sessions/.
     for id in ["..", "../outside", "a/b"] {
-        assert!(service.for_recreation(id).is_err());
+        let _ = service.for_recreation(id);
+        assert_eq!(layout.session_dir(id).parent(), Some(layout.sessions_dir().as_path()), "{id}");
     }
-    assert!(!root.exists());
+    assert!(service.for_recreation("").is_err());
+    let outside: Vec<_> =
+        std::fs::read_dir(temp.path()).unwrap().map(|entry| entry.unwrap().file_name()).filter(|name| name != "runtime").collect();
+    assert!(outside.is_empty(), "{outside:?}");
 }
 
 // Behaviour: a starting daemon publishes its pid registration whole. A reader

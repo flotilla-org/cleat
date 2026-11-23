@@ -1540,7 +1540,7 @@ fn start_session(
     let vt_engine = vt_engine.unwrap_or_else(vt::default_vt_engine_kind);
     vt_engine.ensure_available()?;
     let id = id.unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
-    crate::runtime::validate_runtime_name(&id)?;
+    crate::session_name::validate_session_name(&id)?;
     crate::runtime::validate_environment(&options.environment)?;
     crate::runtime::validate_program(cmd.as_deref(), options.argv.as_deref())?;
     let mut session = layout.session_metadata(id, vt_engine, cwd, cmd);
@@ -1748,7 +1748,7 @@ fn connect_foreground_upgrade(
             strict,
         })
         .map_err(|err| format!("serialize attach request: {err}"))?;
-        http_uds::write_attach_upgrade_request(&mut stream, &format!("/sessions/{id}/{role}"), &body)
+        http_uds::write_attach_upgrade_request(&mut stream, &format!("/sessions/{}/{role}", crate::session_name::path_segment(id)), &body)
             .map_err(|err| format!("write {role} upgrade request: {err}"))?;
         let response = http_uds::read_response_head(&mut stream).map_err(|err| format!("read {role} upgrade response: {err}"))?;
         match response.status {
@@ -3874,7 +3874,7 @@ fn handle_http_request(
                 )
                 .map_err(|err| format!("write drain refusal: {err}"));
             }
-            crate::runtime::validate_runtime_name(&session.id)?;
+            crate::session_name::validate_session_name(&session.id)?;
             crate::runtime::validate_environment(&session.environment)?;
             crate::runtime::validate_program(session.cmd.as_deref(), session.argv.as_deref())?;
             session.vt_engine.ensure_available()?;

@@ -15,7 +15,7 @@ pub fn connect_packets(socket: &Path) -> Result<(PacketClient<SessionStream>, Di
 }
 
 pub fn attach(socket: &Path, id: &str, identity: AttachmentIdentity, strict: bool, take: bool) -> Result<ForegroundAttach, String> {
-    crate::runtime::validate_runtime_name(id)?;
+    crate::session_name::validate_session_name(id)?;
     let (stream, directory) = connect(socket)?;
     crate::session::attach_packet_stream((stream, directory), id, PacketAttachOptions {
         identity,

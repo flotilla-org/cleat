@@ -249,8 +249,13 @@ fn adopt_session(session: &mut CleatSession) -> Result<(), String> {
     let identity = daemon.view.slot.lock().map_err(|_| "session channel lock poisoned")?.identity.clone();
     let layout = daemon.view.connection.channel_layout(daemon.view.channel).resolved()?;
     let mut inspect_stream = stream(&layout)?;
-    crate::http_uds::write_request(&mut inspect_stream, http::Method::GET, &format!("/sessions/{}", daemon.id), &[])
-        .map_err(|err| err.to_string())?;
+    crate::http_uds::write_request(
+        &mut inspect_stream,
+        http::Method::GET,
+        &format!("/sessions/{}", crate::session_name::path_segment(&daemon.id)),
+        &[],
+    )
+    .map_err(|err| err.to_string())?;
     let response = crate::http_uds::read_response(&mut inspect_stream).map_err(|err| err.to_string())?;
     let inspect: crate::protocol::InspectResult =
         serde_json::from_slice(&response.body).map_err(|err| format!("inspect before adoption: {err}"))?;
@@ -260,7 +265,7 @@ fn adopt_session(session: &mut CleatSession) -> Result<(), String> {
     crate::http_uds::write_request_with_epoch(
         &mut stream,
         http::Method::POST,
-        &format!("/sessions/{}/adopt", daemon.id),
+        &format!("/sessions/{}/adopt", crate::session_name::path_segment(&daemon.id)),
         &[],
         Some(inspect.hosting_epoch),
     )

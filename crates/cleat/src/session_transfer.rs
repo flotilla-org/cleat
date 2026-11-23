@@ -551,7 +551,7 @@ impl TransferHub {
     ) -> Result<(), String> {
         maybe_refuse_adoption_for_test(&manifest.session.id)?;
         let id = &manifest.session.id;
-        crate::runtime::validate_runtime_name(id)?;
+        crate::session_name::validate_session_name(id)?;
         if (sessions.contains_key(id) && !returning) || self.pending_adoptions.contains_key(id) {
             return Err(format!("session {id} is already live on this daemon"));
         }

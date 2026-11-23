@@ -142,7 +142,7 @@ impl Relocation {
             }
             Err(_) => {}
         }
-        let staging = sessions.join(format!(".{}.transfer-{}", self.session_id, uuid::Uuid::new_v4()));
+        let staging = sessions.join(format!(".{}.transfer-{}", crate::session_name::directory_for(&self.session_id), uuid::Uuid::new_v4()));
         let copied = copy_dir(&self.source, &staging).and_then(|()| {
             std::fs::rename(&staging, &destination)
                 .map_err(|err| format!("publish copied session directory {}: {err}", destination.display()))

@@ -22,7 +22,7 @@ pub(crate) struct SessionIdentity {
 
 impl SessionIdentity {
     fn new(layout: &RuntimeLayout, session: &str) -> Result<Self, String> {
-        crate::runtime::validate_runtime_name(session)?;
+        crate::session_name::validate_session_name(session)?;
         let directory = fs::canonicalize(layout.daemon_dir()).map_err(|e| format!("resolve output daemon: {e}"))?;
         let daemon = directory.file_name().and_then(|name| name.to_str()).ok_or("invalid output daemon directory")?;
         Ok(Self {

@@ -5473,3 +5473,78 @@ fn keyed_send_257th_key_evicts_the_oldest() {
     wait_until("258 writes", || std::fs::read_to_string(&sink).is_ok_and(|text| text.len() == 258 * 2));
     service.kill("keyed-evict").unwrap();
 }
+
+// Session names are the client's own text: flotilla's carry `#`, `:` and `/`.
+const UNRESTRICTED_NAMES: [&str; 2] = ["terminal-convoy-abc-work#12007-coder", "project:katzensteg/convoy:governor-govern#7673-governor"];
+
+fn run(service: &SessionService, args: &[&str]) -> Result<Option<String>, String> {
+    let command = Cli::try_parse_from(args).unwrap_or_else(|err| panic!("parse {args:?}: {err}"));
+    match cli::execute(command, service) {
+        ExecResult::Ok(output) => Ok(output),
+        ExecResult::Err(err) => Err(err),
+        ExecResult::Exit { code, message, .. } => Err(format!("exit {code}: {}", message.unwrap_or_default())),
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[test]
+fn sessions_take_any_name_through_the_cli() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let _cleanup = ListTestCleanup::start(temp.path(), &service, &UNRESTRICTED_NAMES);
+
+    for name in UNRESTRICTED_NAMES {
+        run(&service, &["cleat", "create", "--json", "--vt", "ghostty", name, "--cmd", "cat"]).expect("create");
+        run(&service, &["cleat", "send", name, &format!("hello {name}")]).expect("send");
+        wait_until("echoed input", || {
+            run(&service, &["cleat", "capture", name]).ok().flatten().is_some_and(|screen| screen.contains(&format!("hello {name}")))
+        });
+        let inspected = run(&service, &["cleat", "inspect", name, "--json"]).expect("inspect").expect("inspect output");
+        assert!(inspected.contains(&serde_json::to_string(name).unwrap()), "{inspected}");
+    }
+
+    let listed: Vec<SessionInfo> =
+        serde_json::from_str(&run(&service, &["cleat", "list", "--json"]).expect("list").expect("list output")).expect("parse list");
+    let mut ids: Vec<_> = listed.iter().map(|session| session.id.as_str()).collect();
+    ids.sort();
+    let mut expected = UNRESTRICTED_NAMES.to_vec();
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    for name in UNRESTRICTED_NAMES {
+        run(&service, &["cleat", "kill", name]).expect("kill");
+    }
+    let listed: Vec<SessionInfo> =
+        serde_json::from_str(&run(&service, &["cleat", "list", "--json"]).expect("list").expect("list output")).expect("parse list");
+    assert!(listed.is_empty(), "{listed:?}");
+}
+
+#[test]
+fn a_dead_daemons_sessions_keep_their_names() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    let name = UNRESTRICTED_NAMES[1];
+    service
+        .create(Some(name.into()), Some(VtEngineKind::Passthrough), None, Some("printf sentinel; sleep 30".into()), true)
+        .expect("create recorded session");
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
+    wait_until("daemon exit", || UnixStream::connect(session_socket_path(temp.path(), name)).is_err());
+
+    let listed: Vec<SessionInfo> =
+        serde_json::from_str(&run(&service, &["cleat", "list", "--json"]).expect("list").expect("list output")).expect("parse list");
+
+    assert_eq!(listed.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec![name]);
+    cleat::platform::daemon::terminate_session_daemon_if_expected(temp.path(), DEFAULT_DAEMON_NAME);
+}
+
+#[test]
+fn session_names_refuse_only_empty_nul_or_overlong_text() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = service_for(temp.path());
+    for (name, reason) in [("", "empty"), ("a\0b", "NUL"), (&"#".repeat(90) as &str, "too long")] {
+        let err = service.create(Some(name.into()), Some(VtEngineKind::Passthrough), None, Some("true".into()), false).expect_err(name);
+        assert!(err.contains(reason), "{name:?}: {err}");
+    }
+}

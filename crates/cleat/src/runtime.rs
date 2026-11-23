@@ -436,7 +436,7 @@ impl RuntimeLayout {
     }
 
     pub fn session_dir(&self, id: &str) -> PathBuf {
-        self.sessions_dir().join(id)
+        self.sessions_dir().join(crate::session_name::directory_for(id))
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -469,7 +469,7 @@ impl RuntimeLayout {
         self.ensure_daemon_dirs()?;
 
         let id = id.unwrap_or_else(|| format!("session-{}", Uuid::new_v4()));
-        validate_runtime_name(&id)?;
+        crate::session_name::validate_session_name(&id)?;
         let dir = self.session_dir(&id);
         fs::create_dir_all(&dir).map_err(|err| format!("create session dir {}: {err}", dir.display()))?;
         ensure_hosting_epoch(&dir)?;

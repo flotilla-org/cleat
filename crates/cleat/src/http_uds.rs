@@ -803,9 +803,10 @@ pub(crate) fn route(request: &HttpRequest) -> Route {
                 return Route::NotFound;
             };
             let mut segments = rest.split('/');
-            let Some(id) = segments.next().filter(|value| !value.is_empty()) else {
+            let Some(id) = segments.next().filter(|value| !value.is_empty()).and_then(crate::session_name::name_from_path_segment) else {
                 return Route::NotFound;
             };
+            let id = id.as_str();
             match (request.method(), segments.next(), segments.next()) {
                 (&Method::GET, None, None) => Route::SessionInspect { id: id.to_string() },
                 (&Method::DELETE, None, None) => Route::SessionDelete { id: id.to_string() },
@@ -1120,6 +1121,10 @@ mod tests {
             ("GET", "/sessions", Route::Sessions),
             ("POST", "/sessions", Route::SessionCreate),
             ("GET", "/sessions/alpha", Route::SessionInspect { id: "alpha".to_string() }),
+            ("GET", "/sessions/work%2312%2Fcoder", Route::SessionInspect { id: "work#12/coder".to_string() }),
+            ("POST", "/sessions/project%3Ak%2Fconvoy%3Agovernor/attach", Route::SessionAttach {
+                id: "project:k/convoy:governor".to_string(),
+            }),
             ("DELETE", "/sessions/alpha", Route::SessionDelete { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/attach", Route::SessionAttach { id: "alpha".to_string() }),
             ("POST", "/sessions/alpha/watch", Route::SessionWatch { id: "alpha".to_string() }),

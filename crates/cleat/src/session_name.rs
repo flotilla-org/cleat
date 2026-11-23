@@ -9,7 +9,10 @@
 //!   how every session was stored before arbitrary names. Any other name is
 //!   stored as `~` followed by its UTF-8 bytes, each byte outside
 //!   `[A-Za-z0-9_-]` written `%XX`. No plain name contains `~`, so the two
-//!   forms never collide, and each directory maps back to one name.
+//!   forms never collide, and each directory maps back to one name. Letters
+//!   are kept as they are, so on a case-insensitive filesystem (the macOS and
+//!   Windows defaults) names that differ only in letter case share a
+//!   directory, escaped or plain.
 //! - In the daemon's HTTP paths a name is one percent-encoded path segment.
 
 const ESCAPED_PREFIX: char = '~';
@@ -93,6 +96,9 @@ fn percent_decode(text: &str) -> Option<Vec<u8>> {
     while i < bytes.len() {
         if bytes[i] == b'%' {
             let hex = bytes.get(i + 1..i + 3)?;
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
             out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
             i += 3;
         } else {
@@ -164,5 +170,14 @@ mod tests {
             assert!(!segment.contains('/') && !segment.contains('#') && !segment.contains('?'), "{segment}");
             assert_eq!(name_from_path_segment(&segment).as_deref(), Some(name));
         }
+    }
+
+    #[test]
+    fn a_percent_sign_needs_two_hex_digits() {
+        assert_eq!(name_from_path_segment("a%2Fb").as_deref(), Some("a/b"));
+        for segment in ["%+1", "%-1", "%1", "%", "%G0", "a%2"] {
+            assert_eq!(name_from_path_segment(segment), None, "{segment}");
+        }
+        assert_eq!(name_from_directory("~%+1"), None);
     }
 }

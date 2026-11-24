@@ -291,10 +291,10 @@ pub enum Command {
                            Tip: launch a shell (e.g. zsh) and use `send` to run commands.\nSessions exit when the launched process exits."
     )]
     Launch {
-        #[arg(value_name = "ID")]
+        #[arg(value_name = "ID", help = "Session name: any text without NUL")]
         id: Option<String>,
         /// Launch in the daemon that owns this source session
-        #[arg(long, value_name = "SESSION", value_parser = parse_runtime_name)]
+        #[arg(long, value_name = "SESSION", value_parser = parse_session_name)]
         from: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -804,7 +804,7 @@ fn execute_socket(cli: &Cli) -> Option<ExecResult> {
         ),
         Command::Packets { socket: Some(socket), id, count } => Some(
             (|| {
-                validate_runtime_name(id)?;
+                crate::session_name::validate_session_name(id)?;
                 let (client, directory) = crate::socket_client::connect_packets(socket)?;
                 render_packet_summaries(client, directory, id, *count)
                     .map_err(|err| format!("socket packets: {err}; recovery requires a fresh connect"))
@@ -2013,8 +2013,8 @@ fn parse_terminal_size(value: &str) -> Result<TerminalSize, String> {
     Ok(TerminalSize { cols, rows })
 }
 
-fn parse_runtime_name(value: &str) -> Result<String, String> {
-    crate::runtime::validate_runtime_name(value)?;
+fn parse_session_name(value: &str) -> Result<String, String> {
+    crate::session_name::validate_session_name(value)?;
     Ok(value.to_string())
 }
 

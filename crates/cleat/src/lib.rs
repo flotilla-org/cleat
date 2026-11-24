@@ -37,6 +37,7 @@ mod screen_activity;
 pub mod screen_query;
 pub mod server;
 pub mod session;
+pub mod session_name;
 mod session_runtime;
 pub mod socket_client;
 mod status_output;

@@ -142,17 +142,23 @@ impl Relocation {
             }
             Err(_) => {}
         }
-        let staging = sessions.join(format!(".{}.transfer-{}", self.session_id, uuid::Uuid::new_v4()));
-        let copied = copy_dir(&self.source, &staging).and_then(|()| {
-            std::fs::rename(&staging, &destination)
-                .map_err(|err| format!("publish copied session directory {}: {err}", destination.display()))
-        });
-        if let Err(err) = copied {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(err);
-        }
+        publish_copy(&self.source, &sessions, &destination)?;
         std::fs::remove_dir_all(&self.source).map_err(|err| format!("remove copied session directory {}: {err}", self.source.display()))
     }
+}
+
+/// Copy `source` into a staging directory under `sessions`, then rename it to
+/// `destination`. The staging name has a fixed length, so every session
+/// directory that fits one path component can be staged.
+fn publish_copy(source: &std::path::Path, sessions: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+    let staging = sessions.join(format!(".transfer-{}", uuid::Uuid::new_v4()));
+    let copied = copy_dir(source, &staging).and_then(|()| {
+        std::fs::rename(&staging, destination).map_err(|err| format!("publish copied session directory {}: {err}", destination.display()))
+    });
+    if copied.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    copied
 }
 
 fn copy_dir(source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
@@ -470,6 +476,24 @@ pub(crate) fn write_commit(stream: &mut impl Write, tail: &[u8]) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copied_session_directory_of_any_valid_length_is_published() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested").join("file"), b"data").unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let name = "#".repeat(84);
+        crate::session_name::validate_session_name(&name).unwrap();
+        let destination = sessions.join(crate::session_name::directory_for(&name));
+
+        publish_copy(&source, &sessions, &destination).unwrap();
+
+        assert_eq!(std::fs::read(destination.join("nested").join("file")).unwrap(), b"data");
+        assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 1, "no staging directory is left behind");
+    }
 
     #[test]
     fn adoption_and_commit_frames_round_trip() {

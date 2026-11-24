@@ -15,7 +15,7 @@ use crate::{
         ipc::{set_stream_read_timeout, try_connect_session_stream, SessionStream},
     },
     protocol::{AttachmentIdentity, SessionInfo, SessionStatus},
-    runtime::{discoverable_runtime_roots, validate_daemon_name, validate_runtime_name, DaemonCoordinates, RuntimeLayout, TerminalSize},
+    runtime::{discoverable_runtime_roots, validate_daemon_name, DaemonCoordinates, RuntimeLayout, TerminalSize},
     session::{
         attach_foreground, attach_packet_foreground, ensure_session_started, run_session_daemon, start_session_in_running_daemon,
         watch_foreground, ForegroundAttach, SessionStartOptions,
@@ -221,7 +221,7 @@ impl SessionService {
     /// Resolve an id through the logical alias. Prefer live claims; retain dead
     /// recordings as recreatable husks when no live generation claims the id.
     pub fn for_session(&self, id: &str) -> Result<Self, String> {
-        validate_runtime_name(id)?;
+        crate::session_name::validate_session_name(id)?;
         if self.layout.daemon_name().contains('@') {
             return Ok(self.clone());
         }
@@ -316,7 +316,7 @@ impl SessionService {
         self.http_json_with_read_timeout(
             id,
             Method::POST,
-            &format!("/sessions/{id}/transfer"),
+            &format!("/sessions/{}/transfer", crate::session_name::path_segment(id)),
             &request,
             timeout.saturating_add(Duration::from_secs(15)),
         )
@@ -739,6 +739,7 @@ impl SessionService {
             controller: None,
             conpty: None,
             error: None,
+            directory: None,
         }
     }
 
@@ -769,7 +770,12 @@ impl SessionService {
                 continue;
             }
             let pid_before = daemon_service.registered_daemon_pid();
-            match daemon_service.http_json::<_, crate::protocol::InspectResult>(id, Method::GET, &format!("/sessions/{id}"), &()) {
+            match daemon_service.http_json::<_, crate::protocol::InspectResult>(
+                id,
+                Method::GET,
+                &format!("/sessions/{}", crate::session_name::path_segment(id)),
+                &(),
+            ) {
                 Ok(_) => match (pid_before, daemon_service.registered_daemon_pid()) {
                     (Ok(before), Ok(after)) if before == after => owners.push(DaemonInstance { name: daemon_name, pid: after }),
                     (Ok(_), Ok(_)) => candidate_errors.push(format!("{daemon_name}: daemon changed while resolving session")),
@@ -858,6 +864,7 @@ impl SessionService {
                 for result in result.sessions {
                     let status =
                         if has_controller_attachment(&result.attachments) { SessionStatus::Attached } else { SessionStatus::Detached };
+                    let directory = Some(self.layout.session_dir(&result.session.id));
                     let info = SessionInfo {
                         id: result.session.id,
                         vt_engine: parse_vt_engine_kind(&result.session.vt_engine),
@@ -874,6 +881,7 @@ impl SessionService {
                         controller: controller_identity(&result.attachments),
                         conpty: result.session.conpty,
                         error: None,
+                        directory,
                     };
                     if session_matches_selectors(&info, selectors) {
                         sessions.push(info);
@@ -896,7 +904,7 @@ impl SessionService {
     pub(crate) fn request_end(&self, id: &str) -> Result<(), String> {
         // For daemon-attached handles: let DELETE reject sessions no longer
         // hosted here, rather than consulting local holder files as CLI kill does.
-        self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &())
+        self.http_no_content(id, Method::DELETE, &format!("/sessions/{}", crate::session_name::path_segment(id)), &())
     }
 
     pub fn kill(&self, id: &str) -> Result<(), String> {
@@ -911,7 +919,9 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        if self.layout.socket_path().exists() && self.http_no_content(id, Method::DELETE, &format!("/sessions/{id}"), &()).is_ok() {
+        if self.layout.socket_path().exists()
+            && self.http_no_content(id, Method::DELETE, &format!("/sessions/{}", crate::session_name::path_segment(id)), &()).is_ok()
+        {
             self.wait_for_session_shutdown(id)?;
             // The daemon owns normal exit cleanup. Never remove metadata or
             // recordings merely because termination was requested.
@@ -941,7 +951,14 @@ impl SessionService {
         loop {
             // Shutdown polling must never auto-start the daemon it is waiting on.
             if !self.layout.session_dir(id).exists()
-                || self.http_json::<_, crate::protocol::InspectResult>(id, Method::GET, &format!("/sessions/{id}"), &()).is_err()
+                || self
+                    .http_json::<_, crate::protocol::InspectResult>(
+                        id,
+                        Method::GET,
+                        &format!("/sessions/{}", crate::session_name::path_segment(id)),
+                        &(),
+                    )
+                    .is_err()
             {
                 return Ok(());
             }
@@ -961,7 +978,7 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
 
-        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/detach"), &())
+        self.http_no_content(id, Method::POST, &format!("/sessions/{}/detach", crate::session_name::path_segment(id)), &())
     }
 
     pub fn capture(&self, id: &str) -> Result<String, String> {
@@ -970,7 +987,8 @@ impl SessionService {
         }
         crate::session::ensure_daemon_started(&self.layout)?;
 
-        let response: http_uds::ScreenResponse = self.http_json(id, Method::GET, &format!("/sessions/{id}/screen"), &())?;
+        let response: http_uds::ScreenResponse =
+            self.http_json(id, Method::GET, &format!("/sessions/{}/screen", crate::session_name::path_segment(id)), &())?;
         Ok(response.text)
     }
 
@@ -1058,7 +1076,12 @@ impl SessionService {
 
     /// Acknowledge retained done/error results for a focus-aware client.
     pub fn acknowledge_program_status(&self, id: &str) -> Result<(), String> {
-        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/input"), &http_uds::InputRequest::AcknowledgeProgramStatus)
+        self.http_no_content(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/input", crate::session_name::path_segment(id)),
+            &http_uds::InputRequest::AcknowledgeProgramStatus,
+        )
     }
 
     pub fn send_keys(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -1066,18 +1089,24 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
 
-        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/keys"), &http_uds::KeysRequest { bytes: bytes.to_vec() })
+        self.http_no_content(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/keys", crate::session_name::path_segment(id)),
+            &http_uds::KeysRequest { bytes: bytes.to_vec() },
+        )
     }
 
     pub fn send_keys_with_mark(&self, id: &str, bytes: &[u8], marker_name: &str) -> Result<u64, String> {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let response: http_uds::MarkResponse =
-            self.http_json(id, Method::POST, &format!("/sessions/{id}/keys-with-mark"), &http_uds::KeysWithMarkRequest {
-                bytes: bytes.to_vec(),
-                marker_name: marker_name.to_string(),
-            })?;
+        let response: http_uds::MarkResponse = self.http_json(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/keys-with-mark", crate::session_name::path_segment(id)),
+            &http_uds::KeysWithMarkRequest { bytes: bytes.to_vec(), marker_name: marker_name.to_string() },
+        )?;
         Ok(response.offset)
     }
 
@@ -1090,7 +1119,12 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}").into());
         }
-        let response = self.http_request(id, Method::POST, &format!("/sessions/{id}/input"), &input.transaction_body()?)?;
+        let response = self.http_request(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/input", crate::session_name::path_segment(id)),
+            &input.transaction_body()?,
+        )?;
         if !response.status.is_success() {
             let status = response.status.as_u16();
             let mut error = serde_json::from_slice::<SendError>(&response.body).unwrap_or_else(|_| http_error_message(response).into());
@@ -1107,7 +1141,7 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
 
-        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/input"), input)
+        self.http_no_content(id, Method::POST, &format!("/sessions/{}/input", crate::session_name::path_segment(id)), input)
     }
 
     #[cfg(all(test, unix))]
@@ -1116,11 +1150,12 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
 
-        let response: http_uds::MarkResponse =
-            self.http_json(id, Method::POST, &format!("/sessions/{id}/paste-with-mark"), &http_uds::PasteWithMarkRequest {
-                text: text.to_string(),
-                marker_name: marker_name.to_string(),
-            })?;
+        let response: http_uds::MarkResponse = self.http_json(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/paste-with-mark", crate::session_name::path_segment(id)),
+            &http_uds::PasteWithMarkRequest { text: text.to_string(), marker_name: marker_name.to_string() },
+        )?;
         Ok(response.offset)
     }
 
@@ -1135,14 +1170,14 @@ impl SessionService {
     ) -> Result<(SessionInfo, ForegroundAttach), String> {
         let info = if no_create {
             let id = name.ok_or_else(|| "attach --no-create requires a session id".to_string())?;
-            validate_runtime_name(&id)?;
+            crate::session_name::validate_session_name(&id)?;
             if !self.layout.session_dir(&id).exists() {
                 return Err(format!("missing session {id}"));
             }
             // inspect() may auto-start a daemon. An existing-only attachment
             // must neither start a replacement nor clean up retained state on
             // a connection, permission, protocol or session lookup failure.
-            let result = self.http_json(&id, Method::GET, &format!("/sessions/{id}"), &())?;
+            let result = self.http_json(&id, Method::GET, &format!("/sessions/{}", crate::session_name::path_segment(&id)), &())?;
             session_info_from_inspect(result, SessionStatus::Attached)
         } else {
             let session = ensure_session_started(&self.layout, name, vt_engine, cwd, cmd, SessionStartOptions {
@@ -1169,6 +1204,7 @@ impl SessionService {
                     controller: None,
                     conpty: None,
                     error: None,
+                    directory: None,
                 }
             }
         };
@@ -1335,7 +1371,7 @@ impl SessionService {
             }
             query
         };
-        self.http_json(id, Method::GET, &format!("/sessions/{id}/screen{query}"), &())
+        self.http_json(id, Method::GET, &format!("/sessions/{}/screen{query}", crate::session_name::path_segment(id)), &())
     }
 
     pub fn inspect(&self, id: &str) -> Result<crate::protocol::InspectResult, String> {
@@ -1343,15 +1379,19 @@ impl SessionService {
             return Err(format!("missing session {id}"));
         }
         crate::session::ensure_daemon_started(&self.layout)?;
-        self.http_json(id, Method::GET, &format!("/sessions/{id}"), &())
+        self.http_json(id, Method::GET, &format!("/sessions/{}", crate::session_name::path_segment(id)), &())
     }
 
     pub fn update_tags(&self, id: &str, add: Vec<String>, remove: Vec<String>) -> Result<Vec<String>, String> {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let response: http_uds::TagResponse =
-            self.http_json(id, Method::POST, &format!("/sessions/{id}/tags"), &http_uds::TagRequest { add, remove })?;
+        let response: http_uds::TagResponse = self.http_json(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/tags", crate::session_name::path_segment(id)),
+            &http_uds::TagRequest { add, remove },
+        )?;
         Ok(response.tags)
     }
 
@@ -1360,10 +1400,12 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let response: http_uds::TagResponse =
-            self.http_json(id, Method::POST, &format!("/sessions/{id}/recognizer"), &http_uds::RecognizerRequest {
-                id: recognizer.into(),
-            })?;
+        let response: http_uds::TagResponse = self.http_json(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/recognizer", crate::session_name::path_segment(id)),
+            &http_uds::RecognizerRequest { id: recognizer.into() },
+        )?;
         Ok(response.tags)
     }
 
@@ -1371,10 +1413,12 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/signal"), &http_uds::SignalRequest {
-            signal,
-            target: signal_target_to_http(target),
-        })
+        self.http_no_content(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/signal", crate::session_name::path_segment(id)),
+            &http_uds::SignalRequest { signal, target: signal_target_to_http(target) },
+        )
     }
 
     pub fn mark(&self, id: &str) -> Result<u64, String> {
@@ -1389,8 +1433,12 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let response: http_uds::MarkResponse =
-            self.http_json(id, Method::POST, &format!("/sessions/{id}/mark"), &http_uds::MarkRequest { name: name.map(str::to_string) })?;
+        let response: http_uds::MarkResponse = self.http_json(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/mark", crate::session_name::path_segment(id)),
+            &http_uds::MarkRequest { name: name.map(str::to_string) },
+        )?;
         Ok(response.offset)
     }
 
@@ -1398,10 +1446,12 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let response: http_uds::MarkResponse =
-            self.http_json(id, Method::POST, &format!("/sessions/{id}/resolve-marker"), &http_uds::ResolveMarkerRequest {
-                name: name.to_string(),
-            })?;
+        let response: http_uds::MarkResponse = self.http_json(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/resolve-marker", crate::session_name::path_segment(id)),
+            &http_uds::ResolveMarkerRequest { name: name.to_string() },
+        )?;
         Ok(response.offset)
     }
 
@@ -1409,10 +1459,12 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        let response: http_uds::ResolveNextMarkerResponse =
-            self.http_json(id, Method::POST, &format!("/sessions/{id}/resolve-next-marker"), &http_uds::ResolveNextMarkerRequest {
-                after,
-            })?;
+        let response: http_uds::ResolveNextMarkerResponse = self.http_json(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/resolve-next-marker", crate::session_name::path_segment(id)),
+            &http_uds::ResolveNextMarkerRequest { after },
+        )?;
         Ok(response.offset)
     }
 
@@ -1420,7 +1472,12 @@ impl SessionService {
         if !self.layout.session_dir(id).exists() {
             return Err(format!("missing session {id}"));
         }
-        self.http_no_content(id, Method::POST, &format!("/sessions/{id}/record"), &http_uds::RecordRequest { enable })
+        self.http_no_content(
+            id,
+            Method::POST,
+            &format!("/sessions/{}/record", crate::session_name::path_segment(id)),
+            &http_uds::RecordRequest { enable },
+        )
     }
 
     pub fn wait(
@@ -1445,7 +1502,7 @@ impl SessionService {
         let response: http_uds::WaitResultResponse = self.http_json_with_read_timeout(
             id,
             Method::POST,
-            &format!("/sessions/{id}/wait"),
+            &format!("/sessions/{}/wait", crate::session_name::path_segment(id)),
             &http_uds::WaitRequest { conditions, select: None, timeout_ms },
             Duration::from_millis(timeout_ms.saturating_add(5000)),
         )?;
@@ -1463,7 +1520,7 @@ impl SessionService {
         let response: http_uds::WaitResultResponse = self.http_json_with_read_timeout(
             id,
             Method::POST,
-            &format!("/sessions/{id}/expect"),
+            &format!("/sessions/{}/expect", crate::session_name::path_segment(id)),
             &http_uds::ExpectRequest { text: text.to_string(), since_offset, timeout_ms },
             Duration::from_millis(timeout_ms.saturating_add(5000)),
         )?;
@@ -1571,7 +1628,7 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
         if !path.is_dir() {
             continue;
         }
-        let Some(id) = path.file_name().and_then(|name| name.to_str()).map(str::to_string) else {
+        let Some(id) = path.file_name().and_then(|name| name.to_str()).and_then(crate::session_name::name_from_directory) else {
             continue;
         };
         #[cfg(unix)]
@@ -1599,6 +1656,7 @@ fn sweep_dead_daemon_sessions(layout: &RuntimeLayout, err: String) -> Result<Vec
             controller: None,
             conpty: None,
             error: Some(err.clone()),
+            directory: Some(path),
         });
     }
     remove_stale_daemon_file(layout.socket_path(), "socket")?;
@@ -1680,6 +1738,7 @@ fn session_info_from_inspect(result: crate::protocol::InspectResult, status: Ses
         controller: controller_identity(&result.attachments),
         conpty: result.session.conpty,
         error: None,
+        directory: None,
     }
 }
 

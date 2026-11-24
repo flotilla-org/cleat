@@ -58,7 +58,10 @@ fn unavailable_socket_never_spawns_or_creates_runtime() {
 fn socket_verbs_reject_invalid_session_ids_consistently() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("missing.sock");
-    for id in ["", ".", "..", "invalid/name", "invalid\\name"] {
+    // A session name is any text without NUL, which no argument can carry: what is left to refuse
+    // is an empty name and one too long to keep.
+    let too_long = "#".repeat(90);
+    for id in ["", too_long.as_str()] {
         let mut errors = Vec::new();
         for verb in ["attach", "packets"] {
             let output = Command::new(env!("CARGO_BIN_EXE_cleat")).args([verb, "--socket"]).arg(&socket).arg(id).output().unwrap();
